@@ -200,9 +200,10 @@ if MISSING_PACKAGES:
 # COMMANDS TO RUN ON EVERY ESXi HOST  ← edit this list as needed
 # ---------------------------------------------------------------------------
 COMMANDS_TO_RUN = [
-    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks",
-    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group setmemconfig -g host/vim/vmvisor/settingsd-task-forks -m 400 -i 0 -l -1 -u mb",
-    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks"
+    "esxcli system version get",
+    "esxcli network ip interface list",
+    "esxcli storage core device list | head -40",
+    "vim-cmd vmsvc/getallvms",
     # Add more commands below, for example:
     # "esxcli hardware cpu global get",
     # "esxcli system ntp get",
@@ -620,12 +621,6 @@ def main():
     parser = build_parser()
     args   = parser.parse_args()
 
-    # Resolve credentials
-    if not args.password:
-        args.password = getpass.getpass(f"vCenter password for '{args.user}': ")
-    if not args.ssh_password:
-        args.ssh_password = args.password   # default: reuse vCenter password
-
     # Guard: --disable-ssh-after is incompatible with the ssh-only modes
     if args.disable_ssh_after and (args.ssh_only_enable or args.ssh_only_disable):
         parser.error(
@@ -640,6 +635,28 @@ def main():
         mode = "ssh-only-disable"
     else:
         mode = "run-commands"
+
+    # ── Interactive credential prompts ───────────────────────────────────
+    # vCenter password — always required
+    if not args.password:
+        args.password = getpass.getpass(f"vCenter password for '{args.user}': ")
+
+    # SSH password — only needed when we actually open SSH sessions (run-commands mode).
+    # Never silently reuse the vCenter password; always ask explicitly.
+    if mode == "run-commands" and not args.ssh_password:
+        sys.stdout.write(
+            f"SSH password for '{args.ssh_user}' on ESXi hosts\n"
+            f"(leave blank to reuse the vCenter password): "
+        )
+        sys.stdout.flush()
+        entered = getpass.getpass("")
+        if entered:
+            args.ssh_password = entered
+        else:
+            args.ssh_password = args.password
+            print("--> No SSH password entered, reusing vCenter password for SSH.")
+    elif not args.ssh_password:
+        args.ssh_password = args.password
 
 
     log_file = None if args.no_log_file else args.log_file
