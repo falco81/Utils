@@ -1,0 +1,7 @@
+# requirements.txt  –  vCenter ESXi SSH Automation
+# Install all dependencies with:
+#   pip install -r requirements.txt
+
+pyVmomi>=8.0.2.0     # vCenter / vSphere Python SDK
+paramiko>=3.4.0      # SSH client
+colorama>=0.4.6      # Coloured terminal output (Windows CMD / PowerShell compatible)
