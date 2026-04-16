@@ -200,10 +200,9 @@ if MISSING_PACKAGES:
 # COMMANDS TO RUN ON EVERY ESXi HOST  ← edit this list as needed
 # ---------------------------------------------------------------------------
 COMMANDS_TO_RUN = [
-    "esxcli system version get",
-    "esxcli network ip interface list",
-    "esxcli storage core device list | head -40",
-    "vim-cmd vmsvc/getallvms",
+    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks",
+    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group setmemconfig -g host/vim/vmvisor/settingsd-task-forks -m 400 -i 0 -l -1 -u mb",
+    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks"
     # Add more commands below, for example:
     # "esxcli hardware cpu global get",
     # "esxcli system ntp get",
