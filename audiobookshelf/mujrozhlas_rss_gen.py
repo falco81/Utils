@@ -3,16 +3,20 @@
 """
 mujrozhlas_rss_gen.py  (v4)
 ---------------------------
-Generuje RSS feed 1:1 shodný se strukturou oficiálního feedu mujRozhlas,
-ale pro VŠECHNY epizody (ne jen posledních 50).
+Generates an RSS feed 1:1 matching the structure of the official mujRozhlas
+feed, but for ALL episodes (not just the last 50).
 
-v4: přepsáno podle referenčního oficiálního feedu - stejné namespace,
-    stejný obrázek (resize variant), stejný promo text v description,
-    stejné GUID (legacyId), stejné odsazení.
+v4: rewritten to match the reference official feed - same namespaces,
+    same image (resize variant), same promo text in description,
+    same GUID (legacyId), same indentation.
 
-Konfigurace přes ENV:
-    OUTPUT_DIR   adresář pro *.rss (výchozí /var/www/rss)
-    SHOWS        JSON {"slug":"UUID"}, jinak DEFAULT_SHOWS
+Configuration via ENV:
+    OUTPUT_DIR   directory for *.rss files (default /var/www/rss)
+    SHOWS        JSON {"slug":"UUID"}, otherwise DEFAULT_SHOWS is used
+
+Note: PROMO_SHOW text and "Copyright Český rozhlas" line are intentionally
+kept in Czech because they are the exact strings used by the official
+mujRozhlas feed (and the generated feed targets Czech listeners).
 """
 
 import html
@@ -29,7 +33,7 @@ from email.utils import format_datetime
 try:
     import requests
 except ImportError:
-    sys.exit("Chybí modul 'requests'. pip3 install requests")
+    sys.exit("Missing 'requests' module. pip3 install requests")
 
 
 API_BASE = "https://api.mujrozhlas.cz"
@@ -39,8 +43,10 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0 Safari/537.36"
 )
 
-# Promo text, který CRo přidává do description každé epizody.
-# Obsahuje {uuid_campaign} = UUID epizody pro tracking.
+# Promo text that Czech Radio (CRo) adds to every episode description.
+# Contains {campaign} = episode UUID for UTM tracking.
+# Kept in Czech - this is the literal string from the official feed and is
+# consumed by Czech-speaking podcast listeners.
 PROMO_SHOW = (
     '<br><br>Všechny díly podcastu {show_title} můžete pohodlně poslouchat '
     'v mobilní aplikaci mujRozhlas pro '
@@ -59,7 +65,7 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/var/www/rss")
 try:
     SHOWS = json.loads(os.environ["SHOWS"]) if os.environ.get("SHOWS") else DEFAULT_SHOWS
 except json.JSONDecodeError:
-    print("CHYBA: SHOWS není platný JSON, používám výchozí.", file=sys.stderr)
+    print("ERROR: SHOWS is not valid JSON, using default.", file=sys.stderr)
     SHOWS = DEFAULT_SHOWS
 
 
@@ -117,7 +123,7 @@ def _fetch_alt(uuid):
     return episodes
 
 
-# --------- utility pro XML ---------
+# --------- XML utilities ---------
 
 def xml_escape(s):
     return html.escape("" if s is None else str(s), quote=True)
@@ -150,23 +156,23 @@ def duration_hms(seconds):
     return f"{s // 3600:02d}:{(s % 3600) // 60:02d}:{s % 60:02d}"
 
 
-# --------- obrazky ---------
+# --------- images ---------
 
 def transform_image_to_resize(url):
     """
-    Převede URL originálního obrázku na resize variantu, jakou používá CRo feed:
+    Converts an original image URL to the resize variant used by the CRo feed:
       /sites/default/files/images/ABC.jpg
         -> /sites/default/files/styles/mr_square_large/public/images/ABC.jpg
 
-    Parametry ?itok a ?v si CRo přidává pro cache-busting, ale bez nich URL
-    stále funguje (CDN ho jen přepočítá).
+    The ?itok and ?v query params are added by CRo for cache-busting, but the
+    URL also works without them (the CDN just recomputes them).
     """
     if not url:
         return url
-    # Pokud už je resize variant, vrať beze změny
+    # If already a resize variant, return unchanged
     if "/styles/" in url:
         return url
-    # Vlož segment 'styles/mr_square_large/public/' před 'images/'
+    # Insert the 'styles/mr_square_large/public/' segment before 'images/'
     new_url = re.sub(
         r'(/sites/default/files/)(images/)',
         r'\1styles/mr_square_large/public/\2',
@@ -176,13 +182,13 @@ def transform_image_to_resize(url):
 
 
 def get_image_url(attrs):
-    """Najde URL obrázku - API mujRozhlas používá 'asset' (objekt)."""
+    """Find the image URL - the mujRozhlas API uses 'asset' (object)."""
     asset = attrs.get("asset")
     if isinstance(asset, dict):
         u = asset.get("url")
         if u:
             return transform_image_to_resize(u)
-    # fallbacky pro jiné pořady
+    # fallbacks for other shows
     for img in (attrs.get("assets") or []):
         if isinstance(img, dict):
             u = img.get("url")
@@ -197,21 +203,21 @@ def get_image_url(attrs):
 # --------- audio ---------
 
 def pick_audio(attrs):
-    """(url, mime, length_bytes) - preferuje podtrac."""
+    """(url, mime, length_bytes) - prefers podtrac."""
     links = attrs.get("audioLinks") or []
     # podtrac URL
     for src in links:
         url = src.get("url", "")
         if url and "podtrac.com" in url:
             length = int(src.get("duration", 0) or 0)
-            # V API je 'duration' v sekundách, ne bajtech - length necháme 0,
-            # správné bajty zjistí --with-lengths režim nebo si je zjistí klient.
+            # In the API, 'duration' is in seconds, not bytes - leave length at 0,
+            # correct bytes will be resolved by --with-lengths mode or by the client.
             return url, src.get("mimeType", "audio/mpeg"), 0
     # mp3 variant
     for src in links:
         if src.get("variant") == "mp3" and src.get("url"):
             return src["url"], src.get("mimeType", "audio/mpeg"), 0
-    # cokoli
+    # anything else
     for src in links:
         if src.get("url"):
             return src["url"], src.get("mimeType", "audio/mpeg"), 0
@@ -230,8 +236,8 @@ def head_content_length(url, timeout=10):
 # --------- GUID ---------
 
 def get_legacy_id(attrs):
-    """Vrátí legacyId (číselný) pokud existuje, jinak None."""
-    # Zkusíme různé klíče, kde API může numerický ID vrátit
+    """Return legacyId (numeric) if present, otherwise None."""
+    # Try various keys where the API might expose a numeric ID
     for key in ("legacyId", "contentId", "cid", "id"):
         v = attrs.get(key)
         if v and (isinstance(v, int) or (isinstance(v, str) and v.isdigit())):
@@ -239,7 +245,7 @@ def get_legacy_id(attrs):
     return None
 
 
-# --------- hlavní build ---------
+# --------- main build ---------
 
 def build_rss(show_data, episodes, fetch_lengths=False):
     attrs = show_data["data"]["attributes"]
@@ -248,7 +254,7 @@ def build_rss(show_data, episodes, fetch_lengths=False):
     short_description = attrs.get("shortDescription") or ""
     base_description = attrs.get("description") or short_description
 
-    # Promo text připojený za description (stejně jako v oficiálním feedu)
+    # Promo text appended to description (same as in the official feed)
     channel_promo = PROMO_SHOW.format(
         show_title=title,
         show_uuid=show_uuid,
@@ -258,16 +264,16 @@ def build_rss(show_data, episodes, fetch_lengths=False):
 
     image_url = get_image_url(attrs)
     if image_url:
-        print(f"  obrázek: {image_url}", file=sys.stderr)
+        print(f"  image: {image_url}", file=sys.stderr)
     else:
-        print(f"  POZOR: obrázek nenalezen", file=sys.stderr)
+        print(f"  WARNING: image not found", file=sys.stderr)
 
     feed_link = f"https://www.mujrozhlas.cz/rapi/view/show/{show_uuid}"
     current_year = datetime.now().year
 
-    # Hlavička - přesně jako oficiální feed:
-    # - žádný 'encoding' v XML prologu (CRo to má taky bez)
-    # - JEN namespace itunes a content, žádný atom
+    # Header - matches the official feed exactly:
+    # - no 'encoding' in the XML prolog (CRo doesn't include it either)
+    # - ONLY itunes and content namespaces, no atom
     parts = [
         '<?xml version="1.0"?>',
         '<rss xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
@@ -290,7 +296,7 @@ def build_rss(show_data, episodes, fetch_lengths=False):
             "    </image>",
         ]
 
-    # itunes:summary používá short_description pokud existuje (CRo tak dělá)
+    # itunes:summary uses short_description if available (that's what CRo does)
     summary = short_description or base_description
     parts += [
         f"    <itunes:summary>{xml_escape(summary)}</itunes:summary>",
@@ -310,16 +316,16 @@ def build_rss(show_data, episodes, fetch_lengths=False):
         "    </itunes:owner>",
     ]
 
-    # --------- epizody ---------
+    # --------- episodes ---------
     skipped = 0
     missing_legacy = 0
     for idx, ep in enumerate(episodes, 1):
         a = ep.get("attributes", {})
         ep_uuid = ep.get("id", "")
-        ep_title = a.get("title", "") or "(bez názvu)"
+        ep_title = a.get("title", "") or "(no title)"
         base_desc = a.get("description") or a.get("shortDescription") or ""
 
-        # Přilepit promo blok s unique utm_campaign = UUID epizody
+        # Append promo block with unique utm_campaign = episode UUID
         ep_promo = PROMO_SHOW.format(
             show_title=title,
             show_uuid=show_uuid,
@@ -342,13 +348,13 @@ def build_rss(show_data, episodes, fetch_lengths=False):
             if idx % 10 == 0:
                 print(f"    ... {idx}/{len(episodes)}", file=sys.stderr, flush=True)
 
-        # GUID - oficiálně je to numerický legacyId, ne UUID.
-        # Pokud chybí, fallback na UUID.
+        # GUID - officially a numeric legacyId, not a UUID.
+        # If missing, fall back to the UUID.
         guid = get_legacy_id(a) or ep_uuid
         if not get_legacy_id(a):
             missing_legacy += 1
 
-        # itunes:subtitle a itunes:summary používají short description (bez promo)
+        # itunes:subtitle and itunes:summary use the short description (no promo)
         ep_short = a.get("description") or a.get("shortDescription") or ""
 
         parts += [
@@ -372,11 +378,11 @@ def build_rss(show_data, episodes, fetch_lengths=False):
     parts += ["  </channel>", "</rss>"]
 
     if skipped:
-        print(f"  POZOR: {skipped} epizod bez audio URL (přeskočeno)",
+        print(f"  WARNING: {skipped} episodes without audio URL (skipped)",
               file=sys.stderr)
     if missing_legacy:
-        print(f"  INFO: {missing_legacy} epizod použilo UUID jako guid "
-              f"(chybí legacyId v API)", file=sys.stderr)
+        print(f"  INFO: {missing_legacy} episodes used UUID as guid "
+              f"(legacyId missing in API)", file=sys.stderr)
 
     return "\n".join(parts).encode("utf-8")
 
@@ -397,11 +403,11 @@ def process_show(slug, uuid, fetch_lengths=False):
           file=sys.stderr, flush=True)
     show = fetch_show(uuid)
     episodes = fetch_all_episodes(uuid)
-    print(f"  -> {len(episodes)} epizod", file=sys.stderr, flush=True)
+    print(f"  -> {len(episodes)} episodes", file=sys.stderr, flush=True)
     xml = build_rss(show, episodes, fetch_lengths=fetch_lengths)
     out_path = os.path.join(OUTPUT_DIR, f"{slug}.rss")
     atomic_write(out_path, xml)
-    print(f"  -> zapsáno {out_path} ({len(xml)} B)",
+    print(f"  -> wrote {out_path} ({len(xml)} B)",
           file=sys.stderr, flush=True)
     return len(episodes)
 
@@ -410,23 +416,23 @@ def main():
     fetch_lengths = "--with-lengths" in sys.argv
 
     print(f"OUTPUT_DIR = {OUTPUT_DIR}", file=sys.stderr)
-    print(f"Pořadů = {list(SHOWS.keys())}", file=sys.stderr)
+    print(f"Shows = {list(SHOWS.keys())}", file=sys.stderr)
     if fetch_lengths:
-        print("Režim: s dotažením Content-Length (pomalé)", file=sys.stderr)
+        print("Mode: with Content-Length fetching (slow)", file=sys.stderr)
 
     failures = []
     for slug, uuid in SHOWS.items():
         try:
             process_show(slug, uuid, fetch_lengths=fetch_lengths)
         except Exception as e:
-            print(f"  !! SELHALO pro {slug}: {e}", file=sys.stderr)
+            print(f"  !! FAILED for {slug}: {e}", file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
             failures.append(slug)
 
     if failures:
-        print(f"DOKONČENO S CHYBAMI: {failures}", file=sys.stderr)
+        print(f"FINISHED WITH ERRORS: {failures}", file=sys.stderr)
         sys.exit(1)
-    print("DOKONČENO.", file=sys.stderr)
+    print("FINISHED.", file=sys.stderr)
 
 
 if __name__ == "__main__":
