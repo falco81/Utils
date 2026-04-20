@@ -2,42 +2,270 @@
 """
 audioteka_sync.py
 =================
-Downloads your entire audioteka.com library into an Audiobookshelf-compatible
-folder structure, with metadata (metadata.opf, cover.jpg, desc.txt, reader.txt).
+Download your entire audioteka.com library into an Audiobookshelf-compatible
+folder tree with full metadata (metadata.opf, cover.jpg, desc.txt, reader.txt)
+and ID3 tags + embedded cover art in every MP3 file.
 
-How it works:
-  1. Reads session cookies exported from your logged-in browser
-     (the web login is protected by reCAPTCHA v3 so we skip it).
-  2. For each book on your shelf:
-       a) POST /v2/commands {"name":"RequestAudiobookDownload", ...}
-          -> returns a "zip_file" URL for a signed ZIP containing MP3s.
-       b) GET that URL -> ZIP with MP3 files + bookinfo.html + cover images.
-       c) Extracts MP3 (keeping the original names, e.g. "01 Kapitola 1.mp3"),
-          parses bookinfo.html for authoritative metadata, picks the largest
-          cover image, and writes metadata.opf / desc.txt / reader.txt.
+Tip: run "python audioteka_sync.py --guide" to print this full manual at any
+time. Run "python audioteka_sync.py --help" for a short option summary.
 
-Requirements:
-    pip install requests mutagen
 
-Prepare cookies (one-time):
-    1) Install the "Get cookies.txt LOCALLY" Chrome/Edge extension:
-       https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
-    2) Open https://audioteka.com/cz/ while logged in.
-    3) Click the extension icon -> Export -> save as cookies.txt.
+================================================================================
+ 1. WHAT IT DOES
+================================================================================
 
-Usage:
-    python audioteka_sync.py -c cookies.txt -o C:\\audiobooks --list
-    python audioteka_sync.py -c cookies.txt -o C:\\audiobooks --skeleton
-    python audioteka_sync.py -c cookies.txt -o C:\\audiobooks --limit 1 -v
-    python audioteka_sync.py -c cookies.txt -o C:\\audiobooks
-    python audioteka_sync.py -c cookies.txt -o C:\\audiobooks --keep-zips
+For each book on your audioteka.com shelf the script:
 
-Notes:
-  * JWT token from cookies is valid for ~60 minutes. If it expires mid-run,
-    re-export cookies.txt from the browser and rerun the script - it skips
-    books that are already downloaded.
-  * Book titles and author names may contain non-ASCII characters. The script
-    reconfigures stdout to UTF-8 on Windows so this prints correctly in cmd.
+  - Asks the API for a signed download URL (POST /v2/commands
+    "RequestAudiobookDownload").
+  - Downloads the ZIP archive (MP3 files + bookinfo.html + cover images).
+  - Extracts the MP3 files keeping their original, correctly numbered names
+    (e.g. "01 Kapitola 1.mp3").
+  - Parses bookinfo.html for authoritative metadata (title, author, narrator,
+    publisher, description, year, chapter list).
+  - Writes metadata.opf, desc.txt, reader.txt, and the largest available
+    cover as cover.jpg.
+  - Writes a full set of ID3 tags into every MP3 and embeds the cover image,
+    so each file is self-describing outside Audiobookshelf as well.
+
+
+================================================================================
+ 2. REQUIREMENTS
+================================================================================
+
+  - Python 3.8 or newer
+  - Python packages: requests, mutagen
+  - A Chromium-based browser (Chrome, Edge, Brave, Opera) OR Firefox to
+    export the session cookies. The browser itself is used only once to
+    produce cookies.txt - the script then runs completely headless.
+
+
+================================================================================
+ 3. INSTALLATION
+================================================================================
+
+  1) Install Python 3.8+ from https://www.python.org/downloads/
+     (On Windows: during install, check "Add Python to PATH".)
+
+  2) Open a terminal (cmd.exe on Windows, bash on Linux/macOS) and install
+     the two required packages:
+
+         pip install requests mutagen
+
+     On Linux / macOS you may need pip3 instead of pip.
+
+  3) Save this file (audioteka_sync.py) anywhere you like, e.g.
+     C:\\Users\\YOU\\audioteka\\  on Windows or  ~/audioteka/  on Linux.
+
+
+================================================================================
+ 4. EXPORTING COOKIES FROM YOUR BROWSER
+================================================================================
+
+The web login on audioteka.com is protected by reCAPTCHA v3, which cannot be
+automated outside a real browser. The workaround is to log in normally and
+hand the browser session to the script in a cookies.txt file.
+
+ --- Chrome / Edge / Brave / Opera --------------------------------------------
+
+  1) Install the extension "Get cookies.txt LOCALLY":
+     https://chromewebstore.google.com/detail/get-cookiestxt-locally/cclelndahbckbenkjhflpdbgdldlbecc
+
+     (Click "Add to Chrome" / "Get" / "Install" and confirm the permissions.
+     On Edge the extension also installs from the Chrome Web Store.)
+
+  2) Go to  https://audioteka.com/cz/  and log in with your email and
+     password. Wait until your username shows in the top-right corner of
+     the page.
+
+  3) Click the jigsaw-puzzle extensions icon in the browser toolbar, then
+     click "Get cookies.txt LOCALLY". A small panel opens with the cookies
+     belonging to audioteka.com.
+
+  4) Click "Export" (or "Export As" on some builds). The browser saves the
+     file as  audioteka.com_cookies.txt  (or similar). Rename it to
+     cookies.txt and move it next to the script, or remember the path.
+
+ --- Firefox ------------------------------------------------------------------
+
+  1) Install the "cookies.txt" add-on:
+     https://addons.mozilla.org/en-US/firefox/addon/cookies-txt/
+
+  2) Repeat steps 2-4 above.
+
+ --- Important notes ----------------------------------------------------------
+
+  * The cookies file contains an active login session. Treat it like a
+    password: don't commit it to Git, don't email it, don't share it.
+    On Linux:  chmod 600 cookies.txt
+  * The session's JWT token is valid for roughly 60 minutes of inactivity.
+    If the script later says "Cookies are invalid or expired", simply
+    re-export cookies.txt (you don't need to log in again as long as the
+    browser session is still alive - just open audioteka.com/cz/ and
+    re-export).
+
+
+================================================================================
+ 5. USAGE
+================================================================================
+
+Basic invocation:
+
+    Windows:
+        python audioteka_sync.py -c cookies.txt -o C:\\audiobooks
+    Linux / macOS:
+        python3 audioteka_sync.py -c cookies.txt -o /data/audiobooks
+
+The two required arguments are:
+
+    -c / --cookies FILE   path to cookies.txt exported above
+    -o / --output  DIR    root folder of your audiobook library;
+                          the script creates <Author>/<Title>/ subfolders
+
+All other flags modify behavior:
+
+  --list           Print the list of books on the shelf and exit.
+                   Does not download anything. Good first sanity check.
+
+  --skeleton       Download only metadata (cover.jpg, metadata.opf,
+                   desc.txt, reader.txt) but no MP3 files. Useful to
+                   scaffold the library and fetch audio later.
+
+  --limit N        Stop after processing N books. Very useful for
+                   testing - "--limit 1 -v" downloads one book with
+                   verbose output so you can verify end-to-end.
+
+  --force          Re-download books that already have MP3 files on
+                   disk. Without this flag, completed books are skipped.
+
+  --retag          Do not download anything. Walk through already-
+                   downloaded books and rewrite ID3 tags in every MP3
+                   using the data in metadata.opf and cover.jpg.
+                   Use this after upgrading the script to pick up new
+                   tag features without re-downloading dozens of GB.
+
+  --no-embed       Do not write ID3 tags or embed cover art into MP3
+                   files. By default the script tags everything.
+
+  --keep-zips DIR  Keep the raw ZIP archives from audioteka.com instead
+                   of deleting them after extraction. Without a DIR
+                   argument, defaults to ./audioteka_zips. Useful as a
+                   local backup.
+
+  --dry-run        Show what would happen, write nothing.
+  -v / --verbose   Enable debug-level logging.
+  -g / --guide     Print this full manual and exit.
+  -h / --help      Short option summary from argparse.
+
+
+================================================================================
+ 6. TYPICAL WORKFLOWS
+================================================================================
+
+First-time full sync (expect ~20 GB for a medium-sized library):
+
+    # 1. Sanity check - are cookies OK, how many books are on the shelf?
+    python audioteka_sync.py -c cookies.txt -o /data/audiobooks --list
+
+    # 2. Test one book end-to-end with verbose logging.
+    python audioteka_sync.py -c cookies.txt -o /data/audiobooks --limit 1 -v
+
+    # 3. If the test passes, run the full sync.
+    python audioteka_sync.py -c cookies.txt -o /data/audiobooks
+
+Incremental sync after buying a new book on audioteka.com:
+
+    # Re-export cookies if the old ones expired, then:
+    python audioteka_sync.py -c cookies.txt -o /data/audiobooks
+
+    # Already-downloaded books are skipped; the script only fetches the
+    # new one(s).
+
+Retag all existing books (no download, no network data cost for the ZIPs):
+
+    python audioteka_sync.py -c cookies.txt -o /data/audiobooks --retag
+
+
+================================================================================
+ 7. WHAT ENDS UP ON DISK
+================================================================================
+
+For each book the script creates:
+
+    /data/audiobooks/
+        Suzanne Collinsova/
+            Usvit sklizne/
+                01 Kapitola 1.mp3
+                02 Kapitola 2.mp3
+                ...
+                28 Epilog.mp3
+                cover.jpg        (largest available front cover)
+                metadata.opf     (OPF 2.0 with Calibre extensions)
+                desc.txt         (plain-text book description)
+                reader.txt       (narrator name, or multiple separated by ", ")
+
+Each MP3 also carries:
+    - TIT2   track title (chapter name from bookinfo.html)
+    - TALB   book title
+    - TPE1, TPE2   author
+    - TCOM   narrator(s)
+    - TRCK   track/total  (e.g. "5/28")
+    - TDRC   release year
+    - TPUB   publisher
+    - TCON   "Audiobook"
+    - TLAN   language (ces)
+    - COMM   short description
+    - APIC   embedded cover image (Front Cover)
+
+
+================================================================================
+ 8. AUDIOBOOKSHELF INTEGRATION
+================================================================================
+
+  1) In Audiobookshelf: Settings -> Libraries -> Add new library
+     - Media Type: Book
+     - Folder: /data/audiobooks (or wherever --output points)
+  2) Save. Click Scan.
+  3) All books appear with correct covers, descriptions, narrators.
+  4) Optional: use Quick Match on the library to fetch series info
+     (Witcher #1-#8, Dune #1-#2, etc.) from Audible, Goodreads or
+     Audnexus. Audioteka itself does not expose series metadata.
+
+
+================================================================================
+ 9. TROUBLESHOOTING
+================================================================================
+
+"Cookies are invalid or expired":
+    Your JWT token expired (~60 min lifetime). Re-export cookies.txt from
+    the browser and rerun. The script resumes where it stopped.
+
+"RequestAudiobookDownload -> 403":
+    The book is not marked "oneoff downloadable" in your account - usually
+    means you only have subscription access, not a purchase. Skip it.
+
+"Corrupted ZIP file":
+    A network hiccup. Delete the book's folder and rerun to retry it.
+
+Windows cmd shows garbled characters:
+    The script reconfigures stdout to UTF-8 on Windows automatically
+    (needs Python 3.7+). If you still see garbage, run:
+        chcp 65001
+    before starting the script.
+
+Too many books to fit on disk:
+    Use --limit and download in batches, or use --skeleton first to see
+    how the folders will look and skip the biggest ones.
+
+
+================================================================================
+ 10. DISCLAIMER
+================================================================================
+
+This script is intended for personal backups of audiobooks you have
+legally purchased on audioteka.com. Do not share the downloaded files.
+The API endpoints used here are reverse-engineered from the public web
+client and may change without notice.
 """
 
 from __future__ import annotations
@@ -810,12 +1038,20 @@ def process_product(api: AudiotekaWeb, product: Dict[str, Any],
 # CLI
 # ---------------------------------------------------------------------------
 def main() -> int:
+    # Handle --guide / -g before argparse so it works without -c/-o
+    if any(a in ("-g", "--guide") for a in sys.argv[1:]):
+        print(__doc__)
+        return 0
+
     ap = argparse.ArgumentParser(
         description=("Download your audioteka.com library (CZ) into "
-                     "Audiobookshelf structure. Uses browser cookies to "
-                     "bypass reCAPTCHA login."),
+                     "an Audiobookshelf-compatible folder tree. "
+                     "Uses browser cookies to bypass reCAPTCHA. "
+                     "Run with --guide for the full manual."),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    ap.add_argument("-g", "--guide", action="store_true",
+                    help="Print the full user manual and exit")
     ap.add_argument("-c", "--cookies", required=True, type=Path,
                     help="Netscape cookies.txt exported from your browser")
     ap.add_argument("-o", "--output", required=True, type=Path,
