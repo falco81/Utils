@@ -82,15 +82,59 @@ def http_get(url, timeout=30):
     return r
 
 
-def resolve_mp3_via_share(share_url, timeout=20):
-    """A share URL (podbean.com/media/share/...) redirects to the real
-    mcdn.podbean.com MP3. Returns (final_url, length) or (None, 0)."""
+def head_length(mp3_url, timeout=20):
+    """HEAD an MP3 URL and return Content-Length, 0 on error."""
     try:
-        r = requests.head(share_url, allow_redirects=True, timeout=timeout,
+        r = requests.head(mp3_url, allow_redirects=True, timeout=timeout,
                           headers={"User-Agent": USER_AGENT})
-        return r.url, int(r.headers.get("Content-Length", 0) or 0)
+        return int(r.headers.get("Content-Length", 0) or 0)
+    except Exception:
+        return 0
+
+
+def resolve_mp3_via_share(share_url, timeout=20):
+    """A Podbean share URL (podbean.com/media/share/...?download=1) is an
+    HTML page, NOT a redirect to the MP3. We have to fetch the HTML and
+    extract the real mcdn.podbean.com/mf/web/... URL from JSON-LD or
+    from the Download button (which points to /mf/download/...).
+
+    Returns (final_url, length) or (None, 0)."""
+    try:
+        r = requests.get(share_url, allow_redirects=True, timeout=timeout,
+                         headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        page = r.text
     except Exception:
         return None, 0
+
+    # 1) JSON-LD contentUrl (points to /mf/web/...).
+    m = re.search(
+        r'"contentUrl"\s*:\s*"(https://mcdn\.podbean\.com/[^"]+?\.mp3)"',
+        page,
+    )
+    mp3 = m.group(1) if m else None
+
+    # 2) Fallback: Download button href (points to /mf/download/...).
+    # We prefer /mf/web/ to match the official feed style, so rewrite.
+    if not mp3:
+        m = re.search(
+            r'href="(https://mcdn\.podbean\.com/mf/download/[^"]+?\.mp3)"',
+            page,
+        )
+        if m:
+            mp3 = m.group(1).replace("/mf/download/", "/mf/web/")
+
+    # 3) Last-resort: any mcdn mp3.
+    if not mp3:
+        m = re.search(r'https://mcdn\.podbean\.com/[^"\'<>\s]+?\.mp3', page)
+        if m:
+            mp3 = m.group(0)
+
+    if not mp3:
+        return None, 0
+
+    length = head_length(mp3, timeout=timeout)
+    return mp3, length
 
 
 # ----------- Archive scraping -----------
@@ -145,15 +189,36 @@ def scrape_episode(url):
     pub_iso = og("article:published_time")
 
     mp3_url, length = None, 0
-    sm = SHARE_RE.search(t)
-    if sm:
-        mp3_url, length = resolve_mp3_via_share(sm.group(0))
+
+    # Strategy 1: JSON-LD contentUrl on the episode page itself.
+    m = re.search(
+        r'"contentUrl"\s*:\s*"(https://mcdn\.podbean\.com/[^"]+?\.mp3)"', t,
+    )
+    if m:
+        mp3_url = m.group(1)
+
+    # Strategy 2: resolve the share URL to an MP3 page.
+    if not mp3_url:
+        sm = SHARE_RE.search(t)
+        if sm:
+            mp3_url, length = resolve_mp3_via_share(sm.group(0))
+
+    # Strategy 3: any mcdn .mp3 URL on the episode page.
     if not mp3_url:
         m = MCDN_RE.search(t)
         if m:
             mp3_url = m.group(0)
+
     if not mp3_url:
         return None
+
+    # Prefer the /mf/web/ URL style used by the official feed.
+    if "/mf/download/" in mp3_url:
+        mp3_url = mp3_url.replace("/mf/download/", "/mf/web/")
+
+    # If we did not get length from the share page, fetch it via HEAD.
+    if not length:
+        length = head_length(mp3_url)
 
     ep_num_m = re.match(r"#?(\d+)[:\s]", title)
     ep_num = int(ep_num_m.group(1)) if ep_num_m else None
@@ -312,12 +377,23 @@ def process_show(slug, subdomain):
 
     # 3) Scrape the missing episodes.
     extra_episodes = []
+    seen_in_batch = set()
     if missing:
         for i, url in enumerate(missing, 1):
+            # Extra belt-and-suspenders dedupe: skip if we somehow see
+            # the same URL twice in `missing`, or if it is already in
+            # the official feed (should not happen after the filter above,
+            # but be defensive).
+            if url in seen_in_batch or url in existing_urls:
+                continue
+            seen_in_batch.add(url)
+
             try:
                 ep = scrape_episode(url)
                 if ep:
                     extra_episodes.append(ep)
+                else:
+                    print(f"  !! no MP3: {url}", file=sys.stderr)
             except Exception as e:
                 print(f"  !! {url}: {e}", file=sys.stderr)
             if i % 20 == 0:
