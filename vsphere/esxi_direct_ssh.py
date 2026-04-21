@@ -5,22 +5,22 @@ esxi_direct_ssh.py
 The vCenter-free sibling of vcenter_esxi_ssh.py.
 
 Instead of discovering hosts via vCenter, the host list is read from a simple
-JSON file (hosts.json by default).  All credentials and options are passed the
-same way as in vcenter_esxi_ssh.py — only --server is replaced by --config.
+JSON file (hosts.json by default).  All credentials and options work the same
+way as in vcenter_esxi_ssh.py - only --server/-s is replaced by --config/-c.
 
 Compatible with: Windows 10/11, Linux, macOS  |  Python 3.8+  |  ESXi 7.0+
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+=========================================================================
   INSTALLATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+=========================================================================
 
     pip install pyVmomi paramiko colorama
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+=========================================================================
   hosts.json FORMAT
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+=========================================================================
 
-  A plain JSON array of IP addresses or FQDNs — nothing else:
+  A plain JSON array of IP addresses or FQDNs:
 
     [
       "192.168.10.11",
@@ -29,14 +29,35 @@ Compatible with: Windows 10/11, Linux, macOS  |  Python 3.8+  |  ESXi 7.0+
       "esxi-04.corp.local"
     ]
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  USAGE EXAMPLES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  When --change-hostname is used every entry MUST be a valid FQDN
+  (e.g. "esx-01.site-a.corp.local").  IP addresses and short names
+  without a domain suffix are rejected before any host is contacted.
 
-  # Dry-run (hosts.json in the current directory, prompted for passwords)
+=========================================================================
+  OPERATING MODES
+=========================================================================
+
+  Default (run-commands)
+    For each host:
+      1. Enable SSH via the ESXi SOAP API
+      2. [if --change-hostname]  esxcli system hostname set --fqdn=<host>
+      3. Execute every command in COMMANDS_TO_RUN over SSH
+      4. Disable SSH (if it was stopped before the run, or --disable-ssh-after)
+
+  --ssh-only-enable
+    Enable the SSH service on every host.  No SSH commands are run.
+
+  --ssh-only-disable
+    Disable the SSH service on every host.  No SSH commands are run.
+
+=========================================================================
+  USAGE EXAMPLES
+=========================================================================
+
+  # Dry-run - preview everything without making any changes
   python esxi_direct_ssh.py -u root --dry-run
 
-  # Run commands and disable SSH afterwards
+  # Run COMMANDS_TO_RUN and disable SSH afterwards
   python esxi_direct_ssh.py -u root --disable-ssh-after
 
   # Separate ESXi API password and SSH password
@@ -48,20 +69,38 @@ Compatible with: Windows 10/11, Linux, macOS  |  Python 3.8+  |  ESXi 7.0+
   # Disable SSH on all hosts (no commands run)
   python esxi_direct_ssh.py -u root --ssh-only-disable
 
+  # Set hostname on each host then run COMMANDS_TO_RUN
+  # (hosts.json must contain FQDNs - IPs and short names are rejected)
+  python esxi_direct_ssh.py -u root --change-hostname --disable-ssh-after
+
+  # Dry-run with --change-hostname - validates FQDNs without touching any host
+  python esxi_direct_ssh.py -u root --change-hostname --dry-run
+
   # Use a different hosts file
   python esxi_direct_ssh.py -u root --config /etc/esxi/prod_hosts.json
 
   # Filter to a specific host by name substring
-  python esxi_direct_ssh.py -u root --host-name "192.168.10.11" --disable-ssh-after
+  python esxi_direct_ssh.py -u root --host-name "esx-01a" --disable-ssh-after
 
-  # Full example with all options explicit
+  # Full example with every option explicit
   python esxi_direct_ssh.py \
       --config hosts.json \
       -u root -p RootPassword \
       --ssh-user root --ssh-password RootPassword \
+      --change-hostname \
       --disable-ssh-after \
       --log-file /var/log/esxi_audit.log \
       --verbose
+
+=========================================================================
+  FLAG COMPATIBILITY
+=========================================================================
+
+  --change-hostname   + --ssh-only-enable   -> rejected (no SSH session opened)
+  --change-hostname   + --ssh-only-disable  -> rejected (no SSH session opened)
+  --disable-ssh-after + --ssh-only-enable   -> rejected
+  --disable-ssh-after + --ssh-only-disable  -> rejected
+  --ssh-only-enable   + --ssh-only-disable  -> rejected (mutually exclusive)
 """
 
 import argparse
@@ -107,7 +146,7 @@ if MISSING_PACKAGES:
 
 
 # ---------------------------------------------------------------------------
-# COMMANDS TO RUN ON EVERY ESXi HOST  ← edit this list as needed
+# COMMANDS TO RUN ON EVERY ESXi HOST  <- edit this list as needed
 # ---------------------------------------------------------------------------
 COMMANDS_TO_RUN = [
     "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks",
@@ -212,7 +251,71 @@ def load_hosts(config_path: str) -> list:
 
 
 # ---------------------------------------------------------------------------
-# Direct ESXi SOAP API connection  (pyVmomi — no vCenter required)
+# FQDN validation  (used by --change-hostname)
+# ---------------------------------------------------------------------------
+import re as _re
+
+# Pre-compiled patterns
+_IP_RE   = _re.compile(r'^\d{1,3}(\.\d{1,3}){3}$')
+_LABEL_RE = _re.compile(r'^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$')
+
+
+def is_valid_fqdn(value: str) -> bool:
+    """
+    Return True when value is a syntactically valid FQDN suitable for use as a
+    hostname (at least two dot-separated labels, no IP addresses, valid characters).
+
+    Rules:
+      - Must contain at least one dot  (e.g. "host.domain.local")
+      - Must NOT be an IPv4 address    (e.g. "192.168.1.10" is rejected)
+      - Each label: 1-63 chars, [a-zA-Z0-9-], must not start or end with a hyphen
+      - The rightmost label (TLD) must be at least 2 characters
+      - Total length must not exceed 253 characters
+    """
+    value = value.rstrip(".")          # strip optional trailing dot
+    if not value or len(value) > 253:
+        return False
+    if _IP_RE.match(value):
+        return False                   # IPv4 addresses are not FQDNs
+    labels = value.split(".")
+    if len(labels) < 3:
+        return False                   # need at least host.domain.tld
+    if len(labels[-1]) < 2:
+        return False                   # TLD too short
+    return all(_LABEL_RE.match(label) for label in labels)
+
+
+def validate_fqdn_hosts(hosts: list, logger: logging.Logger) -> bool:
+    """
+    Check every entry in hosts for FQDN validity.
+    Logs a clear error for each invalid entry.
+    Returns True when all entries are valid, False otherwise.
+    """
+    invalid = [h for h in hosts if not is_valid_fqdn(h)]
+    if not invalid:
+        return True
+    logger.error(
+        f"[ERROR] --change-hostname requires every entry in hosts.json to be a valid FQDN."
+    )
+    logger.error(
+        f"        The following {len(invalid)} entry/entries are not valid FQDNs:"
+    )
+    for h in invalid:
+        if _IP_RE.match(h):
+            reason = "IP address - use a fully-qualified hostname instead"
+        elif "." not in h:
+            reason = "no domain part - add the domain suffix (e.g. host.corp.local)"
+        else:
+            reason = "invalid label characters or format"
+        logger.error(f"          [X]  {h}  ({reason})")
+    logger.error(
+        "        Fix hosts.json or remove --change-hostname and re-run."
+    )
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Direct ESXi SOAP API connection  (pyVmomi - no vCenter required)
 # ---------------------------------------------------------------------------
 def connect_esxi(host: str, user: str, password: str, port: int,
                  logger: logging.Logger):
@@ -244,7 +347,7 @@ def _svc_system(si):
 
     Correct object tree on a direct ESXi connection (no vCenter):
       rootFolder        (vim.Folder)
-        childEntity[0]  (vim.Datacenter  – always named 'ha-datacenter')
+        childEntity[0]  (vim.Datacenter  - always named 'ha-datacenter')
           hostFolder    (vim.Folder)
             childEntity[0]  (vim.ComputeResource)
               host[0]   (vim.HostSystem)
@@ -385,7 +488,7 @@ def print_summary(summary: list, logger: logging.Logger, dry_run: bool):
     logger.info(sep)
     logger.info(
         f"  SUMMARY {'[DRY-RUN] ' if dry_run else ''}"
-        f"– {len(summary)} host(s) processed"
+        f"- {len(summary)} host(s) processed"
     )
     logger.info(sep)
 
@@ -414,14 +517,14 @@ def print_summary(summary: list, logger: logging.Logger, dry_run: bool):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "ESXi Direct SSH Automation – "
+            "ESXi Direct SSH Automation - "
             "same as vcenter_esxi_ssh.py but reads hosts from a JSON file instead of vCenter"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    # ── Host list ─────────────────────────────────────────────────────────
+    # -- Host list ---------------------------------------------------------
     vc = parser.add_argument_group("Host list")
     vc.add_argument(
         "--config", "-c",
@@ -432,7 +535,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ── ESXi SOAP API credentials (used to manage the SSH service) ────────
+    # -- ESXi SOAP API credentials (used to manage the SSH service) --------
     api = parser.add_argument_group("ESXi API credentials  (for SSH service management)")
     api.add_argument("-u", "--user",     required=True,
                      help="ESXi username  (e.g. root)")
@@ -441,7 +544,7 @@ def build_parser() -> argparse.ArgumentParser:
     api.add_argument("--port", type=int, default=443,
                      help="ESXi HTTPS API port  (default: 443)")
 
-    # ── SSH options ───────────────────────────────────────────────────────
+    # -- SSH options -------------------------------------------------------
     ssh = parser.add_argument_group("SSH options")
     ssh.add_argument("--ssh-user",     default="root",
                      help="SSH username on ESXi hosts  (default: root)")
@@ -452,14 +555,14 @@ def build_parser() -> argparse.ArgumentParser:
     ssh.add_argument("--ssh-timeout",  type=int, default=30,
                      help="SSH connection/command timeout in seconds  (default: 30)")
 
-    # ── Filtering ─────────────────────────────────────────────────────────
+    # -- Filtering ---------------------------------------------------------
     flt = parser.add_argument_group("Filtering")
     flt.add_argument(
         "--host-name", default=None,
         help="Only process hosts whose IP/FQDN contains this string (case-insensitive)",
     )
 
-    # ── SSH-only modes ────────────────────────────────────────────────────
+    # -- SSH-only modes ----------------------------------------------------
     ssh_only = parser.add_argument_group(
         "SSH-only modes  (no commands executed in either mode)"
     )
@@ -481,7 +584,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ── Behaviour options ─────────────────────────────────────────────────
+    # -- Behaviour options -------------------------------------------------
     opts = parser.add_argument_group("Behaviour options")
     opts.add_argument(
         "--disable-ssh-after", action="store_true",
@@ -489,6 +592,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Disable SSH after running commands, even if it was already running "
             "before the script started.  "
             "Incompatible with --ssh-only-enable / --ssh-only-disable."
+        ),
+    )
+    opts.add_argument(
+        "--change-hostname",
+        action="store_true",
+        help=(
+            "After running COMMANDS_TO_RUN on each host, also run "
+            "'esxcli system hostname set --fqdn=<value>' where <value> is the "
+            "host's entry from hosts.json.  "
+            "Requires every entry in hosts.json to be a valid FQDN - "
+            "IP addresses and short names (without a domain) are rejected.  "
+            "Validation runs even in --dry-run mode.  "
+            "Incompatible with --ssh-only-enable and --ssh-only-disable."
         ),
     )
     opts.add_argument("--dry-run",  action="store_true",
@@ -520,6 +636,13 @@ def main():
             "--ssh-only-enable or --ssh-only-disable"
         )
 
+    if args.change_hostname and (args.ssh_only_enable or args.ssh_only_disable):
+        parser.error(
+            "--change-hostname cannot be combined with "
+            "--ssh-only-enable or --ssh-only-disable "
+            "(no SSH session is opened in those modes)"
+        )
+
     # Determine operating mode
     if args.ssh_only_enable:
         mode = "ssh-only-enable"
@@ -528,7 +651,7 @@ def main():
     else:
         mode = "run-commands"
 
-    # ── Interactive credential prompts ────────────────────────────────────
+    # -- Interactive credential prompts ------------------------------------
     if not args.password:
         args.password = getpass.getpass(f"ESXi API password for '{args.user}': ")
 
@@ -550,16 +673,16 @@ def main():
     log_file = None if args.no_log_file else args.log_file
     logger   = setup_logging(log_file, args.verbose)
 
-    # ── Banner ────────────────────────────────────────────────────────────
+    # -- Banner ------------------------------------------------------------
     SEP  = "=" * 74
     sep2 = "-" * 74
     logger.info(SEP)
     logger.info(
-        f"  ESXi Direct SSH Automation  –  "
+        f"  ESXi Direct SSH Automation  -  "
         f"started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     if args.dry_run:
-        logger.info("  *** DRY-RUN MODE – no changes will be made ***")
+        logger.info("  *** DRY-RUN MODE - no changes will be made ***")
     mode_label = {
         "ssh-only-enable":  "SSH-ONLY ENABLE  (no commands will be run)",
         "ssh-only-disable": "SSH-ONLY DISABLE (no commands will be run)",
@@ -577,7 +700,11 @@ def main():
         logger.info(f"  SSH timeout       : {args.ssh_timeout}s")
         logger.info(
             f"  Disable SSH after : "
-            f"{'YES – always' if args.disable_ssh_after else 'only if SSH was stopped before this run'}"
+            f"{'YES - always' if args.disable_ssh_after else 'only if SSH was stopped before this run'}"
+        )
+        logger.info(
+            f"  Change hostname   : "
+            f"{'YES - esxcli system hostname set --fqdn=<host>' if args.change_hostname else 'NO'}"
         )
         logger.info(f"  Commands to run   : {len(COMMANDS_TO_RUN)}")
         for cmd in COMMANDS_TO_RUN:
@@ -588,7 +715,7 @@ def main():
     )
     logger.info(SEP)
 
-    # ── Load host list ────────────────────────────────────────────────────
+    # -- Load host list ----------------------------------------------------
     hosts = load_hosts(args.config)
 
     # Apply --host-name filter
@@ -601,7 +728,15 @@ def main():
 
     logger.info(f"Hosts to process: {len(hosts)}")
 
-    # ── Per-host processing ───────────────────────────────────────────────
+    # -- FQDN validation for --change-hostname -----------------------------
+    # Runs unconditionally (including --dry-run) so problems are caught early.
+    if args.change_hostname:
+        logger.info("-->  Validating hosts.json entries as FQDNs (required by --change-hostname) ...")
+        if not validate_fqdn_hosts(hosts, logger):
+            sys.exit(1)
+        logger.info("[OK] All host entries are valid FQDNs")
+
+    # -- Per-host processing -----------------------------------------------
     results_summary: list = []
     total = len(hosts)
 
@@ -628,9 +763,9 @@ def main():
             f"{'RUNNING' if ssh_was_already_running else 'STOPPED'}"
         )
 
-        # ════════════════════════════════════════════════════════════
+        # ============================================================
         # MODE: --ssh-only-enable
-        # ════════════════════════════════════════════════════════════
+        # ============================================================
         if mode == "ssh-only-enable":
             if ssh_was_already_running:
                 logger.info(f"   [OK] SSH already running on {host}, nothing to do")
@@ -647,9 +782,9 @@ def main():
                 Disconnect(si)
             continue
 
-        # ════════════════════════════════════════════════════════════
+        # ============================================================
         # MODE: --ssh-only-disable
-        # ════════════════════════════════════════════════════════════
+        # ============================================================
         if mode == "ssh-only-disable":
             if not ssh_was_already_running:
                 logger.info(f"   [OK] SSH already stopped on {host}, nothing to do")
@@ -663,9 +798,9 @@ def main():
                 Disconnect(si)
             continue
 
-        # ════════════════════════════════════════════════════════════
+        # ============================================================
         # MODE: run-commands  (default)
-        # ════════════════════════════════════════════════════════════
+        # ============================================================
         host_failed = False
 
         # Step 1: Enable SSH
@@ -678,7 +813,25 @@ def main():
                 Disconnect(si)
             continue
 
-        # Step 2: Run commands via SSH
+        # Step 2: Set hostname first (only when --change-hostname is active)
+        if args.change_hostname:
+            hostname_cmd = f"esxcli system hostname set --fqdn={host}"
+            logger.info(f"   -->  Setting hostname: {hostname_cmd}")
+            hn_results = run_ssh_commands(
+                host=host,
+                ssh_user=args.ssh_user,
+                ssh_password=args.ssh_password,
+                ssh_port=args.ssh_port,
+                commands=[hostname_cmd],
+                ssh_timeout=args.ssh_timeout,
+                logger=logger,
+                dry_run=args.dry_run,
+            )
+            if hn_results[hostname_cmd]["exit_code"] not in (0,):
+                logger.error(f"   [FAIL] hostname set command failed on {host}")
+                host_failed = True
+
+        # Step 3: Run COMMANDS_TO_RUN via SSH
         logger.info(f"   -->  Running {len(COMMANDS_TO_RUN)} command(s) via SSH ...")
         cmd_results = run_ssh_commands(
             host=host,
@@ -721,7 +874,7 @@ def main():
             f"Host {host} finished  (status: {status})"
         )
 
-    # ── Final summary & exit ──────────────────────────────────────────────
+    # -- Final summary & exit ----------------------------------------------
     print_summary(results_summary, logger, args.dry_run)
 
     if log_file:

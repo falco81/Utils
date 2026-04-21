@@ -8,25 +8,25 @@ disables SSH again. Supports dry-run mode and detailed logging to both CLI and a
 
 Compatible with: Windows 10/11, Linux, macOS  |  Python 3.8+
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+============================================================================
   INSTALLATION
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+============================================================================
 
     pip install -r requirements.txt
-        – or –
+        - or -
     pip install pyVmomi paramiko colorama
 
 Required packages:
-    pyVmomi   – vCenter / vSphere Python SDK
-    paramiko  – SSH client
-    colorama  – Coloured terminal output (Windows-compatible)
+    pyVmomi   - vCenter / vSphere Python SDK
+    paramiko  - SSH client
+    colorama  - Coloured terminal output (Windows-compatible)
 
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+============================================================================
   WORKFLOW EXAMPLES
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+============================================================================
 
-  1) AUDIT – Collect version & hardware info from every host (read-only, safe)
-     ─────────────────────────────────────────────────────────────────────────
+  1) AUDIT - Collect version & hardware info from every host (read-only, safe)
+     -------------------------------------------------------------------------
      Always start with a dry-run to confirm the scope before touching anything.
 
        # Step 1: preview what the script would do
@@ -42,10 +42,10 @@ Required packages:
        esxcli storage core device list
        esxcli network ip interface list
 
-  ─────────────────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------------------
 
-  2) COMPLIANCE CHECK – Verify security settings across all hosts
-     ─────────────────────────────────────────────────────────────
+  2) COMPLIANCE CHECK - Verify security settings across all hosts
+     -------------------------------------------------------------
      Use --disable-ssh-after to guarantee SSH is closed when the script finishes,
      regardless of whether it was open before the run.
 
@@ -60,10 +60,10 @@ Required packages:
        esxcli system settings advanced list -o /UserVars/ESXiShellInteractiveTimeOut
        cat /etc/vmware/config
 
-  ─────────────────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------------------
 
-  3) PATCH PREP – Inventory installed VIBs before a maintenance window
-     ──────────────────────────────────────────────────────────────────
+  3) PATCH PREP - Inventory installed VIBs before a maintenance window
+     ------------------------------------------------------------------
      Target a single production cluster; enable verbose output so every detail
      appears in the log file for later comparison.
 
@@ -78,10 +78,10 @@ Required packages:
        esxcli software profile get
        esxcli system version get
 
-  ─────────────────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------------------
 
-  4) EMERGENCY REMEDIATION – Push a config fix to one specific host
-     ───────────────────────────────────────────────────────────────
+  4) EMERGENCY REMEDIATION - Push a config fix to one specific host
+     ---------------------------------------------------------------
      Use --host-name to pin execution to a single host; --verbose gives a
      line-by-line trace in both the terminal and the log file.
 
@@ -95,10 +95,10 @@ Required packages:
        /etc/init.d/ntpd restart
        esxcli system ntp get
 
-  ─────────────────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------------------
 
-  5) MULTI-CLUSTER SWEEP – Separate credentials & logs per environment
-     ───────────────────────────────────────────────────────────────────
+  5) MULTI-CLUSTER SWEEP - Separate credentials & logs per environment
+     -------------------------------------------------------------------
      Run the script once per cluster with its own credentials and log file.
      Exit code 1 is returned on any failure, making this easy to chain in a
      CI pipeline or scheduled task.
@@ -111,10 +111,10 @@ Required packages:
            --cluster "Cluster-Dev"  --ssh-password DevRootPass \
            --disable-ssh-after --log-file C:\\Logs\\sweep_dev.log
 
-  ─────────────────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------------------
 
-  6) SSH TOGGLE – Enable or disable SSH across hosts without running any commands
-     ────────────────────────────────────────────────────────────────────────────
+  6) SSH TOGGLE - Enable or disable SSH across hosts without running any commands
+     ----------------------------------------------------------------------------
      Use --ssh-only-enable to turn SSH on across every host (e.g. before a
      maintenance window) and --ssh-only-disable to close it again afterwards.
      Both modes support the same --cluster / --host-name filters and --dry-run.
@@ -134,10 +134,10 @@ Required packages:
      NOTE: --ssh-only-enable and --ssh-only-disable are mutually exclusive
            with each other and with --disable-ssh-after.
 
-  ─────────────────────────────────────────────────────────────────────────────
+  -----------------------------------------------------------------------------
 
-  7) SCHEDULED TASK – Windows Task Scheduler with env-variable credentials
-     ──────────────────────────────────────────────────────────────────────
+  7) SCHEDULED TASK - Windows Task Scheduler with env-variable credentials
+     ----------------------------------------------------------------------
      Avoid plain-text passwords in scheduled task XML by reading them from
      environment variables set as user-level secrets.
 
@@ -197,12 +197,12 @@ if MISSING_PACKAGES:
 
 
 # ---------------------------------------------------------------------------
-# COMMANDS TO RUN ON EVERY ESXi HOST  ← edit this list as needed
+# COMMANDS TO RUN ON EVERY ESXi HOST  <- edit this list as needed
 # ---------------------------------------------------------------------------
 COMMANDS_TO_RUN = [
     "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks",
     "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group setmemconfig -g host/vim/vmvisor/settingsd-task-forks -m 400 -i 0 -l -1 -u mb",
-    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks"
+    "localcli --plugin-dir=/usr/lib/vmware/esxcli/int sched group getmemconfig -g host/vim/vmvisor/settingsd-task-forks",
     # Add more commands below, for example:
     # "esxcli hardware cpu global get",
     # "esxcli system ntp get",
@@ -277,7 +277,7 @@ def connect_vcenter(host: str, user: str, password: str, port: int,
     try:
         si = SmartConnect(host=host, user=user, pwd=password, port=port, sslContext=ctx)
         about = si.content.about
-        logger.info(f"[OK] Connected – {about.fullName}  (build {about.build})")
+        logger.info(f"[OK] Connected - {about.fullName}  (build {about.build})")
         return si
     except Exception as e:
         logger.critical(f"[FAIL] vCenter connection failed: {e}")
@@ -487,7 +487,7 @@ def print_summary(summary: list, logger: logging.Logger, dry_run: bool):
     logger.info(sep)
     logger.info(
         f"  SUMMARY {'[DRY-RUN] ' if dry_run else ''}"
-        f"– {len(summary)} host(s) processed"
+        f"- {len(summary)} host(s) processed"
     )
     logger.info(sep)
 
@@ -518,14 +518,14 @@ def print_summary(summary: list, logger: logging.Logger, dry_run: bool):
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "vCenter ESXi SSH Automation – "
+            "vCenter ESXi SSH Automation - "
             "run commands on all registered ESXi hosts via the vCenter API + SSH"
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
 
-    # ── vCenter connection ────────────────────────────────────────────────
+    # -- vCenter connection ------------------------------------------------
     vc = parser.add_argument_group("vCenter connection")
     vc.add_argument("-s", "--server",   required=True,
                     help="vCenter hostname or IP address")
@@ -536,7 +536,7 @@ def build_parser() -> argparse.ArgumentParser:
     vc.add_argument("--port", type=int, default=443,
                     help="vCenter HTTPS port  (default: 443)")
 
-    # ── ESXi SSH options ──────────────────────────────────────────────────
+    # -- ESXi SSH options --------------------------------------------------
     ssh = parser.add_argument_group("ESXi SSH options")
     ssh.add_argument("--ssh-user",     default="root",
                      help="SSH username on ESXi hosts  (default: root)")
@@ -547,7 +547,7 @@ def build_parser() -> argparse.ArgumentParser:
     ssh.add_argument("--ssh-timeout",  type=int, default=30,
                      help="SSH connection/command timeout in seconds  (default: 30)")
 
-    # ── Filtering ─────────────────────────────────────────────────────────
+    # -- Filtering ---------------------------------------------------------
     flt = parser.add_argument_group("Filtering")
     flt.add_argument("--cluster",   default=None,
                      help=(
@@ -562,7 +562,7 @@ def build_parser() -> argparse.ArgumentParser:
     flt.add_argument("--skip-disconnected", action="store_true", default=True,
                      help="Skip hosts in disconnected / notResponding state  (default: on)")
 
-    # ── SSH-only modes (mutually exclusive with each other & --disable-ssh-after) ──
+    # -- SSH-only modes (mutually exclusive with each other & --disable-ssh-after) --
     ssh_only = parser.add_argument_group(
         "SSH-only modes  (no commands are executed in either mode)"
     )
@@ -586,7 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
-    # ── Behaviour options ─────────────────────────────────────────────────
+    # -- Behaviour options -------------------------------------------------
     opts = parser.add_argument_group("Behaviour options")
     opts.add_argument("--disable-ssh-after", action="store_true",
                       help=(
@@ -635,12 +635,12 @@ def main():
     else:
         mode = "run-commands"
 
-    # ── Interactive credential prompts ───────────────────────────────────
-    # vCenter password — always required
+    # -- Interactive credential prompts -----------------------------------
+    # vCenter password - always required
     if not args.password:
         args.password = getpass.getpass(f"vCenter password for '{args.user}': ")
 
-    # SSH password — only needed when we actually open SSH sessions (run-commands mode).
+    # SSH password - only needed when we actually open SSH sessions (run-commands mode).
     # Never silently reuse the vCenter password; always ask explicitly.
     if mode == "run-commands" and not args.ssh_password:
         sys.stdout.write(
@@ -661,16 +661,16 @@ def main():
     log_file = None if args.no_log_file else args.log_file
     logger   = setup_logging(log_file, args.verbose)
 
-    # ── Banner ────────────────────────────────────────────────────────────
+    # -- Banner ------------------------------------------------------------
     SEP  = "=" * 74
     sep2 = "-" * 74
     logger.info(SEP)
     logger.info(
-        f"  vCenter ESXi SSH Automation  –  "
+        f"  vCenter ESXi SSH Automation  -  "
         f"started {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
     if args.dry_run:
-        logger.info("  *** DRY-RUN MODE – no changes will be made ***")
+        logger.info("  *** DRY-RUN MODE - no changes will be made ***")
     mode_label = {
         "ssh-only-enable":  "SSH-ONLY ENABLE  (no commands will be run)",
         "ssh-only-disable": "SSH-ONLY DISABLE (no commands will be run)",
@@ -688,7 +688,7 @@ def main():
         logger.info(f"  SSH timeout       : {args.ssh_timeout}s")
         logger.info(
             f"  Disable SSH after : "
-            f"{'YES – always' if args.disable_ssh_after else 'only if SSH was stopped before this run'}"
+            f"{'YES - always' if args.disable_ssh_after else 'only if SSH was stopped before this run'}"
         )
         logger.info(f"  Commands to run   : {len(COMMANDS_TO_RUN)}")
         for cmd in COMMANDS_TO_RUN:
@@ -699,10 +699,10 @@ def main():
     )
     logger.info(SEP)
 
-    # ── Connect to vCenter ───────────────────────────────────────────────
+    # -- Connect to vCenter -----------------------------------------------
     si = connect_vcenter(args.server, args.user, args.password, args.port, logger)
 
-    # ── Retrieve hosts ───────────────────────────────────────────────────
+    # -- Retrieve hosts ---------------------------------------------------
     hosts = get_all_hosts(si, args.cluster, logger)
 
     if not hosts:
@@ -713,7 +713,7 @@ def main():
     results_summary: list = []
     total = len(hosts)
 
-    # ── Per-host processing ──────────────────────────────────────────────
+    # -- Per-host processing ----------------------------------------------
     for idx, host_obj in enumerate(hosts, start=1):
         info = get_host_info(host_obj)
         logger.info("")
@@ -755,9 +755,9 @@ def main():
         host_failed             = False
         ssh_was_already_running = is_ssh_running(host_obj)
 
-        # ════════════════════════════════════════════════════════════════
-        # MODE: --ssh-only-enable  →  just turn SSH on, nothing else
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
+        # MODE: --ssh-only-enable  ->  just turn SSH on, nothing else
+        # ================================================================
         if mode == "ssh-only-enable":
             logger.info(
                 f"   -->  SSH service: "
@@ -776,9 +776,9 @@ def main():
                 )
             continue
 
-        # ════════════════════════════════════════════════════════════════
-        # MODE: --ssh-only-disable  →  just turn SSH off, nothing else
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
+        # MODE: --ssh-only-disable  ->  just turn SSH off, nothing else
+        # ================================================================
         if mode == "ssh-only-disable":
             logger.info(
                 f"   -->  SSH service: "
@@ -793,11 +793,11 @@ def main():
                 results_summary.append({**info, "status": "OK", "note": "SSH disabled"})
             continue
 
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
         # MODE: run-commands  (default)
-        # ════════════════════════════════════════════════════════════════
+        # ================================================================
 
-        # ── Step 1: Enable SSH ───────────────────────────────────────────
+        # -- Step 1: Enable SSH -------------------------------------------
         logger.info(
             f"   -->  SSH service: "
             f"{'RUNNING' if ssh_was_already_running else 'STOPPED'}  -> enabling ..."
@@ -809,7 +809,7 @@ def main():
             )
             continue
 
-        # ── Step 2: Run commands via SSH ─────────────────────────────────
+        # -- Step 2: Run commands via SSH ---------------------------------
         logger.info(f"   -->  Running {len(COMMANDS_TO_RUN)} command(s) via SSH ...")
         cmd_results = run_ssh_commands(
             ip=info["ip"],
@@ -828,10 +828,10 @@ def main():
             logger.warning(f"   [WARN] {len(failed_cmds)} command(s) returned a non-zero exit code")
             host_failed = True
 
-        # ── Step 3: Disable SSH if needed ───────────────────────────────
-        # Always disable  →  --disable-ssh-after was set
-        # Disable anyway  →  SSH was not running before we started (we turned it on)
-        # Leave running   →  SSH was already on AND --disable-ssh-after not set
+        # -- Step 3: Disable SSH if needed -------------------------------
+        # Always disable  ->  --disable-ssh-after was set
+        # Disable anyway  ->  SSH was not running before we started (we turned it on)
+        # Leave running   ->  SSH was already on AND --disable-ssh-after not set
         if args.disable_ssh_after:
             reason = "--disable-ssh-after flag"
         elif not ssh_was_already_running:
@@ -853,7 +853,7 @@ def main():
             f"Host {info['name']} finished  (status: {status})"
         )
 
-    # ── Disconnect from vCenter ──────────────────────────────────────────
+    # -- Disconnect from vCenter ------------------------------------------
     logger.info("")
     logger.info("-->  Disconnecting from vCenter ...")
     try:
@@ -862,7 +862,7 @@ def main():
     except Exception as e:
         logger.warning(f"Warning during vCenter disconnect: {e}")
 
-    # ── Final summary & exit ─────────────────────────────────────────────
+    # -- Final summary & exit ---------------------------------------------
     print_summary(results_summary, logger, args.dry_run)
 
     if log_file:
