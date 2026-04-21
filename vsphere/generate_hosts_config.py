@@ -23,6 +23,14 @@ DESCRIPTION:
     is skipped and the 'vvolStorageProtocolType' field is omitted from the
     resulting JSON file.
 
+    VCF accepts a maximum of 50 hosts per commissioning file. When the input
+    contains more than 50 FQDNs the output is split into multiple files with
+    at most 50 hosts each. In that case a zero-padded '_partNN' suffix is
+    inserted before the file extension of the configured output path, for
+    example 'hosts_config.json' becomes 'hosts_config_part01.json',
+    'hosts_config_part02.json', and so on. When the input has 50 FQDNs or
+    fewer a single output file is written using the exact configured name.
+
 INPUT FILE FORMAT (hosts.json):
     A JSON array of FQDN strings, for example:
 
@@ -114,6 +122,11 @@ VVOL_PROTOCOL_TYPES = [
     "ISCSI",
     "NFS",
 ]
+
+# VCF imposes a 50-host limit per commissioning operation. When the input
+# contains more than this, the output is split into multiple files, each
+# containing at most MAX_HOSTS_PER_FILE host entries.
+MAX_HOSTS_PER_FILE = 50
 
 
 def parse_arguments():
@@ -239,6 +252,30 @@ def build_host_entries(fqdns, common_params):
     return hosts
 
 
+def chunk_list(items, chunk_size):
+    """Yield successive chunks of the given size from a list."""
+    for start in range(0, len(items), chunk_size):
+        yield items[start:start + chunk_size]
+
+
+def build_chunked_output_paths(output_path, num_chunks):
+    """Return a list of output paths, one per chunk.
+
+    If there is only a single chunk the original path is returned unchanged.
+    Otherwise a zero-padded '_partNN' suffix is inserted before the file
+    extension, for example 'hosts_config.json' -> 'hosts_config_part01.json'.
+    """
+    if num_chunks <= 1:
+        return [output_path]
+
+    root, ext = os.path.splitext(output_path)
+    width = max(2, len(str(num_chunks)))
+    return [
+        f"{root}_part{str(idx).zfill(width)}{ext}"
+        for idx in range(1, num_chunks + 1)
+    ]
+
+
 def write_output(output_path, payload):
     """Write the final JSON payload to disk."""
     try:
@@ -299,12 +336,29 @@ def main():
         "vvolStorageProtocolType": vvol_protocol,
     }
 
-    payload = {"hosts": build_host_entries(fqdns, common_params)}
+    all_hosts = build_host_entries(fqdns, common_params)
 
-    write_output(args.output, payload)
+    # VCF accepts at most MAX_HOSTS_PER_FILE hosts per commissioning file,
+    # so we split the output into multiple files when the list is larger.
+    chunks = list(chunk_list(all_hosts, MAX_HOSTS_PER_FILE))
+    output_paths = build_chunked_output_paths(args.output, len(chunks))
+
+    for chunk, path in zip(chunks, output_paths):
+        write_output(path, {"hosts": chunk})
 
     print("-" * 60)
-    print(f"SUCCESS: Wrote {len(fqdns)} host(s) to: {os.path.abspath(args.output)}")
+    if len(chunks) == 1:
+        print(
+            f"SUCCESS: Wrote {len(all_hosts)} host(s) to: "
+            f"{os.path.abspath(output_paths[0])}"
+        )
+    else:
+        print(
+            f"SUCCESS: Wrote {len(all_hosts)} host(s) split across "
+            f"{len(chunks)} files (max {MAX_HOSTS_PER_FILE} hosts each):"
+        )
+        for chunk, path in zip(chunks, output_paths):
+            print(f"  - {os.path.abspath(path)}  ({len(chunk)} hosts)")
 
 
 if __name__ == "__main__":
