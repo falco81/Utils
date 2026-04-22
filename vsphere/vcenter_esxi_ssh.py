@@ -320,15 +320,30 @@ def get_host_info(host_obj) -> dict:
         if isinstance(host_obj.parent, vim.ClusterComputeResource)
         else "(standalone)"
     )
-    # Prefer the management VMkernel IP over the registered hostname/IP
-    ip = name
+
+    # Resolve the management IP using the VirtualNicManager, which tracks
+    # which VMkernel adapters are tagged for each traffic type.
+    # Fallback chain:
+    #   1. VMkernel port explicitly tagged as "management" traffic type
+    #   2. host_obj.name as registered in vCenter  (always the management address)
+    ip = name  # safest fallback -- this is how vCenter knows the host
     try:
-        for nic in host_obj.config.network.vnic:
-            if nic.spec.ip.ipAddress:
-                ip = nic.spec.ip.ipAddress
-                break
+        nic_mgr = host_obj.config.virtualNicManagerInfo
+        # Find VMkernel device keys selected for "management" traffic
+        mgmt_keys = set()
+        for net_cfg in nic_mgr.netConfig:
+            if net_cfg.nicType == "management":
+                for selected in net_cfg.selectedVnic:
+                    mgmt_keys.add(selected)
+
+        if mgmt_keys:
+            # Match selected keys to actual vnic entries to get the IP
+            for vnic in host_obj.config.network.vnic:
+                if vnic.key in mgmt_keys and vnic.spec.ip.ipAddress:
+                    ip = vnic.spec.ip.ipAddress
+                    break
     except Exception:
-        pass
+        pass  # leave ip = host_obj.name
 
     return {
         "name":             name,
