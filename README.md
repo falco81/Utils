@@ -16,11 +16,12 @@ Utils/
 |   |-- modrak_archive.py          offline archive of the Modrak Opinio podcast
 |   +-- modrak_rss_gen.py          extended RSS feed for the Modrak Podbean podcast
 +-- vsphere/
-    |-- vcenter_esxi_ssh.py        run commands on all ESXi hosts via vCenter
-    |-- esxi_direct_ssh.py         same, but from a JSON host list (no vCenter)
-    |-- generate_hosts_config.py   generate VCF host commissioning JSON from hosts.json
-    |-- hosts.json                 sample host list
-    +-- requirements.txt           vSphere-specific dependencies
+    |-- vcenter_esxi_ssh.py                run commands on all ESXi hosts via vCenter
+    |-- esxi_direct_ssh.py                 same, but from a JSON host list (no vCenter)
+    |-- vcenter_rename_local_datastores.py rename local datastores across clusters
+    |-- generate_hosts_config.py           generate VCF host commissioning JSON
+    |-- hosts.json                         sample host list
+    +-- requirements.txt                   vSphere-specific dependencies
 ```
 
 ---
@@ -238,7 +239,7 @@ python mujrozhlas_rss_gen.py
 python mujrozhlas_rss_gen.py --with-lengths
 ```
 
-Intended use: run as a cron job producing static `*.rss` files served by nginx/Apache. Consumers (Podcast Addict, AudioBookshelf, ...) point at those URLs and see the complete back catalogue. Output is written atomically (`write to temp file` + `os.replace`) so HTTP consumers never see a half-written feed.
+Intended use: run as a cron job producing static `*.rss` files served by nginx/Apache. Output is written atomically (`write to temp file` + `os.replace`) so HTTP consumers never see a half-written feed.
 
 **Dependencies:** `pip install requests`
 
@@ -247,8 +248,6 @@ Intended use: run as a cron job producing static `*.rss` files served by nginx/A
 ### `modrak_archive.py` -- Offline archive of the Modrak Opinio podcast
 
 Creates and maintains a full offline copy of the paid Modrak Opinio podcast. Downloads every MP3/M4A, cover image, and generates a local RSS feed in which all `<enclosure>` URLs point to local files instead of Opinio's CDN servers.
-
-When a subscription lapses, the hosted feed stops working. This archive preserves a fully functional local copy of every episode that was ever released during the subscription.
 
 The script is idempotent -- re-running only downloads episodes that are new or changed; everything already archived is skipped.
 
@@ -277,12 +276,9 @@ ARCHIVE_DIR/
 ```
 pip install requests
 python modrak_archive.py
-
-# Typical cron line:
-# 0 6 * * * /usr/bin/python3 /opt/modrak-archive/modrak_archive.py
 ```
 
-**Security note:** `feed-opinio.xml` contains your `player_key` in every enclosure URL. It is written with mode `0600` and must not be exposed via a web server. The generated `modrak-archive.rss` is clean of tokens and safe to serve publicly.
+**Security note:** `feed-opinio.xml` contains your `player_key` in every enclosure URL. It is written with mode `0600` and must not be exposed via a web server.
 
 **Dependencies:** `pip install requests`
 
@@ -291,8 +287,6 @@ python modrak_archive.py
 ### `modrak_rss_gen.py` -- Extended RSS feed for the Modrak Podbean podcast
 
 Fetches the official Podbean feed for the Modrak podcast and extends it with older episodes that have fallen off the feed (Podbean serves only the ~300 most recent episodes). The merged complete RSS feed is written to `OUTPUT_DIR`. Intended for cron.
-
-The original XML channel metadata and all existing `<item>` elements are kept verbatim. Additional `<item>` elements for older scraped episodes are inserted before `</channel>` using the same item format.
 
 **Configuration** (environment variables):
 
@@ -306,20 +300,15 @@ The original XML channel metadata and all existing `<item>` elements are kept ve
 ```
 pip install requests
 python modrak_rss_gen.py
-
-# Typical cron line:
-# 0 5 * * * /usr/bin/python3 /opt/modrak-rss/modrak_rss_gen.py
 ```
-
-Output is written atomically (`write to temp file` + `os.replace`) so nginx never serves a partial or corrupted feed.
 
 **Dependencies:** `pip install requests`
 
 ---
 
-## `vsphere/` -- ESXi SSH automation
+## `vsphere/` -- ESXi automation scripts
 
-Three scripts for automating SSH operations and host commissioning across ESXi fleets. The SSH scripts use the ESXi SOAP API (pyVmomi) to manage the SSH service and Paramiko to execute commands over SSH. Every action is logged to both the console and a timestamped log file. All console output is ASCII-only and compatible with Windows 10 CMD and PowerShell without any code page changes.
+Four scripts for automating SSH operations, host commissioning, and datastore management across ESXi fleets. All console output is ASCII-only and compatible with Windows 10 CMD and PowerShell without any code page changes. Passwords are never echoed to the terminal.
 
 **Installation:**
 
@@ -331,7 +320,7 @@ pip install pyVmomi paramiko colorama
 
 `colorama` is optional -- if missing, console output still works without colours.
 
-**`hosts.json` format** (shared by all three scripts):
+**`hosts.json` format** (shared by the direct-SSH and generate scripts):
 
 ```json
 [
@@ -363,8 +352,6 @@ COMMANDS_TO_RUN = [
 ]
 ```
 
-Commands are executed sequentially on each host. A non-zero exit code is logged as a warning but does not abort the remaining commands or skip the host.
-
 **Per-host execution order:**
 
 ```
@@ -376,31 +363,14 @@ Commands are executed sequentially on each host. A non-zero exit code is logged 
 **Usage:**
 
 ```
-# Dry-run first -- preview without changing anything
 python vcenter_esxi_ssh.py -s vcenter.corp.local -u admin@vsphere.local --dry-run
-
-# Run for real -- disable SSH afterwards
 python vcenter_esxi_ssh.py -s vcenter.corp.local -u admin@vsphere.local \
     --ssh-user root --disable-ssh-after --log-file audit.log
-
-# Target one cluster only
-python vcenter_esxi_ssh.py -s vcenter.corp.local -u admin@vsphere.local \
-    --cluster "Cluster-Prod" --disable-ssh-after --verbose
-
-# Target a single host
-python vcenter_esxi_ssh.py -s vcenter.corp.local -u admin@vsphere.local \
-    --host-name "esxi-prod-07" --disable-ssh-after --verbose
-
-# Enable SSH cluster-wide without running any commands
 python vcenter_esxi_ssh.py -s vcenter.corp.local -u admin@vsphere.local \
     --cluster "Cluster-Prod" --ssh-only-enable
-
-# Disable SSH cluster-wide without running any commands
 python vcenter_esxi_ssh.py -s vcenter.corp.local -u admin@vsphere.local \
     --cluster "Cluster-Prod" --ssh-only-disable
 ```
-
-Passwords are prompted interactively when omitted from the command line. The vCenter password and the SSH password are prompted separately; pressing Enter at the SSH password prompt reuses the vCenter password.
 
 **All options:**
 
@@ -408,43 +378,28 @@ Passwords are prompted interactively when omitted from the command line. The vCe
 |---|---|---|---|
 | vCenter | `-s / --server` | required | vCenter hostname or IP address |
 | vCenter | `-u / --user` | required | vCenter username (e.g. `administrator@vsphere.local`) |
-| vCenter | `-p / --password` | prompted | vCenter password |
+| vCenter | `-p / --password` | prompted | vCenter password. Never echoed to the terminal. |
 | vCenter | `--port` | `443` | vCenter HTTPS port |
 | SSH | `--ssh-user` | `root` | SSH username on ESXi hosts |
-| SSH | `--ssh-password` | prompted | SSH password (Enter to reuse vCenter password) |
+| SSH | `--ssh-password` | prompted | SSH password. Press Enter to reuse the vCenter password. |
 | SSH | `--ssh-port` | `22` | SSH port on ESXi hosts |
 | SSH | `--ssh-timeout` | `30` | SSH connection and command timeout in seconds |
 | Filtering | `--cluster` | all | Only hosts in clusters whose name contains this substring (case-insensitive) |
 | Filtering | `--host-name` | all | Only hosts whose registered name contains this substring (case-insensitive) |
 | Filtering | `--skip-disconnected` | on | Skip hosts in `disconnected` or `notResponding` state |
-| SSH-only | `--ssh-only-enable` | off | Enable SSH on every matched host and exit (no commands run) |
-| SSH-only | `--ssh-only-disable` | off | Disable SSH on every matched host and exit (no commands run) |
-| Behaviour | `--disable-ssh-after` | off | Disable SSH after the run even if it was already on before |
+| SSH-only | `--ssh-only-enable` | off | Enable SSH on every matched host and exit. No commands are run. |
+| SSH-only | `--ssh-only-disable` | off | Disable SSH on every matched host and exit. No commands are run. |
+| Behaviour | `--disable-ssh-after` | off | Disable SSH after the run even if SSH was already on before the script started |
 | Behaviour | `--dry-run` | off | Simulate all actions without making any changes |
 | Behaviour | `--verbose` | off | Print DEBUG-level output to the console |
-| Behaviour | `--log-file` | `vcenter_esxi_ssh_YYYYMMDD_HHMMSS.log` | Log file path |
+| Behaviour | `--log-file` | `vcenter_esxi_ssh_YYYYMMDD_HHMMSS.log` | Log file path. Directory is created automatically. |
 | Behaviour | `--no-log-file` | off | Disable log file, write to console only |
-
-**Flag compatibility:**
-
-| Combination | Result |
-|---|---|
-| `--ssh-only-enable` + `--ssh-only-disable` | Rejected (mutually exclusive) |
-| `--ssh-only-enable` + `--disable-ssh-after` | Rejected |
-| `--ssh-only-disable` + `--disable-ssh-after` | Rejected |
 
 ---
 
 ### `esxi_direct_ssh.py` -- Host-list SSH automation (no vCenter)
 
-Identical behaviour to `vcenter_esxi_ssh.py`, but the host list comes from `hosts.json` instead of being discovered via vCenter. Each host is contacted directly via its own built-in ESXi SOAP API -- no vCenter instance is required.
-
-The script connects to two separate endpoints on each host:
-
-- **ESXi SOAP API** (port 443) -- used only to start and stop the SSH service.
-- **SSH** (port 22) -- used to execute `COMMANDS_TO_RUN`.
-
-These two connections use the same credentials by default. Separate usernames and passwords can be provided when they differ.
+Identical behaviour to `vcenter_esxi_ssh.py` but reads hosts from `hosts.json` instead of vCenter. Each host is contacted directly via its built-in ESXi SOAP API.
 
 **Per-host execution order:**
 
@@ -460,36 +415,14 @@ These two connections use the same credentials by default. Separate usernames an
 **Usage:**
 
 ```
-# Dry-run (hosts.json in the current directory)
 python esxi_direct_ssh.py -u root --dry-run
-
-# Run commands and disable SSH afterwards
 python esxi_direct_ssh.py -u root --disable-ssh-after
-
-# Separate ESXi API password and SSH password
-python esxi_direct_ssh.py -u root -p ApiPass --ssh-user root --ssh-password SshPass
-
-# Enable SSH on all hosts (no commands run)
 python esxi_direct_ssh.py -u root --ssh-only-enable
-
-# Disable SSH on all hosts (no commands run)
 python esxi_direct_ssh.py -u root --ssh-only-disable
-
-# Set hostname on each host then run COMMANDS_TO_RUN
-# hosts.json must contain valid FQDNs -- IPs and short names are rejected
 python esxi_direct_ssh.py -u root --change-hostname --disable-ssh-after
-
-# Dry-run with --change-hostname validates FQDNs without touching any host
-python esxi_direct_ssh.py -u root --change-hostname --dry-run
-
-# Use a different hosts file
 python esxi_direct_ssh.py -u root --config /etc/esxi/prod_hosts.json
-
-# Filter by substring
 python esxi_direct_ssh.py -u root --host-name "esx-01a" --disable-ssh-after
 ```
-
-Passwords are prompted interactively when omitted. The ESXi API password and SSH password are prompted separately; pressing Enter at the SSH password prompt reuses the API password.
 
 **All options:**
 
@@ -497,86 +430,166 @@ Passwords are prompted interactively when omitted. The ESXi API password and SSH
 |---|---|---|---|
 | Host list | `-c / --config` | `hosts.json` | Path to the JSON host list file |
 | ESXi API | `-u / --user` | required | ESXi username (typically `root`) |
-| ESXi API | `-p / --password` | prompted | ESXi SOAP API password |
+| ESXi API | `-p / --password` | prompted | ESXi SOAP API password. Never echoed to the terminal. |
 | ESXi API | `--port` | `443` | ESXi HTTPS API port |
 | SSH | `--ssh-user` | `root` | SSH username on ESXi hosts |
-| SSH | `--ssh-password` | prompted | SSH password (Enter to reuse API password) |
+| SSH | `--ssh-password` | prompted | SSH password. Press Enter to reuse the API password. |
 | SSH | `--ssh-port` | `22` | SSH port |
 | SSH | `--ssh-timeout` | `30` | SSH connection and command timeout in seconds |
 | Filtering | `--host-name` | all | Only hosts whose IP or FQDN contains this substring (case-insensitive) |
-| SSH-only | `--ssh-only-enable` | off | Enable SSH on every matched host and exit (no commands run) |
-| SSH-only | `--ssh-only-disable` | off | Disable SSH on every matched host and exit (no commands run) |
-| Behaviour | `--change-hostname` | off | Set FQDN hostname before running commands. Requires all hosts.json entries to be valid FQDNs (min. 3 labels: host.domain.tld). Validated even in --dry-run. |
-| Behaviour | `--disable-ssh-after` | off | Disable SSH after the run even if it was already on before |
+| SSH-only | `--ssh-only-enable` | off | Enable SSH on every matched host and exit. No commands are run. |
+| SSH-only | `--ssh-only-disable` | off | Disable SSH on every matched host and exit. No commands are run. |
+| Behaviour | `--change-hostname` | off | Set FQDN hostname before running commands. All hosts.json entries must be valid FQDNs (min. 3 labels: host.domain.tld). Validated even in dry-run. |
+| Behaviour | `--disable-ssh-after` | off | Disable SSH after the run even if SSH was already on before the script started |
 | Behaviour | `--dry-run` | off | Simulate all actions without making any changes |
 | Behaviour | `--verbose` | off | Print DEBUG-level output to the console |
-| Behaviour | `--log-file` | `esxi_direct_ssh_YYYYMMDD_HHMMSS.log` | Log file path |
+| Behaviour | `--log-file` | `esxi_direct_ssh_YYYYMMDD_HHMMSS.log` | Log file path. Directory is created automatically. |
 | Behaviour | `--no-log-file` | off | Disable log file, write to console only |
 
-**Flag compatibility:**
-
-| Combination | Result |
-|---|---|
-| `--ssh-only-enable` + `--ssh-only-disable` | Rejected (mutually exclusive) |
-| `--ssh-only-enable` + `--disable-ssh-after` | Rejected |
-| `--ssh-only-disable` + `--disable-ssh-after` | Rejected |
-| `--change-hostname` + `--ssh-only-enable` | Rejected (no SSH session opened in ssh-only modes) |
-| `--change-hostname` + `--ssh-only-disable` | Rejected |
-
-**FQDN validation for `--change-hostname`:**
-
-Validation runs before any host is contacted, including during `--dry-run`. The script rejects entries that are IP addresses, single-label names, or names with only two labels:
+FQDN validation for `--change-hostname`:
 
 ```
-[X]  192.168.10.11   (IP address -- use a fully-qualified hostname)
-[X]  esxi-hostname   (no domain part -- add the domain suffix)
-[X]  esx-01.site-a  (only 2 labels -- need at least host.domain.tld)
+[X]  192.168.10.11   IP address
+[X]  esxi-hostname   no domain suffix
+[X]  esx-01.site-a   only 2 labels -- need at least host.domain.tld
 [OK] esx-01.site-a.vcf.lab
 [OK] esxi-03.corp.local
 ```
 
 ---
 
-### `generate_hosts_config.py` -- VCF host commissioning JSON generator
+### `vcenter_rename_local_datastores.py` -- Local datastore rename
 
-Reads the same `hosts.json` file used by the SSH scripts and generates a host commissioning JSON file in the format expected by VMware Cloud Foundation (VCF). The same parameters (username, password, network pool name, storage type) are applied to every host.
+Renames local VMFS datastores on ESXi hosts across one or more vCenter instances. Supports Enhanced Linked Mode (ELM) environments by accepting multiple `--server` flags and processing each vCenter in sequence with a single set of SSO credentials.
 
-VCF accepts a maximum of 50 hosts per commissioning operation. When `hosts.json` contains more than 50 entries the output is automatically split into multiple files with at most 50 hosts each. A zero-padded `_partNN` suffix is inserted before the file extension (e.g. `hosts_config.json` becomes `hosts_config_part01.json`, `hosts_config_part02.json`, ...).
+A datastore is treated as **local** when it is mounted by exactly one host and its type is VMFS. This matches the default `datastore1`, `datastore1 (1)`, `datastore1 (2)`, ... naming that ESXi assigns during installation.
+
+**Recommended workflow:**
+
+```
+# Step 1 -- inventory: see what is there without changing anything
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local --list-only
+
+# Step 2 -- dry-run: confirm old and new names side by side
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local \
+    --cluster "Cluster-Prod" --dry-run
+
+# Step 3 -- rename for real
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local \
+    --cluster "Cluster-Prod" --log-file C:\Logs\ds_rename.log
+```
+
+**Naming pattern** (`--pattern`, default: `{shortname}-local`):
+
+| Host registered in vCenter | Resolved datastore name |
+|---|---|
+| `esx01-15.domain.local` | `esx01-15-local` |
+| `esx15.domain.local` | `esx15-local` |
+| `testesx.domain2.local` | `testesx-local` |
+
+Available placeholders:
+
+| Placeholder | Resolved to | Example |
+|---|---|---|
+| `{hostname}` | Full hostname as registered in vCenter | `esx-01a.site-a.vcf.lab` |
+| `{shortname}` | First label before the first dot | `esx-01a` |
+| `{cluster}` | Cluster name verbatim | `Cluster Prod A` |
+| `{cluster_slug}` | Cluster name lowercased, non-alphanumeric chars replaced by `-` | `cluster-prod-a` |
+| `{vcenter}` | vCenter hostname used for this connection | `vc-mgmt.corp.local` |
+| `{index}` | 1-based 2-digit counter; empty string when only one local datastore exists on the host, prepended with `-` otherwise | (empty) or `-02` |
+| `{index!}` | Same counter, always shown, no leading dash | `01` or `02` |
+
+Pattern examples:
+
+```
+{shortname}-local             ->  esx-01a-local       /  esx-01a-local-02
+{shortname}-ds{index!}        ->  esx-01a-ds01        /  esx-01a-ds02
+{cluster_slug}-{shortname}    ->  cluster-prod-a-esx-01a
+```
 
 **Usage:**
 
 ```
-# Run with defaults (reads ./hosts.json, writes ./hosts_config.json)
+# Inventory -- read-only, nothing changed
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local --list-only
+
+# Dry-run -- show current and target names
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local --dry-run
+
+# Rename all local datastores with default pattern
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local
+
+# Only specific clusters (--cluster is repeatable)
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local \
+    --cluster "Cluster-Prod" --cluster "Cluster-Dev"
+
+# Custom naming pattern
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local \
+    --pattern "{shortname}-ds{index!}"
+
+# Multiple vCenters -- Enhanced Linked Mode (one SSO password for all)
+python vcenter_rename_local_datastores.py \
+    -s vc-site-a.corp.local \
+    -s vc-site-b.corp.local \
+    -u administrator@vsphere.local \
+    --cluster "Cluster-Prod" --dry-run
+
+# Skip datastores that already have the correct name
+python vcenter_rename_local_datastores.py \
+    -s vcenter.corp.local -u administrator@vsphere.local \
+    --skip-already-named
+```
+
+**All options:**
+
+| Group | Flag | Default | Description |
+|---|---|---|---|
+| vCenter | `-s / --server` | required (repeatable) | vCenter hostname or IP. Repeat for multiple vCenters: `-s vc1 -s vc2`. In ELM environments all vCenters share one SSO domain so the same credentials apply everywhere. |
+| vCenter | `-u / --user` | required | vCenter / SSO username |
+| vCenter | `-p / --password` | prompted | Password. Never echoed to the terminal. Used for all specified vCenters. |
+| vCenter | `--port` | `443` | vCenter HTTPS port |
+| Filtering | `-c / --cluster` | all (repeatable) | Only process clusters whose name contains this substring (case-insensitive). Repeat for multiple clusters: `--cluster Prod --cluster Dev`. |
+| Filtering | `--host-name` | all | Only process hosts whose name contains this substring (case-insensitive) |
+| Naming | `--pattern` | `{shortname}-local` | Naming pattern with placeholders. See table above. |
+| Behaviour | `--list-only` | off | Print all local datastores with capacity and free space. No renames are performed. |
+| Behaviour | `--skip-already-named` | off | Skip datastores whose current name already matches the resolved target name |
+| Behaviour | `--include-nfs` | off | Include single-host NFS datastores in addition to VMFS (default: VMFS only) |
+| Behaviour | `--dry-run` | off | Show what would be renamed without making any changes |
+| Behaviour | `--verbose` | off | Print DEBUG-level output to the console |
+| Behaviour | `--log-file` | `vcenter_rename_datastores_YYYYMMDD_HHMMSS.log` | Log file path. Directory is created automatically. |
+| Behaviour | `--no-log-file` | off | Disable log file, write to console only |
+| Behaviour | `--task-timeout` | `60` | Seconds to wait for each vCenter rename task before treating it as failed |
+
+**Conflict detection:** before each rename the script checks whether the target name already exists anywhere in the same vCenter. If it does, the rename is skipped with a `[CONFLICT]` status. Names created during the current run are tracked in memory so back-to-back renames are also covered.
+
+**Exit codes:**
+
+| Code | Meaning |
+|---|---|
+| `0` | All processed datastores completed successfully (skipped and conflict entries do not count as failures) |
+| `1` | One or more rename tasks failed |
+
+**Dependencies:** `pip install pyVmomi colorama`
+
+---
+
+### `generate_hosts_config.py` -- VCF host commissioning JSON generator
+
+Reads `hosts.json` and generates a host commissioning JSON file in the format expected by VMware Cloud Foundation (VCF). VCF accepts a maximum of 50 hosts per operation; when `hosts.json` contains more the output is split into `_part01`, `_part02`, ... files automatically.
+
+**Usage:**
+
+```
 python generate_hosts_config.py
-
-# Custom input and output paths
 python generate_hosts_config.py -i my_hosts.json -o my_output.json
-```
-
-The script prompts interactively for all parameters. The password is entered in hidden mode and must be confirmed. Storage type is selected from a numbered menu.
-
-**Supported storage types:**
-
-```
-VSAN  /  VSAN_REMOTE  /  VSAN_ESA  /  VSAN_MAX  /  NFS  /  VMFS_FC  /  VVOL
-```
-
-When `VVOL` is selected an additional menu appears for the vVol storage protocol type (`VMFS_FC`, `ISCSI`, or `NFS`) and the `vvolStorageProtocolType` field is included in the output. For all other storage types the field is omitted.
-
-**Output format (non-VVOL example):**
-
-```json
-{
-    "hosts": [
-        {
-            "fqdn": "esx-01a.site-a.vcf.lab",
-            "username": "root",
-            "storageType": "VSAN",
-            "password": "...",
-            "networkPoolName": "sfo-m01-np01"
-        }
-    ]
-}
 ```
 
 **Options:**
@@ -586,21 +599,17 @@ When `VVOL` is selected an additional menu appears for the vVol storage protocol
 -o / --output   Path to output file        (default: hosts_config.json)
 ```
 
-**Exit codes:**
+**Supported storage types:** VSAN / VSAN_REMOTE / VSAN_ESA / VSAN_MAX / NFS / VMFS_FC / VVOL
 
-| Code | Meaning |
-|---|---|
-| `0` | Success |
-| `1` | Input file not found or invalid JSON |
-| `2` | Invalid user input or user aborted (Ctrl+C) |
+When VVOL is selected a second menu appears for the vVol protocol type (VMFS_FC / ISCSI / NFS).
+
+**Exit codes:** `0` success, `1` file/JSON error, `2` invalid input or Ctrl+C
 
 **Dependencies:** stdlib only (Python 3.6+)
 
 ---
 
 ### SSH disable logic (vcenter_esxi_ssh.py and esxi_direct_ssh.py)
-
-The SSH service state on each host is recorded before the script makes any changes:
 
 | SSH state before run | `--disable-ssh-after` set | SSH state after run |
 |---|---|---|
@@ -609,7 +618,7 @@ The SSH service state on each host is recorded before the script makes any chang
 | Running | No | Running -- left as found |
 | Running | Yes | Stopped |
 
-This prevents the scripts from altering the security posture of hosts where SSH is intentionally left on. If the script is interrupted mid-run (`Ctrl+C`, power loss), some hosts may be left with SSH enabled. Run `--ssh-only-disable` afterwards to restore the expected state.
+If the script is interrupted mid-run, some hosts may be left with SSH enabled. Run `--ssh-only-disable` afterwards to restore the expected state.
 
 ---
 
@@ -617,16 +626,15 @@ This prevents the scripts from altering the security posture of hosts where SSH 
 
 - Python 3.8+ -- tested on 3.8 -- 3.12
 - pyVmomi 8.0.2+, paramiko 3.4+, colorama 0.4.6+
-- vCenter 7.0+ (vCenter 8 tested) -- required only for `vcenter_esxi_ssh.py`
+- vCenter 7.0+ (vCenter 8 and 9 tested)
 - ESXi 7.0+ (ESXi 8 and 9 tested)
 - Windows 10/11, Linux, macOS
-- All console output is ASCII-only (compatible with Windows 10 CMD and PowerShell without `chcp 65001`)
+- All console output is ASCII-only (no `chcp 65001` required)
+- Passwords prompted via `getpass`, never echoed or written to log files
 
 ---
 
 ## Requirements summary
-
-Python 3.10 or newer is required for the `str | None` union syntax used in most scripts. `dircomp.py` and the `vsphere/` scripts work from Python 3.8. `generate_hosts_config.py` works from Python 3.6.
 
 | Script | Extra packages |
 |---|---|
@@ -640,6 +648,7 @@ Python 3.10 or newer is required for the `str | None` union syntax used in most 
 | `audiobookshelf/modrak_rss_gen.py` | `requests` |
 | `vsphere/vcenter_esxi_ssh.py` | `pyVmomi`, `paramiko`, `colorama` (optional) |
 | `vsphere/esxi_direct_ssh.py` | `pyVmomi`, `paramiko`, `colorama` (optional) |
+| `vsphere/vcenter_rename_local_datastores.py` | `pyVmomi`, `colorama` (optional) |
 | `vsphere/generate_hosts_config.py` | -- |
 
 ---
