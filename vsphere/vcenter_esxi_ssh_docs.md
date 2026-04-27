@@ -1,12 +1,13 @@
 # vsphere/ -- Documentation
 
-Four scripts for automating SSH operations, local datastore management, and host commissioning across ESXi fleets.
+Five scripts for automating SSH operations, local datastore management, TPM recovery key export, and host commissioning across ESXi fleets.
 
 | Script | Purpose |
 |---|---|
 | `vcenter_esxi_ssh.py` | Run SSH commands on every ESXi host registered in vCenter |
 | `esxi_direct_ssh.py` | Same as above but reads hosts from `hosts.json` -- no vCenter required |
 | `vcenter_rename_local_datastores.py` | Rename local VMFS datastores across clusters and vCenter instances |
+| `vcenter_export_tpm_keys.py` | Export TPM encryption recovery keys via SSH |
 | `generate_hosts_config.py` | Generate a VCF host commissioning JSON file from `hosts.json` |
 
 `vcenter_esxi_ssh.py` and `esxi_direct_ssh.py` share the same operating modes, logging behaviour, SSH disable logic, and `COMMANDS_TO_RUN` list. All console output is ASCII-only and compatible with Windows 10 CMD and PowerShell without any code page changes. Passwords are never echoed to the terminal.
@@ -23,17 +24,18 @@ Four scripts for automating SSH operations, local datastore management, and host
 6. [Command Reference -- vcenter_esxi_ssh.py](#6-command-reference----vcenter_esxi_sshpy)
 7. [Command Reference -- esxi_direct_ssh.py](#7-command-reference----esxi_direct_sshpy)
 8. [Command Reference -- vcenter_rename_local_datastores.py](#8-command-reference----vcenter_rename_local_datastorespy)
-9. [Command Reference -- generate_hosts_config.py](#9-command-reference----generate_hosts_configpy)
-10. [SSH Disable Logic](#10-ssh-disable-logic)
-11. [Credential Prompts](#11-credential-prompts)
-12. [Logging](#12-logging)
-13. [Host Filtering](#13-host-filtering)
-14. [Exit Codes](#14-exit-codes)
-15. [Workflow Examples](#15-workflow-examples)
-16. [Scheduled Execution on Windows](#16-scheduled-execution-on-windows)
-17. [Troubleshooting](#17-troubleshooting)
-18. [Security Considerations](#18-security-considerations)
-19. [Architecture Overview](#19-architecture-overview)
+9. [Command Reference -- vcenter_export_tpm_keys.py](#9-command-reference----vcenter_export_tpm_keyspy)
+10. [Command Reference -- generate_hosts_config.py](#10-command-reference----generate_hosts_configpy)
+11. [SSH Disable Logic](#11-ssh-disable-logic)
+12. [Credential Prompts](#12-credential-prompts)
+13. [Logging](#13-logging)
+14. [Host Filtering](#14-host-filtering)
+15. [Exit Codes](#15-exit-codes)
+16. [Workflow Examples](#16-workflow-examples)
+17. [Scheduled Execution on Windows](#17-scheduled-execution-on-windows)
+18. [Troubleshooting](#18-troubleshooting)
+19. [Security Considerations](#19-security-considerations)
+20. [Architecture Overview](#20-architecture-overview)
 
 ---
 
@@ -495,7 +497,109 @@ python vcenter_rename_local_datastores.py \
 
 ---
 
-## 9. Command Reference -- generate_hosts_config.py
+## 9. Command Reference -- vcenter_export_tpm_keys.py
+
+Discovers ESXi hosts via vCenter, enables SSH on each host via the vCenter
+API, runs three `esxcli` commands to collect TPM state and recovery keys,
+then disables SSH. Supports multiple vCenters (ELM) and three simultaneous
+output modes.
+
+**Commands run on each ESXi host via SSH:**
+
+| Command | Data returned |
+|---|---|
+| `esxcli system settings encryption get` | Encryption mode, Secure Boot requirement, Physical Presence |
+| `esxcli system settings encryption recovery list` | Recovery ID and full recovery key string |
+| `esxcli hardware trustedboot get` | TPM presence, version (1.2 / 2.0), Secure Boot state |
+
+**TXT output format** (cluster-grouped, keys only):
+
+```
+================================================================================
+Cluster          : CLUSTER-MGMT
+ HOST             : nsx01n.corp.local
+ ID  : {AB3F3271-05E6-4A7E-A91F-527E49F6DEF3}
+ KEY : 672595-512392-589338-241376-619117-509184-009686-393576-...
+ HOST             : nsx02n.corp.local
+ ID  : {CD4A1382-16F7-5B8F-B02G-638F60G7EFG4}
+ KEY : 112233-445566-778899-001122-334455-667788-990011-223344-...
+================================================================================
+```
+
+If a host has no recovery key configured the entry shows:
+```
+ ID  : (no recovery key configured)
+ KEY : -
+```
+
+### vCenter Connection
+
+| Parameter | Short | Required | Default | Description |
+|---|---|---|---|---|
+| `--server` | `-s` | Yes (repeatable) | -- | vCenter hostname or IP. Repeat for ELM environments: `-s vc-a -s vc-b`. Each vCenter is processed independently with the same SSO credentials. |
+| `--user` | `-u` | Yes | -- | vCenter / SSO username |
+| `--password` | `-p` | No | prompted | vCenter password. Never echoed to the terminal. |
+| `--port` | | No | `443` | vCenter HTTPS port |
+
+### SSH Credentials
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--ssh-user` | `root` | SSH username on ESXi hosts |
+| `--ssh-password` | prompted | SSH password. Prompted separately from the vCenter password. Press Enter to reuse the vCenter password. |
+| `--ssh-port` | `22` | SSH port on ESXi hosts |
+| `--ssh-timeout` | `30` | Timeout in seconds for SSH connection and each individual command |
+
+### Filtering
+
+| Parameter | Short | Default | Description |
+|---|---|---|---|
+| `--cluster` | `-c` | all (repeatable) | Only process clusters whose name contains this substring (case-insensitive). Repeat for multiple clusters: `--cluster Prod --cluster Dev`. |
+| `--host-name` | | all | Only process hosts whose registered name contains this substring (case-insensitive) |
+
+### Output Options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--html [FILE]` | off | Write a self-contained HTML report. If FILE is omitted a timestamped filename (`tpm_export_YYYYMMDD_HHMMSS.html`) is created in the current working directory. |
+| `--txt [FILE]` | off | Write a plain-text cluster-grouped report. If FILE is omitted a timestamped filename (`tpm_export_YYYYMMDD_HHMMSS.txt`) is created in the current working directory. |
+| `--log-file` | off | Also write the console log to a file |
+| `--verbose` | off | Print DEBUG-level output to the console |
+
+### Behaviour Options
+
+| Parameter | Default | Description |
+|---|---|---|
+| `--disable-ssh-after` | `auto` | Controls SSH state after each host is processed. `auto` = disable SSH only if the script turned it on (same logic as the other SSH scripts). `yes` = always disable. `no` = leave SSH in whatever state it is after collection. |
+
+### Example invocations
+
+```
+# CLI output only -- all clusters
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local
+
+# HTML and TXT with auto-generated filenames (current directory)
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --html --txt
+
+# HTML and TXT with explicit filenames
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --html C:\Reports\tpm.html --txt C:\Reports\tpm.txt
+
+# Specific cluster(s) only
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --cluster "Cluster-Prod" --cluster "Cluster-Dev" --html
+
+# Different SSH credentials
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --ssh-user root --ssh-password RootPass --html --txt
+
+# Multiple vCenters (ELM -- one SSO password for all)
+python vcenter_export_tpm_keys.py     -s vc-site-a.corp.local     -s vc-site-b.corp.local     -u administrator@vsphere.local     --html --txt
+
+# Leave SSH running after collection
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --disable-ssh-after no --html
+```
+
+---
+
+## 10. Command Reference -- generate_hosts_config.py
 
 Reads `hosts.json` and generates a host commissioning JSON file in the format expected by VMware Cloud Foundation (VCF). All parameters are entered interactively with hidden password input.
 
@@ -584,7 +688,7 @@ python generate_hosts_config.py -i site-a-hosts.json -o site-a-commissioning.jso
 
 ---
 
-## 10. SSH Disable Logic
+## 11. SSH Disable Logic
 
 The SSH service state on each host is recorded before the script makes any changes. The same logic applies to both SSH scripts.
 
@@ -603,7 +707,7 @@ SSH-only modes make a single explicit change and do not apply restore logic. The
 
 ---
 
-## 11. Credential Prompts
+## 12. Credential Prompts
 
 All scripts prompt interactively for any password not provided on the command line. Prompts appear before any host is contacted. Passwords are never echoed to the terminal.
 
@@ -643,7 +747,7 @@ A single prompt is shown even when multiple vCenters are specified, because in E
 
 ---
 
-## 12. Logging
+## 13. Logging
 
 All scripts write two independent log streams simultaneously.
 
@@ -681,7 +785,7 @@ Default filenames:
 
 ---
 
-## 13. Host Filtering
+## 14. Host Filtering
 
 ### vcenter_esxi_ssh.py
 
@@ -710,7 +814,7 @@ Hosts in clusters that do not match, hosts that are not powered on or not connec
 
 ---
 
-## 14. Exit Codes
+## 15. Exit Codes
 
 | Script | Code | Meaning |
 |---|---|---|
@@ -720,6 +824,8 @@ Hosts in clusters that do not match, hosts that are not powered on or not connec
 | esxi_direct_ssh.py | `1` | One or more hosts reported FAILED status |
 | vcenter_rename_local_datastores.py | `0` | All processed datastores completed successfully |
 | vcenter_rename_local_datastores.py | `1` | One or more rename tasks failed |
+| vcenter_export_tpm_keys.py | `0` | All hosts processed successfully |
+| vcenter_export_tpm_keys.py | `1` | One or more hosts failed data collection |
 | generate_hosts_config.py | `0` | Success |
 | generate_hosts_config.py | `1` | Input file not found or invalid JSON |
 | generate_hosts_config.py | `2` | Invalid user input or user aborted |
@@ -728,7 +834,7 @@ Skipped, conflict, and already-correctly-named entries do not count as failures.
 
 ---
 
-## 15. Workflow Examples
+## 16. Workflow Examples
 
 ### Workflow 1 -- Apply a configuration change to all hosts via vCenter
 
@@ -812,7 +918,23 @@ python vcenter_rename_local_datastores.py \
     --log-file C:\Logs\ds_rename_all.log
 ```
 
-### Workflow 7 -- Generate VCF commissioning file
+### Workflow 7 -- Export TPM recovery keys
+
+```
+# Step 1: CLI only to verify connectivity and see what's there
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local
+
+# Step 2: Export to both HTML and TXT
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local \
+    --cluster "Cluster-Prod" --html --txt
+
+# ELM: both vCenters, one command
+python vcenter_export_tpm_keys.py \
+    -s vc-site-a.corp.local -s vc-site-b.corp.local \
+    -u administrator@vsphere.local --html --txt
+```
+
+### Workflow 8 -- Generate VCF commissioning file
 
 ```
 # Edit hosts.json with the target FQDNs, then run
@@ -824,7 +946,7 @@ python generate_hosts_config.py -i site-a-hosts.json -o site-a-commission.json
 
 ---
 
-## 16. Scheduled Execution on Windows
+## 17. Scheduled Execution on Windows
 
 Store credentials in user-level environment variables to avoid plain-text passwords in scheduled task XML:
 
@@ -884,7 +1006,7 @@ echo [OK] Log: %LOG%
 
 ---
 
-## 17. Troubleshooting
+## 18. Troubleshooting
 
 ### `Failed to start SSH on <host>: host`
 
@@ -961,7 +1083,7 @@ The reboot command terminates the SSH connection before Paramiko can read the ex
 
 ---
 
-## 18. Security Considerations
+## 19. Security Considerations
 
 **Credentials**
 
@@ -991,7 +1113,7 @@ The script writes the password in plaintext into the output JSON file. This is r
 
 ---
 
-## 19. Architecture Overview
+## 20. Architecture Overview
 
 ### vcenter_esxi_ssh.py
 
@@ -1144,6 +1266,66 @@ vcenter_rename_local_datastores.py
     +-- Aggregate summary report + exit code
 ```
 
+### vcenter_export_tpm_keys.py
+
+```
+vcenter_export_tpm_keys.py
+|
++-- safe_getpass()               ReadConsoleW on Windows, getpass elsewhere
+|
++-- Logging layer                identical structure to SSH scripts
+|
++-- vCenter layer  (pyVmomi)
+|   +-- connect_vcenter()        SSL connection, accepts self-signed certs
+|   +-- get_clusters()           ContainerView for vim.ClusterComputeResource
+|   +-- get_mgmt_ip()            VirtualNicManager management-tagged vnic
+|   +-- is_ssh_running()         reads vim.host.ServiceSystem.serviceInfo
+|   +-- enable_ssh()             StartService("TSM-SSH") + 12s polling
+|   +-- disable_ssh()            StopService("TSM-SSH")
+|
++-- SSH layer  (paramiko)
+|   +-- run_ssh_command()        single-command SSH execute; returns (out,err,code)
+|
++-- Parsers
+|   +-- parse_kv()               key: value line format
+|   +-- parse_recovery_list()    parses "esxcli ... recovery list" tabular output
+|   +-- parse_trustedboot()      parses "esxcli hardware trustedboot get"
+|   +-- parse_encryption_get()   parses "esxcli system settings encryption get"
+|
++-- Output layer
+|   +-- print_cli_report()       summary table + per-host detail
+|   +-- write_txt()              cluster-grouped keys-only plain text
+|   +-- write_html()             self-contained dark-theme HTML with cards
+|
++-- Argument parser
+|   +-- vCenter connection group  --server (repeatable), -u, -p, --port
+|   +-- SSH credentials group     --ssh-user, --ssh-password, --ssh-port, --ssh-timeout
+|   +-- Filtering group           --cluster (repeatable), --host-name
+|   +-- Output group              --html, --txt, --log-file, --verbose
+|   +-- Behaviour group           --disable-ssh-after (auto/yes/no)
+|
++-- main()
+    +-- Credential prompts        vCenter password then SSH password
+    +-- Banner + config summary
+    +-- Per-vCenter loop
+    |   +-- connect_vcenter()
+    |   +-- get_clusters() + filter
+    |   +-- Per-cluster loop
+    |       +-- Per-host loop
+    |           +-- skip if not connected / not poweredOn
+    |           +-- enable_ssh() via vCenter API
+    |           +-- collect_host_data()
+    |           |   +-- run_ssh_command() x3
+    |           |   +-- parse all outputs
+    |           +-- disable_ssh() according to --disable-ssh-after policy
+    |   +-- Disconnect(si)
+    +-- print_cli_report()
+    +-- write_html() if --html
+    +-- write_txt()  if --txt
+```
+
+---
+
 ### generate_hosts_config.py
 
 ```
@@ -1169,4 +1351,5 @@ generate_hosts_config.py
 
 ---
 
-*Tested on: vCenter 8.0 / 9.0, ESXi 8.0 / 9.0, Python 3.11, Windows 10/11, Ubuntu 22.04.*
+*Tested on: vCenter 8.0 / 9.0, ESXi 8.0 / 9.0, Python 3.11, Windows 10/11, Ubuntu 22.04.  
+Dependencies: pyVmomi 8.0.2+, paramiko 3.4+, colorama 0.4.6+ (optional).*
