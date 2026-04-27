@@ -19,6 +19,7 @@ Utils/
     |-- vcenter_esxi_ssh.py                run commands on all ESXi hosts via vCenter
     |-- esxi_direct_ssh.py                 same, but from a JSON host list (no vCenter)
     |-- vcenter_rename_local_datastores.py rename local datastores across clusters
+    |-- vcenter_export_tpm_keys.py         export TPM encryption recovery keys
     |-- generate_hosts_config.py           generate VCF host commissioning JSON
     |-- hosts.json                         sample host list
     +-- requirements.txt                   vSphere-specific dependencies
@@ -308,7 +309,7 @@ python modrak_rss_gen.py
 
 ## `vsphere/` -- ESXi automation scripts
 
-Four scripts for automating SSH operations, host commissioning, and datastore management across ESXi fleets. All console output is ASCII-only and compatible with Windows 10 CMD and PowerShell without any code page changes. Passwords are never echoed to the terminal.
+Five scripts for automating SSH operations, host commissioning, datastore management, and TPM recovery key export across ESXi fleets. All console output is ASCII-only and compatible with Windows 10 CMD and PowerShell without any code page changes. Passwords are never echoed to the terminal.
 
 **Installation:**
 
@@ -581,6 +582,88 @@ python vcenter_rename_local_datastores.py \
 
 ---
 
+
+### `vcenter_export_tpm_keys.py` -- TPM encryption recovery key export
+
+Connects to one or more vCenter instances, discovers ESXi hosts (with optional
+cluster filtering), enables SSH on each host via the vCenter API, runs the
+relevant `esxcli` commands to collect TPM state and encryption recovery keys,
+then disables SSH again. Supports Enhanced Linked Mode (ELM) by accepting
+multiple `--server` flags.
+
+**Commands run on each host via SSH:**
+
+| Command | Data collected |
+|---|---|
+| `esxcli system settings encryption get` | Encryption mode (TPM / None), Secure Boot requirement |
+| `esxcli system settings encryption recovery list` | Recovery ID and full recovery key string |
+| `esxcli hardware trustedboot get` | TPM presence, version (1.2 / 2.0), Secure Boot state |
+
+**Output formats** (any combination, active simultaneously):
+
+- **CLI** -- always printed; colour-coded summary table and per-host detail
+- **HTML** (`--html`) -- self-contained dark-theme report with expandable cards and raw command output
+- **TXT** (`--txt`) -- compact cluster-grouped plain-text file focused on the recovery keys
+
+**TXT file format:**
+
+```
+================================================================================
+Cluster          : CLUSTER-MGMT
+ HOST             : nsx01n.corp.local
+ ID  : {AB3F3271-05E6-4A7E-A91F-527E49F6DEF3}
+ KEY : 672595-512392-589338-241376-619117-509184-009686-393576-...
+ HOST             : nsx02n.corp.local
+ ID  : {CD4A1382-16F7-5B8F-B02G-638F60G7EFG4}
+ KEY : 112233-445566-778899-001122-334455-667788-990011-223344-...
+================================================================================
+```
+
+**Usage:**
+
+```
+# CLI output only -- all clusters
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local
+
+# HTML and TXT with auto-generated timestamped filenames in current directory
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --html --txt
+
+# HTML and TXT with explicit paths
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --html C:\Reports\tpm.html --txt C:\Reports\tpm.txt
+
+# Specific cluster(s)
+python vcenter_export_tpm_keys.py -s vcenter.corp.local -u admin@vsphere.local     --cluster "Cluster-Prod" --cluster "Cluster-Dev" --html
+
+# Multiple vCenters (Enhanced Linked Mode)
+python vcenter_export_tpm_keys.py     -s vc-site-a.corp.local -s vc-site-b.corp.local     -u administrator@vsphere.local --html --txt
+```
+
+**All options:**
+
+| Group | Flag | Default | Description |
+|---|---|---|---|
+| vCenter | `-s / --server` | required (repeatable) | vCenter hostname or IP. Repeat for ELM: `-s vc1 -s vc2` |
+| vCenter | `-u / --user` | required | vCenter / SSO username |
+| vCenter | `-p / --password` | prompted | vCenter password. Never echoed. |
+| vCenter | `--port` | `443` | vCenter HTTPS port |
+| SSH | `--ssh-user` | `root` | SSH username on ESXi hosts |
+| SSH | `--ssh-password` | prompted | SSH password. Press Enter to reuse vCenter password. |
+| SSH | `--ssh-port` | `22` | SSH port |
+| SSH | `--ssh-timeout` | `30` | SSH connection and command timeout in seconds |
+| Filtering | `-c / --cluster` | all (repeatable) | Only process clusters whose name contains this substring (case-insensitive) |
+| Filtering | `--host-name` | all | Only process hosts whose name contains this substring |
+| Output | `--html [FILE]` | off | Write HTML report. Omit FILE for an auto-generated timestamped name. |
+| Output | `--txt [FILE]` | off | Write TXT report. Omit FILE for an auto-generated timestamped name. |
+| Output | `--log-file` | off | Also write the console log to a file |
+| Output | `--verbose` | off | Print DEBUG-level output to the console |
+| Behaviour | `--disable-ssh-after` | `auto` | `auto` = disable SSH only if the script turned it on. `yes` = always disable. `no` = leave SSH running. |
+
+**Exit codes:** `0` success, `1` if host data collection fails for one or more hosts.
+
+**Dependencies:** `pip install pyVmomi paramiko colorama`
+
+---
+
 ### `generate_hosts_config.py` -- VCF host commissioning JSON generator
 
 Reads `hosts.json` and generates a host commissioning JSON file in the format expected by VMware Cloud Foundation (VCF). VCF accepts a maximum of 50 hosts per operation; when `hosts.json` contains more the output is split into `_part01`, `_part02`, ... files automatically.
@@ -649,6 +732,7 @@ If the script is interrupted mid-run, some hosts may be left with SSH enabled. R
 | `vsphere/vcenter_esxi_ssh.py` | `pyVmomi`, `paramiko`, `colorama` (optional) |
 | `vsphere/esxi_direct_ssh.py` | `pyVmomi`, `paramiko`, `colorama` (optional) |
 | `vsphere/vcenter_rename_local_datastores.py` | `pyVmomi`, `colorama` (optional) |
+| `vsphere/vcenter_export_tpm_keys.py` | `pyVmomi`, `paramiko`, `colorama` (optional) |
 | `vsphere/generate_hosts_config.py` | -- |
 
 ---
