@@ -211,6 +211,86 @@ COMMANDS_TO_RUN = [
 ]
 
 
+
+# ---------------------------------------------------------------------------
+# Password input -- handles Alt codes and special characters on Windows
+# ---------------------------------------------------------------------------
+def safe_getpass(prompt: str = "") -> str:
+    """
+    Secure password input that correctly handles Alt codes and special characters
+    on Windows (e.g. Czech/Slovak keyboards where passwords contain accented chars).
+
+    Root cause of the original problem
+    -----------------------------------
+    The standard getpass on Windows reads from sys.stdin which is a text stream
+    bound to the console OEM code page (cp852 for Central Europe).  Windows Alt
+    codes (Alt+0xxx) generate characters in the ANSI code page (cp1250).  When
+    the two pages differ, typed special characters are silently mis-decoded and
+    the resulting password string does not match the one the user intended.
+
+    Why msvcrt.getwch() also fails
+    --------------------------------
+    getwch() reads characters one at a time in unbuffered mode.  Alt codes work
+    by holding Alt while typing a sequence of numpad digits; Windows only resolves
+    and buffers the final character when Alt is released.  In unbuffered mode the
+    intermediate keystrokes can interfere and the composed character is not
+    reliably delivered.
+
+    Solution: ReadConsoleW with ENABLE_LINE_INPUT
+    -----------------------------------------------
+    ReadConsoleW is the Windows console Unicode API.  With ENABLE_LINE_INPUT the
+    console buffers the entire line (including Alt code composition) and only
+    returns when Enter is pressed -- the same way a normal input() call works.
+    With ENABLE_ECHO_INPUT cleared the typed characters are not shown.  The
+    result is a proper UTF-16 Unicode string regardless of any code page settings.
+
+    On non-Windows platforms the function falls back to the standard getpass.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes
+
+        kernel32        = ctypes.windll.kernel32
+        STD_INPUT       = -10
+        ENABLE_ECHO     = 0x0004   # bit to clear (hide typing)
+        ENABLE_LINE     = 0x0002   # keep: buffer until Enter
+        ENABLE_PROC     = 0x0001   # keep: process Ctrl+C / Alt codes
+
+        h = kernel32.GetStdHandle(STD_INPUT)
+
+        old_mode = ctypes.wintypes.DWORD()
+        kernel32.GetConsoleMode(h, ctypes.byref(old_mode))
+
+        # Disable echo; keep line-buffering and processed input so that Alt
+        # code composition is handled by the Windows console subsystem.
+        new_mode = (old_mode.value & ~ENABLE_ECHO) | ENABLE_LINE | ENABLE_PROC
+        kernel32.SetConsoleMode(h, new_mode)
+
+        try:
+            buf        = ctypes.create_unicode_buffer(512)
+            chars_read = ctypes.wintypes.DWORD()
+            kernel32.ReadConsoleW(
+                h,
+                buf,
+                len(buf) - 1,
+                ctypes.byref(chars_read),
+                None,
+            )
+            password = buf.value.rstrip("\r\n")
+        finally:
+            # Always restore original console mode
+            kernel32.SetConsoleMode(h, old_mode.value)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        return password
+    else:
+        import getpass as _gp
+        return _gp.getpass("")
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -653,7 +733,7 @@ def main():
     # -- Interactive credential prompts -----------------------------------
     # vCenter password - always required
     if not args.password:
-        args.password = getpass.getpass(f"vCenter password for '{args.user}': ")
+        args.password = safe_getpass(f"vCenter password for '{args.user}': ")
 
     # SSH password - only needed when we actually open SSH sessions (run-commands mode).
     # Never silently reuse the vCenter password; always ask explicitly.
@@ -663,7 +743,7 @@ def main():
             f"(leave blank to reuse the vCenter password): "
         )
         sys.stdout.flush()
-        entered = getpass.getpass("")
+        entered = safe_getpass("")
         if entered:
             args.ssh_password = entered
         else:
