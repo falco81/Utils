@@ -734,19 +734,22 @@ def write_html(results: list, path: str, vcenters: List[str],
     n_err  = sum(1 for r in results if r["errors"])
 
     # Summary table
-    sum_rows = "".join(
-        f"<tr>"
-        f"<td>{r['hostname']}</td>"
-        f"<td>{r['cluster']}</td>"
-        f"<td>{_tpm_badge(r)}</td>"
-        f"<td>{_enc_badge(r)}</td>"
-        f"<td>{'<b>' if r['recovery_keys'] else ''}"
-        f"{len(r['recovery_keys'])}"
-        f"{'</b>' if r['recovery_keys'] else ''}</td>"
-        f"<td>{'<span class=\"err\">ERROR</span>' if r['errors'] else '[OK]'}</td>"
-        f"</tr>"
-        for r in results
-    )
+    sum_rows = []
+    for r in results:
+        n_keys_r   = len(r["recovery_keys"])
+        keys_bold  = f"<b>{n_keys_r}</b>" if n_keys_r else str(n_keys_r)
+        err_cell   = '<span class="err">ERROR</span>' if r["errors"] else "[OK]"
+        sum_rows.append(
+            f"<tr>"
+            f"<td>{r['hostname']}</td>"
+            f"<td>{r['cluster']}</td>"
+            f"<td>{_tpm_badge(r)}</td>"
+            f"<td>{_enc_badge(r)}</td>"
+            f"<td>{keys_bold}</td>"
+            f"<td>{err_cell}</td>"
+            f"</tr>"
+        )
+    sum_rows_html = "".join(sum_rows)
 
     # Detail cards
     cards = []
@@ -842,7 +845,7 @@ def write_html(results: list, path: str, vcenters: List[str],
 <h2>Summary</h2>
 <table>
 <thead><tr><th>Host</th><th>Cluster</th><th>TPM</th><th>Encryption</th><th>Keys</th><th>Status</th></tr></thead>
-<tbody>{sum_rows}</tbody>
+<tbody>{sum_rows_html}</tbody>
 </table>
 <h2>Host Details <span style="font-size:11px;font-weight:400">(click to expand)</span></h2>
 {''.join(cards)}
