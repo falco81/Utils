@@ -472,8 +472,11 @@ def resolve_compatible_datastores(pbm_si, policy_cache, ds_lookup, pod_lookup):
     if not pbm_si:
         return
     try:
-        profile_mgr = pbm_si.RetrieveContent().profileManager
-    except Exception:
+        # PbmQueryMatchingHub lives on the placementSolver, NOT profileManager
+        placement_solver = pbm_si.RetrieveContent().placementSolver
+    except Exception as e:
+        print(f"{C_YELLOW}[!] Placement solver unavailable: {e}{C_RESET}",
+              file=sys.stderr)
         return
 
     total = sum(1 for v in policy_cache.values()
@@ -497,7 +500,7 @@ def resolve_compatible_datastores(pbm_si, policy_cache, ds_lookup, pod_lookup):
         print(f"    [{counter}/{total}] {info.get('name', '<unknown>')} ...",
               end="", flush=True)
         try:
-            hubs = profile_mgr.PbmQueryMatchingHub(
+            hubs = placement_solver.PbmQueryMatchingHub(
                 hubsToSearch=None, profile=profile_id) or []
             ds_list = []
             for hub in hubs:
