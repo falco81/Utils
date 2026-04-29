@@ -45,6 +45,8 @@ the fault domains of the hosts that DRS pins the VM to.
 - `pyvmomi` — VMware vSphere management SDK
 - `vmware-vcenter` — VMware vSphere Automation SDK (only for tag collection;
   the script gracefully degrades without it)
+- `colorama` — coloured terminal output (optional; falls back to plain text
+  if not installed)
 
 The vCenter user needs read access to clusters, hosts, VMs, storage profiles
 (`StorageProfile.View`) and tags.
@@ -56,11 +58,12 @@ The vCenter user needs read access to clusters, hosts, VMs, storage profiles
 ### Option 1 — Standard PyPI install
 
 ```bash
-pip install pyvmomi vmware-vcenter
+pip install pyvmomi vmware-vcenter colorama
 ```
 
 `vmware-vcenter` brings in `vmware-vapi-runtime` and the tagging client bindings
-as transitive dependencies.
+as transitive dependencies. `colorama` is optional — script runs fine without
+it, just without colored terminal output.
 
 ### Option 2 — Air-gapped environment with a private PyPI proxy (Nexus, Artifactory)
 
@@ -79,13 +82,13 @@ Both packages are published on pypi.org so a regular proxy works.
 On a machine with internet access:
 
 ```bash
-pip download pyvmomi vmware-vcenter -d ./wheels
+pip download pyvmomi vmware-vcenter colorama -d ./wheels
 ```
 
 Transfer `./wheels` to the target host and:
 
 ```bash
-pip install --no-index --find-links=./wheels pyvmomi vmware-vcenter
+pip install --no-index --find-links=./wheels pyvmomi vmware-vcenter colorama
 ```
 
 ### Option 4 — Skip tagging entirely
@@ -102,7 +105,7 @@ runs and reports DRS rules, storage policies and issues — it just notes:
 ## Usage
 
 ```bash
-python vcenter_vm_report.py -s vcenter.example.com -u 'admin@vsphere.local' -o report --insecure
+python vcenter_vm_report.py -s vcenter.example.com -u 'admin@vsphere.local' -o report
 ```
 
 Arguments:
@@ -112,9 +115,15 @@ Arguments:
 | `-s`, `--server` | vCenter hostname or IP (required) |
 | `-u`, `--user` | Username (required) |
 | `-p`, `--password` | Password (prompted if omitted) |
-| `-o`, `--output` | Output filename base, `.csv` and `.html` are appended (default: `vm_report`) |
+| `-o`, `--output` | Output filename base, `.csv` and `.html` are appended. Default: `vm_report_<vcenter>_<timestamp>` (e.g. `vm_report_vc-mgmt-a_2026-04-29_15-30-45.csv`) so each run produces unique files |
 | `--cluster` | Limit the report to a single cluster |
-| `--insecure` | Skip TLS verification (for self-signed vCenter certs) |
+
+Self-signed certificates are accepted by default — the script always uses
+`ssl.CERT_NONE`. This matches the typical internal vCenter / VCF lab setup;
+if you need strict TLS verification, modify `connect_vcenter()` directly.
+
+Password input on Windows uses `ReadConsoleW` so passwords with Czech /
+Slovak / Polish accented characters typed via Alt-codes work correctly.
 
 The script writes two files:
 

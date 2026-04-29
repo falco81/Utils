@@ -10,12 +10,11 @@ Produces a CSV and HTML report:
 
 Usage:
   python vcenter_vm_report.py -s vcenter.local -u 'user@vsphere.local' \
-      -o report [--cluster CLUSTER] [--insecure]
+      -o report [--cluster CLUSTER]
 """
 
 import argparse
 import csv
-import getpass
 import html
 import re
 import ssl
@@ -32,8 +31,108 @@ try:
 except ImportError:
     pass
 
+# --- Colored output (colorama is optional) ---
+try:
+    from colorama import init as _colorama_init, Fore, Style
+    _colorama_init(autoreset=True)
+    HAS_COLOR = True
+    C_RED    = Fore.RED
+    C_GREEN  = Fore.GREEN
+    C_YELLOW = Fore.YELLOW
+    C_BLUE   = Fore.BLUE
+    C_CYAN   = Fore.CYAN
+    C_MAGENTA = Fore.MAGENTA
+    C_BRIGHT = Style.BRIGHT
+    C_DIM    = Style.DIM
+    C_RESET  = Style.RESET_ALL
+except ImportError:
+    HAS_COLOR = False
+    C_RED = C_GREEN = C_YELLOW = C_BLUE = C_CYAN = C_MAGENTA = ""
+    C_BRIGHT = C_DIM = C_RESET = ""
+
 from pyVim.connect import SmartConnect, Disconnect
 from pyVmomi import vim, pbm, VmomiSupport, SoapStubAdapter
+
+
+# =====================================================================
+# Password input -- handles Alt codes and special characters on Windows
+# =====================================================================
+
+def safe_getpass(prompt: str = "") -> str:
+    """
+    Secure password input that correctly handles Alt codes and special characters
+    on Windows (e.g. Czech/Slovak keyboards where passwords contain accented chars).
+
+    Root cause of the original problem
+    -----------------------------------
+    The standard getpass on Windows reads from sys.stdin which is a text stream
+    bound to the console OEM code page (cp852 for Central Europe). Windows Alt
+    codes (Alt+0xxx) generate characters in the ANSI code page (cp1250). When
+    the two pages differ, typed special characters are silently mis-decoded and
+    the resulting password string does not match the one the user intended.
+
+    Why msvcrt.getwch() also fails
+    --------------------------------
+    getwch() reads characters one at a time in unbuffered mode. Alt codes work
+    by holding Alt while typing a sequence of numpad digits; Windows only resolves
+    and buffers the final character when Alt is released. In unbuffered mode the
+    intermediate keystrokes can interfere and the composed character is not
+    reliably delivered.
+
+    Solution: ReadConsoleW with ENABLE_LINE_INPUT
+    -----------------------------------------------
+    ReadConsoleW is the Windows console Unicode API. With ENABLE_LINE_INPUT the
+    console buffers the entire line (including Alt code composition) and only
+    returns when Enter is pressed -- the same way a normal input() call works.
+    With ENABLE_ECHO_INPUT cleared the typed characters are not shown. The
+    result is a proper UTF-16 Unicode string regardless of any code page settings.
+
+    On non-Windows platforms the function falls back to the standard getpass.
+    """
+    sys.stdout.write(prompt)
+    sys.stdout.flush()
+
+    if sys.platform == "win32":
+        import ctypes
+        import ctypes.wintypes
+
+        kernel32    = ctypes.windll.kernel32
+        STD_INPUT   = -10
+        ENABLE_ECHO = 0x0004   # bit to clear (hide typing)
+        ENABLE_LINE = 0x0002   # keep: buffer until Enter
+        ENABLE_PROC = 0x0001   # keep: process Ctrl+C / Alt codes
+
+        h = kernel32.GetStdHandle(STD_INPUT)
+
+        old_mode = ctypes.wintypes.DWORD()
+        kernel32.GetConsoleMode(h, ctypes.byref(old_mode))
+
+        # Disable echo; keep line-buffering and processed input so that Alt
+        # code composition is handled by the Windows console subsystem.
+        new_mode = (old_mode.value & ~ENABLE_ECHO) | ENABLE_LINE | ENABLE_PROC
+        kernel32.SetConsoleMode(h, new_mode)
+
+        try:
+            buf        = ctypes.create_unicode_buffer(512)
+            chars_read = ctypes.wintypes.DWORD()
+            kernel32.ReadConsoleW(
+                h,
+                buf,
+                len(buf) - 1,
+                ctypes.byref(chars_read),
+                None,
+            )
+            password = buf.value.rstrip("\r\n")
+        finally:
+            # Always restore original console mode
+            kernel32.SetConsoleMode(h, old_mode.value)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+
+        return password
+    else:
+        import getpass as _gp
+        return _gp.getpass("")
 
 try:
     import requests
@@ -53,11 +152,12 @@ except ImportError:
 # Connections
 # =====================================================================
 
-def connect_vcenter(host, user, pwd, insecure=True):
-    ctx = ssl.create_default_context()
-    if insecure:
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
+def connect_vcenter(host, user, pwd):
+    """Connect to vCenter; always accepts self-signed certs (typical for
+    internal/lab vCenter deployments)."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
     si = SmartConnect(host=host, user=user, pwd=pwd, sslContext=ctx)
     return si, ctx
 
@@ -1208,71 +1308,91 @@ def main():
     p.add_argument("-s", "--server", required=True, help="vCenter hostname/IP")
     p.add_argument("-u", "--user", required=True, help="Username")
     p.add_argument("-p", "--password", help="Password (prompted if omitted)")
-    p.add_argument("-o", "--output", default="vm_report",
-                   help="Output filename base (.csv/.html appended)")
+    p.add_argument("-o", "--output", default=None,
+                   help="Output filename base (.csv/.html appended). "
+                        "Default: vm_report_<vcenter>_<timestamp>")
     p.add_argument("--cluster", help="Limit to a specific cluster")
-    p.add_argument("--insecure", action="store_true", help="Skip TLS verification")
     args = p.parse_args()
 
-    pwd = args.password or getpass.getpass(f"Password for {args.user}: ")
-    base = args.output
-    if base.lower().endswith((".csv", ".html")):
-        base = base.rsplit(".", 1)[0]
+    pwd = args.password or safe_getpass(f"Password for {args.user}: ")
+
+    # Build output paths
+    if args.output is None:
+        vc_short = re.sub(r"[^a-zA-Z0-9._-]", "_", args.server.split(".")[0])
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        base = f"vm_report_{vc_short}_{ts}"
+    else:
+        base = args.output
+        if base.lower().endswith((".csv", ".html")):
+            base = base.rsplit(".", 1)[0]
     csv_path, html_path = base + ".csv", base + ".html"
 
-    print(f"[*] Connecting to {args.server} ...")
-    si, _ = connect_vcenter(args.server, args.user, pwd, insecure=args.insecure)
+    print(f"{C_CYAN}[*]{C_RESET} Connecting to {C_BRIGHT}{args.server}{C_RESET} ...")
+    try:
+        si, _ = connect_vcenter(args.server, args.user, pwd)
+    except Exception as e:
+        print(f"{C_RED}[!] vCenter connection failed: {e}{C_RESET}", file=sys.stderr)
+        sys.exit(1)
     content = si.RetrieveContent()
+    about = content.about
+    print(f"{C_GREEN}[OK]{C_RESET} Connected - {about.fullName} (build {about.build})")
 
-    print("[*] Connecting to SPBM ...")
+    print(f"{C_CYAN}[*]{C_RESET} Connecting to SPBM ...")
     try:
         pbm_si = connect_pbm(si)
+        print(f"{C_GREEN}[OK]{C_RESET} SPBM ready")
     except Exception as e:
-        print(f"[!] SPBM unavailable: {e}", file=sys.stderr)
+        print(f"{C_YELLOW}[!] SPBM unavailable: {e}{C_RESET}", file=sys.stderr)
         pbm_si = None
 
-    print("[*] Connecting to tagging API ...")
+    print(f"{C_CYAN}[*]{C_RESET} Connecting to tagging API ...")
     tagging = None
     if HAS_VAPI:
         try:
             tagging = connect_tagging(args.server, args.user, pwd)
+            print(f"{C_GREEN}[OK]{C_RESET} Tagging API ready")
         except Exception as e:
-            print(f"[!] Tagging API failed: {e}", file=sys.stderr)
+            print(f"{C_YELLOW}[!] Tagging API failed: {e}{C_RESET}", file=sys.stderr)
     else:
-        print("[!] vsphere-automation-sdk not installed, tags will be skipped.",
-              file=sys.stderr)
+        print(f"{C_YELLOW}[!] vsphere-automation-sdk not installed, "
+              f"tags will be skipped.{C_RESET}", file=sys.stderr)
 
     clusters = get_obj(content, [vim.ClusterComputeResource])
     if args.cluster:
         clusters = [c for c in clusters if c.name == args.cluster]
         if not clusters:
-            print(f"[!] Cluster '{args.cluster}' not found.", file=sys.stderr)
+            print(f"{C_RED}[!] Cluster '{args.cluster}' not found.{C_RESET}",
+                  file=sys.stderr)
             sys.exit(1)
 
     total_vms = sum(
         1 for cluster in clusters for host in cluster.host for vm in host.vm
         if vm.config is not None and not vm.config.template
     )
-    print(f"[*] Total: {len(clusters)} cluster(s), {total_vms} VM(s)\n")
+    print(f"{C_CYAN}[*]{C_RESET} Total: {C_BRIGHT}{len(clusters)}{C_RESET} cluster(s), "
+          f"{C_BRIGHT}{total_vms}{C_RESET} VM(s)\n")
 
     rows, counter, policy_cache = [], 0, {}
     for cluster in clusters:
-        print(f"[*] Cluster: {cluster.name}")
+        print(f"{C_CYAN}[*]{C_RESET} Cluster: {C_BRIGHT}{cluster.name}{C_RESET}")
         vm_rule_idx = build_drs_rule_index(cluster)
         host_fd_map = get_host_fault_domains(cluster)
         if host_fd_map:
-            print(f"    Fault domains: {', '.join(sorted(set(host_fd_map.values())))}")
+            print(f"    {C_BLUE}Fault domains:{C_RESET} "
+                  f"{', '.join(sorted(set(host_fd_map.values())))}")
 
         for host in cluster.host:
             for vm in host.vm:
                 if vm.config is None or vm.config.template: continue
                 counter += 1
-                print(f"    [{counter}/{total_vms}] {vm.name} ...", end="", flush=True)
+                print(f"    [{counter}/{total_vms}] {vm.name} ...",
+                      end="", flush=True)
 
                 rules = vm_rule_idx.get(vm._moId, [])
                 policies = get_vm_storage_policies(pbm_si, vm, policy_cache)
                 tags = get_vm_tags(tagging, vm._moId)
-                issues = detect_issues(rules, policies, host_fd_map, _short_host(host.name))
+                issues = detect_issues(rules, policies, host_fd_map,
+                                        _short_host(host.name))
 
                 rows.append({
                     "cluster": cluster.name, "host": host.name, "vm": vm.name,
@@ -1287,14 +1407,16 @@ def main():
                 crit = sum(1 for i in issues if i["severity"] == "critical")
                 warn = sum(1 for i in issues if i["severity"] == "warning")
                 marker = ""
-                if crit: marker = f" \033[91m[!]\033[0m {crit}c/{warn}w"
-                elif warn: marker = f" \033[93m[!]\033[0m {warn}w"
+                if crit:
+                    marker = f" {C_RED}[!]{C_RESET} {C_RED}{crit}c{C_RESET}/{C_YELLOW}{warn}w{C_RESET}"
+                elif warn:
+                    marker = f" {C_YELLOW}[!]{C_RESET} {C_YELLOW}{warn}w{C_RESET}"
                 print(f" rules={len(rules)}, policies={len(policies)}, "
                       f"tags={len(tags)}, issues={len(issues)}{marker}")
 
     Disconnect(si)
 
-    print(f"\n[*] Writing CSV: {csv_path}")
+    print(f"\n{C_CYAN}[*]{C_RESET} Writing CSV: {C_BRIGHT}{csv_path}{C_RESET}")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=[
             "cluster", "host", "vm", "power_state",
@@ -1303,12 +1425,16 @@ def main():
         w.writeheader()
         w.writerows(rows)
 
-    print(f"[*] Writing HTML: {html_path}")
+    print(f"{C_CYAN}[*]{C_RESET} Writing HTML: {C_BRIGHT}{html_path}{C_RESET}")
     render_html(rows, args.server, html_path)
 
     crit = sum(1 for r in rows if any(i["severity"] == "critical" for i in r["_issues"]))
     warn = sum(1 for r in rows if any(i["severity"] == "warning" for i in r["_issues"]))
-    print(f"\n[+] Done. Critical: {crit}, Warnings: {warn}.")
+
+    crit_str = f"{C_RED}{crit}{C_RESET}" if crit else f"{C_GREEN}{crit}{C_RESET}"
+    warn_str = f"{C_YELLOW}{warn}{C_RESET}" if warn else f"{C_GREEN}{warn}{C_RESET}"
+    print(f"\n{C_GREEN}[+] Done.{C_RESET} "
+          f"Critical: {crit_str}, Warnings: {warn_str}.")
 
 
 if __name__ == "__main__":
