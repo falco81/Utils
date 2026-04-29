@@ -354,6 +354,7 @@ def get_vm_storage_policies(pbm_si, vm, policy_cache):
                         "name": p.name,
                         "description": getattr(p, "description", "") or "",
                         "capabilities": _extract_capabilities(p),
+                        "profile_id_obj": p.profileId,
                     }
                     key = getattr(p.profileId, "uniqueId", None) or str(p.profileId)
                     policy_cache[key] = info
@@ -387,6 +388,131 @@ def get_vm_storage_policies(pbm_si, vm, policy_cache):
     except Exception:
         pass
     return result
+
+
+# =====================================================================
+# Datastore lookup + storage compatibility (PbmQueryMatchingHub)
+# =====================================================================
+
+def _human_bytes(b):
+    """Render bytes as human-readable string."""
+    if b is None:
+        return "?"
+    try:
+        b = float(b)
+    except (TypeError, ValueError):
+        return "?"
+    if b >= 1024 ** 4:
+        return f"{b / 1024 ** 4:.2f} TB"
+    if b >= 1024 ** 3:
+        return f"{b / 1024 ** 3:.2f} GB"
+    if b >= 1024 ** 2:
+        return f"{b / 1024 ** 2:.2f} MB"
+    if b >= 1024:
+        return f"{b / 1024:.2f} KB"
+    return f"{int(b)} B"
+
+
+def build_datastore_lookup(content):
+    """MoID -> datastore object."""
+    container = content.viewManager.CreateContainerView(
+        content.rootFolder, [vim.Datastore], True
+    )
+    out = {ds._moId: ds for ds in container.view}
+    container.Destroy()
+    return out
+
+
+def build_storage_pod_lookup(content):
+    """MoID -> StoragePod (datastore cluster) object."""
+    container = content.viewManager.CreateContainerView(
+        content.rootFolder, [vim.StoragePod], True
+    )
+    out = {pod._moId: pod for pod in container.view}
+    container.Destroy()
+    return out
+
+
+def _datastore_summary(ds):
+    """Extract usable info from a vim.Datastore summary."""
+    try:
+        summary = ds.summary
+        return {
+            "name": ds.name,
+            "type": getattr(summary, "type", "") or "?",
+            "capacity_b": getattr(summary, "capacity", 0) or 0,
+            "free_b": getattr(summary, "freeSpace", 0) or 0,
+            "accessible": getattr(summary, "accessible", True),
+            "kind": "datastore",
+        }
+    except Exception:
+        return {"name": getattr(ds, "name", "?"), "type": "?",
+                "capacity_b": 0, "free_b": 0, "accessible": False,
+                "kind": "datastore"}
+
+
+def _pod_summary(pod):
+    try:
+        summary = pod.summary
+        return {
+            "name": pod.name,
+            "type": "Datastore Cluster",
+            "capacity_b": getattr(summary, "capacity", 0) or 0,
+            "free_b": getattr(summary, "freeSpace", 0) or 0,
+            "accessible": True,
+            "kind": "pod",
+        }
+    except Exception:
+        return {"name": getattr(pod, "name", "?"), "type": "Datastore Cluster",
+                "capacity_b": 0, "free_b": 0, "accessible": False, "kind": "pod"}
+
+
+def resolve_compatible_datastores(pbm_si, policy_cache, ds_lookup, pod_lookup):
+    """Populate `compatible_datastores` field on each cached policy info."""
+    if not pbm_si:
+        return
+    try:
+        profile_mgr = pbm_si.RetrieveContent().profileManager
+    except Exception:
+        return
+
+    total = sum(1 for v in policy_cache.values()
+                if "compatible_datastores" not in v
+                and v.get("profile_id_obj") is not None)
+    if total == 0:
+        return
+
+    print(f"\n{C_CYAN}[*]{C_RESET} Resolving storage compatibility for "
+          f"{C_BRIGHT}{total}{C_RESET} policies ...")
+
+    counter = 0
+    for key, info in list(policy_cache.items()):
+        if "compatible_datastores" in info:
+            continue
+        profile_id = info.get("profile_id_obj")
+        if profile_id is None:
+            info["compatible_datastores"] = []
+            continue
+        counter += 1
+        print(f"    [{counter}/{total}] {info.get('name', '<unknown>')} ...",
+              end="", flush=True)
+        try:
+            hubs = profile_mgr.PbmQueryMatchingHub(
+                hubsToSearch=None, profile=profile_id) or []
+            ds_list = []
+            for hub in hubs:
+                hub_type = getattr(hub, "hubType", "")
+                hub_id = getattr(hub, "hubId", None)
+                if hub_type == "Datastore" and hub_id in ds_lookup:
+                    ds_list.append(_datastore_summary(ds_lookup[hub_id]))
+                elif hub_type == "StoragePod" and hub_id in pod_lookup:
+                    ds_list.append(_pod_summary(pod_lookup[hub_id]))
+            ds_list.sort(key=lambda x: x["name"].lower())
+            info["compatible_datastores"] = ds_list
+            print(f" {C_GREEN}{len(ds_list)} compatible{C_RESET}")
+        except Exception as e:
+            info["compatible_datastores"] = {"error": str(e)}
+            print(f" {C_RED}error: {e}{C_RESET}")
 
 
 # =====================================================================
@@ -811,6 +937,48 @@ HTML_TEMPLATE = """<!doctype html>
   }
   .vm-link:hover { text-decoration: underline; }
 
+  /* Compatible datastores */
+  .ds-list {
+    display: flex; flex-direction: column; gap: 0;
+    border: 1px solid var(--border); border-radius: 4px; overflow: hidden;
+  }
+  .ds-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 10px; font-size: 12px;
+    border-bottom: 1px solid var(--border); background: #fff;
+  }
+  .ds-row:last-child { border-bottom: none; }
+  .ds-row:nth-child(even) { background: var(--row-alt); }
+  .ds-name {
+    font-weight: 600; min-width: 160px; flex-shrink: 0;
+    word-break: break-all;
+  }
+  .ds-type {
+    font-size: 10px; padding: 1px 6px; border-radius: 3px;
+    background: var(--pill-bg); color: var(--pill-fg);
+    text-transform: uppercase; letter-spacing: 0.3px;
+    flex-shrink: 0; font-weight: 600;
+  }
+  .ds-type.vsan { background: #e6f0ff; color: #0042c4; }
+  .ds-type.vmfs { background: #e6f4ea; color: var(--pill-host-fg); }
+  .ds-type.nfs  { background: #fff4d6; color: var(--warn-fg); }
+  .ds-type.dsc  { background: #f0e6ff; color: #5b00c4; }
+  .ds-bar {
+    flex: 1; height: 8px; min-width: 100px;
+    background: #eef2f6; border-radius: 4px; overflow: hidden;
+  }
+  .ds-fill {
+    height: 100%; background: var(--pill-host-fg);
+  }
+  .ds-fill.warn { background: #d4b46a; }
+  .ds-fill.crit { background: var(--crit-fg); }
+  .ds-stats {
+    font-size: 11px; color: var(--muted); min-width: 150px;
+    text-align: right; flex-shrink: 0;
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+  }
+  .ds-stats strong { color: var(--fg); }
+
   footer { text-align: center; color: var(--muted); padding: 24px; font-size: 12px; }
 </style>
 </head>
@@ -1107,8 +1275,58 @@ def _render_policy_card(name, entry):
         out.append("".join(items))
         out.append('</div>')
 
+    # Compatible datastores (from PbmQueryMatchingHub)
+    ds_data = info.get("compatible_datastores")
+    if ds_data is not None:
+        out.append('<div class="lbl">Compatible datastores</div>')
+        out.append('<div class="val">')
+        out.append(_render_compatible_datastores(ds_data))
+        out.append('</div>')
+
     out.append('</div></div>')
     return "".join(out)
+
+
+def _render_compatible_datastores(ds_data):
+    if isinstance(ds_data, dict) and "error" in ds_data:
+        return f'<span class="empty">error: {_esc(ds_data["error"])}</span>'
+    if not ds_data:
+        return '<span class="empty">no compatible datastores</span>'
+
+    rows = ['<div class="ds-list">']
+    for ds in ds_data:
+        cap = ds.get("capacity_b", 0) or 0
+        free = ds.get("free_b", 0) or 0
+        free_pct = (free / cap * 100) if cap else 0
+        used_pct = max(0, min(100, 100 - free_pct))
+        bar_cls = ""
+        if free_pct < 10:
+            bar_cls = "crit"
+        elif free_pct < 25:
+            bar_cls = "warn"
+
+        # Type pill class
+        t = (ds.get("type") or "").lower()
+        type_cls = ""
+        if "vsan" in t: type_cls = "vsan"
+        elif "vmfs" in t: type_cls = "vmfs"
+        elif "nfs" in t: type_cls = "nfs"
+        elif ds.get("kind") == "pod": type_cls = "dsc"
+
+        rows.append(
+            f'<div class="ds-row">'
+            f'<span class="ds-name">{_esc(ds["name"])}</span>'
+            f'<span class="ds-type {type_cls}">{_esc(ds.get("type", "?"))}</span>'
+            f'<div class="ds-bar"><div class="ds-fill {bar_cls}" '
+            f'style="width: {used_pct:.1f}%;"></div></div>'
+            f'<span class="ds-stats">'
+            f'<strong>{_esc(_human_bytes(free))}</strong> free '
+            f'/ {_esc(_human_bytes(cap))}'
+            f'</span>'
+            f'</div>'
+        )
+    rows.append('</div>')
+    return "".join(rows)
 
 
 def _render_rule_card(cluster, name, entry):
@@ -1413,6 +1631,13 @@ def main():
                     marker = f" {C_YELLOW}[!]{C_RESET} {C_YELLOW}{warn}w{C_RESET}"
                 print(f" rules={len(rules)}, policies={len(policies)}, "
                       f"tags={len(tags)}, issues={len(issues)}{marker}")
+
+    # Resolve which datastores are compatible with each policy
+    # (mirror of vCenter "Storage Compatibility" tab)
+    if pbm_si and policy_cache:
+        ds_lookup = build_datastore_lookup(content)
+        pod_lookup = build_storage_pod_lookup(content)
+        resolve_compatible_datastores(pbm_si, policy_cache, ds_lookup, pod_lookup)
 
     Disconnect(si)
 
