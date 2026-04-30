@@ -285,6 +285,7 @@ def build_drs_rule_index(cluster):
 # =====================================================================
 
 def get_host_fault_domains(cluster):
+    """Return short_host_name -> fault_domain_name (None if not stretched)."""
     fd_map = {}
     cfg = cluster.configurationEx
     for hc in (getattr(cfg, "vsanHostConfig", None) or []):
@@ -293,6 +294,64 @@ def get_host_fault_domains(cluster):
         if host and fd_info and getattr(fd_info, "name", None):
             fd_map[_short_host(host.name)] = fd_info.name
     return fd_map
+
+
+def get_preferred_fault_domain(si, cluster):
+    """Return the name of the *preferred* fault domain for a stretched cluster,
+    or None if unknown / not a stretched cluster.
+
+    Tries the vSAN management API first (authoritative). If that fails
+    (e.g. missing privileges, OSA-only build, older vCenter), tries to read
+    the value from the cluster's vsanConfigInfo property as a fallback.
+    """
+    # Method 1: vSAN management API
+    try:
+        import pyVmomi
+        if hasattr(pyVmomi, "vim") and hasattr(pyVmomi.vim, "cluster"):
+            from pyVmomi import VmomiSupport, SoapStubAdapter
+            host = si._stub.host.split(":")[0]
+            stub = SoapStubAdapter(
+                host=host,
+                version="vim.version.version10",
+                path="/vsanHealth",
+                poolSize=0,
+                sslContext=si._stub.schemeArgs.get("context"),
+            )
+            # Carry over the auth cookie
+            stub.cookie = si._stub.cookie
+            vsan_sc_system = pyVmomi.vim.cluster.VsanVcStretchedClusterSystem(
+                "vsan-stretched-cluster-system", stub)
+            try:
+                pref_fd_obj = vsan_sc_system.VSANVcGetPreferredFaultDomain(
+                    cluster=cluster)
+                # API returns either a string FD name directly or an object
+                if pref_fd_obj is None:
+                    return None
+                name = getattr(pref_fd_obj, "preferredFaultDomainName", None)
+                if name:
+                    return name
+                if isinstance(pref_fd_obj, str):
+                    return pref_fd_obj
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Method 2: walk vsanConfigInfo (fallback heuristic)
+    try:
+        cfg = cluster.configurationEx
+        vsan_cfg = getattr(cfg, "vsanConfigInfo", None)
+        if vsan_cfg:
+            stretched = getattr(vsan_cfg, "stretchedClusterInfo", None)
+            if stretched:
+                pref = getattr(stretched, "preferredFdName", None) or \
+                       getattr(stretched, "preferredFaultDomainName", None)
+                if pref:
+                    return pref
+    except Exception:
+        pass
+
+    return None
 
 
 # =====================================================================
@@ -544,23 +603,70 @@ def get_vm_tags(tagging, vm_moid):
 
 LOCALITY_HINTS = ("locality", "siteaffinity", "sitedisaster", "datalocality")
 
+# Locality values that mean "no site preference" - data goes everywhere
+LOCALITY_NEUTRAL = (
+    "", "none", "rfc-2606 hosts",
+    "dual site mirroring", "dual site mirroring (stretched cluster)",
+    "none - standard cluster",
+)
+
 
 def _is_locality_capability(cap_name):
     n = (cap_name or "").lower().replace("_", "").replace(" ", "")
     return any(h in n for h in LOCALITY_HINTS)
 
 
-def _locality_matches_fd(locality_value, fd_name):
-    lv = (locality_value or "").lower().strip()
-    fn = (fd_name or "").lower().strip()
-    if not lv or not fn: return False
-    if lv == fn or lv in fn or fn in lv: return True
-    if "preferred" in lv and "preferred" in fn: return True
-    if "secondary" in lv and "secondary" in fn: return True
-    return False
+def _resolve_policy_locality_to_fd(locality_value, preferred_fd, all_fds):
+    """Translate a storage policy locality value into the actual fault domain
+    name(s) it pins data to.
+
+    Returns a set of FD names, or empty set if locality is neutral / unknown.
+
+    Examples (with preferred_fd='primary-az' and all_fds={'primary-az','secondary-az'}):
+      'Preferred Fault Domain'           -> {'primary-az'}
+      'None - Keep data on Preferred'    -> {'primary-az'}
+      'Secondary Fault Domain'           -> {'secondary-az'}
+      'None - Keep data on Non-preferred'-> {'secondary-az'}
+      'primary-az'                       -> {'primary-az'}  (literal name)
+      'None'                             -> set()           (no preference)
+    """
+    lv = (locality_value or "").strip().lower()
+    if lv in LOCALITY_NEUTRAL:
+        return set()
+
+    # Literal FD name match (the user named the policy with the actual FD name)
+    for fd in all_fds:
+        if lv == fd.lower():
+            return {fd}
+
+    # Preferred-FD references
+    if "preferred" in lv and ("non-preferred" not in lv and "non preferred" not in lv
+                              and "nonpreferred" not in lv):
+        if preferred_fd:
+            return {preferred_fd}
+        return set()  # we don't know which FD is preferred -> can't decide
+
+    # Non-preferred / Secondary references
+    if ("non-preferred" in lv or "non preferred" in lv or
+            "nonpreferred" in lv or "secondary" in lv):
+        if preferred_fd and all_fds:
+            others = {fd for fd in all_fds if fd != preferred_fd}
+            return others
+        return set()
+
+    return set()
 
 
-def detect_issues(rules, policies, host_fd_map, vm_host_short):
+def _locality_matches_fd(locality_value, fd_name, preferred_fd, all_fds):
+    """Decide whether a policy's locality value applies to a given FD."""
+    target_fds = _resolve_policy_locality_to_fd(locality_value, preferred_fd, all_fds)
+    if not target_fds:
+        # Neutral or unresolvable -> treat as compatible (don't false-positive)
+        return True
+    return fd_name in target_fds
+
+
+def detect_issues(rules, policies, host_fd_map, vm_host_short, preferred_fd=None):
     issues = []
     cluster_fds = set(v for v in host_fd_map.values() if v)
 
@@ -576,6 +682,31 @@ def detect_issues(rules, policies, host_fd_map, vm_host_short):
         if isinstance(info, dict) and info.get("error"):
             issues.append({"severity": "warning",
                 "message": f"Storage policy lookup issue for {label}: {info['error']}"})
+
+    # Mixed storage policies across disks of the same VM
+    # (typical mistake: admin added a disk and forgot to set the policy,
+    #  or used a different policy by accident)
+    policy_per_disk = {}
+    for label, info in policies.items():
+        if not isinstance(info, dict): continue
+        if info.get("error"): continue
+        name = info.get("name")
+        if name:
+            policy_per_disk[label] = name
+    if len(set(policy_per_disk.values())) > 1:
+        # Group disks by policy for a readable message
+        by_policy = defaultdict(list)
+        for disk, pol in policy_per_disk.items():
+            by_policy[pol].append(disk)
+        parts = [f"'{pol}' on {', '.join(sorted(disks))}"
+                 for pol, disks in sorted(by_policy.items())]
+        issues.append({
+            "severity": "warning",
+            "message": ("Mixed storage policies across disks: "
+                        + " | ".join(parts)
+                        + ". Verify this is intentional - inconsistent policies "
+                        "across a VM's disks usually indicate a configuration mistake."),
+        })
 
     for r in rules:
         if "host_group_members" in r and not r["host_group_members"]:
@@ -600,7 +731,7 @@ def detect_issues(rules, policies, host_fd_map, vm_host_short):
                 if _is_locality_capability(cap.get("capability")) or \
                    _is_locality_capability(cap.get("property")):
                     val = str(cap.get("value", ""))
-                    if val.strip().lower() in ("none", "", "rfc-2606 hosts"): continue
+                    if val.strip().lower() in LOCALITY_NEUTRAL: continue
                     policy_localities.append(
                         (label, cap.get("capability") or cap.get("property"), val))
 
@@ -617,16 +748,29 @@ def detect_issues(rules, policies, host_fd_map, vm_host_short):
             if not pinned_fds: continue
 
             for disk_label, cap_name, locality_val in policy_localities:
-                if not any(_locality_matches_fd(locality_val, fd) for fd in pinned_fds):
+                # Resolve which FDs the policy actually pins data to
+                policy_fds = _resolve_policy_locality_to_fd(
+                    locality_val, preferred_fd, cluster_fds)
+                if not policy_fds:
+                    # Neutral locality (e.g. "None", dual-site mirroring) ->
+                    # no site constraint -> can't be a mismatch
+                    continue
+                # Matching: any pinned FD overlaps with policy FDs
+                if not (pinned_fds & policy_fds):
                     severity = "critical" if is_must else "warning"
                     verb = "must" if is_must else "should"
                     direction = "run on" if is_affine else "NOT run on"
+                    # Resolve human-readable target for the message
+                    policy_target = (locality_val
+                                      if any(fd.lower() == locality_val.lower()
+                                             for fd in cluster_fds)
+                                      else f"{locality_val} (= {sorted(policy_fds)})")
                     issues.append({"severity": severity, "message": (
                         f"Site mismatch: DRS rule '{r['name']}' says VM {verb} "
                         f"{direction} hosts in {sorted(host_fds_in_rule)}, "
                         f"effectively pinning compute to {sorted(pinned_fds)}; "
                         f"but storage policy on {disk_label} requires data on "
-                        f"'{locality_val}' ({cap_name}). Cross-site I/O for every R/W.")})
+                        f"{policy_target}. Cross-site I/O for every R/W.")})
 
     if len(cluster_fds) > 1 and vm_host_short:
         host_fd = host_fd_map.get(vm_host_short)
@@ -637,12 +781,16 @@ def detect_issues(rules, policies, host_fd_map, vm_host_short):
                     if not (_is_locality_capability(cap.get("capability")) or
                             _is_locality_capability(cap.get("property"))): continue
                     val = str(cap.get("value", ""))
-                    if val.strip().lower() in ("none", "", "rfc-2606 hosts"): continue
-                    if not _locality_matches_fd(val, host_fd):
+                    policy_fds = _resolve_policy_locality_to_fd(
+                        val, preferred_fd, cluster_fds)
+                    if not policy_fds:
+                        continue
+                    if host_fd not in policy_fds:
                         issues.append({"severity": "warning", "message": (
                             f"Runtime site mismatch: VM is currently on host "
                             f"'{vm_host_short}' (fault domain '{host_fd}'), "
-                            f"but storage policy on {label} keeps data on '{val}'.")})
+                            f"but storage policy on {label} keeps data on "
+                            f"'{val}' (= {sorted(policy_fds)}).")})
 
     seen, unique = set(), []
     for i in issues:
@@ -749,11 +897,33 @@ HTML_TEMPLATE = """<!doctype html>
   .summary-card {
     background: #f8fafd; border: 1px solid var(--border); border-radius: 6px;
     padding: 8px 14px; font-size: 13px;
+    font-family: inherit; color: inherit; text-align: left;
+    cursor: pointer; transition: all 0.15s ease;
+    display: flex; align-items: baseline; gap: 6px;
+  }
+  .summary-card:hover {
+    background: #fff; border-color: var(--accent);
+    transform: translateY(-1px);
+    box-shadow: 0 2px 6px rgba(31,111,235,0.12);
+  }
+  .summary-card:focus-visible {
+    outline: 2px solid var(--accent); outline-offset: 2px;
+  }
+  .summary-card.active {
+    background: #fff; border-color: var(--accent);
+    box-shadow: 0 0 0 2px rgba(31,111,235,0.18);
   }
   .summary-card .num { font-weight: 700; font-size: 16px; }
   .summary-card.crit .num { color: var(--crit-fg); }
+  .summary-card.crit.active { border-color: var(--crit-fg);
+                              box-shadow: 0 0 0 2px rgba(168,29,29,0.18); }
   .summary-card.warn .num { color: var(--warn-fg); }
+  .summary-card.warn.active { border-color: var(--warn-fg);
+                              box-shadow: 0 0 0 2px rgba(138,97,0,0.18); }
   .summary-card.info .num { color: var(--info-fg); }
+  .summary-card.clean .num { color: var(--pill-host-fg); }
+  .summary-card.clean.active { border-color: var(--pill-host-fg);
+                               box-shadow: 0 0 0 2px rgba(26,127,55,0.18); }
 
   nav.toc {
     background: #fff; padding: 10px 28px; border-bottom: 1px solid var(--border);
@@ -982,6 +1152,77 @@ HTML_TEMPLATE = """<!doctype html>
   }
   .ds-stats strong { color: var(--fg); }
 
+  /* Fault domains */
+  .fd-cluster-block { margin-bottom: 22px; }
+  .fd-cluster-name {
+    margin: 14px 0 8px; font-size: 13px; font-weight: 600;
+    color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;
+  }
+  .fd-grid {
+    display: grid; gap: 14px;
+    grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  }
+  .fd-card {
+    background: #fff; border: 1px solid var(--border);
+    border-radius: 8px; padding: 14px 16px;
+  }
+  .fd-card.preferred {
+    border-color: var(--pill-host-fg);
+    box-shadow: 0 0 0 2px rgba(26, 127, 55, 0.08);
+  }
+  .fd-card.witness  { border-style: dashed; opacity: 0.85; }
+  .fd-card .fd-title {
+    display: flex; align-items: baseline; gap: 8px;
+    margin-bottom: 8px; flex-wrap: wrap;
+  }
+  .fd-card .fd-title .name {
+    font-weight: 600; font-size: 14px; word-break: break-all; flex: 1;
+  }
+  .fd-card .fd-title .badge.preferred-fd {
+    background: #e6f4ea; color: var(--pill-host-fg);
+  }
+  .fd-card .fd-title .badge.secondary-fd {
+    background: #eef2f6; color: var(--muted);
+  }
+  .fd-card .fd-summary {
+    font-size: 11px; color: var(--muted); margin-bottom: 8px;
+    display: flex; gap: 12px; flex-wrap: wrap;
+  }
+  .fd-card .fd-summary strong { color: var(--fg); font-weight: 600; }
+  .fd-host-table {
+    width: 100%; border-collapse: collapse; font-size: 12px;
+  }
+  .fd-host-table th, .fd-host-table td {
+    padding: 5px 8px; text-align: left; border-bottom: 1px solid var(--border);
+    vertical-align: middle;
+  }
+  .fd-host-table th {
+    font-size: 10px; text-transform: uppercase; letter-spacing: 0.3px;
+    color: var(--muted); font-weight: 600; background: #f8fafd; cursor: default;
+  }
+  .fd-host-table th:hover { background: #f8fafd; }
+  .fd-host-table tr:nth-child(even) td { background: var(--row-alt); }
+  .fd-host-table tr:last-child td { border-bottom: none; }
+  .fd-host-table .host-name {
+    font-family: ui-monospace, "SF Mono", Consolas, monospace;
+    font-size: 11px; word-break: break-all;
+  }
+  .fd-host-table .host-state.connected { color: var(--pill-host-fg); }
+  .fd-host-table .host-state.disconnected,
+  .fd-host-table .host-state.notResponding { color: var(--crit-fg); font-weight: 600; }
+  .fd-host-table .host-state.maint {
+    color: var(--warn-fg); font-weight: 600;
+  }
+  .fd-host-table .num-cell {
+    text-align: right; font-variant-numeric: tabular-nums;
+    font-size: 11px;
+  }
+  .fd-warn {
+    background: var(--warn-bg); color: var(--warn-fg);
+    border-left: 3px solid var(--warn-fg); padding: 8px 12px;
+    border-radius: 4px; font-size: 12px; margin-top: 6px;
+  }
+
   footer { text-align: center; color: var(--muted); padding: 24px; font-size: 12px; }
 </style>
 </head>
@@ -994,7 +1235,8 @@ HTML_TEMPLATE = """<!doctype html>
 <nav class="toc">
   <a href="#vms">VMs</a><span class="sep">·</span>
   <a href="#policies">Storage Policies</a><span class="sep">·</span>
-  <a href="#rules">DRS Rules</a>
+  <a href="#rules">DRS Rules</a><span class="sep">·</span>
+  <a href="#faultdomains">Fault Domains</a>
 </nav>
 <div class="controls">
   <input type="text" id="filter" placeholder="Filter (VM, host, rule, policy, tag, issue)…">
@@ -1003,8 +1245,10 @@ HTML_TEMPLATE = """<!doctype html>
     <option value="">Issues: all</option>
     <option value="any">Any issue</option>
     <option value="critical">Critical only</option>
-    <option value="warning">Critical + Warning</option>
-    <option value="none">No issues</option>
+    <option value="warning-only">Warning only</option>
+    <option value="warning-plus">Critical + Warning</option>
+    <option value="info-only">Info only</option>
+    <option value="none">No issues (clean)</option>
   </select>
   <select id="ruleFilter">
     <option value="">DRS: all</option>
@@ -1023,6 +1267,10 @@ HTML_TEMPLATE = """<!doctype html>
   <h2>DRS Rules <span class="count">__RULE_COUNT__</span></h2>
   __RULE_DETAILS__
 </section>
+<section class="catalog" id="faultdomains">
+  <h2>Fault Domains <span class="count">__FD_COUNT__</span></h2>
+  __FD_DETAILS__
+</section>
 </main>
 <footer>Generated __TIMESTAMP__</footer>
 <script>
@@ -1034,6 +1282,14 @@ HTML_TEMPLATE = """<!doctype html>
   const stats = document.getElementById('stats');
   const rows = Array.from(document.querySelectorAll('tr.vm-row'));
   const sections = Array.from(document.querySelectorAll('.cluster-section'));
+  const summaryCards = Array.from(document.querySelectorAll('.summary-card'));
+
+  function syncSummaryCards() {
+    const sv = sevSel.value;
+    summaryCards.forEach(card => {
+      card.classList.toggle('active', card.dataset.filter === sv);
+    });
+  }
 
   function apply() {
     const q = filter.value.toLowerCase();
@@ -1051,7 +1307,9 @@ HTML_TEMPLATE = """<!doctype html>
       if (c && cluster !== c) show = false;
       if (sv === 'any' && sev === 'none') show = false;
       if (sv === 'critical' && sev !== 'critical') show = false;
-      if (sv === 'warning' && !(sev === 'critical' || sev === 'warning')) show = false;
+      if (sv === 'warning-only' && sev !== 'warning') show = false;
+      if (sv === 'warning-plus' && !(sev === 'critical' || sev === 'warning')) show = false;
+      if (sv === 'info-only' && sev !== 'info') show = false;
       if (sv === 'none' && sev !== 'none') show = false;
       if (r === 'has-rule' && !hasRule) show = false;
       if (r === 'no-rule' && hasRule) show = false;
@@ -1065,8 +1323,22 @@ HTML_TEMPLATE = """<!doctype html>
       if (cnt) cnt.textContent = visRows + ' VMs';
     });
     stats.textContent = visible + ' / ' + rows.length + ' VMs';
+    syncSummaryCards();
   }
+
   [filter, clusterSel, sevSel, ruleSel].forEach(el => el.addEventListener('input', apply));
+
+  // Clickable summary tiles - data-filter on each tile matches a value
+  // in the severity dropdown. Clicking the same tile again clears the filter.
+  summaryCards.forEach(card => {
+    card.addEventListener('click', () => {
+      const target = card.dataset.filter || '';
+      sevSel.value = (sevSel.value === target) ? '' : target;
+      apply();
+      const vmsAnchor = document.getElementById('vms');
+      if (vmsAnchor) vmsAnchor.scrollIntoView({behavior: 'smooth', block: 'start'});
+    });
+  });
 
   document.querySelectorAll('table').forEach(table => {
     table.querySelectorAll('th').forEach((th, idx) => {
@@ -1396,11 +1668,133 @@ def _render_rule_card(cluster, name, entry):
     return "".join(out)
 
 
-# =====================================================================
-# Main HTML render
-# =====================================================================
+# ---------------------------------------------------------------------
+# Fault domain rendering
+# ---------------------------------------------------------------------
 
-def render_html(rows, vcenter_host, output_path):
+def _host_state_class(connection, in_maintenance):
+    if in_maintenance:
+        return "maint"
+    return (connection or "").strip()
+
+
+def _host_state_label(connection, in_maintenance):
+    if in_maintenance:
+        return "Maintenance"
+    return connection or "?"
+
+
+def _render_fault_domain_card(fd_name, hosts, preferred_fd, vm_count_by_fd):
+    is_preferred = (preferred_fd is not None and fd_name == preferred_fd)
+    is_secondary = (preferred_fd is not None and fd_name and fd_name != preferred_fd
+                    and len({h["fd"] for h in hosts if h["fd"]} | {preferred_fd}) > 1)
+
+    # Aggregate stats
+    total_cores = sum(h.get("cpu_cores") or 0 for h in hosts)
+    total_mem = sum(h.get("memory_b") or 0 for h in hosts)
+    total_vms = sum(h.get("vm_count", 0) for h in hosts)
+    connected = sum(1 for h in hosts
+                    if (h.get("connection") == "connected"
+                        and not h.get("in_maintenance")))
+
+    classes = ["fd-card"]
+    if is_preferred: classes.append("preferred")
+
+    out = [f'<div class="{" ".join(classes)}">']
+    out.append('<div class="fd-title">')
+    out.append(f'<span class="name">{_esc(fd_name)}</span>')
+    if is_preferred:
+        out.append('<span class="badge preferred-fd">Preferred</span>')
+    elif preferred_fd:
+        out.append('<span class="badge secondary-fd">Secondary</span>')
+    out.append('</div>')
+
+    summary_parts = []
+    summary_parts.append(f'<span><strong>{len(hosts)}</strong> host(s)</span>')
+    summary_parts.append(f'<span><strong>{connected}</strong> active</span>')
+    summary_parts.append(f'<span><strong>{total_vms}</strong> VMs</span>')
+    if total_cores:
+        summary_parts.append(f'<span><strong>{total_cores}</strong> cores</span>')
+    if total_mem:
+        summary_parts.append(f'<span><strong>{_human_bytes(total_mem)}</strong> RAM</span>')
+    out.append(f'<div class="fd-summary">{"".join(summary_parts)}</div>')
+
+    out.append('<table class="fd-host-table"><thead><tr>')
+    out.append('<th>Host</th><th>State</th>'
+               '<th class="num-cell">VMs</th>'
+               '<th class="num-cell">Cores</th>'
+               '<th class="num-cell">RAM</th>')
+    out.append('</tr></thead><tbody>')
+    for h in sorted(hosts, key=lambda x: x["short"].lower()):
+        state_cls = _host_state_class(h.get("connection"), h.get("in_maintenance"))
+        state_lbl = _host_state_label(h.get("connection"), h.get("in_maintenance"))
+        cores = h.get("cpu_cores")
+        mem = h.get("memory_b")
+        out.append('<tr>')
+        out.append(f'<td class="host-name">{_esc(h["short"])}</td>')
+        out.append(f'<td><span class="host-state {state_cls}">{_esc(state_lbl)}</span></td>')
+        out.append(f'<td class="num-cell">{h.get("vm_count", 0)}</td>')
+        out.append(f'<td class="num-cell">{cores if cores else "—"}</td>')
+        out.append(f'<td class="num-cell">{_human_bytes(mem) if mem else "—"}</td>')
+        out.append('</tr>')
+    out.append('</tbody></table>')
+    out.append('</div>')
+    return "".join(out)
+
+
+def _render_fault_domain_section(cluster_fd_info):
+    """Build the body of the Fault Domains catalog section."""
+    if not cluster_fd_info:
+        return '<p class="empty">No cluster topology data available.</p>'
+
+    parts = []
+    total_clusters = 0
+    for cluster_name in sorted(cluster_fd_info):
+        info = cluster_fd_info[cluster_name]
+        hosts = info.get("hosts") or []
+        if not hosts:
+            continue
+        preferred_fd = info.get("preferred_fd")
+        # Group hosts by fault domain (use a placeholder for hosts without FD)
+        by_fd = defaultdict(list)
+        for h in hosts:
+            fd = h.get("fd") or "(no fault domain)"
+            by_fd[fd].append(h)
+
+        total_clusters += 1
+        parts.append('<div class="fd-cluster-block">')
+        parts.append(f'<div class="fd-cluster-name">{_esc(cluster_name)} '
+                     f'· {len(hosts)} host(s) · {len(by_fd)} '
+                     f'fault domain(s)</div>')
+
+        # Warn if cluster looks stretched but preferred FD couldn't be resolved
+        real_fds = [fd for fd in by_fd if fd != "(no fault domain)"]
+        if len(real_fds) > 1 and not preferred_fd:
+            parts.append(
+                '<div class="fd-warn">Could not determine the preferred '
+                'fault domain for this stretched cluster. Site-mismatch '
+                'detection is limited to literal FD-name matches.</div>'
+            )
+
+        parts.append('<div class="fd-grid">')
+        # Preferred first, then alphabetical
+        ordered = sorted(by_fd, key=lambda x: (x != preferred_fd, x.lower()))
+        for fd in ordered:
+            parts.append(_render_fault_domain_card(
+                fd, by_fd[fd], preferred_fd, None))
+        parts.append('</div></div>')
+
+    if total_clusters == 0:
+        return '<p class="empty">No host topology data available.</p>'
+    return "".join(parts)
+
+
+# ---------------------------------------------------------------------
+# Catalog rendering helpers (already defined above)
+# ---------------------------------------------------------------------
+
+def render_html(rows, vcenter_host, output_path, cluster_fd_info=None):
+    cluster_fd_info = cluster_fd_info or {}
     by_cluster = defaultdict(list)
     for r in rows:
         by_cluster[r["cluster"]].append(r)
@@ -1484,12 +1878,27 @@ def render_html(rows, vcenter_host, output_path):
     meta = (f"vCenter: {_esc(vcenter_host)} &nbsp;·&nbsp; "
             f"{len(rows)} VMs &nbsp;·&nbsp; {len(by_cluster)} clusters")
     summary = (
-        f'<div class="summary-card crit"><span class="num">{crit_count}</span> critical</div>'
-        f'<div class="summary-card warn"><span class="num">{warn_count}</span> warnings</div>'
-        f'<div class="summary-card info"><span class="num">{info_count}</span> info</div>'
-        f'<div class="summary-card"><span class="num">{clean_count}</span> clean</div>'
+        f'<button type="button" class="summary-card crit" data-filter="critical">'
+        f'<span class="num">{crit_count}</span> critical</button>'
+        f'<button type="button" class="summary-card warn" data-filter="warning-only">'
+        f'<span class="num">{warn_count}</span> warnings</button>'
+        f'<button type="button" class="summary-card info" data-filter="info-only">'
+        f'<span class="num">{info_count}</span> info</button>'
+        f'<button type="button" class="summary-card clean" data-filter="none">'
+        f'<span class="num">{clean_count}</span> clean</button>'
     )
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # Fault domain catalog
+    fd_section = _render_fault_domain_section(cluster_fd_info)
+    total_hosts = sum(len(info.get("hosts") or [])
+                      for info in cluster_fd_info.values())
+    total_fds = sum(len({h.get("fd") for h in (info.get("hosts") or [])
+                        if h.get("fd")})
+                    for info in cluster_fd_info.values())
+    fd_count_label = (f"{total_fds} fault domain(s) across "
+                       f"{total_hosts} host(s)" if total_fds
+                       else f"{total_hosts} host(s)")
 
     html_out = (HTML_TEMPLATE
                 .replace("__META__", meta)
@@ -1502,6 +1911,8 @@ def render_html(rows, vcenter_host, output_path):
                 .replace("__RULE_COUNT__", f"{len(unique_rules)} rules")
                 .replace("__RULE_DETAILS__", rule_details
                          or '<p class="empty">No DRS rules found.</p>')
+                .replace("__FD_COUNT__", fd_count_label)
+                .replace("__FD_DETAILS__", fd_section)
                 .replace("__TIMESTAMP__", timestamp))
 
     with open(output_path, "w", encoding="utf-8") as f:
@@ -1594,13 +2005,64 @@ def main():
           f"{C_BRIGHT}{total_vms}{C_RESET} VM(s)\n")
 
     rows, counter, policy_cache = [], 0, {}
+    cluster_fd_info = {}  # cluster_name -> {preferred_fd, hosts: [{name, fd, connection, ...}]}
     for cluster in clusters:
         print(f"{C_CYAN}[*]{C_RESET} Cluster: {C_BRIGHT}{cluster.name}{C_RESET}")
         vm_rule_idx = build_drs_rule_index(cluster)
         host_fd_map = get_host_fault_domains(cluster)
+        preferred_fd = None
+        if host_fd_map and len(set(host_fd_map.values())) > 1:
+            preferred_fd = get_preferred_fault_domain(si, cluster)
         if host_fd_map:
-            print(f"    {C_BLUE}Fault domains:{C_RESET} "
-                  f"{', '.join(sorted(set(host_fd_map.values())))}")
+            fds = sorted(set(host_fd_map.values()))
+            fd_display = []
+            for fd in fds:
+                if fd == preferred_fd:
+                    fd_display.append(f"{fd} {C_GREEN}(preferred){C_RESET}")
+                else:
+                    fd_display.append(fd)
+            print(f"    {C_BLUE}Fault domains:{C_RESET} {', '.join(fd_display)}")
+            if not preferred_fd and len(fds) > 1:
+                print(f"    {C_YELLOW}[!]{C_RESET} Could not determine preferred "
+                      f"fault domain - site mismatch detection will be limited "
+                      f"to literal FD-name matches.")
+
+        # Snapshot host info for the HTML report (only when cluster has FDs;
+        # for non-stretched clusters we still collect basic host info because
+        # the table is useful for visualizing cluster topology in general)
+        host_entries = []
+        for h in cluster.host:
+            try:
+                short = _short_host(h.name)
+                rt = getattr(h, "runtime", None)
+                summary = getattr(h, "summary", None)
+                hardware = getattr(summary, "hardware", None) if summary else None
+                quick = getattr(summary, "quickStats", None) if summary else None
+                host_entries.append({
+                    "name": h.name,
+                    "short": short,
+                    "fd": host_fd_map.get(short),
+                    "connection": (getattr(rt, "connectionState", "") if rt else ""),
+                    "in_maintenance": (getattr(rt, "inMaintenanceMode", False)
+                                        if rt else False),
+                    "power_state": (getattr(rt, "powerState", "") if rt else ""),
+                    "vm_count": len([v for v in h.vm
+                                     if v.config is not None and not v.config.template]),
+                    "cpu_cores": (getattr(hardware, "numCpuCores", None)
+                                   if hardware else None),
+                    "memory_b": (getattr(hardware, "memorySize", None)
+                                  if hardware else None),
+                    "cpu_usage_mhz": (getattr(quick, "overallCpuUsage", None)
+                                       if quick else None),
+                    "mem_usage_mb": (getattr(quick, "overallMemoryUsage", None)
+                                      if quick else None),
+                })
+            except Exception:
+                continue
+        cluster_fd_info[cluster.name] = {
+            "preferred_fd": preferred_fd,
+            "hosts": host_entries,
+        }
 
         for host in cluster.host:
             for vm in host.vm:
@@ -1613,7 +2075,7 @@ def main():
                 policies = get_vm_storage_policies(pbm_si, vm, policy_cache)
                 tags = get_vm_tags(tagging, vm._moId)
                 issues = detect_issues(rules, policies, host_fd_map,
-                                        _short_host(host.name))
+                                        _short_host(host.name), preferred_fd)
 
                 rows.append({
                     "cluster": cluster.name, "host": host.name, "vm": vm.name,
@@ -1654,7 +2116,7 @@ def main():
         w.writerows(rows)
 
     print(f"{C_CYAN}[*]{C_RESET} Writing HTML: {C_BRIGHT}{html_path}{C_RESET}")
-    render_html(rows, args.server, html_path)
+    render_html(rows, args.server, html_path, cluster_fd_info)
 
     crit = sum(1 for r in rows if any(i["severity"] == "critical" for i in r["_issues"]))
     warn = sum(1 for r in rows if any(i["severity"] == "warning" for i in r["_issues"]))
