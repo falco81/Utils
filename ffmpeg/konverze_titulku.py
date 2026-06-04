@@ -1,26 +1,15 @@
 import subprocess
 import sys
 import json
+import re
 from pathlib import Path
 
 # ============================================================
 # NASTAVENÍ - změň podle potřeby
-FONT_SIZE = 55        # velikost písma titulků (doporučeno 45-65 pro 1080p)
+FONT_SIZE = 60        # velikost písma titulků (doporučeno 45-65 pro 1080p)
 FONT_NAME = "Arial"   # font
+MKVMERGE = r"C:\Program Files\MKVToolNix\mkvmerge.exe"
 # ============================================================
-
-ASS_HEADER = """[Script Info]
-ScriptType: v4.00+
-PlayResX: 1920
-PlayResY: 1080
-
-[V4+ Styles]
-Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,{font},{size},&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,1,2,10,10,20,1
-
-[Events]
-Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
-"""
 
 def run(cmd, silent=True, **kwargs):
     if silent:
@@ -47,6 +36,9 @@ def get_subtitle_streams(mkv_path):
             'title': tags.get('title', ''),
             'default': disposition.get('default', 0),
             'forced': disposition.get('forced', 0),
+            'hearing_impaired': disposition.get('hearing_impaired', 0),
+            'original': disposition.get('original', 0),
+            'dub': disposition.get('dub', 0),
         })
     return streams
 
@@ -60,83 +52,60 @@ def extract_srt(mkv_path, stream_index, out_path):
     ])
     return result.returncode == 0 and out_path.exists() and out_path.stat().st_size > 0
 
-def srt_time_to_ass(ts):
-    """Převede SRT časový formát na ASS formát"""
-    ts = ts.strip().replace(',', '.')
-    h, m, rest = ts.split(':')
-    s, ms = rest.split('.')
-    ms = ms[:2]  # ASS má jen 2 desetinná místa
-    return f"{int(h)}:{m}:{s}.{ms}"
+def patch_se_settings(se_path):
+    """Nastaví velikost písma v SubtitleEdit konfiguráku"""
+    settings_path = se_path.parent / 'Settings.xml'
+    if not settings_path.exists():
+        print(f"  Varování: Settings.xml nenalezen")
+        return
 
-def srt_to_ass(srt_path, ass_path):
-    """Převede SRT na ASS s nastavenou velikostí písma"""
-    header = ASS_HEADER.format(font=FONT_NAME, size=FONT_SIZE)
-    
-    content = srt_path.read_text(encoding='utf-8', errors='replace')
-    blocks = content.strip().split('\n\n')
-    
-    lines = []
-    for block in blocks:
-        block_lines = block.strip().split('\n')
-        if len(block_lines) < 3:
-            continue
-        # Přeskoč číslo titulku
-        time_line = None
-        text_lines = []
-        for bl in block_lines:
-            if '-->' in bl:
-                time_line = bl
-            elif bl.strip().isdigit():
-                continue
-            elif time_line is not None:
-                text_lines.append(bl)
-        
-        if not time_line or not text_lines:
-            continue
-        
-        try:
-            start_raw, end_raw = time_line.split('-->')
-            start = srt_time_to_ass(start_raw)
-            end = srt_time_to_ass(end_raw)
-        except Exception:
-            continue
-        
-        text = r'\N'.join(text_lines)
-        lines.append(f"Dialogue: 0,{start},{end},Default,,0,0,0,,{text}")
-    
-    ass_path.write_text(header + '\n'.join(lines) + '\n', encoding='utf-8')
-    return ass_path.exists() and ass_path.stat().st_size > 0
+    content = settings_path.read_text(encoding='utf-8', errors='replace')
+    content = re.sub(r'<ExportBluRayFontName>.*?</ExportBluRayFontName>', f'<ExportBluRayFontName>{FONT_NAME}</ExportBluRayFontName>', content)
+    content = re.sub(r'<ExportBluRayFontSize>.*?</ExportBluRayFontSize>', f'<ExportBluRayFontSize>{FONT_SIZE}</ExportBluRayFontSize>', content)
+    content = re.sub(r'<ExportLastFontSize>.*?</ExportLastFontSize>', f'<ExportLastFontSize>{FONT_SIZE}</ExportLastFontSize>', content)
+    content = re.sub(r'<ExportBluRayVideoResolution>.*?</ExportBluRayVideoResolution>', f'<ExportBluRayVideoResolution>1920x1080</ExportBluRayVideoResolution>', content)
+    settings_path.write_text(content, encoding='utf-8')
+    print(f"  SubtitleEdit nastaven: font={FONT_NAME}, size={FONT_SIZE}px, rozlišení=1920x1080")
 
-def convert_to_sup(se_path, ass_path, sup_path):
+def convert_to_sup(se_path, srt_path, sup_path):
+    """Přímá konverze SRT -> SUP"""
     result = run([
         str(se_path),
-        '/convert', str(ass_path),
+        '/convert', str(srt_path),
         'Blu-raysup',
         '/resolution:1920x1080',
         '/overwrite'
-    ], silent=False)
+    ])
     return sup_path.exists()
 
 def merge_mkv(mkv_path, sup_files, streams, out_path):
-    cmd = ['ffmpeg', '-y', '-i', str(mkv_path)]
-    for sup in sup_files:
-        cmd += ['-i', str(sup)]
-    cmd += ['-map', '0:v', '-map', '0:a']
-    for i in range(len(sup_files)):
-        cmd += ['-map', f'{i+1}:s']
-    cmd += ['-c:v', 'copy', '-c:a', 'copy', '-c:s', 'copy']
-    for i, stream in enumerate(streams):
-        cmd += [f'-metadata:s:s:{i}', f'language={stream["language"]}']
+    """Použij mkvmerge pro správné zachování timingu"""
+
+    cmd = [
+        MKVMERGE,
+        '-o', str(out_path),
+        '--no-subtitles',
+        str(mkv_path)
+    ]
+
+    for sup, stream in zip(sup_files, streams):
+        cmd += ['--language', f'0:{stream["language"]}']
+
         if stream['title']:
-            cmd += [f'-metadata:s:s:{i}', f'title={stream["title"]}']
-        if stream['default'] == 1:
-            cmd += [f'-disposition:s:{i}', 'default']
-        elif stream['forced'] == 1:
-            cmd += [f'-disposition:s:{i}', 'forced']
-        else:
-            cmd += [f'-disposition:s:{i}', 'none']
-    cmd.append(str(out_path))
-    result = run(cmd)
+            cmd += ['--track-name', f'0:{stream["title"]}']
+
+        cmd += ['--default-track-flag', f'0:{"yes" if stream["default"] == 1 else "no"}']
+        cmd += ['--forced-display-flag', f'0:{"yes" if stream["forced"] == 1 else "no"}']
+
+        if stream.get('hearing_impaired', 0) == 1:
+            cmd += ['--hearing-impaired-flag', '0:yes']
+
+        if stream.get('original', 0) == 1:
+            cmd += ['--original-flag', '0:yes']
+
+        cmd.append(str(sup))
+
+    result = run(cmd, silent=False)
     return result.returncode == 0
 
 def process_mkv(mkv_path, se_path):
@@ -170,28 +139,20 @@ def process_mkv(mkv_path, se_path):
         print(f"\n  Stopa {stream['index']} - jazyk: {lang} - title: {title}")
 
         srt_path = folder / f"{base}_tmp_{idx}_{lang}.srt"
-        ass_path = folder / f"{base}_tmp_{idx}_{lang}.ass"
         sup_path = folder / f"{base}_tmp_{idx}_{lang}.sup"
-        temp_files += [srt_path, ass_path, sup_path]
+        temp_files += [srt_path, sup_path]
 
         print(f"    Extrahuji SRT...")
         if not extract_srt(mkv_path, stream['index'], srt_path):
             print(f"    CHYBA: Nepodařilo se extrahovat stopu {stream['index']}")
             continue
 
-        print(f"    Převádím SRT → ASS (font {FONT_NAME} {FONT_SIZE}px)...")
-        if not srt_to_ass(srt_path, ass_path):
-            print(f"    CHYBA: Nepodařilo se převést na ASS")
+        print(f"    Převádím SRT -> SUP...")
+        if not convert_to_sup(se_path, srt_path, sup_path):
+            print(f"    CHYBA: Nepodařilo se převést na SUP")
             srt_path.unlink(missing_ok=True)
             continue
         srt_path.unlink(missing_ok=True)
-
-        print(f"    Převádím ASS → SUP...")
-        if not convert_to_sup(se_path, ass_path, sup_path):
-            print(f"    CHYBA: Nepodařilo se převést na SUP")
-            ass_path.unlink(missing_ok=True)
-            continue
-        ass_path.unlink(missing_ok=True)
 
         print(f"    Hotovo: {sup_path.name}")
         sup_files.append(sup_path)
@@ -201,7 +162,7 @@ def process_mkv(mkv_path, se_path):
         print("\n  CHYBA: Žádné SUP soubory nebyly vytvořeny")
         return
 
-    print(f"\n  Sestavuji výsledné MKV...")
+    print(f"\n  Sestavuji výsledné MKV (mkvmerge)...")
     if merge_mkv(mkv_path, sup_files, successful_streams, out_path):
         print(f"  Hotovo: {out_path.name}")
     else:
@@ -217,11 +178,17 @@ def main():
     if not se_path.exists():
         print(f"CHYBA: SubtitleEdit.exe nenalezen v {script_dir}")
         sys.exit(1)
+
     if run(['ffmpeg', '-version']).returncode != 0:
         print("CHYBA: ffmpeg není dostupný v PATH")
         sys.exit(1)
+
     if run(['ffprobe', '-version']).returncode != 0:
         print("CHYBA: ffprobe není dostupný v PATH")
+        sys.exit(1)
+
+    if not Path(MKVMERGE).exists():
+        print(f"CHYBA: mkvmerge nenalezen na cestě: {MKVMERGE}")
         sys.exit(1)
 
     mkv_files = [
@@ -235,6 +202,8 @@ def main():
 
     print(f"Nalezeno {len(mkv_files)} MKV souborů")
     print(f"Velikost písma: {FONT_SIZE}px  Font: {FONT_NAME}")
+
+    patch_se_settings(se_path)
 
     for mkv in mkv_files:
         try:
