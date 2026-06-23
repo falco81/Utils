@@ -1098,6 +1098,9 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         return
 
     total_bytes = sum(j.size for j in ready)
+    # Per-file bars stay in place (leave=True) and show their own done/FAILED status — no
+    # writing between live bars (that caused gaps/jumping on Windows). Above the limit, one
+    # overall bar with OK/FAIL lines is used instead.
     per_file_bars = len(ready) <= PER_FILE_BAR_LIMIT
 
     print(f"[INFO] Downloading {len(ready)} file(s) with a shared pool of {budget} connections "
@@ -1110,14 +1113,15 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             initial = sum(os.path.getsize(s['path']) for s in job.segments if os.path.exists(s['path']))
             job.bar = make_bar(total=max(job.size, 1), initial=min(initial, job.size or initial),
                                unit='B', unit_scale=True, desc=os.path.basename(job.filename),
-                               position=idx, leave=False)
+                               position=idx, leave=True)
     else:
         done_bytes = sum(os.path.getsize(s['path']) for j in ready for s in j.segments if os.path.exists(s['path']))
         overall = make_bar(total=max(total_bytes, 1), initial=min(done_bytes, total_bytes or done_bytes),
-                           unit='B', unit_scale=True, desc='Total', position=0)
+                           unit='B', unit_scale=True, desc=f'{len(ready)} files', position=0)
 
     result = {'ok': 0, 'fail': 0}
     result_lock = threading.Lock()
+    failures = []  # (title, reason)
 
     def on_bytes(job):
         def _cb(n):
@@ -1129,25 +1133,31 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         return _cb
 
     def finalize(job):
-        if job.bar is not None:
-            with bar_lock:
-                job.bar.close()
-        ok = False
-        if not job.failed:
+        ok, reason = False, None
+        if job.failed:
+            reason = "download failed"
+        else:
             got = sum(os.path.getsize(s['path']) for s in job.segments if os.path.exists(s['path']))
             if job.size == 0 or got >= job.size:
                 merge_parts([s['path'] for s in job.segments], job.filename, verbose)
                 ok = True
             else:
-                tqdm.write(f"{CLR.RED}[ERROR]{CLR.RESET} Incomplete {job.title}: {got}/{job.size} bytes "
-                           f"(parts kept for resume).")
+                reason = f"incomplete {got}/{job.size} bytes"
         if job.locked:
             release_lock(job.lock_path)
         with result_lock:
             result['ok' if ok else 'fail'] += 1
             n = result['ok'] + result['fail']
-        tag = f"{CLR.GREEN}OK  {CLR.RESET}" if ok else f"{CLR.RED}FAIL{CLR.RESET}"
-        tqdm.write(f"[{n}/{len(ready)}] {tag} {job.title}")
+            if not ok:
+                failures.append((job.title, reason))
+        if per_file_bars and job.bar is not None:
+            with bar_lock:
+                job.bar.colour = 'green' if ok else 'red'
+                job.bar.set_postfix_str('done' if ok else 'FAILED', refresh=False)
+                job.bar.refresh()
+        elif overall is not None:
+            tag = f"{CLR.GREEN}OK  {CLR.RESET}" if ok else f"{CLR.RED}FAIL{CLR.RESET}"
+            tqdm.write(f"[{n}/{len(ready)}] {tag} {job.title}")
 
     def run_segment(job, seg):
         if job.failed:
@@ -1174,6 +1184,11 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         for _ in as_completed(futures):
             pass
 
+    if per_file_bars:
+        with bar_lock:
+            for job in ready:
+                if job.bar is not None:
+                    job.bar.close()
     if overall is not None:
         overall.close()
     with _seg_sessions_lock:
@@ -1185,6 +1200,8 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
     color = CLR.GREEN if result['fail'] == 0 else CLR.YELLOW
     print(f"\n{color}[INFO] Folder done: {result['ok']} succeeded, {result['fail']} failed, "
           f"out of {len(ready)}.{CLR.RESET}")
+    for title, reason in failures:
+        print(f"[WARN] {title}: {reason or 'failed'} (parts kept for resume).")
 
 
 def process_folder(folder_id: str, session: requests.Session, chunk_size: int, num_threads: int,
@@ -1221,14 +1238,35 @@ def process_folder(folder_id: str, session: requests.Session, chunk_size: int, n
     download_folder_pooled(videos, session, chunk_size, verbose)
 
 
+def _auto_settings():
+    """Pick threads-per-file and a connection budget from the CPU count. Downloads are
+    I/O-bound, so connections scale above the logical CPU count; threads track it. Capped
+    to stay reasonable on big machines."""
+    logical = os.cpu_count() or 4
+    threads = max(4, min(32, logical))
+    conns = max(16, min(128, logical * 4))
+    return threads, conns, logical
+
+
 def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUNK_SIZE,
-         num_threads: int = DEFAULT_THREADS, verbose: bool = False, cookies_file: str = None,
+         num_threads: int = None, verbose: bool = False, cookies_file: str = None,
          folder_workers: int = DEFAULT_FOLDER_WORKERS, recursive: bool = DEFAULT_RECURSIVE,
-         max_connections: int = DEFAULT_MAX_CONNECTIONS, use_color: bool = USE_COLOR,
-         auto_cookies: bool = AUTO_COOKIES, select: bool = False) -> None:
+         max_connections: int = None, use_color: bool = USE_COLOR,
+         auto_cookies: bool = AUTO_COOKIES, select: bool = False, auto: bool = False) -> None:
     """Process a Drive file OR folder URL/ID and download the video(s)."""
     setup_console(use_color)
     kind, target_id = extract_drive_target(id_or_url)
+
+    # Resolve threads/connections: explicit -t/-m always win; otherwise --auto scales by CPU,
+    # else the configured defaults.
+    if auto:
+        a_threads, a_conns, logical = _auto_settings()
+        print(f"[INFO] --auto: {logical} logical CPU(s) detected -> {a_threads} threads/file, "
+              f"{a_conns} connections.")
+    if num_threads is None:
+        num_threads = a_threads if auto else DEFAULT_THREADS
+    if max_connections is None:
+        max_connections = a_conns if auto else DEFAULT_MAX_CONNECTIONS
 
     # Cap total simultaneous connections regardless of folder_workers * threads.
     set_connection_limit(max_connections)
@@ -1286,19 +1324,20 @@ if __name__ == "__main__":
     parser.add_argument("video_id", type=str, help="A Drive file ID, file URL (.../file/d/ID/view), or a FOLDER URL (.../drive/folders/ID). For a folder, all videos inside are downloaded.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders).")
     parser.add_argument("-c", "--chunk_size", type=positive_int, default=DEFAULT_CHUNK_SIZE, help=f"Streaming chunk size in bytes. Default {DEFAULT_CHUNK_SIZE} (edit DEFAULT_CHUNK_SIZE at the top of the script).")
-    parser.add_argument("-t", "--threads", type=positive_int, default=DEFAULT_THREADS, help=f"Download threads per file (>=1). Default {DEFAULT_THREADS}. Edit DEFAULT_THREADS at the top.")
+    parser.add_argument("-t", "--threads", type=positive_int, default=None, help=f"Download threads per file (>=1). Default {DEFAULT_THREADS}. Edit DEFAULT_THREADS at the top.")
     parser.add_argument("-w", "--folder-workers", type=nonneg_int, default=DEFAULT_FOLDER_WORKERS, help=f"How many videos to download at once for a folder. 0 = ALL at once. Default {DEFAULT_FOLDER_WORKERS}. Edit DEFAULT_FOLDER_WORKERS at the top.")
-    parser.add_argument("-m", "--max-connections", type=positive_int, default=DEFAULT_MAX_CONNECTIONS, help=f"Hard cap on simultaneous connections regardless of workers x threads. Default {DEFAULT_MAX_CONNECTIONS}. Lower (e.g. 16) if you hit 'insufficient resources'.")
+    parser.add_argument("-m", "--max-connections", type=positive_int, default=None, help=f"Hard cap on simultaneous connections regardless of workers x threads. Default {DEFAULT_MAX_CONNECTIONS}. Lower (e.g. 16) if you hit 'insufficient resources'.")
+    parser.add_argument("--auto", action="store_true", help="Auto-pick threads and connections from the detected CPU. Explicit -t/-m still win.")
     parser.add_argument("-s", "--select", action="store_true", help="For a folder: list all files first and interactively choose which to download.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
     parser.add_argument("--cookies", type=str, help="Path to a Netscape cookies.txt file or JSON cookie export for private Google Drive files/folders.")
-    parser.add_argument("--version", action="version", version="%(prog)s 1.11.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.14.0")
 
     args = parser.parse_args()
     main(args.video_id, args.output, args.chunk_size, args.threads, args.verbose, args.cookies,
          folder_workers=args.folder_workers, recursive=(not args.no_recursive and DEFAULT_RECURSIVE),
          max_connections=args.max_connections, use_color=(USE_COLOR and not args.no_color),
-         auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), select=args.select)
+         auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), select=args.select, auto=args.auto)
