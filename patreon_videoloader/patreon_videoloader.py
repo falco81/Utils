@@ -64,6 +64,8 @@ BAR_NCOLS = 100
 BAR_DESC_WIDTH = 26
 PATREON_REFERER = "https://www.patreon.com/"
 VIMEO_REFERER = "https://player.vimeo.com/"
+VIMEO_HEADERS = {'Referer': VIMEO_REFERER, 'Origin': 'https://player.vimeo.com'}
+MUX_HEADERS = {'Referer': PATREON_REFERER}
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 # =============================================================================
@@ -491,7 +493,9 @@ def get_collection_info(collection_id, session, verbose):
 
 
 def list_collection_videos(collection_id, campaign_id, session, verbose):
-    """Return a list of {'title', 'vimeo_id', 'vimeo_hash'} for video posts in the collection."""
+    """Return a list of video descriptors for the collection. Each is either
+    {'source':'vimeo', 'title', 'vimeo_id', 'vimeo_hash'} or
+    {'source':'mux', 'title', 'master_url'} (Patreon-hosted / "embedded" videos)."""
     params = {
         'include': 'collections,drop,primary_image,audio,video,embed',
         'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
@@ -518,19 +522,49 @@ def list_collection_videos(collection_id, campaign_id, session, verbose):
     videos = []
     for p in posts if isinstance(posts, list) else []:
         a = p.get('attributes', {})
+        post_type = a.get('post_type')
+
+        # 1) Patreon-hosted ("embedded") video on Mux: the signed HLS master URL is ready to use.
+        pf = a.get('post_file') or {}
+        pf_url = pf.get('url', '') or ''
+        playback = ((a.get('post_metadata') or {}).get('playback_data') or {})
+        if 'stream.mux.com' in pf_url:
+            mux_url = pf_url
+        elif playback.get('playback_id') and playback.get('playback_token'):
+            mux_url = (f"https://stream.mux.com/{playback['playback_id']}.m3u8"
+                       f"?token={playback['playback_token']}")
+        else:
+            mux_url = None
+        if mux_url and post_type in (None, 'video_external_file', 'video_file', 'video'):
+            title = (a.get('title') or str(p.get('id'))).strip()
+            videos.append({'source': 'mux', 'title': title, 'master_url': mux_url})
+            continue
+
+        # 2) Vimeo embed: extract id + privacy hash.
         emb = a.get('embed') or {}
         url_field = emb.get('url', '') or ''
         html = emb.get('html', '') or ''
         m = re.search(r'vimeo\.com/(\d+)/([0-9a-zA-Z]+)', url_field)
         if not m:
             m = re.search(r'player\.vimeo\.com/video/(\d+)\?h=([0-9a-zA-Z]+)', html)
-        if not m:
-            if verbose and a.get('post_type') == 'video_embed':
-                print(f"[WARN] Could not parse Vimeo embed for: {a.get('title')}")
+        if m:
+            title = (emb.get('subject') or a.get('title') or m.group(1)).strip()
+            videos.append({'source': 'vimeo', 'title': title,
+                           'vimeo_id': m.group(1), 'vimeo_hash': m.group(2)})
             continue
-        title = (emb.get('subject') or a.get('title') or m.group(1)).strip()
-        videos.append({'title': title, 'vimeo_id': m.group(1), 'vimeo_hash': m.group(2)})
+
+        if verbose and post_type and 'video' in str(post_type):
+            print(f"[WARN] Unrecognized video post (type {post_type}): {a.get('title')}")
     return videos
+
+
+def resolve_master(video, session, verbose):
+    """Resolve a video descriptor to (hls_master_url, headers). Returns (None, {}) on failure."""
+    if video.get('source') == 'mux':
+        return video.get('master_url'), MUX_HEADERS
+    # default: vimeo
+    master, _title, _dur = resolve_vimeo(video['vimeo_id'], video['vimeo_hash'], session, verbose)
+    return master, VIMEO_HEADERS
 
 
 # --------------------------------------------------------------------------- #
@@ -594,9 +628,9 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     return master, title, duration
 
 
-def parse_master_playlist(master_url, session, max_height, verbose):
+def parse_master_playlist(master_url, session, max_height, headers, verbose):
     """Fetch the HLS master and return (video_url, audio_url_or_None) for the chosen quality."""
-    r = session.get(master_url, headers={'Referer': VIMEO_REFERER})
+    r = session.get(master_url, headers=headers)
     if r.status_code != 200:
         if verbose:
             print(f"[WARN] HLS master returned {r.status_code}")
@@ -666,6 +700,14 @@ def _try_ffmpeg(path):
         return True
     except Exception:
         return False
+
+
+def _auto_connections():
+    """Pick a connection budget from the CPU count. Downloads are I/O-bound, so we scale
+    above the logical CPU count (more in-flight segments than cores), capped to stay polite
+    to Vimeo/Mux."""
+    logical = os.cpu_count() or 4
+    return max(16, min(128, logical * 4)), logical
 
 
 def ffmpeg_available():
@@ -761,9 +803,9 @@ def ensure_ffmpeg(verbose):
     return False
 
 
-def parse_media_playlist(url, session):
+def parse_media_playlist(url, session, headers):
     """Fetch an HLS media playlist and return (init_segment_url_or_None, [segment_urls])."""
-    r = session.get(url, headers={'Referer': VIMEO_REFERER, 'Origin': 'https://player.vimeo.com'})
+    r = session.get(url, headers=headers)
     if r.status_code != 200:
         return None, []
     init = None
@@ -790,9 +832,7 @@ def _seg_session(base):
     if s is None:
         s = requests.Session()
         s.cookies.update(base.cookies)
-        s.headers.update({'User-Agent': USER_AGENT,
-                          'Referer': VIMEO_REFERER,
-                          'Origin': 'https://player.vimeo.com'})
+        s.headers.update({'User-Agent': USER_AGENT})
         adapter = _build_adapter()
         s.mount('https://', adapter)
         s.mount('http://', adapter)
@@ -802,13 +842,13 @@ def _seg_session(base):
     return s
 
 
-def _download_hls_segment(url, path, session):
+def _download_hls_segment(url, path, session, headers):
     """Download one HLS segment to `path` (atomic). Skips if already present."""
     if os.path.exists(path) and os.path.getsize(path) > 0:
         return True
     for attempt in range(3):
         try:
-            with session.get(url, stream=True) as r:
+            with session.get(url, stream=True, headers=headers) as r:
                 if r.status_code != 200:
                     if attempt < 2:
                         continue
@@ -836,7 +876,7 @@ def _concat_stream(parts, out_file):
 
 
 def _ffmpeg_mux(video_file, audio_file, out_path, verbose):
-    """Mux already-downloaded local stream files into out_path with ffmpeg (-c copy)."""
+    """Mux already-downloaded local stream files into out_path. Returns (ok, error_text)."""
     tmp = out_path + ".part.mp4"
     cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', video_file]
     if audio_file:
@@ -848,23 +888,23 @@ def _ffmpeg_mux(video_file, audio_file, out_path, verbose):
         tqdm.write("[INFO] ffmpeg " + " ".join(cmd[1:]))
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
-        tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-4:] if l.strip()) or "(no error text)"
-        tqdm.write(f"{CLR.RED}[ffmpeg]{CLR.RESET} {os.path.basename(out_path)}: {tail}")
+        tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-3:] if l.strip()) or "(no error text)"
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)
             except OSError:
                 pass
-        return False
+        return False, tail
     os.replace(tmp, out_path)
-    return True
+    return True, None
 
 
 class _HlsJob:
-    def __init__(self, video, out_path):
+    def __init__(self, video, out_path, headers):
         self.video = video
         self.title = video['title']
         self.out_path = out_path
+        self.headers = headers
         self.lock_path = out_path + ".lock"
         self.locked = False
         self.parts_dir = out_path + ".parts"
@@ -876,9 +916,9 @@ class _HlsJob:
 
 
 def _build_job(video, session, out_dir, max_height, verbose):
-    """Resolve a video to its HLS segment lists. Returns a ready _HlsJob or None."""
-    vid, vh = video['vimeo_id'], video['vimeo_hash']
-    filename = safe_filename(video['title'] or vid, vid)
+    """Resolve a video (Vimeo or Mux) to its HLS segment lists. Returns a ready _HlsJob or None."""
+    fallback = video.get('vimeo_id') or video.get('title') or 'video'
+    filename = safe_filename(video['title'] or fallback, fallback)
     if not filename.lower().endswith('.mp4'):
         filename += '.mp4'
     out_path = os.path.join(out_dir, filename) if out_dir else filename
@@ -887,21 +927,21 @@ def _build_job(video, session, out_dir, max_height, verbose):
         tqdm.write(f"[INFO] Already have {filename}, skipping.")
         return None
 
-    master, _t, _d = resolve_vimeo(vid, vh, session, verbose)
+    master, headers = resolve_master(video, session, verbose)
     if not master:
         tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} No HLS for {video['title']} (private/unavailable).")
         return None
-    video_url, audio_url = parse_master_playlist(master, session, max_height, verbose)
+    video_url, audio_url = parse_master_playlist(master, session, max_height, headers, verbose)
     if not video_url:
         tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} No video stream for {video['title']}.")
         return None
 
-    job = _HlsJob(video, out_path)
+    job = _HlsJob(video, out_path, headers)
     os.makedirs(job.parts_dir, exist_ok=True)
     for key, murl in (('v', video_url), ('a', audio_url)):
         if not murl:
             continue
-        init, segs = parse_media_playlist(murl, session)
+        init, segs = parse_media_playlist(murl, session, headers)
         parts = []
         if init:
             p = os.path.join(job.parts_dir, f"{key}_init")
@@ -941,6 +981,9 @@ def download_collection_pooled(videos, session, out_dir, max_connections, max_he
         print("[INFO] Nothing to download.")
         return
 
+    # Per-file bars stay in place (leave=True) and show their own done/FAILED status — no
+    # writing between live bars (that caused the gaps/jumping on Windows). Above the limit,
+    # one overall bar with OK/FAIL lines is used instead.
     per_file_bars = len(jobs) <= PER_FILE_BAR_LIMIT
     print(f"[INFO] Downloading {len(jobs)} video(s) with a shared pool of {max_connections} "
           f"connections; segments fetched in parallel, muxed with ffmpeg.\n")
@@ -951,21 +994,23 @@ def download_collection_pooled(videos, session, out_dir, max_connections, max_he
         for idx, job in enumerate(jobs):
             done = sum(1 for (_k, _i, _u, p) in job.tasks if os.path.exists(p) and os.path.getsize(p) > 0)
             job.bar = make_bar(total=max(len(job.tasks), 1), initial=done, unit='seg', unit_scale=False,
-                               desc=os.path.basename(job.out_path), position=idx, leave=False)
+                               desc=os.path.basename(job.out_path), position=idx, leave=True)
     else:
         total_tasks = sum(len(j.tasks) for j in jobs)
-        overall = make_bar(total=max(total_tasks, 1), unit='seg', unit_scale=False,
-                           desc='Segments', position=0)
+        done = sum(1 for j in jobs for (_k, _i, _u, p) in j.tasks
+                   if os.path.exists(p) and os.path.getsize(p) > 0)
+        overall = make_bar(total=max(total_tasks, 1), initial=done, unit='seg', unit_scale=False,
+                           desc=f'{len(jobs)} videos', position=0)
 
     result = {'ok': 0, 'fail': 0}
     result_lock = threading.Lock()
+    failures = []  # (title, reason)
 
     def finalize(job):
-        if job.bar is not None:
-            with bar_lock:
-                job.bar.close()
-        ok = False
-        if not job.failed:
+        ok, reason = False, None
+        if job.failed:
+            reason = "segment download failed"
+        else:
             try:
                 vfile = job.out_path + ".video"
                 _concat_stream(job.streams['v']['parts'], vfile)
@@ -973,9 +1018,9 @@ def download_collection_pooled(videos, session, out_dir, max_connections, max_he
                 if 'a' in job.streams:
                     afile = job.out_path + ".audio"
                     _concat_stream(job.streams['a']['parts'], afile)
-                ok = _ffmpeg_mux(vfile, afile, job.out_path, verbose)
+                ok, reason = _ffmpeg_mux(vfile, afile, job.out_path, verbose)
             except Exception as exc:
-                tqdm.write(f"{CLR.RED}[ERROR]{CLR.RESET} Mux {job.title}: {exc}")
+                reason = str(exc)
             finally:
                 for extra in (job.out_path + ".video", job.out_path + ".audio"):
                     if os.path.exists(extra):
@@ -985,21 +1030,29 @@ def download_collection_pooled(videos, session, out_dir, max_connections, max_he
                             pass
         if ok:
             shutil.rmtree(job.parts_dir, ignore_errors=True)
-        else:
-            tqdm.write(f"[INFO] Kept partial segments in {os.path.basename(job.parts_dir)} for resume.")
         if job.locked:
             release_lock(job.lock_path)
         with result_lock:
             result['ok' if ok else 'fail'] += 1
             n = result['ok'] + result['fail']
-        tag = f"{CLR.GREEN}OK  {CLR.RESET}" if ok else f"{CLR.RED}FAIL{CLR.RESET}"
-        tqdm.write(f"[{n}/{len(jobs)}] {tag} {job.title}")
+            if not ok:
+                failures.append((job.title, reason))
+        # Status feedback: in-place on the file's own bar (no inter-bar writing), or as a
+        # log line when a single overall bar is used.
+        if per_file_bars and job.bar is not None:
+            with bar_lock:
+                job.bar.colour = 'green' if ok else 'red'
+                job.bar.set_postfix_str('done' if ok else 'FAILED', refresh=False)
+                job.bar.refresh()
+        elif overall is not None:
+            tag = f"{CLR.GREEN}OK  {CLR.RESET}" if ok else f"{CLR.RED}FAIL{CLR.RESET}"
+            tqdm.write(f"[{n}/{len(jobs)}] {tag} {job.title}")
 
     def run_task(job, key, idx, url, path):
         if job.failed:
             return
         sess = _seg_session(session)
-        if not _download_hls_segment(url, path, sess):
+        if not _download_hls_segment(url, path, sess, job.headers):
             job.failed = True
         with bar_lock:
             if job.bar is not None:
@@ -1026,6 +1079,11 @@ def download_collection_pooled(videos, session, out_dir, max_connections, max_he
         for _ in as_completed(futures):
             pass
 
+    if per_file_bars:
+        with bar_lock:
+            for job in jobs:
+                if job.bar is not None:
+                    job.bar.close()
     if overall is not None:
         overall.close()
     with _seg_sessions_lock:
@@ -1037,6 +1095,8 @@ def download_collection_pooled(videos, session, out_dir, max_connections, max_he
     color = CLR.GREEN if result['fail'] == 0 else CLR.YELLOW
     print(f"\n{color}[INFO] Collection done: {result['ok']} succeeded, {result['fail']} failed, "
           f"out of {len(jobs)}.{CLR.RESET}")
+    for title, reason in failures:
+        print(f"[WARN] {title}: {reason or 'failed'} (partial segments kept for resume).")
 
 
 def process_collection(collection_id, session, out_dir, max_connections, max_height,
@@ -1053,7 +1113,11 @@ def process_collection(collection_id, session, out_dir, max_connections, max_hei
 
     if list_only:
         for i, v in enumerate(videos, 1):
-            print(f"   {i:>3}) {v['title']}  (vimeo {v['vimeo_id']})")
+            if v.get('source') == 'mux':
+                tag = 'embedded/Mux'
+            else:
+                tag = f"vimeo {v.get('vimeo_id')}"
+            print(f"   {i:>3}) {v['title']}  ({tag})")
         return
 
     if select:
@@ -1074,13 +1138,23 @@ def process_collection(collection_id, session, out_dir, max_connections, max_hei
 def main(url, out_dir=None, video_workers=DEFAULT_VIDEO_WORKERS, max_height=DEFAULT_MAX_HEIGHT,
          verbose=False, cookies_file=None, use_color=USE_COLOR, auto_cookies=AUTO_COOKIES,
          select=False, list_only=False, ffmpeg_path=None, ffmpeg_url=None,
-         max_connections=DEFAULT_MAX_CONNECTIONS):
+         max_connections=None, auto=False):
     global FFMPEG, FFMPEG_DOWNLOAD_URL
     if ffmpeg_path:
         FFMPEG = ffmpeg_path
     if ffmpeg_url is not None:
         FFMPEG_DOWNLOAD_URL = ffmpeg_url
     setup_console(use_color)
+
+    # Resolve the connection budget: explicit -m always wins; otherwise --auto scales by CPU,
+    # else the configured default.
+    if max_connections is None:
+        if auto:
+            max_connections, logical = _auto_connections()
+            print(f"[INFO] --auto: {logical} logical CPU(s) detected, using {max_connections} "
+                  f"parallel connections.")
+        else:
+            max_connections = DEFAULT_MAX_CONNECTIONS
 
     collection_id = extract_collection_id(url)
     if not collection_id:
@@ -1135,7 +1209,8 @@ if __name__ == "__main__":
     parser.add_argument("url", type=str, help="Patreon collection URL, e.g. https://www.patreon.com/collection/512335")
     parser.add_argument("-o", "--output-dir", type=str, default=None, help="Directory to save videos into (default: current directory).")
     parser.add_argument("-w", "--workers", type=positive_int, default=DEFAULT_VIDEO_WORKERS, help=argparse.SUPPRESS)
-    parser.add_argument("-m", "--max-connections", type=positive_int, default=DEFAULT_MAX_CONNECTIONS, help=f"Shared pool of parallel segment connections across all videos. Default {DEFAULT_MAX_CONNECTIONS}. Lower if you hit rate limits.")
+    parser.add_argument("-m", "--max-connections", type=positive_int, default=None, help=f"Shared pool of parallel segment connections across all videos. Default {DEFAULT_MAX_CONNECTIONS}. Lower if you hit rate limits.")
+    parser.add_argument("--auto", action="store_true", help="Auto-pick the connection count from the detected CPU. Ignored if -m is given.")
     parser.add_argument("-q", "--max-height", type=nonneg_int, default=DEFAULT_MAX_HEIGHT, help="Cap video height (e.g. 720). 0 = best available (default).")
     parser.add_argument("-s", "--select", action="store_true", help="List all videos first and interactively choose which to download.")
     parser.add_argument("-l", "--list", action="store_true", help="Only list the videos in the collection; do not download.")
@@ -1145,7 +1220,7 @@ if __name__ == "__main__":
     parser.add_argument("--cookies", type=str, help="Path to a Netscape cookies.txt or JSON cookie export (your Patreon session).")
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable (overrides the FFMPEG setting).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive (zip/tar.*) to auto-download if ffmpeg is missing. Empty string disables auto-download.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.0.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.4.0")
 
     args = parser.parse_args()
     main(args.url, out_dir=args.output_dir, video_workers=args.workers, max_height=args.max_height,
@@ -1154,4 +1229,4 @@ if __name__ == "__main__":
          auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies),
          select=args.select, list_only=args.list,
          ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
-         max_connections=args.max_connections)
+         max_connections=args.max_connections, auto=args.auto)
