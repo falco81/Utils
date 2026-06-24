@@ -36,7 +36,7 @@ AUTO_COOKIES = True               # if --cookies is omitted, auto-use a *.json c
 USE_COLOR = True                  # colored output (needs colorama on Windows)
 FORCE_ASCII_BARS = None           # None = auto (ASCII on Windows); True/False to force
 # Above this many concurrent files, show one overall bar instead of one bar per file.
-PER_FILE_BAR_LIMIT = 16
+PER_FILE_BAR_LIMIT = 32
 SEGMENT_MIB = 32                  # folder mode: split each file into segments of this size (MiB)
                                   # so freed connections flow to remaining files (work-stealing).
 BAR_NCOLS = 100                   # fixed progress-bar width so bars don't stretch across wide terminals
@@ -1334,7 +1334,7 @@ if __name__ == "__main__":
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
     parser.add_argument("--cookies", type=str, help="Path to a Netscape cookies.txt file or JSON cookie export for private Google Drive files/folders.")
-    parser.add_argument("--version", action="version", version="%(prog)s 1.14.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.15.0")
 
     args = parser.parse_args()
     main(args.video_id, args.output, args.chunk_size, args.threads, args.verbose, args.cookies,
