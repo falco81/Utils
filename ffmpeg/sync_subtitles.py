@@ -799,18 +799,64 @@ def apply_transform(events, scale, offset):
     return out
 
 
-def fix_short_durations(events, min_cps=17.0, min_duration_floor=1.0, min_gap=0.084):
+# Výchozí hodnoty pro fix_short_durations - jako konstanty, aby na ně šlo
+# odkazovat z víc míst (CLI defaulty teď None, aby se poznalo, že je
+# uživatel NEzadal explicitně - důležité pro --fix-readability níž).
+DEFAULT_MIN_CPS = 17.0
+DEFAULT_MIN_DURATION_FLOOR = 1.0
+DEFAULT_MIN_GAP = 0.084
+DEFAULT_LINE_OVERHEAD = 0.2  # extra sekundy za KAŽDÝ řádek navíc (oči musí "přeskočit" na další řádek)
+
+# Jmenované presety čtecí rychlosti: (cps, floor). Slouží jako rychlá
+# volba jak pro --reading-speed na příkazové řádce, tak pro interaktivní
+# nabídku u --fix-readability - jedno místo pravdy pro obojí.
+READING_SPEED_PRESETS = {
+    "normal":    (17.0, 1.0, "Normální tempo"),
+    "slow":      (12.0, 1.3, "Pomalí čtenáři"),
+    "very-slow": (9.0, 1.6, "Extrémně pomalí / začínající čtenáři"),
+}
+
+
+def resolve_speed_params(args):
+    """Sjednocené rozhodnutí cps/floor/gap/line_overhead z args:
+    --reading-speed dá základ, explicitní --min-cps/--min-duration-floor/
+    --min-gap/--line-overhead (pokud zadané) mají před presetem přednost."""
+    if args.reading_speed:
+        cps, floor, _label = READING_SPEED_PRESETS[args.reading_speed]
+    else:
+        cps, floor = DEFAULT_MIN_CPS, DEFAULT_MIN_DURATION_FLOOR
+    if args.min_cps is not None:
+        cps = args.min_cps
+    if args.min_duration_floor is not None:
+        floor = args.min_duration_floor
+    gap = args.min_gap if args.min_gap is not None else DEFAULT_MIN_GAP
+    line_overhead = args.line_overhead if args.line_overhead is not None else DEFAULT_LINE_OVERHEAD
+    return cps, floor, gap, line_overhead
+
+
+def fix_short_durations(events, min_cps=DEFAULT_MIN_CPS, min_duration_floor=DEFAULT_MIN_DURATION_FLOOR,
+                         min_gap=DEFAULT_MIN_GAP, line_overhead=DEFAULT_LINE_OVERHEAD):
     """
     Prodlouží titulky, které zmizí příliš rychle vzhledem k délce textu,
     a to POUZE pokud je k tomu volné místo (mezera do dalšího titulku) -
     nikdy nepřesáhne mezeru (minus bezpečnostní min_gap před dalším titulkem)
-    a nikdy neprodlouží víc, než kolik si text reálně "žádá" (žádné jedno
-    slovo nezůstane viset na obrazovce přes celou tichou scénu).
+    a nikdy neprodlouží víc, než kolik si text reálně "žádá". ČASOVÁNÍ MÁ
+    VŽDY PŘEDNOST: tahle funkce nikdy nezmění start žádného titulku a nikdy
+    nezasáhne do dalšího - to je neporušitelná hranice, bez ohledu na to,
+    jaké parametry níž zvolíš.
+
+    Cílová délka zobrazení NENÍ jen "počet znaků / rychlost" - zohledňuje
+    i počet řádků (vícero řádků = oko musí navíc přeskočit na další řádek,
+    takže krátké jednoslovné titulky nikdy nedostanou stejnou délku jako
+    víceřádková věta jen kvůli společné "podlaze").
 
     min_cps           - cílová čtecí rychlost ve znacích/s (default 17;
                          menší hodnota = delší ideální zobrazení)
     min_duration_floor - absolutní podlaha v sekundách bez ohledu na text
     min_gap           - mezera, která musí zůstat zachována před dalším titulkem
+    line_overhead     - extra sekundy za každý řádek NAD první (default 0.2);
+                         dvouřádkový titulek tak dostane +0.2s, třířádkový +0.4s
+                         navíc oproti čistě znakovému výpočtu
     """
     out = [dict(ev) for ev in events]
     n = len(out)
@@ -819,7 +865,11 @@ def fix_short_durations(events, min_cps=17.0, min_duration_floor=1.0, min_gap=0.
         char_count = len(re.sub(r"\s+", "", out[i]["text"]))
         if char_count == 0:
             continue
-        ideal_duration = max(min_duration_floor, char_count / min_cps)
+        line_count = max(1, len([l for l in out[i]["text"].split("\n") if l.strip()]))
+        ideal_duration = max(
+            min_duration_floor,
+            char_count / min_cps + (line_count - 1) * line_overhead,
+        )
         duration = out[i]["end"] - out[i]["start"]
         if duration >= ideal_duration:
             continue
@@ -1023,9 +1073,16 @@ def build_passthrough_args(args):
     out += ["--tolerance", str(args.tolerance)]
     if args.fix_short_duration:
         out += ["--fix-short-duration"]
-    out += ["--min-cps", str(args.min_cps)]
-    out += ["--min-duration-floor", str(args.min_duration_floor)]
-    out += ["--min-gap", str(args.min_gap)]
+    if args.reading_speed:
+        out += ["--reading-speed", args.reading_speed]
+    if args.min_cps is not None:
+        out += ["--min-cps", str(args.min_cps)]
+    if args.min_duration_floor is not None:
+        out += ["--min-duration-floor", str(args.min_duration_floor)]
+    if args.min_gap is not None:
+        out += ["--min-gap", str(args.min_gap)]
+    if args.line_overhead is not None:
+        out += ["--line-overhead", str(args.line_overhead)]
     if args.mkvmerge:
         out += ["--mkvmerge", args.mkvmerge]
     if args.mkvextract:
@@ -1157,6 +1214,284 @@ def run_batch(args):
 
 
 # ----------------------------------------------------------------------
+# --fix-readability: samostatný dávkový režim, který NEDĚLÁ ŽÁDNOU
+# synchronizaci - jen u titulků (které už mají SPRÁVNÉ časování) prodlouží
+# příliš krátké zobrazení pro pohodlnější čtení. Nepotřebuje video ani
+# mkvtoolnix/ffmpeg - pracuje čistě s .srt soubory.
+#
+# Bezpečnost časování: používá tu samou fix_short_durations(), jako
+# jednosouborový režim výše - ta NIKDY neposouvá začátek titulku a nikdy
+# neprodlouží konec za hranici (mezera do dalšího titulku - bezpečnostní
+# rezerva), takže touto operací nelze rozbít existující časování ani
+# způsobit překryv mezi titulky.
+# ----------------------------------------------------------------------
+
+def estimate_avg_cps(srt_files, sample_limit=5):
+    """Pro orientaci uživateli při interaktivním dotazu: spočítá, jaké
+    čtecí tempo (znaky/s) typicky MAJÍ aktuální titulky (jen u vět
+    dost dlouhých na to, aby to bylo vypovídající - kratší než 0.3s
+    se ignorují, často jde o překryvy/efekty)."""
+    speeds = []
+    for path in srt_files[:sample_limit]:
+        try:
+            events = parse_srt(Path(path))
+        except SystemExit:
+            continue
+        for ev in events:
+            dur = ev["end"] - ev["start"]
+            chars = len(re.sub(r"\s+", "", ev["text"]))
+            if dur >= 0.3 and chars >= 3:
+                speeds.append(chars / dur)
+    if not speeds:
+        return None
+    speeds.sort()
+    return speeds[len(speeds) // 2]  # medián
+
+
+def ask_readability_params(srt_files):
+    """Interaktivně se zeptá na parametry prodlužování titulků, s jasným
+    vysvětlením, k čemu každý slouží, a s orientačním údajem o aktuálním
+    tempu titulků (pokud se podaří spočítat). Vrací (cps, floor, gap, line_overhead)."""
+    print()
+    print(f"{Fore.CYAN}Nastavení prodlužování titulků pro pohodlnější čtení{Style.RESET_ALL}")
+    print(
+        "Tohle NEMĚNÍ začátek žádného titulku a nikdy nezasáhne do dalšího "
+        "titulku - jen tam, kde je volné místo (ticho/mezera), prodlouží konec "
+        "zobrazení, pokud je text na danou dobu zobrazení příliš dlouhý. "
+        "ČASOVÁNÍ MÁ VŽDY PŘEDNOST před tímto nastavením."
+    )
+
+    avg_cps = estimate_avg_cps(srt_files)
+    if avg_cps:
+        print(f"  (Pro srovnání: tvoje aktuální titulky mají typické tempo ~{avg_cps:.1f} znaků/s.)")
+    print()
+
+    print(
+        "1) Čtecí rychlost - kolik znaků titulku má čtenář v průměru přečíst "
+        "za 1 sekundu. Nižší číslo = titulky zůstanou na obrazovce déle. "
+        "(Krátká slova/věty stejně nikdy nedostanou stejnou délku jako dlouhé "
+        "víceřádkové věty - délka se vždy počítá podle skutečné délky textu.)"
+    )
+    preset_keys = list(READING_SPEED_PRESETS.keys())
+    options = [f"{READING_SPEED_PRESETS[k][2]} ({READING_SPEED_PRESETS[k][0]:.0f} znaků/s)" for k in preset_keys]
+    options.append("Zadat vlastní čtecí tempo (znaků/s)")
+    choice = ask_choice("Zvol cílové čtecí tempo:", options, allow_skip=False, allow_abort=True)
+    if choice == "abort":
+        return None
+
+    if choice == len(preset_keys):
+        raw = input("  Zadej čtecí tempo ve znacích/s (např. 15): ").strip()
+        try:
+            min_cps = float(raw)
+        except ValueError:
+            min_cps = DEFAULT_MIN_CPS
+        default_floor = DEFAULT_MIN_DURATION_FLOOR
+    else:
+        min_cps, default_floor, _label = READING_SPEED_PRESETS[preset_keys[choice]]
+
+    print()
+    print(
+        "2) Minimální délka zobrazení (s) - i jedno krátké slovo se zobrazí "
+        f"alespoň takhle dlouho, bez ohledu na čtecí tempo výše. Enter = doporučená {default_floor}."
+    )
+    raw = input(f"  Minimální délka v sekundách [{default_floor}]: ").strip()
+    try:
+        min_floor = float(raw) if raw else default_floor
+    except ValueError:
+        min_floor = default_floor
+
+    print()
+    print(
+        "3) Bezpečnostní mezera (s) před dalším titulkem, kterou prodloužení "
+        f"nikdy nepřekročí (aby se titulky nezačaly překrývat). Enter = výchozí {DEFAULT_MIN_GAP}."
+    )
+    raw = input(f"  Mezera v sekundách [{DEFAULT_MIN_GAP}]: ").strip()
+    try:
+        min_gap = float(raw) if raw else DEFAULT_MIN_GAP
+    except ValueError:
+        min_gap = DEFAULT_MIN_GAP
+
+    print()
+    print(
+        "4) Příplatek za řádek (s) - kolik sekund navíc dostane titulek za KAŽDÝ "
+        "řádek nad první (oči musí přeskočit na další řádek). Díky tomu dvouřádková "
+        f"věta dostane víc času než jednoslovný titulek se stejným počtem znaků. Enter = výchozí {DEFAULT_LINE_OVERHEAD}."
+    )
+    raw = input(f"  Příplatek za řádek v sekundách [{DEFAULT_LINE_OVERHEAD}]: ").strip()
+    try:
+        line_overhead = float(raw) if raw else DEFAULT_LINE_OVERHEAD
+    except ValueError:
+        line_overhead = DEFAULT_LINE_OVERHEAD
+
+    return min_cps, min_floor, min_gap, line_overhead
+
+
+def detect_lang_tags(srt_files):
+    """Odhadne jazykové/jiné tagy z názvů souborů ('epizoda.cs.srt' -> 'cs').
+    Jen orientační - používá se pro interaktivní nabídku, ne pro tvrdé filtrování."""
+    tags = set()
+    for s in srt_files:
+        stem = Path(s).stem
+        parts = stem.rsplit(".", 1)
+        if len(parts) == 2 and 1 <= len(parts[1]) <= 8 and parts[1].isalpha():
+            tags.add(parts[1].lower())
+    return sorted(tags)
+
+
+def filter_by_tag(srt_files, tag):
+    def has_tag(p):
+        stem = Path(p).stem
+        parts = stem.rsplit(".", 1)
+        return len(parts) == 2 and parts[1].lower() == tag.lower()
+    tagged = [s for s in srt_files if has_tag(s)]
+    return tagged if tagged else srt_files
+
+
+def ask_yes_no(prompt, default_no=True):
+    suffix = "[a/N]" if default_no else "[A/n]"
+    raw = input(f"{prompt} {suffix}: ").strip().lower()
+    if not raw:
+        return not default_no
+    return raw in ("a", "y", "ano", "yes", "ja")
+
+
+def run_fix_readability(args):
+    interactive = not args.yes
+    print()
+    if interactive and not args.mkv:
+        print(f"{Fore.CYAN}--fix-readability: úprava délky zobrazení titulků (bez ovlivnění časování){Style.RESET_ALL}")
+        print("Postupně se zeptám na pár věcí - cokoliv je možné zadat i přímo jako parametr příkazu, "
+              "abys to příště nemusel/a vyplňovat znovu (viz --help).")
+        print()
+
+    # 1) adresář nebo konkrétní .srt soubor ----------------------------------
+    if args.mkv:
+        target = str(args.mkv)
+    elif interactive:
+        print("1) Co zpracovat - adresář k prohledání, nebo přímo konkrétní .srt soubor.")
+        raw = input("   Cesta [. = aktuální adresář]: ").strip()
+        target = raw if raw else "."
+        print()
+    else:
+        target = "."
+
+    if os.path.isfile(target) and target.lower().endswith(".srt"):
+        srt_files = [target]
+        is_single_file = True
+    elif os.path.isdir(target):
+        is_single_file = False
+        # 2) rekurzivní hledání ------------------------------------------------
+        recursive = args.recursive
+        if interactive and not args.recursive:
+            print("2) Mám prohledat i podadresáře, nebo jen tento jeden adresář?")
+            recursive = ask_yes_no("   Prohledat i podadresáře?", default_no=True)
+            print()
+        srt_files = collect_srts(target, recursive)
+    else:
+        die(f"Není to ani .srt soubor, ani adresář: {target}")
+
+    if not srt_files:
+        log_warn("Nenalezeny žádné .srt soubory ke zpracování.")
+        return
+
+    # 3) jazykový/jiný filtr - jen když je víc variant a uživatel nezadal -----
+    target_lang = args.target_lang
+    if not is_single_file and target_lang is None and interactive and len(srt_files) > 1:
+        tags = detect_lang_tags(srt_files)
+        if len(tags) > 1:
+            print(f"3) Nalezeno {len(srt_files)} .srt souborů s různými jazykovými tagy v názvu ({', '.join(tags)}).")
+            options = [f"jen '{t}'" for t in tags] + ["všechny (nefiltrovat)"]
+            choice = ask_choice("   Co zpracovat?", options, allow_skip=False, allow_abort=True)
+            if choice == "abort":
+                log_warn("Zrušeno uživatelem.")
+                return
+            if choice < len(tags):
+                target_lang = tags[choice]
+            print()
+    if target_lang:
+        srt_files = filter_by_tag(srt_files, target_lang)
+
+    log_info(f"Ke zpracování: {len(srt_files)} .srt souborů.")
+
+    # 4) přepsat originál, nebo uložit jako nový soubor -----------------------
+    overwrite = args.overwrite
+    if not args.overwrite and interactive:
+        print()
+        print("4) Jak uložit výsledek?")
+        choice = ask_choice(
+            "   Zvol režim uložení:",
+            ["Nový soubor '<jméno>.readability.srt' vedle originálu (doporučeno - nic se nepřepíše)",
+             "Přepsat originál přímo (jednorázově se vytvoří '.bak' záloha)"],
+            allow_skip=False, allow_abort=True,
+        )
+        if choice == "abort":
+            log_warn("Zrušeno uživatelem.")
+            return
+        overwrite = (choice == 1)
+        print()
+
+    # 5) parametry čtecí rychlosti ---------------------------------------------
+    has_explicit_speed_choice = (
+        args.reading_speed is not None or args.min_cps is not None or args.min_duration_floor is not None
+    )
+    if not has_explicit_speed_choice and interactive:
+        result = ask_readability_params(srt_files)
+        if result is None:
+            log_warn("Zrušeno uživatelem.")
+            return
+        min_cps, min_floor, min_gap, line_overhead = result
+    else:
+        min_cps, min_floor, min_gap, line_overhead = resolve_speed_params(args)
+
+    print()
+    log_info(
+        f"Používám: čtecí tempo {min_cps:.1f} znaků/s, min. délka {min_floor:.2f}s, "
+        f"mezera {min_gap:.3f}s, příplatek za řádek {line_overhead:.2f}s, "
+        f"výstup: {'přepsat originál (+.bak)' if overwrite else '*.readability.srt'}"
+    )
+    print()
+
+    changed = 0
+    unchanged = 0
+    failed = 0
+
+    for srt_file in srt_files:
+        name = os.path.basename(srt_file)
+        try:
+            events = parse_srt(Path(srt_file))
+        except SystemExit:
+            log_warn(f"{name}: nepodařilo se načíst (přeskočeno)")
+            failed += 1
+            continue
+
+        fixed, n_extended = fix_short_durations(
+            events, min_cps=min_cps, min_duration_floor=min_floor, min_gap=min_gap, line_overhead=line_overhead
+        )
+
+        if n_extended == 0:
+            print(f"  = {name} - beze změny")
+            unchanged += 1
+            continue
+
+        srt_path = Path(srt_file)
+        if overwrite:
+            bak = srt_path.with_suffix(srt_path.suffix + ".bak")
+            if not bak.exists():
+                shutil.copy(srt_path, bak)
+            out_path = srt_path
+        else:
+            out_path = srt_path.with_name(srt_path.stem + ".readability" + srt_path.suffix)
+
+        write_srt(fixed, out_path)
+        print(f"  {Fore.GREEN}+{Style.RESET_ALL} {name} - prodlouženo {n_extended} titulků -> {out_path.name}")
+        changed += 1
+
+    print()
+    tail = f", {failed} selhalo" if failed else ""
+    log_done(f"Hotovo: {changed} upraveno, {unchanged} beze změny{tail} (z {len(srt_files)}).")
+
+
+# ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
 
@@ -1183,7 +1518,16 @@ def main():
                               "Bez tohoto se výstup ukládá jako '<jméno>.synced.srt' vedle originálu.")
     parser.add_argument("--yes", action="store_true",
                          help="S --all: když u videa chybí potřebné stopy, automaticky přeskočit "
-                              "bez interaktivního dotazu (pro nehlídané/dávkové spouštění).")
+                              "bez interaktivního dotazu (pro nehlídané/dávkové spouštění). "
+                              "S --fix-readability: nepoužívat výchozí hodnoty parametrů bez ptaní.")
+
+    parser.add_argument("--fix-readability", action="store_true",
+                         help="Samostatný režim (BEZ synchronizace): najde v adresáři (1. argument, "
+                              "default aktuální adresář; nebo přímo konkrétní .srt) všechny titulky, "
+                              "které už mají SPRÁVNÉ časování, a jen prodlouží ty, co zmizí příliš "
+                              "rychle na pohodlné přečtení - výhradně do volného místa, nikdy na úkor "
+                              "překryvu. Bez --min-cps/--min-duration-floor/--min-gap se na hodnoty "
+                              "interaktivně zeptá (s vysvětlením a orientačním odhadem aktuálního tempa).")
 
     parser.add_argument("--ref-lang", help="Jazyk referenční TITULKOVÉ stopy v MKV, např. eng, cze, ces")
     parser.add_argument("--track-id", type=int, help="ID titulkové stopy v MKV (viz --list-tracks)")
@@ -1208,15 +1552,25 @@ def main():
                          help="Po synchronizaci prodloužit titulky, které zmizí příliš rychle vzhledem "
                               "k délce textu - ale jen pokud je k tomu volné místo (mezera do dalšího "
                               "titulku), nikdy na úkor překryvu s dalším titulkem.")
-    parser.add_argument("--min-cps", type=float, default=17.0,
-                         help="Cílová čtecí rychlost ve znacích/s pro výpočet ideální min. délky "
-                              "zobrazení (default 17; nižší = delší zobrazení pro stejný text)")
-    parser.add_argument("--min-duration-floor", type=float, default=1.0,
-                         help="Absolutní minimální délka zobrazení titulku v sekundách, bez ohledu "
-                              "na délku textu (default 1.0)")
-    parser.add_argument("--min-gap", type=float, default=0.084,
-                         help="Mezera v sekundách, která musí zůstat zachována před dalším titulkem "
-                              "při prodlužování (default 0.084 - cca 2 snímky při 24fps)")
+    parser.add_argument("--reading-speed", choices=list(READING_SPEED_PRESETS.keys()),
+                         help="Rychlá volba presetu čtecí rychlosti místo ručního --min-cps/--min-duration-floor: "
+                              + "; ".join(f"'{k}' = {v[2]} ({v[0]:.0f} znaků/s, podlaha {v[1]:.1f}s)"
+                                          for k, v in READING_SPEED_PRESETS.items())
+                              + ". Explicitně zadané --min-cps/--min-duration-floor mají před presetem přednost.")
+    parser.add_argument("--min-cps", type=float, default=None,
+                         help=f"Cílová čtecí rychlost ve znacích/s pro výpočet ideální min. délky "
+                              f"zobrazení (default {DEFAULT_MIN_CPS}; nižší = delší zobrazení pro stejný text)")
+    parser.add_argument("--min-duration-floor", type=float, default=None,
+                         help=f"Absolutní minimální délka zobrazení titulku v sekundách, bez ohledu "
+                              f"na délku textu (default {DEFAULT_MIN_DURATION_FLOOR})")
+    parser.add_argument("--min-gap", type=float, default=None,
+                         help=f"Mezera v sekundách, která musí zůstat zachována před dalším titulkem "
+                              f"při prodlužování (default {DEFAULT_MIN_GAP} - cca 2 snímky při 24fps)")
+    parser.add_argument("--line-overhead", type=float, default=None,
+                         help=f"Extra sekundy navíc za KAŽDÝ řádek titulku nad první - vícero řádků "
+                              f"potřebuje navíc čas na přeskočení očí (default {DEFAULT_LINE_OVERHEAD}; "
+                              f"díky tomu jednoslovný titulek nikdy nedostane stejnou délku jako "
+                              f"víceřádková věta jen kvůli společné podlaze)")
     parser.add_argument("--mkvmerge", help="Cesta k mkvmerge.exe nebo ke složce s ním, pokud není v PATH")
     parser.add_argument("--mkvextract", help="Cesta k mkvextract.exe nebo ke složce s ním, pokud není v PATH")
     parser.add_argument("--no-mkvtoolnix-download", action="store_true",
@@ -1225,6 +1579,13 @@ def main():
     parser.add_argument("--no-ffmpeg-download", action="store_true",
                          help="Nezkoušet automaticky stáhnout ffmpeg, pokud nebyl nikde nalezen")
     args = parser.parse_args()
+
+    if args.all and args.fix_readability:
+        die("--all a --fix-readability nelze použít současně (jsou to dva oddělené dávkové režimy).")
+
+    if args.fix_readability:
+        run_fix_readability(args)
+        return
 
     if args.all:
         run_batch(args)
@@ -1372,9 +1733,9 @@ def main():
         corrected = apply_transform(target_events, scale, offset)
 
         if args.fix_short_duration:
+            cps, floor, gap, overhead = resolve_speed_params(args)
             corrected, n_extended = fix_short_durations(
-                corrected, min_cps=args.min_cps,
-                min_duration_floor=args.min_duration_floor, min_gap=args.min_gap,
+                corrected, min_cps=cps, min_duration_floor=floor, min_gap=gap, line_overhead=overhead,
             )
             log_info(f"Prodlouženo {n_extended} titulků se zkráceným zobrazením (využita volná místa)")
 
