@@ -34,10 +34,20 @@ Instalace na Windows 10
 ------------------------
 1) Python 3.9+  (https://www.python.org/downloads/)
 2) pip install numpy colorama
-3) MKVToolNix pro Windows:
-   - stáhni instalátor z https://mkvtoolnix.download/downloads.html#windows
-   - nainstaluj (instalátor sám nabídne přidání do PATH, nebo zaškrtni tu možnost)
-   - ověř v cmd: mkvmerge --version
+3) MKVToolNix - NEMUSÍŠ řešit ručně. Skript hledá v tomto pořadí (stažení
+   je AŽ POSLEDNÍ MOŽNOST):
+     1. PATH / --mkvmerge,--mkvextract
+     2. typické instalační cesty (C:\\Program Files\\MKVToolNix apod.)
+     3. adresář videa, aktuální adresář, adresář skriptu, cache .mkvtoolnix
+     4. teprve když nic z výše uvedeného nenajde: stáhne aktuální portable
+        verzi (.7z) z mkvtoolnix.download a rozbalí ji do .mkvtoolnix
+        vedle skriptu.
+   Rozbalení .7z potřebuje navíc buď balíček `py7zr` (pip install py7zr,
+   doporučeno - čistě přes pip), nebo externí 7z/7za v PATH. Bez jednoho
+   z těch dvou se stažený archiv nerozbalí - v tom případě nainstaluj
+   MKVToolNix klasicky instalátorem.
+   Vypnout auto-stažení lze přepínačem --no-mkvtoolnix-download, nebo
+   zadat vlastní cestu přes --mkvmerge / --mkvextract.
 4) ffmpeg (jen pro --audio-mode replace/combine) - NEMUSÍŠ řešit ručně:
    pokud ho skript nenajde v PATH ani v cache složce ".ffmpeg" vedle sebe,
    automaticky si ho stáhne z gyan.dev a rozbalí do ".ffmpeg\" sám.
@@ -287,27 +297,41 @@ def _resolve_tool(value, name):
 
 
 def _try_ff(path):
+    """ffmpeg chce '-version' (jedna pomlčka), mkvmerge/mkvextract chtějí
+    '--version' (dvě pomlčky, GNU styl) - zkusíme obě varianty."""
     if not path:
         return False
-    try:
-        subprocess.run([path, "-version"], stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL, check=True)
-        return True
-    except Exception:
-        return False
+    for flag in ("--version", "-version"):
+        try:
+            subprocess.run([path, flag], stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, check=True)
+            return True
+        except Exception:
+            continue
+    return False
 
 
-def _cache_dir():
-    base = os.path.dirname(os.path.abspath(sys.argv[0] or ".")) or os.getcwd()
-    return os.path.join(base, ".ffmpeg")
+def _cache_dir(name=".ffmpeg"):
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
+    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
+    return os.path.join(base, name)
 
 
-def _find_cached(name, search_dirs):
+def _find_cached(name, search_dirs, max_depth=None):
+    """max_depth omezuje, jak hluboko se chodí (kvůli prohledávání širokých
+    adresářů typu Program Files / adresář videa - bez limitu by to mohlo
+    procházet celé obrovské stromy). None = bez omezení (cache složky)."""
     exe = _exe(name)
     for d in search_dirs:
         if not d or not os.path.isdir(d):
             continue
-        for root, _dirs, files in os.walk(d):
+        base_depth = os.path.abspath(d).rstrip(os.sep).count(os.sep)
+        for root, dirs, files in os.walk(d):
+            if max_depth is not None:
+                depth = os.path.abspath(root).rstrip(os.sep).count(os.sep) - base_depth
+                if depth >= max_depth:
+                    dirs[:] = []
+                    continue
             if exe in files:
                 p = os.path.join(root, exe)
                 if os.name != "nt":
@@ -330,17 +354,37 @@ def _extract_archive(path, dest, url):
         with tarfile.open(path) as t:
             t.extractall(dest)
     else:
-        raise ValueError("Neznámý formát archivu ffmpeg.")
+        raise ValueError("Neznámý formát archivu (čekal jsem .zip/.tar.*).")
 
 
-def _download_ffmpeg(url):
+def _extract_7z(path, dest):
+    """Rozbalí .7z. MKVToolNix portable se distribuuje jen jako .7z, ne .zip,
+    takže na rozdíl od ffmpeg archivu to potřebuje navíc buď balíček py7zr,
+    nebo externí 7z/7za binárku (pokud je v PATH)."""
+    try:
+        import py7zr
+        with py7zr.SevenZipFile(path, mode="r") as z:
+            z.extractall(path=dest)
+        return True
+    except ImportError:
+        pass
+    except Exception as e:
+        log_warn(f"Rozbalení .7z přes py7zr selhalo: {e}")
+
+    seven_zip = find_tool(["7z", "7z.exe", "7za", "7za.exe"])
+    if seven_zip:
+        result = subprocess.run([seven_zip, "x", f"-o{dest}", "-y", path],
+                                 capture_output=True, text=True)
+        if result.returncode == 0:
+            return True
+        log_warn(f"Rozbalení .7z přes {seven_zip} selhalo: {result.stderr[-500:]}")
+    return False
+
+
+def _download_to_file(url, dest_path, label):
     import urllib.request
-    cache = _cache_dir()
-    os.makedirs(cache, exist_ok=True)
-    log_info(f"ffmpeg nenalezen; stahuji z {url}")
-    tmp = os.path.join(cache, "ffmpeg_download.tmp")
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
+    with urllib.request.urlopen(req) as r, open(dest_path, "wb") as f:
         total = int(r.headers.get("Content-Length", 0) or 0)
         done = 0
         while True:
@@ -351,8 +395,16 @@ def _download_ffmpeg(url):
             done += len(chunk)
             if total:
                 print(f"\r  {Fore.CYAN}{done * 100 // total:3d}%{Style.RESET_ALL}  "
-                      f"{done // 1048576} / {total // 1048576} MB", end="")
+                      f"{label}: {done // 1048576} / {total // 1048576} MB", end="")
         print()
+
+
+def _download_ffmpeg(url):
+    cache = _cache_dir(".ffmpeg")
+    os.makedirs(cache, exist_ok=True)
+    log_info(f"ffmpeg nenalezen; stahuji z {url}")
+    tmp = os.path.join(cache, "ffmpeg_download.tmp")
+    _download_to_file(url, tmp, "ffmpeg")
     log_info("Rozbaluji ffmpeg ...")
     _extract_archive(tmp, cache, url)
     try:
@@ -362,13 +414,18 @@ def _download_ffmpeg(url):
 
 
 def ensure_ffmpeg(target_dir, allow_download):
-    """Najde ffmpeg: PATH -> --ffmpeg/FFMPEG override -> cache .ffmpeg vedle
-    skriptu/u videa/v cwd -> (pokud povoleno) stáhne a rozbalí z gyan.dev."""
-    search = [_cache_dir(), os.path.join(target_dir, ".ffmpeg"), target_dir,
-              os.path.join(os.getcwd(), ".ffmpeg"), os.getcwd()]
+    """Najde ffmpeg: PATH -> --ffmpeg/FFMPEG override -> cache .ffmpeg (bez
+    omezení hloubky) -> adresář videa/cwd (omezená hloubka, ať to neprochází
+    celé obrovské stromy) -> (až jako poslední možnost, pokud povoleno)
+    stáhne a rozbalí z gyan.dev."""
+    cache_dirs = [_cache_dir(".ffmpeg"), os.path.join(target_dir, ".ffmpeg"),
+                  os.path.join(os.getcwd(), ".ffmpeg")]
+    broad_dirs = [target_dir, os.getcwd()]
     ff = _resolve_tool(FFMPEG, "ffmpeg")
     if not _try_ff(ff):
-        ff = _find_cached("ffmpeg", search)
+        ff = _find_cached("ffmpeg", cache_dirs)
+        if not _try_ff(ff):
+            ff = _find_cached("ffmpeg", broad_dirs, max_depth=3)
         if not _try_ff(ff):
             ff = None
     if ff is None and allow_download and FFMPEG_DOWNLOAD_URL:
@@ -376,10 +433,116 @@ def ensure_ffmpeg(target_dir, allow_download):
             _download_ffmpeg(FFMPEG_DOWNLOAD_URL)
         except Exception as e:
             log_warn(f"Stažení ffmpeg selhalo: {e}")
-        ff = _find_cached("ffmpeg", search)
+        ff = _find_cached("ffmpeg", cache_dirs)
         if not _try_ff(ff):
             ff = None
     return ff
+
+
+# ----------------------------------------------------------------------
+# mkvtoolnix toolkit - stejný princip jako ffmpeg výše, navíc s o trochu
+# složitější logikou: portable balíček je .7z (ne .zip) a stahovací URL
+# obsahuje číslo verze, takže se musí nejdřív vyčíst ze stránky downloadů.
+# ----------------------------------------------------------------------
+
+MKVMERGE = "mkvmerge"
+MKVEXTRACT = "mkvextract"
+MKVTOOLNIX_DOWNLOAD_PAGE = "https://mkvtoolnix.download/downloads.html"
+
+
+def _resolve_mkvtoolnix_url():
+    """Stránka downloadů obsahuje verzované odkazy (např. .../99.0/mkvtoolnix-
+    -64-bit-99.0.7z) - není tam fixní 'latest' URL, takže si to musíme
+    nejdřív z HTML vyčíst."""
+    import urllib.request
+    req = urllib.request.Request(MKVTOOLNIX_DOWNLOAD_PAGE, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=20) as r:
+        html = r.read().decode("utf-8", errors="ignore")
+
+    m = re.search(r"https://mkvtoolnix\.download/windows/releases/[\d.]+/mkvtoolnix-64-bit-[\d.]+\.7z", html)
+    if m:
+        return m.group(0)
+
+    m = re.search(r"windows/releases/([\d.]+)/mkvtoolnix-64-bit-([\d.]+)\.7z", html)
+    if m:
+        return f"https://mkvtoolnix.download/windows/releases/{m.group(1)}/mkvtoolnix-64-bit-{m.group(2)}.7z"
+
+    return None
+
+
+def _download_mkvtoolnix(url):
+    cache = _cache_dir(".mkvtoolnix")
+    os.makedirs(cache, exist_ok=True)
+    log_info(f"mkvtoolnix nenalezen; stahuji portable verzi z {url}")
+    tmp = os.path.join(cache, "mkvtoolnix_download.tmp")
+    _download_to_file(url, tmp, "mkvtoolnix")
+    log_info("Rozbaluji mkvtoolnix (.7z) ...")
+    ok = _extract_7z(tmp, cache)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    if not ok:
+        raise RuntimeError(
+            "Nepodařilo se rozbalit .7z archiv. Nainstaluj balíček py7zr "
+            "(pip install py7zr) a zkus to znovu, nebo si MKVToolNix "
+            "stáhni/nainstaluj manuálně."
+        )
+
+
+MKV_PROGRAM_FILES_DIRS = [
+    r"C:\Program Files\MKVToolNix",
+    r"C:\Program Files (x86)\MKVToolNix",
+]
+
+
+def ensure_mkvtoolnix(target_dir, allow_download):
+    """Najde mkvmerge+mkvextract, V TOMTO POŘADÍ (stažení je AŽ POSLEDNÍ MOŽNOST):
+    1) PATH / --mkvmerge,--mkvextract override
+    2) typické instalační cesty (Program Files\\MKVToolNix)
+    3) adresář videa, aktuální adresář, adresář skriptu, cache .mkvtoolnix
+       (kdyby tam zůstal z dřívějška)
+    4) až když NIC z výše uvedeného nenajde a je to povoleno: stáhne portable
+       .7z z mkvtoolnix.download a rozbalí do .mkvtoolnix vedle skriptu.
+    Vrací (mkvmerge, mkvextract), kterákoliv položka může být None."""
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else os.getcwd()
+    cache = _cache_dir(".mkvtoolnix")
+
+    def _try_path_override(value, name):
+        p = _resolve_tool(value, name)
+        return p if _try_ff(p) else None
+
+    # 1) PATH / explicitní override
+    mm = _try_path_override(MKVMERGE, "mkvmerge")
+    me = _try_path_override(MKVEXTRACT, "mkvextract")
+
+    # 2) + 3) širší prohledání adresářů - PŘED jakýmkoliv stahováním
+    if mm is None or me is None:
+        broad_dirs = MKV_PROGRAM_FILES_DIRS + [target_dir, os.getcwd(), script_dir, cache]
+        if mm is None:
+            mm = _find_cached("mkvmerge", broad_dirs, max_depth=3)
+            mm = mm if _try_ff(mm) else None
+        if me is None:
+            me = _find_cached("mkvextract", broad_dirs, max_depth=3)
+            me = me if _try_ff(me) else None
+
+    # 4) teprve teď, jako poslední možnost, stažení
+    if (mm is None or me is None) and allow_download:
+        try:
+            url = _resolve_mkvtoolnix_url()
+            if not url:
+                raise RuntimeError("Nenašel jsem odkaz na portable verzi na mkvtoolnix.download.")
+            _download_mkvtoolnix(url)
+        except Exception as e:
+            log_warn(f"Stažení/rozbalení mkvtoolnix selhalo: {e}")
+        if mm is None:
+            mm = _find_cached("mkvmerge", [cache])
+            mm = mm if _try_ff(mm) else None
+        if me is None:
+            me = _find_cached("mkvextract", [cache])
+            me = me if _try_ff(me) else None
+
+    return mm, me
 
 
 def extract_audio_wav(ffmpeg_bin: str, mkv_path: Path, audio_position: int, out_wav: Path, sample_rate: int = 16000):
@@ -671,6 +834,329 @@ def fix_short_durations(events, min_cps=17.0, min_duration_floor=1.0, min_gap=0.
 
 
 # ----------------------------------------------------------------------
+# Dávkové zpracování (--all) - spáruje video<->titulky v adresáři, ověří
+# dostupné stopy PŘED zpracováním, na problém se interaktivně zeptá, a
+# každý pár pak zpracuje jako podproces tohoto skriptu (žádné riziko, že
+# selhání u jednoho dílu zastaví / poškodí ostatní).
+# ----------------------------------------------------------------------
+
+VIDEO_EXTS_BATCH = {".mkv", ".mp4", ".m4v", ".mov", ".webm"}
+
+
+def collect_videos(directory, recursive):
+    videos = []
+    if recursive:
+        for root, _d, files in os.walk(directory):
+            for f in files:
+                if Path(f).suffix.lower() in VIDEO_EXTS_BATCH:
+                    videos.append(os.path.join(root, f))
+    else:
+        for f in os.listdir(directory):
+            full = os.path.join(directory, f)
+            if os.path.isfile(full) and Path(f).suffix.lower() in VIDEO_EXTS_BATCH:
+                videos.append(full)
+    return sorted(videos)
+
+
+def collect_srts(directory, recursive):
+    srts = []
+    if recursive:
+        for root, _d, files in os.walk(directory):
+            for f in files:
+                if f.lower().endswith(".srt"):
+                    srts.append(os.path.join(root, f))
+    else:
+        for f in os.listdir(directory):
+            full = os.path.join(directory, f)
+            if os.path.isfile(full) and f.lower().endswith(".srt"):
+                srts.append(full)
+    return sorted(srts)
+
+
+def _srt_lang_tag(srt_path, vstem):
+    """'X.S01E01.cs.srt' + vstem='X.S01E01' -> 'cs'. None, pokud žádný tag."""
+    sstem = Path(srt_path).stem
+    if sstem == vstem:
+        return None
+    if sstem.startswith(vstem + "."):
+        return sstem[len(vstem) + 1:].lower()
+    return None
+
+
+def match_srt_for_video(video_path, srt_candidates, target_lang):
+    """Najde .srt soubory se stejným základem jména jako video (+ volitelný
+    jazykový/forced tag za poslední tečkou), POUZE ve stejném adresáři jako
+    video (aby --recursive nepárovalo přes různé složky)."""
+    vstem = Path(video_path).stem
+    vdir = os.path.dirname(video_path) or "."
+    matches = []
+    for s in srt_candidates:
+        if (os.path.dirname(s) or ".") != vdir:
+            continue
+        sstem = Path(s).stem
+        if sstem == vstem or sstem.startswith(vstem + "."):
+            matches.append(s)
+    if target_lang:
+        tagged = [s for s in matches if _srt_lang_tag(s, vstem) == target_lang.lower()]
+        if tagged:
+            matches = tagged
+    return matches
+
+
+def ask_choice(prompt, options, allow_skip=True, allow_abort=True):
+    """Jednoduchý textový interaktivní výběr v CLI. Vrací index (int),
+    'skip', nebo 'abort'."""
+    while True:
+        print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
+        for i, opt in enumerate(options, 1):
+            print(f"  {i}) {opt}")
+        if allow_skip:
+            print("  s) přeskočit tento soubor")
+        if allow_abort:
+            print("  a) zrušit celý dávkový běh")
+        choice = input("Tvoje volba: ").strip().lower()
+        if allow_skip and choice == "s":
+            return "skip"
+        if allow_abort and choice == "a":
+            return "abort"
+        if choice.isdigit() and 1 <= int(choice) <= len(options):
+            return int(choice) - 1
+        print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
+
+
+def try_list_tracks(mkvmerge_bin, video_path):
+    """Jako mkvmerge_tracks(), ale nikdy neumírá (sys.exit) - pro dávkový
+    pre-flight, kde chyba u jednoho souboru nemá zastavit celý běh."""
+    try:
+        result = subprocess.run([mkvmerge_bin, "-J", str(video_path)],
+                                 capture_output=True, text=True, timeout=60)
+        data = json.loads(result.stdout)
+    except Exception as e:
+        return None, None, str(e)
+    subs, audio = [], []
+    for track in data.get("tracks", []):
+        props = track.get("properties", {})
+        entry = {"id": track["id"], "codec": track.get("codec", "?"),
+                  "lang": props.get("language", "und"), "title": props.get("track_name", "")}
+        if track.get("type") == "subtitles":
+            subs.append(entry)
+        elif track.get("type") == "audio":
+            audio.append(entry)
+    return subs, audio, None
+
+
+def preflight_check(video_path, mkvmerge_bin, args):
+    """Ověří PŘED zpracováním, že video obsahuje stopy potřebné pro zvolený
+    --audio-mode (+ --ref-lang/--track-id, --audio-lang/--audio-track-id).
+    Vrací (ok: bool, problem: str, sub_tracks, audio_tracks)."""
+    sub_tracks, audio_tracks, err = try_list_tracks(mkvmerge_bin, video_path)
+    if err:
+        return False, f"nelze přečíst stopy ({err})", [], []
+
+    need_sub = args.audio_mode in ("off", "combine")
+    need_aud = args.audio_mode in ("replace", "combine")
+    problems = []
+
+    if need_sub:
+        if args.track_id is not None:
+            if not any(t["id"] == args.track_id for t in sub_tracks):
+                problems.append(f"titulková stopa s ID {args.track_id} neexistuje")
+        else:
+            text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
+            if not text_tracks:
+                problems.append("chybí použitelná textová titulková stopa")
+            elif args.ref_lang and not any(
+                    t["lang"].lower().startswith(args.ref_lang.lower()) for t in text_tracks):
+                avail = ", ".join(t["lang"] for t in text_tracks) or "žádné"
+                problems.append(f"chybí titulková stopa v jazyce '{args.ref_lang}' (dostupné: {avail})")
+
+    if need_aud:
+        if args.audio_track_id is not None:
+            if not any(t["id"] == args.audio_track_id for t in audio_tracks):
+                problems.append(f"zvuková stopa s ID {args.audio_track_id} neexistuje")
+        else:
+            if not audio_tracks:
+                problems.append("chybí zvuková stopa")
+            elif args.audio_lang and not any(
+                    t["lang"].lower().startswith(args.audio_lang.lower()) for t in audio_tracks):
+                avail = ", ".join(t["lang"] for t in audio_tracks) or "žádné"
+                problems.append(f"chybí zvuková stopa v jazyce '{args.audio_lang}' (dostupné: {avail})")
+
+    return (len(problems) == 0), "; ".join(problems), sub_tracks, audio_tracks
+
+
+def resolve_preflight_problem(video_path, problem, sub_tracks, audio_tracks):
+    """Interaktivně se zeptá, co dělat, když video nemá očekávané stopy.
+    Vrací ('skip'|'abort'|'override', track_id_or_None, audio_track_id_or_None)."""
+    log_warn(f"{os.path.basename(video_path)}: {problem}")
+    if sub_tracks:
+        print("  Dostupné titulkové stopy:")
+        for t in sub_tracks:
+            print(f"    ID={t['id']:>3}  jazyk={t['lang']:<5} kodek={t['codec']}")
+    if audio_tracks:
+        print("  Dostupné zvukové stopy:")
+        for t in audio_tracks:
+            print(f"    ID={t['id']:>3}  jazyk={t['lang']:<5} kodek={t['codec']}")
+
+    choice = ask_choice("Co s tím?", ["Zadat konkrétní ID stopy/stop a zkusit to"])
+    if choice in ("skip", "abort"):
+        return choice, None, None
+
+    t_raw = input("  ID titulkové stopy k použití (Enter = nezadávat): ").strip()
+    a_raw = input("  ID zvukové stopy k použití (Enter = nezadávat): ").strip()
+    t_id = int(t_raw) if t_raw.isdigit() else None
+    a_id = int(a_raw) if a_raw.isdigit() else None
+    return "override", t_id, a_id
+
+
+def build_passthrough_args(args):
+    """Sestaví CLI argumenty pro jednotlivé soubory z hodnot v args (mimo
+    dávkové/batch-only a positional argumenty a track-id override, ty se
+    řeší zvlášť per soubor)."""
+    out = ["--audio-mode", args.audio_mode]
+    if args.ref_lang:
+        out += ["--ref-lang", args.ref_lang]
+    if args.audio_lang:
+        out += ["--audio-lang", args.audio_lang]
+    out += ["--vad-percentile", str(args.vad_percentile)]
+    out += ["--max-shift", str(args.max_shift)]
+    out += ["--tolerance", str(args.tolerance)]
+    if args.fix_short_duration:
+        out += ["--fix-short-duration"]
+    out += ["--min-cps", str(args.min_cps)]
+    out += ["--min-duration-floor", str(args.min_duration_floor)]
+    out += ["--min-gap", str(args.min_gap)]
+    if args.mkvmerge:
+        out += ["--mkvmerge", args.mkvmerge]
+    if args.mkvextract:
+        out += ["--mkvextract", args.mkvextract]
+    if args.no_mkvtoolnix_download:
+        out += ["--no-mkvtoolnix-download"]
+    if args.ffmpeg:
+        out += ["--ffmpeg", args.ffmpeg]
+    if args.no_ffmpeg_download:
+        out += ["--no-ffmpeg-download"]
+    return out
+
+
+def run_batch(args):
+    directory = str(args.mkv) if args.mkv else "."
+    if not os.path.isdir(directory):
+        die(f"Není adresář: {directory}")
+
+    global MKVMERGE, MKVEXTRACT
+    if args.mkvmerge:
+        MKVMERGE = args.mkvmerge
+    if args.mkvextract:
+        MKVEXTRACT = args.mkvextract
+    mkvmerge_bin = args.mkvmerge or find_tool(["mkvmerge", "mkvmerge.exe"])
+    if not mkvmerge_bin:
+        mkvmerge_bin, _ = ensure_mkvtoolnix(directory, allow_download=not args.no_mkvtoolnix_download)
+    if not mkvmerge_bin:
+        die("mkvmerge nenalezen - nutný i jen pro náhled stop v dávkovém režimu (--all).")
+
+    videos = collect_videos(directory, args.recursive)
+    if not videos:
+        log_warn(f"V '{directory}' nenalezeny žádné video soubory ({', '.join(sorted(VIDEO_EXTS_BATCH))}).")
+        return
+    srts = collect_srts(directory, args.recursive)
+    log_info(f"Nalezeno {len(videos)} video souborů, {len(srts)} .srt souborů v '{directory}'.")
+
+    plan = []
+    skipped = []
+
+    for v in videos:
+        matches = match_srt_for_video(v, srts, args.target_lang)
+        if not matches:
+            log_warn(f"{os.path.basename(v)}: nenalezen odpovídající .srt - přeskočeno")
+            skipped.append(v)
+            continue
+
+        if len(matches) > 1:
+            choice = ask_choice(
+                f"{os.path.basename(v)}: nalezeno {len(matches)} odpovídajících .srt - který patří sem?",
+                [os.path.basename(m) for m in matches],
+            )
+            if choice == "skip":
+                skipped.append(v)
+                continue
+            if choice == "abort":
+                log_warn("Dávkový běh zrušen uživatelem.")
+                return
+            srt = matches[choice]
+        else:
+            srt = matches[0]
+
+        ok, problem, sub_tracks, audio_tracks = preflight_check(v, mkvmerge_bin, args)
+        override_track, override_audio = args.track_id, args.audio_track_id
+        if not ok:
+            if args.yes:
+                log_warn(f"{os.path.basename(v)}: {problem} - PŘESKOČENO (--yes, bez dotazu).")
+                skipped.append(v)
+                continue
+            action, t_id, a_id = resolve_preflight_problem(v, problem, sub_tracks, audio_tracks)
+            if action == "skip":
+                skipped.append(v)
+                continue
+            if action == "abort":
+                log_warn("Dávkový běh zrušen uživatelem.")
+                return
+            if t_id is not None:
+                override_track = t_id
+            if a_id is not None:
+                override_audio = a_id
+
+        plan.append((v, srt, override_track, override_audio))
+
+    print()
+    if skipped:
+        log_warn(f"Přeskočeno (chybí titulky/stopy): {len(skipped)}")
+        for v in skipped:
+            print(f"   - {os.path.basename(v)}")
+    if not plan:
+        log_warn("Nic ke zpracování.")
+        return
+
+    log_info(f"Ke zpracování: {len(plan)} souborů:")
+    for v, s, *_ in plan:
+        print(f"   {os.path.basename(v)}  <-  {os.path.basename(s)}")
+    print()
+
+    base_pass = build_passthrough_args(args)
+    ok_count = 0
+    fail_count = 0
+    for v, s, t_id, a_id in plan:
+        srt_path = Path(s)
+        if args.overwrite:
+            out_path = srt_path
+            bak = srt_path.with_suffix(srt_path.suffix + ".bak")
+            if not bak.exists():
+                shutil.copy(srt_path, bak)
+        else:
+            out_path = srt_path.with_name(srt_path.stem + ".synced" + srt_path.suffix)
+
+        extra = list(base_pass)
+        if t_id is not None:
+            extra += ["--track-id", str(t_id)]
+        if a_id is not None:
+            extra += ["--audio-track-id", str(a_id)]
+
+        cmd = [sys.executable, os.path.abspath(__file__), str(v), str(srt_path), str(out_path)] + extra
+        print(f"{Fore.CYAN}### {os.path.basename(v)}{Style.RESET_ALL}")
+        result = subprocess.run(cmd)
+        if result.returncode == 0:
+            ok_count += 1
+        else:
+            fail_count += 1
+            log_warn(f"Zpracování '{os.path.basename(v)}' selhalo (exit code {result.returncode}).")
+        print()
+
+    summary_color = Fore.GREEN if fail_count == 0 else Fore.YELLOW
+    tail = f", {fail_count} selhalo" if fail_count else ""
+    print(f"{summary_color}Hotovo: {ok_count}/{len(plan)} úspěšně{tail}.{Style.RESET_ALL}")
+
+
+# ----------------------------------------------------------------------
 # main
 # ----------------------------------------------------------------------
 
@@ -678,9 +1164,26 @@ def main():
     parser = argparse.ArgumentParser(
         description="Opraví časování titulků podle referenčních titulků a/nebo zvukové stopy z MKV (bez alass; mkvtoolnix pro titulky, ffmpeg volitelně pro zvuk)."
     )
-    parser.add_argument("mkv", type=Path, help="Vstupní MKV/MP4 soubor obsahující referenční titulky a/nebo zvuk")
+    parser.add_argument("mkv", type=Path, nargs="?",
+                         help="Vstupní MKV/MP4 soubor (nebo s --all: adresář k prohledání, default '.')")
     parser.add_argument("subtitle_to_fix", type=Path, nargs="?", help="SRT se špatným časováním, který chceme opravit")
     parser.add_argument("output", type=Path, nargs="?", help="Cesta k výstupnímu opravenému SRT")
+
+    parser.add_argument("--all", action="store_true",
+                         help="Dávkový režim: zpracuje všechna videa v adresáři (1. argument, default "
+                              "aktuální adresář). Pro každé video se podle názvu souboru dohledá "
+                              "odpovídající .srt, ověří se dostupné stopy, a teprve poté se zpracuje.")
+    parser.add_argument("-r", "--recursive", action="store_true",
+                         help="S --all: prohledat i podadresáře.")
+    parser.add_argument("--target-lang", help="S --all: pokud k jednomu videu sedí víc .srt souborů "
+                                                "(různé jazyky), použít ten s tímto jazykovým tagem v názvu "
+                                                "(např. 'cs' pro 'epizoda.cs.srt').")
+    parser.add_argument("--overwrite", action="store_true",
+                         help="S --all: přepsat původní .srt přímo (vytvoří jednorázově .bak zálohu). "
+                              "Bez tohoto se výstup ukládá jako '<jméno>.synced.srt' vedle originálu.")
+    parser.add_argument("--yes", action="store_true",
+                         help="S --all: když u videa chybí potřebné stopy, automaticky přeskočit "
+                              "bez interaktivního dotazu (pro nehlídané/dávkové spouštění).")
 
     parser.add_argument("--ref-lang", help="Jazyk referenční TITULKOVÉ stopy v MKV, např. eng, cze, ces")
     parser.add_argument("--track-id", type=int, help="ID titulkové stopy v MKV (viz --list-tracks)")
@@ -714,12 +1217,21 @@ def main():
     parser.add_argument("--min-gap", type=float, default=0.084,
                          help="Mezera v sekundách, která musí zůstat zachována před dalším titulkem "
                               "při prodlužování (default 0.084 - cca 2 snímky při 24fps)")
-    parser.add_argument("--mkvmerge", help="Cesta k mkvmerge.exe, pokud není v PATH")
-    parser.add_argument("--mkvextract", help="Cesta k mkvextract.exe, pokud není v PATH")
+    parser.add_argument("--mkvmerge", help="Cesta k mkvmerge.exe nebo ke složce s ním, pokud není v PATH")
+    parser.add_argument("--mkvextract", help="Cesta k mkvextract.exe nebo ke složce s ním, pokud není v PATH")
+    parser.add_argument("--no-mkvtoolnix-download", action="store_true",
+                         help="Nezkoušet automaticky stáhnout MKVToolNix, pokud nebyl nikde nalezen")
     parser.add_argument("--ffmpeg", help="Cesta k ffmpeg.exe nebo ke složce s ním (jen pro --audio-mode replace/combine)")
     parser.add_argument("--no-ffmpeg-download", action="store_true",
                          help="Nezkoušet automaticky stáhnout ffmpeg, pokud nebyl nikde nalezen")
     args = parser.parse_args()
+
+    if args.all:
+        run_batch(args)
+        return
+
+    if not args.mkv:
+        parser.error("the following arguments are required: mkv")
 
     if not args.mkv.exists():
         die(f"Vstupní soubor neexistuje: {args.mkv}")
@@ -730,19 +1242,35 @@ def main():
     need_ffmpeg = need_audio or (need_sub_extraction and not is_mkv_container)
 
     mkvmerge_bin = args.mkvmerge or find_tool(["mkvmerge", "mkvmerge.exe"])
+    mkvextract_bin = args.mkvextract or find_tool(["mkvextract", "mkvextract.exe"])
+    need_mkvextract = need_sub_extraction and is_mkv_container
+    if not mkvmerge_bin or (need_mkvextract and not mkvextract_bin):
+        global MKVMERGE, MKVEXTRACT
+        if args.mkvmerge:
+            MKVMERGE = args.mkvmerge
+        if args.mkvextract:
+            MKVEXTRACT = args.mkvextract
+        mkvmerge_bin, mkvextract_bin = ensure_mkvtoolnix(
+            str(args.mkv.parent), allow_download=not args.no_mkvtoolnix_download
+        )
+        if mkvmerge_bin:
+            log_info(f"mkvmerge: {mkvmerge_bin}")
+        if mkvextract_bin:
+            log_info(f"mkvextract: {mkvextract_bin}")
+
     if not mkvmerge_bin:
         die(
-            "mkvmerge nenalezen v PATH. Stáhni a nainstaluj MKVToolNix z "
-            "https://mkvtoolnix.download/downloads.html#windows (instalátor nabízí "
-            "přidání do PATH), nebo použij --mkvmerge s plnou cestou k mkvmerge.exe "
-            "(obvykle C:\\Program Files\\MKVToolNix\\mkvmerge.exe). Používá se i pro "
-            "MP4 jen na výpis/identifikaci stop, samotnou extrakci z MP4 dělá ffmpeg."
+            "mkvmerge nenalezen a automatické stažení se nepodařilo / je vypnuté. "
+            "Stáhni a nainstaluj MKVToolNix z https://mkvtoolnix.download/downloads.html#windows "
+            "(instalátor nabízí přidání do PATH), nebo použij --mkvmerge s plnou cestou "
+            "k mkvmerge.exe (obvykle C:\\Program Files\\MKVToolNix\\mkvmerge.exe). Používá se "
+            "i pro MP4 jen na výpis/identifikaci stop, samotnou extrakci z MP4 dělá ffmpeg."
         )
-    mkvextract_bin = args.mkvextract or find_tool(["mkvextract", "mkvextract.exe"])
-    if need_sub_extraction and is_mkv_container and not mkvextract_bin:
+    if need_mkvextract and not mkvextract_bin:
         die(
-            "mkvextract nenalezen v PATH (potřebný pro extrakci titulků z .mkv/.webm). "
-            "Nainstaluj MKVToolNix nebo použij --mkvextract s plnou cestou k .exe."
+            "mkvextract nenalezen a automatické stažení se nepodařilo / je vypnuté "
+            "(potřebný pro extrakci titulků z .mkv/.webm). Nainstaluj MKVToolNix nebo "
+            "použij --mkvextract s plnou cestou k .exe."
         )
 
     ffmpeg_bin = None
