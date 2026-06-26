@@ -75,6 +75,100 @@ def lang_label(code3):
     return f"{code3} – {name}" if name else code3
 
 
+# Reverzní mapa pro odhad jazyka z názvu stopy ("English" -> eng).
+# Pár alternativ pro běžné rozšířené tvary.
+NAME_TO_LANG3 = {n.lower(): c for c, n in LANG_NAME.items() if c != "und"}
+NAME_TO_LANG3.update({
+    "english (sdh)": "eng", "english (cc)": "eng", "english (hi)": "eng",
+    "english forced": "eng",
+    "anglicky": "eng", "angličtina": "eng", "anglictina": "eng",
+    "czech (sdh)": "cze", "česky": "cze", "cesky": "cze", "čeština": "cze",
+    "cestina": "cze",
+    "slovensky": "slo", "slovenčina": "slo", "slovencina": "slo",
+    "deutsch": "ger", "německy": "ger", "nemecky": "ger",
+    "français": "fre", "francais": "fre", "francouzsky": "fre",
+    "español": "spa", "espanol": "spa", "španělsky": "spa", "spanelsky": "spa",
+    "italiano": "ita", "italsky": "ita",
+    "português": "por", "portugues": "por",
+    "nederlands": "dut", "polski": "pol", "polsky": "pol",
+    "русский": "rus", "rusky": "rus",
+    "日本語": "jpn", "japonsky": "jpn",
+    "한국어": "kor", "korejsky": "kor",
+    "中文": "chi", "čínsky": "chi", "cinsky": "chi",
+})
+
+_FLAG_SUFFIX_RE = re.compile(
+    r"\s*(\(?(forced|sdh|cc|hi|hearing impaired|forced display)\)?)\s*$", re.I)
+
+
+def strip_name_suffix(name):
+    """Odřízne koncové '(Forced)', '(SDH)' atd. – pro odhad jazyka i pro
+    rozhodnutí, jestli „smysluplný" název už je."""
+    if not name:
+        return ""
+    s = name.strip()
+    while True:
+        new = _FLAG_SUFFIX_RE.sub("", s).strip()
+        if new == s:
+            break
+        s = new
+    return s
+
+
+def guess_lang_from_name(name):
+    """Z názvu stopy ('English', 'Czech (Forced)', ...) odhadne 3-písm. kód
+    nebo vrátí None."""
+    if not name:
+        return None
+    base = strip_name_suffix(name).lower()
+    if not base:
+        return None
+    if base in NAME_TO_LANG3:
+        return NAME_TO_LANG3[base]
+    # 'English audio', 'Czech subtitles' – první slovo
+    first = base.split()[0]
+    return NAME_TO_LANG3.get(first)
+
+
+def annotate_metadata(track, force_names):
+    """K track dictu doplní `new_lang` a `new_name` (= cílový stav).
+
+    - Chybí jazyk (und) a název má rozpoznatelný jazyk -> doplní jazyk.
+    - Chybí název a jazyk známe -> doplní název podle LANG_NAME.
+    - force_names: i existující jméno přepíše podle jazyka (zachová
+      koncovku „(Forced)/(SDH)" pokud byla v původním názvu).
+    """
+    lang = track.get("lang") or "und"
+    name = track.get("name") or ""
+    new_lang = lang
+    new_name = name
+
+    if lang == "und":
+        guessed = guess_lang_from_name(name)
+        if guessed:
+            new_lang = guessed
+
+    eff_lang = new_lang if new_lang != "und" else lang
+    canonical = LANG_NAME.get(eff_lang) if eff_lang != "und" else None
+
+    if canonical:
+        if not name.strip():
+            new_name = canonical
+        elif force_names:
+            # zachovej koncovku (Forced)/(SDH) z původního názvu
+            m = _FLAG_SUFFIX_RE.search(name)
+            new_name = canonical + (m.group(0) if m else "")
+
+    track["new_lang"] = new_lang
+    track["new_name"] = new_name
+
+
+def metadata_change(track):
+    """(lang_zmena, name_zmena) – True/False."""
+    return (track["new_lang"] != (track.get("lang") or "und"),
+            (track["new_name"] or "") != (track.get("name") or ""))
+
+
 # =========================================================================== #
 #  Windows 10 CLI + barvy (colorama volitelně)
 # =========================================================================== #
@@ -381,7 +475,7 @@ def aggregate_langs(infos, kind):
     order = []
     for info in infos.values():
         for tr in info[kind]:
-            l = tr["lang"]
+            l = tr.get("new_lang") or tr["lang"]
             if l not in counts:
                 counts[l] = 0
                 order.append(l)
@@ -423,6 +517,8 @@ def compute_targets(tracks, choice):
     """Pro daný typ stop vrátí seznam (track, desired_default) nebo None=neměnit.
 
     choice: kanonický kód / 'keep' / 'none'.
+    Porovnává se podle nového (opraveného) jazyka, aby fungovalo i u stop,
+    kde byl jazyk und a odvodil se z názvu.
     """
     if choice == "keep":
         return None
@@ -432,7 +528,8 @@ def compute_targets(tracks, choice):
         if choice == "none":
             desired = False
         else:
-            match = (tr["lang"] == choice) and not first_done
+            eff_lang = tr.get("new_lang") or tr["lang"]
+            match = (eff_lang == choice) and not first_done
             if match:
                 first_done = True
             desired = match
@@ -480,15 +577,41 @@ def mp4_adjust(targets):
 # =========================================================================== #
 #  Aplikace
 # =========================================================================== #
-def apply_mkv(video, a_targets, s_targets):
+def _meta_edits_for_mkv(track):
+    """Vrátí mkvpropedit --set fragmenty pro opravu language/name dané stopy."""
     edits = []
+    lang_changed, name_changed = metadata_change(track)
+    if lang_changed:
+        edits += ["--set", f"language={track['new_lang']}"]
+    if name_changed:
+        if (track["new_name"] or "").strip():
+            edits += ["--set", f"name={track['new_name']}"]
+        else:
+            edits += ["--delete", "name"]
+    return edits
+
+
+def apply_mkv(video, info, a_targets, s_targets):
+    edits = []
+    # default flagy + případně oprava metadat (jeden --edit per stopa)
+    targets_map = {}
     for targets in (a_targets, s_targets):
         if targets is None:
             continue
         for tr, desired in targets:
-            if bool(desired) != bool(tr["default"]):
-                edits += ["--edit", f"track:{tr['sel']}",
-                          "--set", f"flag-default={1 if desired else 0}"]
+            targets_map[id(tr)] = desired
+
+    msg_parts = []
+    for kind in ("audio", "subs"):
+        for tr in info[kind]:
+            sets = []
+            desired = targets_map.get(id(tr))
+            if desired is not None and bool(desired) != bool(tr["default"]):
+                sets += ["--set", f"flag-default={1 if desired else 0}"]
+            sets += _meta_edits_for_mkv(tr)
+            if sets:
+                edits += ["--edit", f"track:{tr['sel']}"] + sets
+
     if not edits:
         return True, "beze změny"
     res = run_capture([MKVPROPEDIT, video] + edits)
@@ -498,9 +621,19 @@ def apply_mkv(video, a_targets, s_targets):
     return True, "ok"
 
 
-def apply_mp4(video, a_targets, s_targets):
-    if not targets_change_anything(a_targets) and \
-            not targets_change_anything(s_targets):
+def _info_has_meta_changes(info):
+    for kind in ("audio", "subs"):
+        for tr in info[kind]:
+            if any(metadata_change(tr)):
+                return True
+    return False
+
+
+def apply_mp4(video, info, a_targets, s_targets):
+    has_default = (targets_change_anything(a_targets)
+                   or targets_change_anything(s_targets))
+    has_meta = _info_has_meta_changes(info)
+    if not has_default and not has_meta:
         return True, "beze změny"
     disp = []
     for targets, t in ((a_targets, "a"), (s_targets, "s")):
@@ -512,10 +645,21 @@ def apply_mp4(video, a_targets, s_targets):
                 flags.append("default")
             if tr["forced"]:
                 flags.append("forced")
-            disp += [f"-disposition:{t}:{tr['rel']}", "+".join(flags) if flags else "0"]
+            disp += [f"-disposition:{t}:{tr['rel']}",
+                     "+".join(flags) if flags else "0"]
+    meta = []
+    for kind, t in (("audio", "a"), ("subs", "s")):
+        for tr in info[kind]:
+            lang_changed, name_changed = metadata_change(tr)
+            if lang_changed:
+                meta += [f"-metadata:s:{t}:{tr['rel']}",
+                         f"language={tr['new_lang']}"]
+            if name_changed:
+                meta += [f"-metadata:s:{t}:{tr['rel']}",
+                         f"title={tr['new_name']}"]
     tmp = video + ".deftmp.mp4"
-    cmd = ([FFMPEG, "-y", "-i", video, "-map", "0", "-c", "copy"] + disp
-           + ["-default_mode", "passthrough", tmp])
+    cmd = ([FFMPEG, "-y", "-i", video, "-map", "0", "-c", "copy"]
+           + disp + meta + ["-default_mode", "passthrough", tmp])
     res = run_capture(cmd)
     if res.returncode != 0 or not os.path.exists(tmp):
         if os.path.exists(tmp):
@@ -553,6 +697,11 @@ def main():
     p.add_argument("--ffmpeg", metavar="CESTA", help="Cesta k ffmpeg.")
     p.add_argument("--no-download", action="store_true",
                    help="Nestahovat ffmpeg pro MP4.")
+    p.add_argument("--no-fix-metadata", action="store_true",
+                   help="Nedoplňovat chybějící názvy stop a jazyky.")
+    p.add_argument("--force-names", action="store_true",
+                   help="Přepsat i existující názvy podle jazyka "
+                        "(koncovku 'Forced'/'SDH' zachová).")
     p.add_argument("--no-color", action="store_true", help="Vypnout barvy.")
     args = p.parse_args()
 
@@ -610,6 +759,19 @@ def main():
             continue
         try:
             infos[v] = probe_mkv(v) if is_mkv else probe_mp4(v)
+            if not args.no_fix_metadata:
+                for kind in ("audio", "subs"):
+                    for tr in infos[v][kind]:
+                        annotate_metadata(tr, args.force_names)
+                        # MP4/mov nezná „title" pro stopy – jen jazyk + handler_name.
+                        # Ten název ffmpeg stejně zahodí, takže ho ani nezkoušíme měnit.
+                        if not is_mkv:
+                            tr["new_name"] = tr["name"]
+            else:
+                for kind in ("audio", "subs"):
+                    for tr in infos[v][kind]:
+                        tr["new_lang"] = tr["lang"]
+                        tr["new_name"] = tr["name"]
         except Exception as e:
             print(f"{C.YELLOW}!  nelze přečíst {os.path.basename(v)}: {e}{C.RESET}")
     if not infos:
@@ -659,22 +821,43 @@ def main():
             a_t, la = mp4_adjust(a_t)
             s_t, ls = mp4_adjust(s_t)
             limited = la or ls
-        will = targets_change_anything(a_t) or targets_change_anything(s_t)
+        meta_fix = _info_has_meta_changes(info)
+        will = (targets_change_anything(a_t)
+                or targets_change_anything(s_t)
+                or meta_fix)
         if will:
             n_changes += 1
-        plans.append((v, a_t, s_t, will))
+        plans.append((v, info, a_t, s_t, will))
         head = f"{C.BOLD}{C.CYAN}# {os.path.basename(v)}{C.RESET}"
         if not will:
             head += f"  {C.DIM}(beze změny){C.RESET}"
         print(head)
         print(f"    {describe(a_t, audio_choice, 'audio')}")
         print(f"    {describe(s_t, sub_choice, 'titulky')}")
+        if meta_fix:
+            fixes = []
+            for kind, label in (("audio", "a"), ("subs", "s")):
+                for i, tr in enumerate(info[kind], 1):
+                    lc, nc = metadata_change(tr)
+                    if not (lc or nc):
+                        continue
+                    ref = tr.get("sel") or f"{label}{i}"
+                    bits = []
+                    if lc:
+                        bits.append(f"jazyk {tr['lang']}→{tr['new_lang']}")
+                    if nc:
+                        was = tr["name"] or "—"
+                        now = tr["new_name"] or "—"
+                        bits.append(f"název '{was}'→'{now}'")
+                    fixes.append(f"{ref}: " + ", ".join(bits))
+            if fixes:
+                print(f"    {C.CYAN}metadata:{C.RESET} " + "; ".join(fixes))
         if limited:
             print(f"    {C.DIM}(MP4: nelze mít nula výchozích stop – "
                   f"první stopa typu zůstává zapnutá){C.RESET}")
 
-    if audio_choice == "keep" and sub_choice == "keep":
-        print(f"\n{C.YELLOW}Nic nevybráno – konec.{C.RESET}")
+    if audio_choice == "keep" and sub_choice == "keep" and n_changes == 0:
+        print(f"\n{C.YELLOW}Nic ke změně.{C.RESET}")
         return
     if n_changes == 0:
         print(f"\n{C.GREEN}Vše už je nastaveno tak, jak chceš. Nic k provedení.{C.RESET}")
@@ -697,13 +880,13 @@ def main():
     # aplikace
     print()
     ok = 0
-    for v, a_t, s_t, will in plans:
+    for v, info, a_t, s_t, will in plans:
         if not will:
             continue
         is_mkv = v.lower().endswith(".mkv")
         print(f"{C.CYAN}>>{C.RESET} {os.path.basename(v)}")
-        success, msg = apply_mkv(v, a_t, s_t) if is_mkv \
-            else apply_mp4(v, a_t, s_t)
+        success, msg = apply_mkv(v, info, a_t, s_t) if is_mkv \
+            else apply_mp4(v, info, a_t, s_t)
         if success:
             ok += 1
             print(f"   {C.GREEN}OK{C.RESET} {C.DIM}({msg}){C.RESET}")
