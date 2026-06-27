@@ -471,23 +471,68 @@ def probe_mp4(video):
 #  Výběr jazyka
 # =========================================================================== #
 def aggregate_langs(infos, kind):
-    counts = {}
-    order = []
+    """Vrátí seznam položek (key, label, count) pro výběrové menu.
+
+    key je:
+      - string s jazykovým kódem ('cze') – když má jazyk napříč soubory
+        jediný název stopy (nebo všechny jsou prázdné),
+      - tuple (lang, name) – když má jazyk víc různých pojmenovaných stop
+        (např. 'Czech' vs 'Czech Viki'). Tím se dají rozlišit ve výběru.
+    """
+    pair_counts = {}     # (lang, name) -> count
+    pair_order = []      # pořadí prvního výskytu (lang, name)
+    lang_names = {}      # lang -> seznam názvů v pořadí výskytu
     for info in infos.values():
         for tr in info[kind]:
             l = tr.get("new_lang") or tr["lang"]
-            if l not in counts:
-                counts[l] = 0
-                order.append(l)
-            counts[l] += 1
-    return [(l, counts[l]) for l in order]
+            n = (tr.get("name") or "").strip()
+            key = (l, n)
+            if key not in pair_counts:
+                pair_counts[key] = 0
+                pair_order.append(key)
+            pair_counts[key] += 1
+            if l not in lang_names:
+                lang_names[l] = []
+            if n not in lang_names[l]:
+                lang_names[l].append(n)
+
+    result = []
+    emitted_langs = set()
+    for (l, _n) in pair_order:
+        if l in emitted_langs:
+            continue
+        emitted_langs.add(l)
+        names = lang_names[l]
+        if len(names) <= 1:
+            # jeden název (nebo všechny prázdné) – sloučit do jednoho řádku
+            total = sum(c for (ll, _), c in pair_counts.items() if ll == l)
+            result.append((l, lang_label(l), total))
+        else:
+            # víc různých názvů – nabídnout každý zvlášť
+            for name in names:
+                cnt = pair_counts[(l, name)]
+                disp = name if name else "(bez názvu)"
+                result.append(((l, name), f'{lang_label(l)} – „{disp}"', cnt))
+    return result
 
 
-def ask_choice(kind_label, langs, allow_none):
-    """Vrátí kanonický kód jazyka, 'keep' (beze změny) nebo 'none'."""
+def fmt_choice(choice):
+    """Hezky naformátuje volbu (string, tuple, 'keep', 'none') pro výpis."""
+    if choice == "keep":
+        return "beze změny"
+    if choice == "none":
+        return "žádný výchozí"
+    if isinstance(choice, tuple):
+        l, n = choice
+        return f'{l} – „{n}"' if n else l
+    return choice
+
+
+def ask_choice(kind_label, entries, allow_none):
+    """Vrátí klíč zvolené položky (string nebo tuple), 'keep' nebo 'none'."""
     print(f"\n{C.BOLD}{kind_label}:{C.RESET}")
-    for i, (l, n) in enumerate(langs, 1):
-        print(f"  {C.CYAN}[{i}]{C.RESET} {lang_label(l)}  ({n}×)")
+    for i, (_key, label, n) in enumerate(entries, 1):
+        print(f"  {C.CYAN}[{i}]{C.RESET} {label}  ({n}×)")
     print(f"  {C.CYAN}[0]{C.RESET} nechat beze změny")
     if allow_none:
         print(f"  {C.CYAN}[z]{C.RESET} zrušit všechny (žádný výchozí)")
@@ -501,12 +546,13 @@ def ask_choice(kind_label, langs, allow_none):
             return "keep"
         if allow_none and ans == "z":
             return "none"
-        if ans.isdigit() and 1 <= int(ans) <= len(langs):
-            return langs[int(ans) - 1][0]
-        # i kód jazyka napsaný ručně
+        if ans.isdigit() and 1 <= int(ans) <= len(entries):
+            return entries[int(ans) - 1][0]
+        # i kód jazyka napsaný ručně – pokud existuje jako lang-only položka
         cc = canon(ans)
-        if cc in [l for l, _ in langs]:
-            return cc
+        for key, _label, _n in entries:
+            if isinstance(key, str) and key == cc:
+                return key
         print(f"  {C.YELLOW}Neplatná volba, zkus to znovu.{C.RESET}")
 
 
@@ -516,12 +562,16 @@ def ask_choice(kind_label, langs, allow_none):
 def compute_targets(tracks, choice):
     """Pro daný typ stop vrátí seznam (track, desired_default) nebo None=neměnit.
 
-    choice: kanonický kód / 'keep' / 'none'.
-    Porovnává se podle nového (opraveného) jazyka, aby fungovalo i u stop,
-    kde byl jazyk und a odvodil se z názvu.
+    choice: 'keep' / 'none' / kanonický kód jazyka / tuple (lang, name).
+    Když je choice tuple, matchuje se jazyk + (původní) název stopy
+    – tak se dají odlišit dvě stopy stejného jazyka s různým názvem.
     """
     if choice == "keep":
         return None
+    if isinstance(choice, tuple):
+        choice_lang, choice_name = choice
+    else:
+        choice_lang, choice_name = choice, None  # None = nezáleží na názvu
     targets = []
     first_done = False
     for tr in tracks:
@@ -529,7 +579,10 @@ def compute_targets(tracks, choice):
             desired = False
         else:
             eff_lang = tr.get("new_lang") or tr["lang"]
-            match = (eff_lang == choice) and not first_done
+            tr_name = (tr.get("name") or "").strip()
+            lang_ok = (eff_lang == choice_lang)
+            name_ok = (choice_name is None) or (tr_name == choice_name)
+            match = lang_ok and name_ok and not first_done
             if match:
                 first_done = True
             desired = match
@@ -549,7 +602,8 @@ def describe(targets, chosen, kind):
     elif chosen == "none":
         parts.append(f"{C.YELLOW}vše vyčištěno{C.RESET}")
     else:
-        parts.append(f"{C.YELLOW}jazyk {chosen} není – vyčištěno, bez výchozího{C.RESET}")
+        parts.append(f"{C.YELLOW}jazyk {fmt_choice(chosen)} není – "
+                     f"vyčištěno, bez výchozího{C.RESET}")
     cleared = [t for t, d in targets if not d and t["default"]]
     if cleared:
         refs = ", ".join((t.get("sel") or f"#{t.get('rel')}") for t in cleared)
@@ -781,11 +835,19 @@ def main():
     audio_langs = aggregate_langs(infos, "audio")
     sub_langs = aggregate_langs(infos, "subs")
 
+    def _summary(entries):
+        bits = []
+        for key, _label, n in entries:
+            if isinstance(key, tuple):
+                l, name = key
+                bits.append(f'{l}/„{name}"({n})' if name else f"{l}({n})")
+            else:
+                bits.append(f"{key}({n})")
+        return ", ".join(bits) or "—"
+
     print(f"{C.BOLD}Souborů ke zpracování: {len(infos)}{C.RESET}")
-    print(f"  audio jazyky:   " +
-          (", ".join(f"{l}({n})" for l, n in audio_langs) or "—"))
-    print(f"  titulkové jaz.: " +
-          (", ".join(f"{l}({n})" for l, n in sub_langs) or "—"))
+    print(f"  audio jazyky:   " + _summary(audio_langs))
+    print(f"  titulkové jaz.: " + _summary(sub_langs))
 
     # výběr audia
     if args.audio_lang:
@@ -806,8 +868,8 @@ def main():
         sub_choice = "keep"
 
     print(f"\n{C.BOLD}Volba:{C.RESET} audio = "
-          f"{C.GREEN}{audio_choice}{C.RESET}, titulky = "
-          f"{C.GREEN}{sub_choice}{C.RESET}\n")
+          f"{C.GREEN}{fmt_choice(audio_choice)}{C.RESET}, titulky = "
+          f"{C.GREEN}{fmt_choice(sub_choice)}{C.RESET}\n")
 
     # plán
     plans = []
