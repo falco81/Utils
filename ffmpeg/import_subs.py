@@ -203,6 +203,48 @@ def parse_sub_meta(sub_name, forced_lang=None):
     return lang3, name, forced
 
 
+def collect_track_names(pairs, forced_lang):
+    """Interaktivně se zeptá na název stopy pro každou unikátní kombinaci
+    (jazyk, forced, SDH). Vrátí dict: (lang3, forced, sdh) -> název.
+
+    Ptá se jen jednou na danou kombinaci – u 10 epizod se stejnými titulky
+    není potřeba 10krát potvrzovat 'Czech'.
+    """
+    seen = {}  # zachová pořadí, ve kterém se objevily
+    for v in sorted(pairs):
+        for s in pairs[v]:
+            lang3, name, forced = parse_sub_meta(
+                os.path.basename(s), forced_lang)
+            sdh = "(SDH)" in name
+            key = (lang3, forced, sdh)
+            if key not in seen:
+                seen[key] = name
+
+    if not seen:
+        return {}
+
+    print(f"\n{C.BOLD}Názvy stop titulků v MKV{C.RESET}")
+    print(f"{C.DIM}(Enter = ponechat výchozí, nebo napiš vlastní "
+          f"název){C.RESET}\n")
+    mapping = {}
+    for key, default_name in seen.items():
+        lang3, forced, sdh = key
+        tag_parts = [lang3]
+        if forced:
+            tag_parts.append("forced")
+        if sdh:
+            tag_parts.append("SDH")
+        tag = "/".join(tag_parts)
+        prompt = f"  {tag} [{C.CYAN}{default_name}{C.RESET}]: "
+        try:
+            user_input = input(prompt).strip()
+        except EOFError:
+            user_input = ""
+        mapping[key] = user_input if user_input else default_name
+    print()
+    return mapping
+
+
 def existing_subtitle_ids(video):
     try:
         out = run_capture([MKVMERGE, "-J", video]).stdout
@@ -229,12 +271,18 @@ def collect(directory, recursive):
 
 
 def build_mkvmerge_cmd(video, sub_list, out_path, set_default,
-                       default_lang, name_override, forced_lang):
+                       default_lang, name_override, forced_lang,
+                       name_map=None):
     metas = []
     for s in sub_list:
         lang3, name, forced = parse_sub_meta(os.path.basename(s), forced_lang)
         if name_override:
             name = name_override
+        elif name_map:
+            sdh = "(SDH)" in name
+            key = (lang3, forced, sdh)
+            if key in name_map:
+                name = name_map[key]
         metas.append((s, lang3, name, forced))
 
     chosen = None
@@ -281,6 +329,9 @@ def main():
                    help="Přepsat originál (jinak zapíše do podsložky 'muxed').")
     p.add_argument("--name", metavar="NAZEV",
                    help="Vlastní název stopy místo automatického.")
+    p.add_argument("--ask-name", action="store_true",
+                   help="Interaktivně se zeptat na název stopy pro každou "
+                        "unikátní kombinaci jazyka (a forced/SDH).")
     p.add_argument("--lang", metavar="KOD",
                    help="Vynutit jazyk, když ho v názvu titulku není.")
     p.add_argument("--mkvmerge", metavar="CESTA",
@@ -339,6 +390,10 @@ def main():
         print("\nNic ke zpracování.")
         return
 
+    name_map = None
+    if args.ask_name and not args.name:
+        name_map = collect_track_names(pairs, args.lang)
+
     jobs = []
     for v in sorted(pairs):
         sub_list = pairs[v]
@@ -351,7 +406,8 @@ def main():
             final = os.path.join(vdir, "muxed", vstem + ".mkv")
             out_path = final
         cmd = build_mkvmerge_cmd(v, sub_list, out_path, args.default,
-                                 args.default_lang, args.name, args.lang)
+                                 args.default_lang, args.name, args.lang,
+                                 name_map=name_map)
         jobs.append((v, sub_list, cmd, out_path, final))
 
     print(f"Naplánováno videí ke zpracování: {C.BOLD}{len(jobs)}{C.RESET}\n")
