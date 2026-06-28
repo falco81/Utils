@@ -81,8 +81,43 @@ jako u nástrojů typu ffsubsync, ale na hrubé/jemné dosazení časování
 podle dialogů to obvykle funguje dobře. Tichá hudba/efekty bez dialogu
 mohou výjimečně VAD zmást - proto je k dispozici i kombinovaný režim.
 
-Tento postup je jazykově nezávislý (nepoužívá text, jen časování), takže
-funguje i mezi různými jazyky a u jinak rozdělených řádků.
+Dvě metody dopočtu časování (přepínač --method)
+-----------------------------------------------
+- "affine" = výše popsaný postup: JEDEN globální vztah nový_čas = a*čas + b
+  (posun + případná změna rychlosti/FPS). Jazykově nezávislý (jen časování),
+  funguje i mezi různými jazyky i jen ze zvuku (VAD). Neumí ale opravit
+  ROZSYNC PO ČÁSTECH (když různé úseky epizody potřebují různý posun).
+- "warp" = obsahová synchronizace PO VĚTÁCH. Spáruje konkrétní české/cizí
+  věty mezi opravovanými a referenčními titulky (podle textu - znakové
+  3-gramy + sdílená jména/čísla), z jistých dvojic ("kotev") postaví po
+  ČÁSTECH lineární časovou mapu a podle ní přesune každý titulek. Tím
+  spraví i blokový/postupný rozsync a jemné ujíždění v jednotlivých
+  scénách. Vyžaduje TEXTOVOU referenční stopu (ze zvuku samotného ne).
+- "auto" (default) = "combo", když je k dispozici textová referenční stopa a
+  najde se dost spolehlivých kotev; jinak se bezpečně vrátí k "affine".
+- "combo" = afinní předsrovnání + warp doladění po větách. Nejrobustnější:
+  afinní fáze srovná global/rychlost (i když je textových kotev málo), warp
+  pak dolaďuje po částech tam, kde má jisté kotvy. Doporučené pro přesnost.
+
+Různé jazyky (--translate)
+--------------------------
+Různé jazyky (--translate) + detekce jazyka z OBSAHU
+----------------------------------------------------
+Skript umí REÁLNĚ detekovat jazyk z obsahu titulků (ne podle přípon/tagů;
+přes 'langdetect', pokud je nainstalován, jinak vestavěným detektorem pro
+cs/sk/pl/en/de/fr/es/it/pt/nl/ru/uk/hu...). V interaktivních režimech --auto
+a --auto-all proto sám pozná, jestli jsou opravované a referenční titulky v
+jiných jazycích, a teprve pak nabídne překlad.
+
+Metoda "warp" porovnává TEXT, takže nejlíp funguje, když jsou obojí titulky
+ve stejném jazyce (dva překlady téhož). Když jsou v RŮZNÝCH jazycích, zapni
+--translate google (online) nebo --translate argos (offline): obě strany se
+JEN PRO PÁROVÁNÍ přeloží do společného jazyka (--pivot-lang, default 'en') a
+teprve překlady se porovnávají. Výstupní text se nepřekládá. Překlady se
+kešují na disk. Bez --translate se různé jazyky bezpečně dopočítají afinní
+metodou (která je jazykově nezávislá, jen neumí rozsync po částech).
+
+Obě metody mění POUZE časování, text titulků se nikdy nemění.
 
 Použití
 -------
@@ -799,6 +834,592 @@ def apply_transform(events, scale, offset):
     return out
 
 
+# ----------------------------------------------------------------------
+# Obsahová synchronizace "warp" - po jednotlivých větách (metoda --method warp)
+# ----------------------------------------------------------------------
+#
+# Afinní metoda výše umí jen JEDEN globální vztah a*t+b pro celou epizodu.
+# To selže, když je rozsync po ČÁSTECH (různé úseky potřebují různý posun -
+# typicky když je reklamní/blokové dělení jinde, nebo když původní titulky
+# "ujíždějí" jen v některých scénách). Tahle metoda místo toho:
+#   1. Spáruje konkrétní VĚTY mezi opravovanými a referenčními titulky
+#      (podle textu - znakové 3-gramy + sdílená jména/čísla, jazykově odolné).
+#   2. Důvěřuje JEN jistým, výrazným a jednoznačným dvojicím ("kotvám").
+#      Krátké generické řádky ("Ano.", "Co?") se nikdy nepárují podle textu -
+#      ty by se trefily kamkoli; dopočítají se mezi kotvami.
+#   3. Z kotev postaví po částech lineární časovou mapu a podle ní přesune
+#      VŠECHNY titulky; navíc jemně "došťouchne" řádky k odpovídající
+#      referenční větě, ale jen v okně pár sekund (nemůže teleportovat).
+# Text se NIKDY nemění, mění se jen časy. Vyžaduje TEXTOVOU referenci
+# (titulkovou stopu) - u --audio-mode replace (jen VAD) text není, takže
+# se v "auto" automaticky použije afinní metoda.
+
+import bisect as _bisect
+import unicodedata as _unicodedata
+from collections import Counter as _Counter
+
+CA_DEFAULTS = dict(
+    coarse_len=20, coarse_sim=0.55, coarse_margin=0.15,   # hrubá globální fáze
+    band=45.0, min_len=12, min_sim=0.50, margin=0.10,     # jemná fáze (s)
+    snap_win=3.0, snap_sim=0.30,                          # lokální došťouchnutí (s)
+    min_dur=0.35,                                         # min. délka titulku (s)
+)
+
+
+def _ca_normalize(text):
+    s = "".join(c for c in _unicodedata.normalize("NFKD", text)
+                if not _unicodedata.combining(c)).lower()
+    s = re.sub(r"[^0-9a-z\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _ca_grams(s, n=3):
+    s = "\u2581" + s.replace(" ", "\u2581") + "\u2581"
+    return _Counter(s[i:i + n] for i in range(len(s) - n + 1))
+
+
+def _ca_distinctive(norm_text):
+    return set(w for w in norm_text.split() if len(w) >= 4) | \
+           set(re.findall(r"\d+", norm_text))
+
+
+def _ca_prepare(events, sim_texts=None):
+    """Vrátí kopie eventů s předpočítanými poli pro porovnávání textu.
+    sim_texts (volitelně) = paralelní seznam textů použitých MÍSTO ev['text']
+    pro VÝPOČET PODOBNOSTI (např. strojový překlad do společného jazyka).
+    Výstupní 'text' (a tedy i uložené titulky) zůstává vždy původní."""
+    out = []
+    for idx, ev in enumerate(events):
+        sim_src = sim_texts[idx] if sim_texts is not None else ev["text"]
+        n = _ca_normalize(sim_src)
+        g = _ca_grams(n)
+        out.append({
+            "start": ev["start"], "end": ev["end"], "text": ev["text"],
+            "_n": n, "_g": g,
+            "_gn": (sum(v * v for v in g.values()) ** 0.5) or 1.0,
+            "_tk": _ca_distinctive(n),
+            "_music": ("\u266a" in ev["text"] or "\u266b" in ev["text"] or "\u2669" in ev["text"]),
+        })
+    return out
+
+
+def _ca_sim(a, b):
+    g1, g2 = a["_g"], b["_g"]
+    if len(g1) > len(g2):
+        g1, g2 = g2, g1
+    dot = sum(c * g2[k] for k, c in g1.items() if k in g2)
+    cos = dot / (a["_gn"] * b["_gn"])
+    return min(1.0, cos + min(0.25, 0.08 * len(a["_tk"] & b["_tk"])))
+
+
+def _ca_combined(texts):
+    n = " ".join(_ca_normalize(t) for t in texts)
+    g = _ca_grams(n)
+    return {"_n": n, "_g": g, "_gn": (sum(v * v for v in g.values()) ** 0.5) or 1.0,
+            "_tk": _ca_distinctive(n)}
+
+
+def _ca_lis(pairs):
+    """Nejdelší ostře rostoucí podposloupnost v j - vynutí monotónní pořadí kotev."""
+    if not pairs:
+        return []
+    js = [p[1] for p in pairs]
+    tails, tails_idx, parent = [], [], [-1] * len(pairs)
+    for k, jv in enumerate(js):
+        pos = _bisect.bisect_left(tails, jv)
+        if pos == len(tails):
+            tails.append(jv); tails_idx.append(k)
+        else:
+            tails[pos] = jv; tails_idx[pos] = k
+        parent[k] = tails_idx[pos - 1] if pos > 0 else -1
+    seq, k = [], (tails_idx[-1] if tails_idx else -1)
+    while k != -1:
+        seq.append(k); k = parent[k]
+    seq.reverse()
+    return [pairs[k] for k in seq]
+
+
+def _ca_find_anchors(S, O, band, min_len, min_sim, margin, prior=None):
+    """Jisté dvojice (cíl_i -> ref_j). prior=warp -> hledá kolem predikce,
+    jinak globálně (hrubá fáze, zvládne i rozsync o minuty)."""
+    m = len(O)
+    ostart = [o["start"] for o in O]
+    raw = []
+    for i, c in enumerate(S):
+        if len(c["_n"]) < min_len:
+            continue
+        if prior is not None:
+            centre = prior(c["start"])
+            lo = _bisect.bisect_left(ostart, centre - band)
+            hi = _bisect.bisect_right(ostart, centre + band)
+            rng = range(lo, hi)
+        else:
+            rng = range(m)
+        best, second = (-1.0, -1), -1.0
+        for j in rng:
+            sc = _ca_sim(c, O[j])
+            if sc > best[0]:
+                second = best[0]; best = (sc, j)
+            elif sc > second:
+                second = sc
+        if best[1] >= 0 and best[0] >= min_sim and (best[0] - max(second, 0.0)) >= margin:
+            raw.append((i, best[1], best[0]))
+    return _ca_lis(raw)
+
+
+def _ca_build_warp(S, O, anchors):
+    pts = sorted({(S[i]["start"], O[j]["start"]) for i, j, _ in anchors})
+    if not pts:
+        return (lambda t: t)
+    xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
+
+    def warp(t):
+        if t <= xs[0]:
+            return t + (ys[0] - xs[0])
+        if t >= xs[-1]:
+            return t + (ys[-1] - xs[-1])
+        k = _bisect.bisect_right(xs, t) - 1
+        x0, x1, y0, y1 = xs[k], xs[k + 1], ys[k], ys[k + 1]
+        return y0 if x1 == x0 else y0 + (t - x0) / (x1 - x0) * (y1 - y0)
+    return warp
+
+
+def _ca_iou(corrected, ref_events):
+    """Intersection-over-union dvou časových os (0..1, vyšší = lepší)."""
+    def merge(iv):
+        iv = sorted(iv); tot = 0.0; cs = ce = None
+        for s, e in iv:
+            if cs is None:
+                cs, ce = s, e
+            elif s <= ce:
+                ce = max(ce, e)
+            else:
+                tot += ce - cs; cs, ce = s, e
+        if cs is not None:
+            tot += ce - cs
+        return tot
+    A = sorted((e["start"], e["end"]) for e in corrected)
+    B = sorted((e["start"], e["end"]) for e in ref_events)
+    inter = 0.0; j = 0
+    for s, e in A:
+        while j < len(B) and B[j][1] < s:
+            j += 1
+        k = j
+        while k < len(B) and B[k][0] < e:
+            inter += max(0.0, min(e, B[k][1]) - max(s, B[k][0])); k += 1
+    uni = merge(A) + merge(B) - inter
+    return inter / uni if uni else 0.0
+
+
+def warp_align(ref_events, target_events, cfg=None, ref_sim_texts=None, target_sim_texts=None):
+    """
+    Obsahová (po větách) synchronizace. ref_events musí mít TEXT.
+    ref_sim_texts / target_sim_texts (volitelně) = texty pro VÝPOČET podobnosti
+    (typicky strojový překlad obou stran do společného jazyka), aby to fungovalo
+    i mezi RŮZNÝMI jazyky. Výstupní text titulků se nikdy nemění - jen časování.
+    Vrací (corrected_events, stats).
+    """
+    cfg = dict(CA_DEFAULTS, **(cfg or {}))
+    S = _ca_prepare(target_events, sim_texts=target_sim_texts)
+    O = _ca_prepare(ref_events, sim_texts=ref_sim_texts)
+    n, m = len(S), len(O)
+    ostart = [o["start"] for o in O]
+
+    # 1) hrubé globální kotvy -> hrubá mapa
+    coarse = _ca_find_anchors(S, O, band=10 ** 9,
+                              min_len=cfg["coarse_len"], min_sim=cfg["coarse_sim"],
+                              margin=cfg["coarse_margin"], prior=None)
+    warp0 = _ca_build_warp(S, O, coarse)
+    # 2) jemné kotvy kolem hrubé predikce
+    anchors = _ca_find_anchors(S, O, band=cfg["band"],
+                               min_len=cfg["min_len"], min_sim=cfg["min_sim"],
+                               margin=cfg["margin"], prior=warp0)
+    if len(anchors) < len(coarse):
+        anchors = coarse
+    warp = _ca_build_warp(S, O, anchors)
+    amap = {i: j for i, j, _ in anchors}
+
+    out = [None] * n; snapj = [None] * n; used_prev = -1
+    for i in range(n):
+        if i in amap:
+            j = amap[i]; out[i] = [O[j]["start"], O[j]["end"]]; snapj[i] = j; used_prev = j; continue
+        tw, twe = warp(S[i]["start"]), warp(S[i]["end"])
+        if not S[i]["_music"]:
+            lo = _bisect.bisect_left(ostart, tw - cfg["snap_win"])
+            hi = _bisect.bisect_right(ostart, tw + cfg["snap_win"])
+            best = (-1.0, -1)
+            for j in range(lo, hi):
+                sc = _ca_sim(S[i], O[j])
+                if sc > best[0]:
+                    best = (sc, j)
+            if best[1] >= 0 and best[0] >= cfg["snap_sim"] and best[1] != used_prev:
+                j = best[1]; out[i] = [O[j]["start"], O[j]["end"]]; snapj[i] = j; used_prev = j; continue
+        out[i] = [tw, twe]; snapj[i] = None
+
+    # 3) podělit běhy více cílových titulků, které spadly do JEDNÉ ref věty
+    i = 0
+    while i < n:
+        j = snapj[i]
+        if j is None:
+            i += 1; continue
+        k = i
+        while k + 1 < n and snapj[k + 1] == j:
+            k += 1
+        if k > i:
+            s, e = O[j]["start"], O[j]["end"]
+            tot = sum(max(1, len(S[t]["text"])) for t in range(i, k + 1)); acc = 0
+            for t in range(i, k + 1):
+                w = max(1, len(S[t]["text"]))
+                st = s + (e - s) * acc / tot; acc += w
+                out[t] = [st, s + (e - s) * acc / tot]
+        i = k + 1
+
+    # 4) monotónní začátky, min. délka, žádné překryvy
+    MIN = cfg["min_dur"]
+    for i in range(n):
+        if i > 0 and out[i][0] < out[i - 1][0]:
+            out[i][0] = out[i - 1][0]
+        if out[i][1] < out[i][0] + MIN:
+            out[i][1] = out[i][0] + MIN
+    for i in range(n - 1):
+        if out[i][1] > out[i + 1][0]:
+            if out[i + 1][0] > out[i][0] + MIN:
+                out[i][1] = out[i + 1][0]
+            else:
+                mid = (out[i][0] + out[i + 1][1]) / 2.0
+                out[i][1] = max(out[i][0] + MIN, min(out[i][1], mid))
+                if out[i + 1][0] < out[i][1]:
+                    out[i + 1][0] = out[i][1]
+                if out[i + 1][1] < out[i + 1][0] + MIN:
+                    out[i + 1][1] = out[i + 1][0] + MIN
+
+    corrected = [{"start": out[i][0], "end": out[i][1], "text": target_events[i]["text"]}
+                 for i in range(n)]
+    # záruka: text a pořadí beze změny
+    assert [e["text"] for e in corrected] == [e["text"] for e in target_events], \
+        "warp_align: text se nesmí změnit!"
+    stats = {"anchors": len(anchors), "iou": _ca_iou(corrected, ref_events)}
+    return corrected, stats
+
+
+# ----------------------------------------------------------------------
+# Strojový překlad pro mezijazyčné párování (jen pro VÝPOČET podobnosti)
+# ----------------------------------------------------------------------
+#
+# Když jsou opravované a referenční titulky v RŮZNÝCH jazycích, textová
+# podobnost (znakové 3-gramy) sama nestačí. Řešení: obě strany se pro účely
+# PÁROVÁNÍ přeloží do společného jazyka (pivot, default angličtina) a teprve
+# přeložené texty se porovnávají. Výstupní titulky se NEPŘEKLÁDAJÍ - mění se
+# jen časování, původní text zůstává. Překlady se kešují na disk (dedup +
+# cache), takže další běhy jsou rychlé a šetří se volání služby.
+
+_TRANSLATE_CACHE = None
+_TRANSLATE_CACHE_PATH = None
+
+
+def _translate_cache_load(path):
+    global _TRANSLATE_CACHE, _TRANSLATE_CACHE_PATH
+    _TRANSLATE_CACHE_PATH = path
+    if _TRANSLATE_CACHE is not None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            _TRANSLATE_CACHE = json.load(f)
+    except Exception:
+        _TRANSLATE_CACHE = {}
+
+
+def _translate_cache_save():
+    if _TRANSLATE_CACHE_PATH is None or _TRANSLATE_CACHE is None:
+        return
+    try:
+        with open(_TRANSLATE_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_TRANSLATE_CACHE, f, ensure_ascii=False)
+    except Exception as e:
+        log_warn(f"Nepodařilo se uložit cache překladů: {e}")
+
+
+def _call_with_timeout(fn, timeout):
+    """Spustí fn() s časovým limitem. Vrací (výsledek, chyba). Při překročení
+    limitu vrací (None, TimeoutError) a nechá vlákno doběžet na pozadí (daemon),
+    aby zaseknutý síťový požadavek nezablokoval celý běh."""
+    import threading
+    box = {}
+
+    def run():
+        try:
+            box["r"] = fn()
+        except Exception as e:  # noqa: BLE001
+            box["e"] = e
+    th = threading.Thread(target=run, daemon=True)
+    th.start()
+    th.join(timeout)
+    if th.is_alive():
+        return None, TimeoutError("timeout")
+    return box.get("r"), box.get("e")
+
+
+def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=None):
+    """Vrátí funkci translate_list(list[str]) -> list[str], která přeloží texty
+    do pivot_lang. Dedup + disková cache. Vrací None, pokud zvolený překladač
+    není k dispozici. Podporuje 'google'/'argos' (zdarma), 'deepl' (API klíč)
+    a 'claude' (Anthropic API klíč)."""
+    if engine in (None, "off"):
+        return None
+    if cache_path is None:
+        cache_path = os.path.join(_cache_dir(".translate_cache"), f"{engine}_{pivot_lang}.json")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    _translate_cache_load(cache_path)
+
+    backend = None
+    if engine == "google":
+        try:
+            from deep_translator import GoogleTranslator
+        except ImportError:
+            log_warn("Pro --translate google chybí balíček 'deep-translator'. "
+                     "Nainstaluj: pip install deep-translator. Pokračuji bez překladu.")
+            return None
+        gt = GoogleTranslator(source="auto", target=pivot_lang)
+
+        def backend(batch):
+            try:
+                res = gt.translate_batch(batch)
+                if isinstance(res, list) and len(res) == len(batch):
+                    return [r if isinstance(r, str) and r else None for r in res]
+            except Exception:
+                pass
+            # po jednom (robustnější vůči chybě v jedné položce); None = selhalo
+            res = []
+            for t in batch:
+                try:
+                    r = gt.translate(t)
+                    res.append(r if isinstance(r, str) and r else None)
+                except Exception:
+                    res.append(None)
+            return res
+
+    elif engine == "deepl":
+        if not api_key:
+            log_warn("Pro --translate deepl chybí API klíč (--deepl-key nebo proměnná "
+                     "DEEPL_API_KEY). Pokračuji bez DeepL.")
+            return None
+        try:
+            from deep_translator import DeeplTranslator
+        except ImportError:
+            log_warn("Pro DeepL chybí balíček 'deep-translator'. "
+                     "Nainstaluj: pip install deep-translator. Pokračuji bez DeepL.")
+            return None
+        try:
+            dt = DeeplTranslator(api_key=api_key, source="auto", target=pivot_lang, use_free_api=True)
+        except Exception as e:
+            log_warn(f"DeepL se nepodařilo inicializovat: {e}")
+            return None
+
+        def backend(batch):
+            res = []
+            for t in batch:
+                try:
+                    r = dt.translate(t)
+                    res.append(r if isinstance(r, str) and r else None)
+                except Exception:
+                    res.append(None)
+            return res
+
+    elif engine == "argos":
+        try:
+            import argostranslate.translate as _at  # noqa: F401
+        except ImportError:
+            log_warn("Pro --translate argos chybí balíček 'argostranslate' "
+                     "(offline překlad). Nainstaluj: pip install argostranslate. "
+                     "Pokračuji bez překladu.")
+            return None
+        try:
+            import langdetect  # noqa: F401
+            from langdetect import detect as _detect
+        except ImportError:
+            log_warn("Offline překlad (argos) potřebuje i 'langdetect' pro detekci "
+                     "zdrojového jazyka: pip install langdetect. Pokračuji bez překladu.")
+            return None
+
+        def backend(batch):
+            import argostranslate.translate as at
+            res = []
+            for t in batch:
+                try:
+                    src = _detect(t)
+                    res.append(t if src == pivot_lang else at.translate(t, src, pivot_lang))
+                except Exception:
+                    res.append(None)
+            return res
+
+    elif engine == "claude":
+        if not api_key:
+            log_warn("Pro překlad přes Claude chybí Anthropic API klíč "
+                     "(--anthropic-key nebo ANTHROPIC_API_KEY). Pokračuji bez Claude.")
+            return None
+        cl_model = model or "claude-sonnet-4-6"
+
+        def backend(batch):
+            res = anthropic_translate_batch(batch, pivot_lang, api_key, cl_model)
+            if not isinstance(res, list) or len(res) != len(batch):
+                return [None] * len(batch)
+            return res
+    else:
+        return None
+
+    def translate_list(texts):
+        key_prefix = f"{engine}|{pivot_lang}|"
+        # co chybí v cache (dedup podle unikátního textu)
+        uniq = []
+        seen = set()
+        for t in texts:
+            kt = t.strip()
+            if kt and (key_prefix + kt) not in _TRANSLATE_CACHE and kt not in seen:
+                seen.add(kt); uniq.append(kt)
+        if uniq:
+            total = len(uniq)
+            CH = 25 if engine in ("google", "deepl", "claude") else 50
+            timeout = 90
+            log_info(f"Překládám {total} unikátních řádků do '{pivot_lang}' ({engine})... "
+                     f"(může chvíli trvat; průběh níže, výsledky se průběžně kešují)")
+            done = 0
+            failed = 0
+            for i in range(0, total, CH):
+                chunk = uniq[i:i + CH]
+                outs, err = _call_with_timeout(lambda c=chunk: backend(c), timeout)
+                if outs is None:
+                    log_warn(f"\nPřekladač neodpověděl do {timeout}s u bloku "
+                             f"{i // CH + 1} - přeskakuji (řádky zůstanou v originále).")
+                    outs = [None] * len(chunk)
+                if not isinstance(outs, list) or len(outs) != len(chunk):
+                    outs = [None] * len(chunk)
+                for src, dst in zip(chunk, outs):
+                    if isinstance(dst, str) and dst:
+                        _TRANSLATE_CACHE[key_prefix + src] = dst   # cachuj jen úspěch
+                    else:
+                        failed += 1
+                done += len(chunk)
+                _translate_cache_save()                      # průběžně -> lze přerušit a navázat
+                pct = int(done * 100 / total)
+                print(f"\r  překlad: {done}/{total} ({pct}%)" + (f", selhalo {failed}" if failed else ""),
+                      end="", flush=True)
+            print()  # nový řádek po průběhu
+            if failed:
+                log_warn(f"Překlad selhal u {failed}/{done} řádků (síť/limit?) - "
+                         "ty zůstanou v originále (nekešují se). U hodně selhání zkontroluj "
+                         "připojení/klíč, nebo zkus jiný překladač (DeepL/Claude/argos).")
+            else:
+                log_info(f"Přeloženo a uloženo do cache ({done} řádků).")
+        # poskládat výstup (klíč chybí = ponech originál)
+        return [_TRANSLATE_CACHE.get(key_prefix + t.strip(), t) for t in texts]
+
+    return translate_list
+
+
+def run_alignment(args, ref_events, ref_events_sub, target_events):
+    """Vybere a spustí metodu synchronizace; vrací opravené titulky (events).
+    method:
+      'affine' - globální a*t+b (jazykově nezávislé, i ze zvuku),
+      'warp'   - po větách (textová reference; opraví i rozsync po částech),
+      'combo'  - afinní předsrovnání + warp doladění (nejrobustnější),
+      'auto'   - combo když je textová reference a dost kotev, jinak affine."""
+    method = getattr(args, "method", "auto")
+    have_text_ref = bool(ref_events_sub)
+
+    def affine_core(targets):
+        shift = coarse_offset(ref_events, targets, max_shift=args.max_shift)
+        scale, offset, n_matched = refine_affine(ref_events, targets, shift, tolerance=args.tolerance)
+        return apply_transform(targets, scale, offset), scale, offset, n_matched
+
+    def do_affine():
+        log_info("Metoda: afinní (globální posun + rychlost).")
+        log_info("Hledám hrubý časový posun (FFT křížová korelace)...")
+        corrected, scale, offset, n_matched = affine_core(target_events)
+        log_info(f"Výsledná transformace: nový_čas = {scale:.6f} * starý_čas + {offset:+.3f}")
+        log_info(f"Spárováno {n_matched} z {len(ref_events)} referenčních kotev pro zpřesnění")
+        if abs(scale - 1.0) > 0.05:
+            log_warn("Velký rozdíl v rychlosti (>5%) - možná jiný framerate zdrojů, zkontroluj výsledek.")
+        return corrected
+
+    def _warp_cfg():
+        cfg = {}
+        if getattr(args, "ca_band", None) is not None:
+            cfg["band"] = args.ca_band
+        if getattr(args, "ca_snap_win", None) is not None:
+            cfg["snap_win"] = args.ca_snap_win
+        if getattr(args, "ca_min_sim", None) is not None:
+            cfg["min_sim"] = args.ca_min_sim
+        return cfg
+
+    def _translations():
+        engine = getattr(args, "translate", "off")
+        if not engine or engine == "off":
+            return None, None
+        pivot = getattr(args, "pivot_lang", None) or "en"
+        key = model = None
+        if engine == "deepl":
+            key = getattr(args, "deepl_key", None) or os.environ.get("DEEPL_API_KEY")
+        elif engine == "claude":
+            key = getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+            model = getattr(args, "anthropic_model", None)
+        translator = make_translator(engine, pivot, api_key=key, model=model)
+        if translator is None:
+            return None, None
+        log_info(f"Mezijazyčný režim: porovnávám přes překlad do '{pivot}' ({engine}).")
+        return (translator([e["text"] for e in ref_events_sub]),
+                translator([e["text"] for e in target_events]))
+
+    def warp_on(targets, ref_sim, target_sim, label):
+        log_info(label)
+        corrected, st = warp_align(ref_events_sub, targets, _warp_cfg(),
+                                   ref_sim_texts=ref_sim, target_sim_texts=target_sim)
+        log_info(f"Použito {st['anchors']} jistých kotev z {len(targets)} titulků; "
+                 f"shoda s referencí (IoU): {st['iou']:.3f}")
+        return corrected, st["anchors"]
+
+    if method == "affine":
+        return do_affine()
+
+    if method in ("warp", "combo"):
+        if not have_text_ref:
+            die(f"--method {method} potřebuje TEXTOVOU referenční titulkovou stopu, ale "
+                "při --audio-mode replace žádná není. Použij --audio-mode off/combine "
+                "nebo --method affine.")
+        ref_sim, target_sim = _translations()
+        if method == "combo":
+            log_info("Metoda: kombinovaná (afinní předsrovnání + warp doladění po větách).")
+            log_info("1/2 afinní předsrovnání...")
+            pre, scale, offset, _ = affine_core(target_events)
+            corrected, n_anchors = warp_on(pre, ref_sim, target_sim, "2/2 warp doladění po větách...")
+            if n_anchors < 2:
+                log_warn("Příliš málo textových kotev - ponechávám výsledek afinní fáze.")
+                return pre
+            return corrected
+        corrected, n_anchors = warp_on(target_events, ref_sim, target_sim,
+                                       "Metoda: obsahová 'warp' (párování vět + po částech lineární mapa).")
+        if n_anchors < 2:
+            log_warn("Příliš málo textových kotev pro spolehlivou 'warp' mapu - "
+                     "přepínám na afinní metodu.")
+            return do_affine()
+        return corrected
+
+    # auto -> combo (afinní předsrovnání + warp), s pojistkou na afinní
+    if have_text_ref:
+        min_anchors = max(5, len(target_events) // 50)
+        ref_sim, target_sim = _translations()
+        log_info("Metoda: auto = kombinovaná (afinní předsrovnání + warp).")
+        log_info("1/2 afinní předsrovnání...")
+        pre, scale, offset, _ = affine_core(target_events)
+        corrected, n_anchors = warp_on(pre, ref_sim, target_sim, "2/2 warp doladění po větách...")
+        if n_anchors >= min_anchors:
+            return corrected
+        log_warn(f"Málo textových kotev ({n_anchors} < {min_anchors}) - referenční překlad "
+                 "je nejspíš v jiném jazyce/hodně odlišný; používám afinní výsledek "
+                 "(zvaž --translate google).")
+        return pre
+    return do_affine()
+
+
 # Výchozí hodnoty pro fix_short_durations - jako konstanty, aby na ně šlo
 # odkazovat z víc míst (CLI defaulty teď None, aby se poznalo, že je
 # uživatel NEzadal explicitně - důležité pro --fix-readability níž).
@@ -1064,6 +1685,15 @@ def build_passthrough_args(args):
     dávkové/batch-only a positional argumenty a track-id override, ty se
     řeší zvlášť per soubor)."""
     out = ["--audio-mode", args.audio_mode]
+    out += ["--method", args.method]
+    if args.ca_band is not None:
+        out += ["--ca-band", str(args.ca_band)]
+    if args.ca_snap_win is not None:
+        out += ["--ca-snap-win", str(args.ca_snap_win)]
+    if args.ca_min_sim is not None:
+        out += ["--ca-min-sim", str(args.ca_min_sim)]
+    if getattr(args, "translate", "off") and args.translate != "off":
+        out += ["--translate", args.translate, "--pivot-lang", args.pivot_lang]
     if args.ref_lang:
         out += ["--ref-lang", args.ref_lang]
     if args.audio_lang:
@@ -1326,6 +1956,105 @@ def ask_readability_params(srt_files):
     return min_cps, min_floor, min_gap, line_overhead
 
 
+# ----------------------------------------------------------------------
+# Detekce jazyka z OBSAHU titulků (ne z přípon/tagů)
+# ----------------------------------------------------------------------
+
+_LANG_ALIASES = {
+    "cze": "cs", "ces": "cs", "cz": "cs", "slk": "sk", "slo": "sk",
+    "ger": "de", "deu": "de", "ger": "de", "eng": "en", "fre": "fr", "fra": "fr",
+    "spa": "es", "ita": "it", "por": "pt", "dut": "nl", "nld": "nl",
+    "rus": "ru", "ukr": "uk", "hun": "hu", "pol": "pl", "rum": "ro", "ron": "ro",
+}
+
+
+def norm_lang(code):
+    if not code:
+        return None
+    c = str(code).strip().lower()
+    if c in ("und", "unknown", ""):
+        return None
+    return _LANG_ALIASES.get(c, c[:2])
+
+
+_LANG_STOPWORDS = {
+    "cs": "a aby ale ani ano až bez bude budou by byl byla bylo být co či do i jak jako je jeho její jen ještě již k kde když ke která které kteří který má mě mi mít my na nad naše ne nebo není než nic o od on ona oni pak po pod podle pro proč protože při s se si tak také tam ten tedy to toho tom ty u už v vám váš ve však všechno vy z za ze že jsem jsi jsme jste jsou",
+    "sk": "a aby ale ani áno až bez bude budú by bol bola bolo byť čo či do i ja ako je jeho jej len ešte už k kde keď ku ktorá ktoré ktorí ktorý má ma mi mať my na nad naša nie alebo nič o od on ona oni potom po pod podľa pre prečo pretože pri s sa si tak tiež tam ten teda to toho tom ty u už v vám váš vo viac však všetko vy z za zo že som sme ste sú",
+    "en": "the a an and or but if then is are was were be been to of in on at for with from by as that this these those it he she they we you i me my your his her their our not no yes do does did have has had will would can could should about into over than when what which who",
+    "de": "der die das und oder aber wenn dann ist sind war waren sein zu von in an auf für mit aus durch als dass dieser diese dieses es er sie wir ihr ich mich mein dein nicht kein ja doch noch schon auch nur wie wo wann warum weil über unter haben hat",
+    "pl": "i a ale lub jeśli wtedy jest są był była było być do z w na o od po pod dla że ten ta to te oni my wy ja mnie mój nie tak czy już jeszcze jak gdzie kiedy dlaczego bo nad przez także również wszystko",
+    "es": "el la los las un una unos unas y o pero si entonces es son era fue ser estar de en por para con sin que este esta esto estos ellos nosotros yo me mi tu su no sí ya como donde cuando porque más muy",
+    "fr": "le la les un une des et ou mais si alors est sont était être de en pour avec sans que ce cette ces ils nous vous je me mon ton son ne pas plus très comme où quand parce qui",
+    "it": "il lo la i gli le un uno una e o ma se allora è sono era essere di in per con senza che questo questa questi quelli noi voi io mi mio tuo suo non sì già come dove quando perché più molto",
+    "pt": "o a os as um uma uns umas e ou mas se então é são era ser estar de em por para com sem que este esta isto estes eles nós eu me meu teu seu não sim já como onde quando porque mais muito",
+    "nl": "de het een en of maar als dan is zijn was waren te van in op voor met uit door dat deze dit die zij wij jij ik mij mijn niet geen ja nog al ook hoe waar wanneer waarom omdat",
+    "ru": "и а но или если то это есть был была было быть в на с по от до для что как эти они мы вы я мне мой не да уже еще где когда почему потому очень так",
+    "uk": "і та але або якщо то це є був була було бути в на з по від до для що як ці вони ми ви я мені мій не так вже ще де коли чому тому дуже",
+    "hu": "a az és vagy de ha akkor van vannak volt lenni hogy ez ezek ők mi ti én nekem nem igen már még hol mikor miért mert nem is",
+}
+_LANG_STOPWORDS = {k: set(v.split()) for k, v in _LANG_STOPWORDS.items()}
+
+
+def _builtin_detect(text):
+    low = text.lower()
+    letters = [c for c in low if c.isalpha()]
+    if not letters:
+        return None
+    cyr = sum(1 for c in letters if "\u0400" <= c <= "\u04ff")
+    if cyr > 0.3 * len(letters):
+        return "uk" if any(c in low for c in "іїєґ") else "ru"
+    toks = re.findall(r"[^\W\d_]+", low, re.UNICODE)
+    if not toks:
+        return None
+    scores = {lang: sum(1 for t in toks if t in sw) for lang, sw in _LANG_STOPWORDS.items()}
+    # boosty podle charakteristických znaků
+    if any(c in low for c in "řěů"):
+        scores["cs"] += 6
+    if any(c in low for c in "ľĺŕôä"):
+        scores["sk"] += 5
+    if any(c in low for c in "łżśźćń"):
+        scores["pl"] += 6
+    if "ß" in low:
+        scores["de"] += 3
+    if any(c in low for c in "ñ¿¡"):
+        scores["es"] += 3
+    if any(c in low for c in "çœ"):
+        scores["fr"] += 2
+    if any(c in low for c in "őű"):
+        scores["hu"] += 5
+    best = max(scores, key=scores.get)
+    return best if scores[best] > 0 else None
+
+
+def detect_language(text, sample_chars=6000):
+    """Detekuje jazyk z OBSAHU textu. Preferuje 'langdetect' (pip install
+    langdetect), pokud je nainstalován; jinak vestavěný detektor (cs/sk/pl/en/
+    de/fr/es/it/pt/nl/ru/uk/hu...). Vrací 2písmenný kód nebo None."""
+    sample = (text or "")[:sample_chars]
+    if len(sample.strip()) < 10:
+        return None
+    try:
+        from langdetect import detect, DetectorFactory
+        DetectorFactory.seed = 0
+        return norm_lang(detect(sample))
+    except Exception:
+        pass
+    return norm_lang(_builtin_detect(sample))
+
+
+def detect_sub_language(events, max_lines=400):
+    """Detekuje jazyk z titulkových eventů (vzorek prvních max_lines řádků)."""
+    txt = " ".join(e["text"] for e in events[:max_lines] if e.get("text"))
+    return detect_language(txt)
+
+
+def detect_srt_file_language(path):
+    try:
+        return detect_sub_language(parse_srt(Path(path)))
+    except Exception:
+        return None
+
+
 def detect_lang_tags(srt_files):
     """Odhadne jazykové/jiné tagy z názvů souborů ('epizoda.cs.srt' -> 'cs').
     Jen orientační - používá se pro interaktivní nabídku, ne pro tvrdé filtrování."""
@@ -1495,108 +2224,731 @@ def run_fix_readability(args):
 # main
 # ----------------------------------------------------------------------
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Opraví časování titulků podle referenčních titulků a/nebo zvukové stopy z MKV (bez alass; mkvtoolnix pro titulky, ffmpeg volitelně pro zvuk)."
-    )
-    parser.add_argument("mkv", type=Path, nargs="?",
-                         help="Vstupní MKV/MP4 soubor (nebo s --all: adresář k prohledání, default '.')")
-    parser.add_argument("subtitle_to_fix", type=Path, nargs="?", help="SRT se špatným časováním, který chceme opravit")
-    parser.add_argument("output", type=Path, nargs="?", help="Cesta k výstupnímu opravenému SRT")
+# ----------------------------------------------------------------------
+# Extrakce + překlad titulků do nového jazyka a uložení .srt (--translate-subs)
+# ----------------------------------------------------------------------
+#
+# Pro každé video v adresáři: vytáhne zvolenou titulkovou stopu, získá titulky
+# v CÍLOVÉM jazyce a uloží je jako <video>.<lang>.srt. Kvalitu řeší dvěma
+# cestami (lze kombinovat):
+#   1) OpenSubtitles - stáhne HOTOVÉ lidské titulky v cílovém jazyce (nejlepší
+#      kvalita), volitelně je časově srovná s videem naším synchronizačním
+#      jádrem (affine).
+#   2) Strojový překlad extrahované stopy (DeepL = nejlepší kvalita, Google,
+#      nebo offline Argos) + korektura (pravidlové očištění zdarma, volitelně
+#      AI korektura přes OpenAI-kompatibilní API).
+# U strojového překladu zůstává PŮVODNÍ ČASOVÁNÍ (překládá se jen text), takže
+# výsledek sedí na video bez další synchronizace.
 
-    parser.add_argument("--all", action="store_true",
-                         help="Dávkový režim: zpracuje všechna videa v adresáři (1. argument, default "
-                              "aktuální adresář). Pro každé video se podle názvu souboru dohledá "
-                              "odpovídající .srt, ověří se dostupné stopy, a teprve poté se zpracuje.")
-    parser.add_argument("-r", "--recursive", action="store_true",
-                         help="S --all: prohledat i podadresáře.")
-    parser.add_argument("--target-lang", help="S --all: pokud k jednomu videu sedí víc .srt souborů "
-                                                "(různé jazyky), použít ten s tímto jazykovým tagem v názvu "
-                                                "(např. 'cs' pro 'epizoda.cs.srt').")
-    parser.add_argument("--overwrite", action="store_true",
-                         help="S --all: přepsat původní .srt přímo (vytvoří jednorázově .bak zálohu). "
-                              "Bez tohoto se výstup ukládá jako '<jméno>.synced.srt' vedle originálu.")
-    parser.add_argument("--yes", action="store_true",
-                         help="S --all: když u videa chybí potřebné stopy, automaticky přeskočit "
-                              "bez interaktivního dotazu (pro nehlídané/dávkové spouštění). "
-                              "S --fix-readability: nepoužívat výchozí hodnoty parametrů bez ptaní.")
 
-    parser.add_argument("--fix-readability", action="store_true",
-                         help="Samostatný režim (BEZ synchronizace): najde v adresáři (1. argument, "
-                              "default aktuální adresář; nebo přímo konkrétní .srt) všechny titulky, "
-                              "které už mají SPRÁVNÉ časování, a jen prodlouží ty, co zmizí příliš "
-                              "rychle na pohodlné přečtení - výhradně do volného místa, nikdy na úkor "
-                              "překryvu. Bez --min-cps/--min-duration-floor/--min-gap se na hodnoty "
-                              "interaktivně zeptá (s vysvětlením a orientačním odhadem aktuálního tempa).")
+def _resolve_tools_for_extract(args, video):
+    is_mkv = video.suffix.lower() in MKVEXTRACT_CONTAINER_EXTS
+    mkvmerge_bin = getattr(args, "mkvmerge", None) or find_tool(["mkvmerge", "mkvmerge.exe"])
+    mkvextract_bin = getattr(args, "mkvextract", None) or find_tool(["mkvextract", "mkvextract.exe"])
+    if not mkvmerge_bin or (is_mkv and not mkvextract_bin):
+        try:
+            mkvmerge_bin, mkvextract_bin = ensure_mkvtoolnix(
+                str(video.parent), allow_download=not getattr(args, "no_mkvtoolnix_download", False))
+        except Exception:
+            pass
+    ffmpeg_bin = None
+    if not is_mkv:
+        ffmpeg_bin = getattr(args, "ffmpeg", None) or find_tool(["ffmpeg", "ffmpeg.exe"])
+        if not ffmpeg_bin:
+            try:
+                ffmpeg_bin = ensure_ffmpeg(str(video.parent), allow_download=not getattr(args, "no_ffmpeg_download", False))
+            except Exception:
+                pass
+    return mkvmerge_bin, mkvextract_bin, ffmpeg_bin, is_mkv
 
-    parser.add_argument("--ref-lang", help="Jazyk referenční TITULKOVÉ stopy v MKV, např. eng, cze, ces")
-    parser.add_argument("--track-id", type=int, help="ID titulkové stopy v MKV (viz --list-tracks)")
 
-    parser.add_argument(
-        "--audio-mode", choices=["off", "replace", "combine"], default="off",
-        help="off = jen titulková reference (default); replace = jen analýza zvuku (VAD), "
-             "titulková reference se nepoužije; combine = titulková reference + zvuk společně "
-             "pro maximální přesnost.",
-    )
-    parser.add_argument("--audio-lang", help="Jazyk zvukové stopy pro VAD, např. eng, cze, ces")
-    parser.add_argument("--audio-track-id", type=int, help="ID zvukové stopy v MKV (viz --list-tracks)")
-    parser.add_argument("--vad-percentile", type=float, default=55.0,
-                         help="Práh hlasitosti pro detekci řeči, percentil 0-100 (default 55; "
-                              "zvyš při hlučném pozadí/hudbě, sniž pro tišší dialogy)")
+def extract_subtitle_events(args, video, track_id=None, ref_lang=None):
+    """Vytáhne zvolenou titulkovou stopu do events (track_id > ref_lang > první).
+    Vrací (events, chosen_track) nebo (None, None). Neukončuje běh při chybě."""
+    video = Path(video)
+    mkvmerge_bin, mkvextract_bin, ffmpeg_bin, is_mkv = _resolve_tools_for_extract(args, video)
+    if not mkvmerge_bin:
+        log_warn(f"{video.name}: mkvmerge nenalezen - přeskakuji.")
+        return None, None
+    sub_tracks = mkvmerge_tracks(mkvmerge_bin, video, "subtitles")
+    if not sub_tracks:
+        log_warn(f"{video.name}: žádné titulkové stopy.")
+        return None, None
+    try:
+        chosen = pick_reference_track(sub_tracks, ref_lang, track_id)
+    except SystemExit:
+        chosen = sub_tracks[0]
+    except Exception:
+        chosen = sub_tracks[0]
+    tmpd = tempfile.mkdtemp()
+    try:
+        outp = Path(tmpd) / "track.srt"
+        if is_mkv:
+            if not mkvextract_bin:
+                log_warn(f"{video.name}: mkvextract nenalezen.")
+                return None, None
+            extract_subtitle_to_srt(mkvextract_bin, video, chosen["id"], outp)
+        else:
+            if not ffmpeg_bin:
+                log_warn(f"{video.name}: ffmpeg nenalezen (extrakce z MP4).")
+                return None, None
+            pos = [t["id"] for t in sub_tracks].index(chosen["id"])
+            extract_subtitle_via_ffmpeg(ffmpeg_bin, video, pos, outp)
+        return parse_srt(outp), chosen
+    except Exception as e:
+        log_warn(f"{video.name}: extrakce selhala: {e}")
+        return None, None
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
 
-    parser.add_argument("--list-tracks", action="store_true", help="Jen vypsat titulkové i zvukové stopy v MKV a skončit")
-    parser.add_argument("--max-shift", type=float, default=120.0, help="Maximální předpokládaný posun v sekundách (default 120)")
-    parser.add_argument("--tolerance", type=float, default=1.5, help="Tolerance v sekundách pro párování při zpřesnění (default 1.5)")
 
-    parser.add_argument("--fix-short-duration", action="store_true",
-                         help="Po synchronizaci prodloužit titulky, které zmizí příliš rychle vzhledem "
-                              "k délce textu - ale jen pokud je k tomu volné místo (mezera do dalšího "
-                              "titulku), nikdy na úkor překryvu s dalším titulkem.")
-    parser.add_argument("--reading-speed", choices=list(READING_SPEED_PRESETS.keys()),
-                         help="Rychlá volba presetu čtecí rychlosti místo ručního --min-cps/--min-duration-floor: "
-                              + "; ".join(f"'{k}' = {v[2]} ({v[0]:.0f} znaků/s, podlaha {v[1]:.1f}s)"
-                                          for k, v in READING_SPEED_PRESETS.items())
-                              + ". Explicitně zadané --min-cps/--min-duration-floor mají před presetem přednost.")
-    parser.add_argument("--min-cps", type=float, default=None,
-                         help=f"Cílová čtecí rychlost ve znacích/s pro výpočet ideální min. délky "
-                              f"zobrazení (default {DEFAULT_MIN_CPS}; nižší = delší zobrazení pro stejný text)")
-    parser.add_argument("--min-duration-floor", type=float, default=None,
-                         help=f"Absolutní minimální délka zobrazení titulku v sekundách, bez ohledu "
-                              f"na délku textu (default {DEFAULT_MIN_DURATION_FLOOR})")
-    parser.add_argument("--min-gap", type=float, default=None,
-                         help=f"Mezera v sekundách, která musí zůstat zachována před dalším titulkem "
-                              f"při prodlužování (default {DEFAULT_MIN_GAP} - cca 2 snímky při 24fps)")
-    parser.add_argument("--line-overhead", type=float, default=None,
-                         help=f"Extra sekundy navíc za KAŽDÝ řádek titulku nad první - vícero řádků "
-                              f"potřebuje navíc čas na přeskočení očí (default {DEFAULT_LINE_OVERHEAD}; "
-                              f"díky tomu jednoslovný titulek nikdy nedostane stejnou délku jako "
-                              f"víceřádková věta jen kvůli společné podlaze)")
-    parser.add_argument("--mkvmerge", help="Cesta k mkvmerge.exe nebo ke složce s ním, pokud není v PATH")
-    parser.add_argument("--mkvextract", help="Cesta k mkvextract.exe nebo ke složce s ním, pokud není v PATH")
-    parser.add_argument("--no-mkvtoolnix-download", action="store_true",
-                         help="Nezkoušet automaticky stáhnout MKVToolNix, pokud nebyl nikde nalezen")
-    parser.add_argument("--ffmpeg", help="Cesta k ffmpeg.exe nebo ke složce s ním (jen pro --audio-mode replace/combine)")
-    parser.add_argument("--no-ffmpeg-download", action="store_true",
-                         help="Nezkoušet automaticky stáhnout ffmpeg, pokud nebyl nikde nalezen")
-    args = parser.parse_args()
+def clean_subtitle_text(text, max_line=42):
+    """Pravidlová korektura: sjednotí mezery, opraví mezery před interpunkcí a
+    přebytečné prázdné řádky, a dlouhý jednořádkový text rozlomí na 2 řádky."""
+    t = text.replace("\r", "")
+    lines = [l.strip() for l in t.split("\n") if l.strip()]
+    t = " ".join(lines)
+    t = re.sub(r"\s+", " ", t).strip()
+    t = re.sub(r"\s+([,.!?;:…])", r"\1", t)
+    t = re.sub(r"([¿¡])\s+", r"\1", t)
+    t = re.sub(r"\.{3,}", "…", t)
+    if len(t) > max_line and " " in t:
+        words = t.split(" ")
+        target = len(t) / 2.0
+        best_i, best_d, acc = None, None, 0
+        for i, w in enumerate(words[:-1]):
+            acc += len(w) + 1
+            d = abs(acc - target)
+            if best_d is None or d < best_d:
+                best_d, best_i = d, i
+        l1 = " ".join(words[:best_i + 1])
+        l2 = " ".join(words[best_i + 1:])
+        if l1 and l2:
+            t = l1 + "\n" + l2
+    return t
 
-    if args.all and args.fix_readability:
-        die("--all a --fix-readability nelze použít současně (jsou to dva oddělené dávkové režimy).")
 
-    if args.fix_readability:
-        run_fix_readability(args)
+def translate_events_to(events, engine, target_lang, api_key=None, model=None):
+    """Přeloží text eventů do target_lang (časování beze změny). Vrací nové
+    events, nebo None když překladač není k dispozici."""
+    tr = make_translator(engine, target_lang, api_key=api_key, model=model)
+    if tr is None:
+        return None
+    src = [e["text"].replace("\n", " ") for e in events]
+    out = tr(src)
+    return [{"start": e["start"], "end": e["end"], "text": (o or e["text"])}
+            for e, o in zip(events, out)]
+
+
+def anthropic_messages(prompt, api_key, model, max_tokens=4000, timeout=180):
+    """Jedno volání Anthropic Messages API. Vrací text odpovědi nebo None."""
+    import urllib.request
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    body = json.dumps({"model": model, "max_tokens": max_tokens,
+                       "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+    req = urllib.request.Request("https://api.anthropic.com/v1/messages",
+                                 data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
+    return "".join(parts) if parts else None
+
+
+def anthropic_translate_batch(batch, target_lang, api_key, model):
+    """Přeloží dávku řádků titulků do target_lang přes Claude. Vrací seznam
+    stejné délky (None u nezdaru jednotlivé položky)."""
+    numbered = "\n".join(f"{k + 1}. {t.replace(chr(10), ' / ')}" for k, t in enumerate(batch))
+    prompt = (f"Přelož následující číslované řádky filmových titulků do jazyka '{target_lang}'. "
+              "Překládej přirozeně a idiomaticky (ne doslovně), zachovej VÝZNAM, tón i POČET a "
+              "POŘADÍ položek. Víceřádkový titulek odděl ' / '. Vrať POUZE číslované řádky "
+              "(číslo. překlad) ve stejném pořadí a počtu, bez komentářů.\n\n" + numbered)
+    try:
+        content = anthropic_messages(prompt, api_key, model)
+    except Exception as e:
+        log_warn(f"Claude překlad selhal u bloku: {e}")
+        return [None] * len(batch)
+    if not content:
+        return [None] * len(batch)
+    parsed = _parse_numbered(content, len(batch))
+    return [(p.replace(" / ", "\n") if p else None) for p in parsed]
+
+
+def anthropic_proofread(events, target_lang, api_key, model, batch=40):
+    """Korektura titulků přes Claude. Vrací seznam textů stejné délky."""
+    out = []
+    for i in range(0, len(events), batch):
+        chunk = events[i:i + batch]
+        numbered = "\n".join(f"{k + 1}. {c['text'].replace(chr(10), ' / ')}" for k, c in enumerate(chunk))
+        prompt = (f"Jsi profesionální korektor filmových titulků v jazyce '{target_lang}'. "
+                  "Oprav gramatiku, překlepy a nepřirozené formulace strojového překladu, "
+                  "zachovej VÝZNAM, POŘADÍ i POČET položek a nepřekládej do jiného jazyka. "
+                  "Víceřádkový titulek odděl ' / '. Vrať POUZE číslované řádky ve stejném "
+                  "pořadí a počtu, bez komentářů.\n\n" + numbered)
+        try:
+            content = anthropic_messages(prompt, api_key, model)
+            fixed = _parse_numbered(content or "", len(chunk))
+        except Exception as e:
+            log_warn(f"Claude korektura selhala u bloku {i // batch + 1}: {e}")
+            fixed = [c["text"] for c in chunk]
+        for c, t in zip(chunk, fixed):
+            out.append(t.replace(" / ", "\n") if t else c["text"])
+    return out
+
+
+def llm_proofread(events, target_lang, api_url, api_key, model, batch=40):
+    """Korektura přes OpenAI-kompatibilní API (/chat/completions). Vrací seznam
+    textů stejné délky; při chybě bloku ponechá originál."""
+    import urllib.request
+    out = []
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    for i in range(0, len(events), batch):
+        chunk = events[i:i + batch]
+        numbered = "\n".join(f"{k + 1}. {c['text'].replace(chr(10), ' / ')}" for k, c in enumerate(chunk))
+        prompt = (f"Jsi profesionální korektor filmových titulků v jazyce '{target_lang}'. "
+                  "Oprav gramatiku, překlepy a nepřirozené formulace strojového překladu, "
+                  "zachovej VÝZNAM i POŘADÍ a POČET položek. Nepřekládej do jiného jazyka. "
+                  "Vrať POUZE číslované řádky ve stejném pořadí a počtu (číslo. text), "
+                  "víceřádkový titulek odděl ' / '. Bez jakýchkoli komentářů.\n\n" + numbered)
+        body = json.dumps({"model": model, "temperature": 0.2,
+                           "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+        try:
+            req = urllib.request.Request(api_url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=180) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            content = data["choices"][0]["message"]["content"]
+            fixed = _parse_numbered(content, len(chunk))
+        except Exception as e:
+            log_warn(f"AI korektura selhala u bloku {i // batch + 1}: {e}")
+            fixed = [c["text"] for c in chunk]
+        for c, t in zip(chunk, fixed):
+            out.append(t.replace(" / ", "\n") if t else c["text"])
+    return out
+
+
+def apply_proofread(events, provider, target_lang, args):
+    """Aplikuje korekturu podle providera ('rules'/'llm'/'anthropic'/'off')."""
+    if provider == "rules":
+        for e in events:
+            e["text"] = clean_subtitle_text(e["text"])
+    elif provider == "llm":
+        key = getattr(args, "llm_key", None) or os.environ.get("OPENAI_API_KEY")
+        url = getattr(args, "llm_api", None) or "https://api.openai.com/v1/chat/completions"
+        model = getattr(args, "llm_model", None) or "gpt-4o-mini"
+        if not key:
+            log_warn("Korektura LLM přeskočena - chybí API klíč.")
+            return events
+        fixed = llm_proofread(events, target_lang, url, key, model)
+        for e, t in zip(events, fixed):
+            if t:
+                e["text"] = t
+    elif provider == "anthropic":
+        key = getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+        model = getattr(args, "anthropic_model", None) or "claude-sonnet-4-6"
+        if not key:
+            log_warn("Korektura přes Claude přeskočena - chybí Anthropic API klíč.")
+            return events
+        fixed = anthropic_proofread(events, target_lang, key, model)
+        for e, t in zip(events, fixed):
+            if t:
+                e["text"] = t
+    return events
+
+
+def _parse_numbered(content, n):
+    res = [None] * n
+    for line in content.split("\n"):
+        m = re.match(r"\s*(\d+)[.)]\s*(.*)", line)
+        if m:
+            idx = int(m.group(1)) - 1
+            if 0 <= idx < n:
+                res[idx] = m.group(2).strip()
+    return res  # caller handles None? -> replace below
+
+
+# --- OpenSubtitles -----------------------------------------------------
+
+def opensubtitles_hash(path):
+    """Oficiální OpenSubtitles moviehash (velikost + 64 kB ze začátku a konce)."""
+    import struct
+    fmt = "<q"
+    size = struct.calcsize(fmt)
+    filesize = os.path.getsize(path)
+    if filesize < 65536 * 2:
+        return None
+    h = filesize
+    with open(path, "rb") as f:
+        for _ in range(65536 // size):
+            (val,) = struct.unpack(fmt, f.read(size))
+            h = (h + val) & 0xFFFFFFFFFFFFFFFF
+        f.seek(filesize - 65536, 0)
+        for _ in range(65536 // size):
+            (val,) = struct.unpack(fmt, f.read(size))
+            h = (h + val) & 0xFFFFFFFFFFFFFFFF
+    return "%016x" % h
+
+
+class OpenSubtitles:
+    BASE = "https://api.opensubtitles.com/api/v1"
+
+    def __init__(self, api_key, ua="sync_subtitles v1.0", username=None, password=None):
+        self.key = api_key
+        self.ua = ua
+        self.user = username
+        self.password = password
+        self.token = None
+
+    def _req(self, method, path, body=None, auth=False):
+        import urllib.request
+        headers = {"Api-Key": self.key, "Content-Type": "application/json",
+                   "Accept": "application/json", "User-Agent": self.ua}
+        if auth and self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(self.BASE + path, data=data, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return json.loads(r.read().decode("utf-8"))
+
+    def login(self):
+        if not (self.user and self.password):
+            return False
+        try:
+            d = self._req("POST", "/login", {"username": self.user, "password": self.password})
+            self.token = d.get("token")
+            return bool(self.token)
+        except Exception as e:
+            log_warn(f"OpenSubtitles login selhal: {e}")
+            return False
+
+    def search(self, languages, moviehash=None, query=None):
+        from urllib.parse import urlencode
+        params = {"languages": languages}
+        if moviehash:
+            params["moviehash"] = moviehash
+        if query:
+            params["query"] = query
+        try:
+            d = self._req("GET", "/subtitles?" + urlencode(params))
+            return d.get("data", [])
+        except Exception as e:
+            log_warn(f"OpenSubtitles hledání selhalo: {e}")
+            return []
+
+    def download_srt(self, file_id):
+        try:
+            d = self._req("POST", "/download", {"file_id": file_id}, auth=True)
+        except Exception as e:
+            log_warn(f"OpenSubtitles /download selhal (účet/limit?): {e}")
+            return None
+        url = d.get("link")
+        if not url:
+            return None
+        try:
+            import urllib.request
+            with urllib.request.urlopen(url, timeout=60) as r:
+                return r.read().decode("utf-8", "replace")
+        except Exception as e:
+            log_warn(f"OpenSubtitles stažení souboru selhalo: {e}")
+            return None
+
+
+def fetch_opensubtitles_events(video, lang, api_key, username=None, password=None, pick="downloads"):
+    """Najde a stáhne shodu lidských titulků v jazyce `lang`.
+    pick: 'downloads' = nejstahovanější, 'rating' = nejlépe hodnocené,
+    'ask' = nabídnout výběr ze seznamu. Vrací events nebo None.
+    Stahování vyžaduje účet (uživatel/heslo)."""
+    client = OpenSubtitles(api_key, username=username, password=password)
+    moviehash = None
+    try:
+        moviehash = opensubtitles_hash(str(video))
+    except Exception:
+        pass
+    results = client.search(lang, moviehash=moviehash, query=None if moviehash else Path(video).stem)
+    if not results and moviehash:
+        results = client.search(lang, query=Path(video).stem)
+    if not results:
+        log_info(f"{Path(video).name}: OpenSubtitles - žádná shoda v '{lang}'.")
+        return None
+
+    def _attr(r, k, d=0):
+        return r.get("attributes", {}).get(k, d) or d
+
+    if pick == "ask" and len(results) > 1:
+        ranked = sorted(results, key=lambda r: _attr(r, "download_count"), reverse=True)[:10]
+        labels = []
+        for r in ranked:
+            a = r.get("attributes", {})
+            rel = a.get("release", a.get("feature_details", {}).get("title", "?"))
+            labels.append(f"{str(rel)[:50]}  | stažení {a.get('download_count', 0)} "
+                          f"| hodnocení {a.get('ratings', 0)} | hi={a.get('hearing_impaired', False)} "
+                          f"| fps {a.get('fps', '?')}")
+        idx = ask_pick(f"{Path(video).name}: vyber verzi titulků:", labels, default=0)
+        best = ranked[idx]
+    elif pick == "rating":
+        best = max(results, key=lambda r: _attr(r, "ratings"))
+    else:
+        best = max(results, key=lambda r: _attr(r, "download_count"))
+
+    files = best.get("attributes", {}).get("files", [])
+    if not files:
+        return None
+    file_id = files[0].get("file_id")
+    client.login()  # download vyžaduje token (účet)
+    srt_text = client.download_srt(file_id)
+    if not srt_text:
+        return None
+    tmp = tempfile.mkdtemp()
+    try:
+        p = Path(tmp) / "dl.srt"
+        p.write_text(srt_text, encoding="utf-8")
+        return parse_srt(p)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _affine_sync_args(base_args):
+    import copy
+    a = copy.copy(base_args)
+    a.method = "affine"
+    a.translate = "off"
+    return a
+
+
+# ----------------------------------------------------------------------
+# Konfigurace (config.json) - API klíče a výchozí volby
+# ----------------------------------------------------------------------
+#
+# --config spustí průvodce, který se zeptá jen na to, co chceš zapnout
+# (DeepL / OpenSubtitles / AI korektura přes Claude nebo OpenAI / výchozí
+# jazyk) a uloží to do config.json vedle skriptu. Při startu se config
+# automaticky načte. Priorita hodnot: parametr na příkazové řádce >
+# proměnná prostředí > config.json > výchozí. Vše je VOLITELNÉ - skript
+# funguje i úplně bez configu a bez online funkcí.
+
+# (config_key, args_attr, env_var, is_secret)
+CONFIG_FIELDS = [
+    ("deepl_key", "deepl_key", "DEEPL_API_KEY", True),
+    ("opensubtitles_key", "opensubtitles_key", "OPENSUBTITLES_API_KEY", True),
+    ("opensubtitles_user", "opensubtitles_user", "OPENSUBTITLES_USER", False),
+    ("opensubtitles_password", "opensubtitles_password", "OPENSUBTITLES_PASSWORD", True),
+    ("anthropic_key", "anthropic_key", "ANTHROPIC_API_KEY", True),
+    ("anthropic_model", "anthropic_model", None, False),
+    ("llm_key", "llm_key", "OPENAI_API_KEY", True),
+    ("llm_api", "llm_api", None, False),
+    ("llm_model", "llm_model", None, False),
+    ("out_lang", "out_lang", None, False),
+]
+
+
+def default_config_path():
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
+    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
+    return os.path.join(base, "config.json")
+
+
+def resolve_config_path(args):
+    return getattr(args, "config_file", None) or default_config_path()
+
+
+def load_config(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(path, cfg):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    try:
+        if os.name != "nt":
+            os.chmod(path, 0o600)   # jen pro vlastníka (jsou tam klíče)
+    except Exception:
+        pass
+
+
+def apply_config_to_args(args, cfg):
+    """Doplní do args hodnoty, které nebyly zadané na příkazové řádce.
+    Priorita: CLI (už nastaveno) > proměnná prostředí > config.json."""
+    for ckey, attr, env, _secret in CONFIG_FIELDS:
+        if getattr(args, attr, None):
+            continue  # zadáno na CLI
+        val = (os.environ.get(env) if env else None) or cfg.get(ckey)
+        if val:
+            setattr(args, attr, val)
+
+
+def _mask(s):
+    if not s:
+        return "(nenastaveno)"
+    s = str(s)
+    return (s[:4] + "…" + s[-2:]) if len(s) > 8 else "••••"
+
+
+def run_config(args):
+    """Interaktivní průvodce nastavením config.json. Ptá se jen na to, co
+    chceš zapnout; nevyplněné nechá být. Klíče jsou v souboru v čitelné
+    podobě - drž ho v bezpečí."""
+    path = resolve_config_path(args)
+    cfg = load_config(path)
+    print(f"{Fore.MAGENTA}=== Nastavení (config.json) ==={Style.RESET_ALL}")
+    log_info(f"Soubor: {path}")
+    if cfg:
+        log_info("Načten stávající config - prázdná odpověď ponechá současnou hodnotu.")
+    log_warn("Pozor: klíče se ukládají v čitelné podobě. Drž config.json v bezpečí.")
+
+    def ask_secret(label, ckey):
+        cur = cfg.get(ckey)
+        prompt = f"{label}" + (f" (teď {_mask(cur)}, Enter = ponechat)" if cur else " (Enter = přeskočit)")
+        val = ask_text(prompt, "")
+        if val:
+            cfg[ckey] = val
+
+    def ask_plain(label, ckey, default=""):
+        cur = cfg.get(ckey, default)
+        val = ask_text(label, cur or "")
+        if val:
+            cfg[ckey] = val
+        elif ckey in cfg and not val and not cur:
+            pass
+
+    # DeepL
+    if ask_yes_no("Nastavit DeepL (kvalitní strojový překlad)?", default_no=not cfg.get("deepl_key")):
+        ask_secret("DeepL API klíč", "deepl_key")
+
+    # OpenSubtitles
+    if ask_yes_no("Nastavit OpenSubtitles (stahování hotových lidských titulků)?",
+                  default_no=not cfg.get("opensubtitles_key")):
+        ask_secret("OpenSubtitles API klíč", "opensubtitles_key")
+        if ask_yes_no("Přidat i účet (uživatel/heslo) pro STAHOVÁNÍ?",
+                      default_no=not cfg.get("opensubtitles_user")):
+            ask_plain("OpenSubtitles uživatel", "opensubtitles_user")
+            ask_secret("OpenSubtitles heslo", "opensubtitles_password")
+
+    # AI korektura / překlad
+    if ask_yes_no("Nastavit AI (korektura nebo překlad přes Claude / OpenAI-kompatibilní API)?",
+                  default_no=not (cfg.get("anthropic_key") or cfg.get("llm_key"))):
+        which = ask_pick("Který AI provider nastavit?",
+                         ["Anthropic (Claude)", "OpenAI-kompatibilní (OpenAI/lokální)", "oba"], default=0)
+        if which in (0, 2):
+            ask_secret("Anthropic API klíč", "anthropic_key")
+            ask_plain("Claude model", "anthropic_model", "claude-sonnet-4-6")
+        if which in (1, 2):
+            ask_secret("OpenAI API klíč", "llm_key")
+            ask_plain("API URL (chat/completions)", "llm_api", "https://api.openai.com/v1/chat/completions")
+            ask_plain("Model", "llm_model", "gpt-4o-mini")
+
+    # výchozí jazyk
+    if ask_yes_no("Nastavit výchozí cílový jazyk pro --translate-subs?",
+                  default_no=not cfg.get("out_lang")):
+        _v = ask_language("Výchozí cílový jazyk (kód, např. cs)", cfg.get("out_lang") or "cs")
+        if _v:
+            cfg["out_lang"] = _v
+
+    if ask_yes_no("Vymazat některou uloženou hodnotu?", default_no=True):
+        keys = list(cfg.keys())
+        if keys:
+            labels = [f"{k} = {_mask(cfg[k]) if 'key' in k or 'password' in k else cfg[k]}" for k in keys]
+            labels.append("(nic nemazat)")
+            idx = ask_pick("Co vymazat?", labels, default=len(labels) - 1)
+            if idx < len(keys):
+                cfg.pop(keys[idx], None)
+
+    save_config(path, cfg)
+    print()
+    log_done(f"Uloženo do {path}")
+    enabled = []
+    if cfg.get("deepl_key"):
+        enabled.append("DeepL")
+    if cfg.get("opensubtitles_key"):
+        enabled.append("OpenSubtitles" + ("+účet" if cfg.get("opensubtitles_user") else ""))
+    if cfg.get("anthropic_key"):
+        enabled.append("Claude")
+    if cfg.get("llm_key"):
+        enabled.append("OpenAI")
+    log_info("Aktivní: " + (", ".join(enabled) if enabled else "(žádné online funkce)"))
+
+
+def run_translate_subs(args):
+    """Interaktivní průvodce: extrahuje stopu, získá cílový jazyk (OpenSubtitles
+    a/nebo strojový překlad + korektura) a uloží .srt pro všechna videa."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+
+    print(f"{Fore.MAGENTA}=== Extrahovat + přeložit titulky (uložit .srt) ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+
+    recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("Žádná videa v adresáři.")
+    log_info(f"Nalezeno {len(videos)} videí.")
+
+    # 1) zdrojová stopa (ze skutečných stop vzorového videa)
+    sample = Path(videos[0])
+    mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, sample)
+    sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles") if mkvmerge_bin else []
+    args.track_id = None
+    if sub_tracks:
+        labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in sub_tracks]
+        labels += ["podle jazyka (zadám kód)", "první vhodná"]
+        i = ask_pick(f"Kterou titulkovou stopu extrahovat (vzorek {sample.name})?", labels, default=0)
+        if i < len(sub_tracks):
+            args.track_id = sub_tracks[i]["id"]; args.ref_lang = None
+        elif i == len(sub_tracks):
+            args.ref_lang = norm_lang(ask_language("Jazyk zdrojové stopy (eng/cze/...)", "") or None)
+        else:
+            args.ref_lang = None
+    else:
+        log_warn("Stopy vzorového videa se nepodařilo přečíst - vyberu podle jazyka/první.")
+        args.ref_lang = norm_lang(ask_language("Jazyk zdrojové titulkové stopy (eng/...; prázdné=první)", "") or None)
+
+    # 2) cílový jazyk
+    out_lang = (ask_language("Do jakého jazyka přeložit (kód, např. cs/en/de)",
+                         getattr(args, "out_lang", None) or "cs") or "cs").lower()
+
+    # 3) strategie zdroje
+    si = ask_pick("Odkud vzít cílové titulky?",
+                  ["auto - nejdřív zkus hotové lidské (OpenSubtitles), jinak strojový překlad",
+                   "jen strojový překlad extrahované stopy",
+                   "jen stáhnout hotové z OpenSubtitles"], default=0)
+    strategy = ["auto", "mt", "opensubtitles"][si]
+
+    engine = mt_key = mt_model = None
+    if strategy in ("auto", "mt"):
+        ei = ask_pick("Strojový překladač:",
+                      ["deepl  - výborná kvalita (API klíč)",
+                       "google - zdarma, slušná kvalita",
+                       "claude - překlad přes Anthropic API (klíč)",
+                       "argos  - offline (pip install argostranslate)"], default=1)
+        engine = ["deepl", "google", "claude", "argos"][ei]
+        if engine == "deepl":
+            mt_key = (getattr(args, "deepl_key", None) or os.environ.get("DEEPL_API_KEY")
+                      or ask_text("DeepL API klíč", ""))
+        elif engine == "claude":
+            mt_key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+                      or ask_text("Anthropic API klíč", ""))
+            mt_model = getattr(args, "anthropic_model", None) or ask_text("Claude model", "claude-sonnet-4-6")
+            args.anthropic_key = args.anthropic_key or mt_key      # ať to může použít i korektura
+            args.anthropic_model = args.anthropic_model or mt_model
+
+    os_key = os_user = os_pw = None
+    os_pick = "downloads"
+    if strategy in ("auto", "opensubtitles"):
+        os_key = (getattr(args, "opensubtitles_key", None) or os.environ.get("OPENSUBTITLES_API_KEY")
+                  or ask_text("OpenSubtitles API klíč (prázdné = přeskočit OpenSubtitles)", ""))
+        os_user = getattr(args, "opensubtitles_user", None) or os.environ.get("OPENSUBTITLES_USER")
+        os_pw = getattr(args, "opensubtitles_password", None) or os.environ.get("OPENSUBTITLES_PASSWORD")
+        if os_key and not os_user and ask_yes_no("Máš účet OpenSubtitles (nutný pro STAHOVÁNÍ)?", default_no=True):
+            os_user = ask_text("Uživatel", "")
+            os_pw = ask_text("Heslo", "")
+        if os_key:
+            pp = ask_pick("Při více nalezených verzích titulků:",
+                          ["nejstahovanější (automaticky)",
+                           "nejlépe hodnocené (automaticky)",
+                           "vybrat ručně u každého videa"], default=0)
+            os_pick = ["downloads", "rating", "ask"][pp]
+        if os_key and not os_user:
+            log_warn("Bez účtu OpenSubtitles půjde jen vyhledat, ne stáhnout - u 'auto' se "
+                     "přejde na strojový překlad.")
+
+    pi = ask_pick("Korektura výsledku:",
+                  ["rules  - rychlé pravidlové očištění (zdarma)",
+                   "off    - žádná",
+                   "claude - AI korektura přes Anthropic API (klíč)",
+                   "llm    - AI korektura přes OpenAI-kompatibilní API (klíč)"], default=0)
+    proofread = ["rules", "off", "anthropic", "llm"][pi]
+    if proofread == "llm":
+        args.llm_api = (getattr(args, "llm_api", None)
+                        or ask_text("API URL (chat/completions)", "https://api.openai.com/v1/chat/completions"))
+        args.llm_key = getattr(args, "llm_key", None) or os.environ.get("OPENAI_API_KEY") or ask_text("API klíč", "")
+        args.llm_model = getattr(args, "llm_model", None) or ask_text("Model", "gpt-4o-mini")
+    elif proofread == "anthropic":
+        args.anthropic_key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+                              or ask_text("Anthropic API klíč", ""))
+        args.anthropic_model = getattr(args, "anthropic_model", None) or ask_text("Claude model", "claude-sonnet-4-6")
+
+    sync_os = (strategy != "mt") and ask_yes_no(
+        "Stažené (lidské) titulky případně časově srovnat s videem (afinně)?", default_no=False)
+
+    # oprava čitelnosti (prodloužení krátkých titulků) na výsledku
+    args.fix_short_duration = False
+    _ask_readability(args, [])
+
+    overwrite = ask_yes_no("Přepsat existující výstupní .srt?", default_no=True)
+
+    print()
+    log_info(f"Cílový jazyk: {out_lang} | zdroj: {strategy}"
+             + (f" | překladač: {engine}" if engine else "")
+             + f" | korektura: {proofread}"
+             + (" | čitelnost: ano" if getattr(args, "fix_short_duration", False) else ""))
+    if not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
         return
 
-    if args.all:
-        run_batch(args)
-        return
+    done = skipped = 0
+    for vid in videos:
+        v = Path(vid)
+        out_path = v.with_name(v.stem + f".{out_lang}.srt")
+        if out_path.exists() and not overwrite:
+            log_info(f"{v.name}: výstup už existuje - přeskakuji.")
+            skipped += 1
+            continue
 
-    if not args.mkv:
-        parser.error("the following arguments are required: mkv")
+        events = None
+        source_used = None
+        if strategy in ("auto", "opensubtitles") and os_key:
+            events = fetch_opensubtitles_events(v, out_lang, os_key, os_user, os_pw, pick=os_pick)
+            if events:
+                source_used = "opensubtitles"
+                if sync_os:
+                    ref_events, _ = extract_subtitle_events(args, v, args.track_id, args.ref_lang)
+                    if ref_events:
+                        log_info(f"{v.name}: srovnávám stažené titulky s videem (affine)...")
+                        events = run_alignment(_affine_sync_args(args), ref_events, ref_events, events)
 
-    if not args.mkv.exists():
-        die(f"Vstupní soubor neexistuje: {args.mkv}")
+        if events is None and strategy in ("auto", "mt"):
+            src_events, chosen = extract_subtitle_events(args, v, args.track_id, args.ref_lang)
+            if src_events:
+                log_info(f"{v.name}: překládám {len(src_events)} titulků do '{out_lang}' ({engine})...")
+                events = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
+                source_used = f"mt:{engine}"
 
+        if not events:
+            log_warn(f"{v.name}: nepodařilo se získat cílové titulky - přeskakuji.")
+            skipped += 1
+            continue
+
+        if proofread != "off":
+            apply_proofread(events, proofread, out_lang, args)
+
+        if getattr(args, "fix_short_duration", False):
+            cps, floor, gap, overhead = resolve_speed_params(args)
+            events, n_ext = fix_short_durations(
+                events, min_cps=cps, min_duration_floor=floor, min_gap=gap, line_overhead=overhead)
+            if n_ext:
+                log_info(f"{v.name}: čitelnost - prodlouženo {n_ext} krátkých titulků")
+
+        try:
+            write_srt(events, out_path)
+            log_done(f"{v.name} -> {out_path.name}  ({source_used})")
+            done += 1
+        except Exception as e:
+            log_warn(f"{v.name}: zápis selhal: {e}")
+            skipped += 1
+
+    print()
+    log_done(f"Hotovo: {done} uloženo, {skipped} přeskočeno (z {len(videos)}).")
+
+
+def process_single(args):
+    """Zpracuje JEDEN video soubor: vytáhne referenci (titulky/zvuk),
+    dopočítá časování zvolenou metodou a uloží výsledek."""
     is_mkv_container = args.mkv.suffix.lower() in MKVEXTRACT_CONTAINER_EXTS
     need_sub_extraction = args.audio_mode in ("off", "combine")
     need_audio = args.audio_mode in ("replace", "combine")
@@ -1718,19 +3070,18 @@ def main():
         target_events = parse_srt(args.subtitle_to_fix)
         log_info(f"Opravovaných titulků: {len(target_events)}")
 
-        log_info("Hledám hrubý časový posun (FFT křížová korelace)...")
-        shift = coarse_offset(ref_events, target_events, max_shift=args.max_shift)
-        log_info(f"Hrubý odhad posunu: {shift:+.3f} s")
+        # reálná detekce jazyka z OBSAHU (po extrakci reference) a varování při
+        # neshodě, když běží obsahová metoda bez překladu
+        if getattr(args, "method", "auto") in ("auto", "warp", "combo") \
+                and getattr(args, "translate", "off") == "off" and ref_events_sub:
+            tl = detect_sub_language(target_events)
+            rl = detect_sub_language(ref_events_sub)
+            if tl and rl and tl != rl:
+                log_warn(f"Detekované jazyky se liší (opravované='{tl}', reference='{rl}'). "
+                         "Obsahové párování (warp) bude slabé - zvaž --translate google "
+                         "(nebo --method affine). Bez překladu se použije afinní fáze.")
 
-        log_info("Zpřesňuji (lineární regrese + robustní filtrování)...")
-        scale, offset, n_matched = refine_affine(ref_events, target_events, shift, tolerance=args.tolerance)
-        log_info(f"Výsledná transformace: nový_čas = {scale:.6f} * starý_čas + {offset:+.3f}")
-        log_info(f"Spárováno {n_matched} z {len(ref_events)} referenčních kotev pro zpřesnění")
-
-        if abs(scale - 1.0) > 0.05:
-            log_warn("Velký rozdíl v rychlosti (>5%) - možná jiný framerate zdrojů, zkontroluj výsledek.")
-
-        corrected = apply_transform(target_events, scale, offset)
+        corrected = run_alignment(args, ref_events, ref_events_sub, target_events)
 
         if args.fix_short_duration:
             cps, floor, gap, overhead = resolve_speed_params(args)
@@ -1743,6 +3094,661 @@ def main():
         write_srt(corrected, args.output)
 
     log_done(f"Synchronizované titulky uloženy do: {args.output}")
+
+
+# ----------------------------------------------------------------------
+# Interaktivní průvodci (--auto pro jeden soubor, --auto-all pro dávku)
+# ----------------------------------------------------------------------
+
+SUB_EXTS_AUTO = (".srt", ".ass", ".ssa", ".vtt")
+
+
+def collect_subs(directory):
+    """Najde titulkové soubory v adresáři (.srt/.ass/.ssa/.vtt a .orig
+    referenční varianty jako 'jmeno.srt.orig')."""
+    out = []
+    try:
+        names = sorted(os.listdir(directory))
+    except OSError:
+        return out
+    for f in names:
+        full = os.path.join(directory, f)
+        if not os.path.isfile(full):
+            continue
+        low = f.lower()
+        if low.endswith(SUB_EXTS_AUTO) or low.endswith(".orig"):
+            out.append(full)
+    return out
+
+
+def ask_pick(prompt, labels, default=0):
+    """Číslovaný výběr s výchozí volbou (Enter). Vrací index do labels."""
+    print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
+    for i, l in enumerate(labels):
+        mark = f" {Fore.CYAN}(výchozí){Style.RESET_ALL}" if i == default else ""
+        print(f"  {i + 1}) {l}{mark}")
+    while True:
+        raw = input(f"Volba [1-{len(labels)}, Enter = {default + 1}]: ").strip()
+        if raw == "":
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(labels):
+            return int(raw) - 1
+        print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
+
+
+def ask_text(prompt, default=""):
+    suffix = f" [{default}]" if default else ""
+    raw = input(f"{prompt}{suffix}: ").strip()
+    return raw or default
+
+
+LANGUAGE_NAMES = {
+    "cs": "čeština", "sk": "slovenština", "en": "angličtina", "de": "němčina",
+    "pl": "polština", "fr": "francouzština", "es": "španělština", "it": "italština",
+    "pt": "portugalština", "nl": "nizozemština", "ru": "ruština", "uk": "ukrajinština",
+    "hu": "maďarština", "ro": "rumunština", "bg": "bulharština", "el": "řečtina",
+    "tr": "turečtina", "sv": "švédština", "no": "norština", "da": "dánština",
+    "fi": "finština", "is": "islandština", "hr": "chorvatština", "sr": "srbština",
+    "sl": "slovinština", "et": "estonština", "lv": "lotyština", "lt": "litevština",
+    "ga": "irština", "mt": "maltština", "ar": "arabština", "he": "hebrejština",
+    "fa": "perština", "hi": "hindština", "bn": "bengálština", "ur": "urdština",
+    "ta": "tamilština", "th": "thajština", "vi": "vietnamština", "id": "indonéština",
+    "ms": "malajština", "tl": "tagalog", "ja": "japonština", "ko": "korejština",
+    "zh": "čínština", "zh-cn": "čínština (zjedn.)", "zh-tw": "čínština (trad.)",
+    "ca": "katalánština", "eu": "baskičtina", "gl": "galicijština",
+    "af": "afrikánština", "sw": "svahilština", "la": "latina",
+}
+
+
+def _print_language_list():
+    items = sorted(LANGUAGE_NAMES.items())
+    cells = [f"{c:<6}{n}" for c, n in items]
+    width = max(len(x) for x in cells) + 2
+    cols = 3
+    print(f"{Fore.MAGENTA}Běžné jazykové kódy:{Style.RESET_ALL}")
+    for i in range(0, len(cells), cols):
+        print("  " + "".join(cell.ljust(width) for cell in cells[i:i + cols]))
+    try:
+        from deep_translator import GoogleTranslator
+        sup = GoogleTranslator().get_supported_languages(as_dict=True)  # name -> code
+        extra = sorted(set(sup.values()) - set(LANGUAGE_NAMES.keys()))
+        if extra:
+            print(f"{Fore.CYAN}Další kódy podporované Googlem:{Style.RESET_ALL}")
+            for i in range(0, len(extra), 12):
+                print("  " + " ".join(extra[i:i + 12]))
+    except Exception:
+        pass
+    print(f"{Fore.CYAN}Pozn.:{Style.RESET_ALL} přesná podpora závisí na službě "
+          "(Google ~130, DeepL ~30, OpenSubtitles dle dostupnosti).")
+
+
+def ask_language(prompt, default=""):
+    """Jako ask_text, ale '?' vypíše seznam dostupných jazykových kódů."""
+    hint = f"{prompt} (? = seznam jazyků)"
+    while True:
+        raw = ask_text(hint, default)
+        if raw.strip() == "?":
+            _print_language_list()
+            continue
+        return raw
+
+
+def _pick_reading_speed():
+    keys = list(READING_SPEED_PRESETS.keys())
+    labels = [f"{k} - {READING_SPEED_PRESETS[k][2]} "
+              f"({READING_SPEED_PRESETS[k][0]:.0f} zn/s, podlaha {READING_SPEED_PRESETS[k][1]:.1f}s)"
+              for k in keys]
+    return keys[ask_pick("Rychlost čtení (cílové tempo):", labels, default=0)]
+
+
+def _ask_readability(into_args, srt_files):
+    """Zeptá se na prodlužování krátkých titulků; volitelně i na detailní
+    parametry (min. doba zobrazení, mezera, příplatek za řádek)."""
+    if not ask_yes_no("Prodloužit příliš krátké titulky kvůli čitelnosti "
+                      "(jen do volného místa, nikdy přes překryv)?", default_no=True):
+        return
+    into_args.fix_short_duration = True
+    if ask_yes_no("Nastavit čitelnost DETAILNĚ (čtecí tempo, min. doba zobrazení, "
+                  "bezpečnostní mezera, příplatek za řádek)?", default_no=True):
+        res = ask_readability_params(srt_files or [])
+        if res:
+            cps, floor, gap, overhead = res
+            into_args.min_cps = cps
+            into_args.min_duration_floor = floor
+            into_args.min_gap = gap
+            into_args.line_overhead = overhead
+            return
+    into_args.reading_speed = _pick_reading_speed()
+
+
+def _pick_method(into_args):
+    mi = ask_pick(
+        "Metoda dopočtu časování:",
+        ["auto  - doporučeno (kombinace: afinní předsrovnání + warp; jinak afinní)",
+         "combo - afinní předsrovnání + warp doladění po větách (nejrobustnější)",
+         "warp  - jen po VĚTÁCH (rychlé; potřebuje textovou referenci)",
+         "affine - jen globální posun + rychlost (jazykově nezávislé, i ze zvuku)"],
+        default=0)
+    into_args.method = ["auto", "combo", "warp", "affine"][mi]
+
+
+def _enable_translate_prompt(into_args):
+    ei = ask_pick("Překladač pro mezijazyčné párování:",
+                  ["google - online, zdarma (pip install deep-translator)",
+                   "deepl  - lepší kvalita (API klíč)",
+                   "claude - přes Anthropic API (klíč)",
+                   "argos  - offline (pip install argostranslate langdetect)"], default=0)
+    into_args.translate = ["google", "deepl", "claude", "argos"][ei]
+    into_args.pivot_lang = ask_text("Společný jazyk pro párování (pivot)", "en") or "en"
+    if into_args.translate == "deepl" and not getattr(into_args, "deepl_key", None):
+        into_args.deepl_key = os.environ.get("DEEPL_API_KEY") or ask_text("DeepL API klíč", "") or None
+    elif into_args.translate == "claude" and not getattr(into_args, "anthropic_key", None):
+        into_args.anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or ask_text("Anthropic API klíč", "") or None
+
+
+def _setup_languages_translate(into_args, target_lang, ref_lang):
+    """Podle DETEKOVANÝCH jazyků (z obsahu) rozhodne o překladu pro párování.
+    Pro 'affine' nemá překlad smysl."""
+    if into_args.method == "affine":
+        return
+    log_info(f"Detekovaný jazyk - opravované: {target_lang or '?'}, reference: {ref_lang or '?'}")
+    if target_lang and ref_lang:
+        if target_lang == ref_lang:
+            log_info("Stejný jazyk - překlad pro párování není potřeba.")
+            return
+        log_warn(f"RŮZNÉ jazyky ({target_lang} vs {ref_lang}). Pro přesné párování "
+                 "po větách pomáhá překlad JEN pro účely párování (text se nemění).")
+        if ask_yes_no("Zapnout překlad pro mezijazyčné párování?", default_no=False):
+            _enable_translate_prompt(into_args)
+        else:
+            log_info("Bez překladu - různé jazyky se dopočítají afinní fází.")
+    else:
+        if ask_yes_no("Jazyk se nepodařilo jednoznačně určit. Jsou opravované a referenční "
+                      "titulky v RŮZNÝCH jazycích (zapnout překlad pro párování)?", default_no=True):
+            _enable_translate_prompt(into_args)
+
+
+def _resolve_mkvmerge(into_args):
+    if getattr(into_args, "mkvmerge", None):
+        return into_args.mkvmerge
+    return find_tool(["mkvmerge", "mkvmerge.exe"])
+
+
+def _is_text_sub(codec):
+    c = (codec or "").lower()
+    return any(x in c for x in ("subrip", "srt", "ass", "ssa", "substation", "vtt", "webvtt", "text"))
+
+
+def _offer_video_reference(into_args, video_path):
+    """Probne reálné stopy ve videu a nabídne je. Vrací (audio_mode, ref_lang)
+    a nastaví track_id / audio_track_id podle volby."""
+    mkvmerge_bin = _resolve_mkvmerge(into_args)
+    subs = audio = None
+    if mkvmerge_bin:
+        subs, audio, _err = try_list_tracks(mkvmerge_bin, video_path)
+    if not subs and not audio:
+        log_warn("Nepodařilo se přečíst stopy z videa (chybí mkvmerge nebo nečitelný "
+                 "kontejner) - použiju automatický výběr.")
+        am = ask_pick("Reference z videa - co použít?",
+                      ["titulková stopa (auto)", "zvuk - detekce řeči/VAD", "obojí"], default=0)
+        mode = ["off", "replace", "combine"][am]
+        rl = None
+        if mode in ("off", "combine"):
+            rl = norm_lang(ask_language("Jazyk referenční stopy (eng/cze; prázdné=auto)", "") or None)
+        return mode, rl
+
+    labels, opts = [], []
+    for t in (subs or []):
+        kind = "text" if _is_text_sub(t["codec"]) else "obrázkové (nelze jako text)"
+        title = f" '{t['title']}'" if t.get("title") else ""
+        labels.append(f"titulky #{t['id']}  {t['lang']}  {t['codec']}{title}  [{kind}]")
+        opts.append(("off", t["id"], norm_lang(t["lang"])))
+    for t in (audio or []):
+        title = f" '{t['title']}'" if t.get("title") else ""
+        labels.append(f"zvuk   #{t['id']}  {t['lang']}  {t['codec']}{title}  [detekce řeči/VAD]")
+        opts.append(("replace", t["id"], None))
+    labels.append("obojí: titulková stopa + zvuk dohromady (max. robustnost)")
+    opts.append(("combine", None, None))
+
+    idx = ask_pick("Co použít jako referenci? (skutečné stopy nalezené ve videu)", labels, default=0)
+    mode, track_id, lang = opts[idx]
+    if mode == "off" and track_id is not None:
+        into_args.track_id = track_id
+    elif mode == "replace" and track_id is not None:
+        into_args.audio_track_id = track_id
+    return mode, lang
+
+
+def sync_two_subs(target_path, ref_path, output, args):
+    """Přímá synchronizace dvou titulkových souborů (referencí je druhý .srt),
+    bez videa a bez externích nástrojů. Text se nemění, jen časování."""
+    target_events = parse_srt(Path(target_path))
+    ref_events = parse_srt(Path(ref_path))
+    log_info(f"Opravovaných titulků: {len(target_events)}; referenčních: {len(ref_events)}")
+    corrected = run_alignment(args, ref_events, ref_events, target_events)
+    if getattr(args, "fix_short_duration", False):
+        cps, floor, gap, overhead = resolve_speed_params(args)
+        corrected, n_ext = fix_short_durations(
+            corrected, min_cps=cps, min_duration_floor=floor, min_gap=gap, line_overhead=overhead)
+        log_info(f"Prodlouženo {n_ext} titulků se zkráceným zobrazením (využita volná místa)")
+    Path(output).parent.mkdir(parents=True, exist_ok=True)
+    write_srt(corrected, Path(output))
+    log_done(f"Synchronizované titulky uloženy do: {output}")
+
+
+def run_auto_single(args):
+    """Interaktivní průvodce pro JEDEN soubor: prohledá adresář, nabídne
+    titulky k opravě i zdroj reference (video se skutečnými stopami, nebo
+    druhý titulkový soubor), reálně detekuje jazyky z obsahu a podle toho
+    nabídne překlad, zeptá se na metodu, výstup a čitelnost."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+
+    print(f"{Fore.MAGENTA}=== Interaktivní synchronizace (jeden soubor) ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+
+    subs = collect_subs(directory)
+    videos = collect_videos(directory, recursive=False)
+    if not subs:
+        die("V adresáři nejsou žádné titulkové soubory (.srt/.ass/.vtt/.orig). "
+            "Spusť skript ve složce s titulky nebo zadej cestu k ní jako 1. argument.")
+
+    ti = ask_pick("Který titulkový soubor se má OPRAVIT (má špatné časování)?",
+                  [os.path.basename(s) for s in subs])
+    target = subs[ti]
+    target_lang = detect_srt_file_language(target)
+
+    ref_opts, labels = [], []
+    for v in videos:
+        ref_opts.append(("video", v))
+        labels.append(f"[video]   {os.path.basename(v)}  (vytáhnout referenční stopu z videa)")
+    for s in subs:
+        if s == target:
+            continue
+        ref_opts.append(("sub", s))
+        labels.append(f"[titulky] {os.path.basename(s)}  (reference přímo z tohoto souboru)")
+    if not ref_opts:
+        die("Nenašel jsem žádný zdroj reference (video ani druhý titulkový soubor). "
+            "Potřebuješ buď video se správně časovanou stopou, nebo druhý .srt jako referenci.")
+
+    ri = ask_pick("Odkud vzít SPRÁVNÉ časování (reference)?", labels, default=0)
+    kind, refpath = ref_opts[ri]
+
+    _pick_method(args)
+
+    audio_mode, ref_lang = "off", None
+    if kind == "video":
+        audio_mode, ref_lang = _offer_video_reference(args, refpath)
+    else:
+        ref_lang = detect_srt_file_language(refpath)
+
+    _setup_languages_translate(args, target_lang, ref_lang)
+
+    tgt = Path(target)
+    default_out = str(tgt.with_name(tgt.stem + ".synced" + tgt.suffix))
+    if ask_yes_no(f"Přepsat původní soubor '{tgt.name}' (vytvoří se jednorázově .bak záloha)?", default_no=True):
+        output = target
+        bak = tgt.with_suffix(tgt.suffix + ".bak")
+        if not bak.exists():
+            shutil.copy(target, bak)
+    else:
+        output = ask_text("Výstupní soubor", default_out)
+
+    _ask_readability(args, [target])
+
+    args.audio_mode = audio_mode
+    args.ref_lang = ref_lang
+    args.output = Path(output)
+
+    print()
+    log_info(f"Opravit:   {os.path.basename(target)} (jazyk: {target_lang or '?'})")
+    log_info(f"Reference: {os.path.basename(refpath)} ({'video' if kind == 'video' else 'titulky'}"
+             + (f", jazyk: {ref_lang}" if ref_lang else "") + ")")
+    log_info(f"Metoda:    {args.method}"
+             + (f" | audio-mode {audio_mode}" if kind == 'video' else "")
+             + (f" | překlad {args.translate}->{args.pivot_lang}" if getattr(args, 'translate', 'off') != 'off' else ""))
+    log_info(f"Výstup:    {output}")
+    if not ask_yes_no("Spustit synchronizaci?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+
+    if kind == "sub":
+        sync_two_subs(target, refpath, args.output, args)
+    else:
+        args.mkv = Path(refpath)
+        args.subtitle_to_fix = Path(target)
+        process_single(args)
+
+
+def run_auto_all(args):
+    """Interaktivní průvodce pro DÁVKU (--all): nabídne skutečné stopy ze
+    vzorového videa, reálně detekuje jazyky z obsahu titulků a podle toho
+    nabídne překlad; pak spustí standardní dávkové zpracování."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+
+    print(f"{Fore.MAGENTA}=== Interaktivní dávková synchronizace (--all) ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+
+    args.recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
+    videos = collect_videos(directory, args.recursive)
+    srts = collect_srts(directory, args.recursive)
+    log_info(f"Nalezeno {len(videos)} videí a {len(srts)} .srt souborů.")
+    if not videos:
+        die("Žádná videa k dávkovému zpracování. Pro synchronizaci dvojice titulkových "
+            "souborů (.srt + reference) použij --auto.")
+
+    _pick_method(args)
+
+    # nabídka reference ze SKUTEČNÝCH stop vzorového videa
+    sample_video = videos[0]
+    log_info(f"Čtu stopy ze vzorového videa: {os.path.basename(sample_video)}")
+    mkvmerge_bin = _resolve_mkvmerge(args)
+    subs_tracks = None
+    if mkvmerge_bin:
+        subs_tracks, _audio, _err = try_list_tracks(mkvmerge_bin, sample_video)
+
+    am = ask_pick("Zdroj reference pro celou dávku:",
+                  ["titulková stopa z videa (doporučeno)",
+                   "zvuk - detekce řeči/VAD",
+                   "obojí dohromady (max. robustnost)"], default=0)
+    args.audio_mode = ["off", "replace", "combine"][am]
+    if args.audio_mode in ("off", "combine"):
+        langs = sorted({norm_lang(t["lang"]) for t in (subs_tracks or []) if norm_lang(t["lang"])})
+        if langs:
+            labels = [f"{l}" for l in langs] + ["jiný (napsat ručně)", "automaticky (nevybírat)"]
+            i = ask_pick(f"Jazyk referenční titulkové stopy (nalezeno ve vzorku): ", labels, default=0)
+            if i < len(langs):
+                args.ref_lang = langs[i]
+            elif i == len(langs):
+                args.ref_lang = norm_lang(ask_language("Jazyk (eng/cze/...)", "") or None)
+            else:
+                args.ref_lang = None
+        else:
+            args.ref_lang = norm_lang(ask_language(
+                "Jazyk referenční titulkové stopy (eng/cze; prázdné=auto)", args.ref_lang or "") or None)
+
+    args.target_lang = ask_text(
+        "Když k jednomu videu sedí víc .srt, preferovaný jazykový tag v názvu (např. cs; prázdné = zeptat se)",
+        args.target_lang or "") or None
+
+    # reálná detekce jazyka opravovaných titulků z OBSAHU vzorového .srt
+    sample_srts = filter_by_tag(srts, args.target_lang) if (args.target_lang and srts) else srts
+    target_lang = detect_srt_file_language(sample_srts[0]) if sample_srts else None
+    _setup_languages_translate(args, target_lang, args.ref_lang)
+
+    args.overwrite = ask_yes_no("Přepsat původní .srt přímo (vytvoří se .bak zálohy)?", default_no=True)
+
+    _ask_readability(args, (sample_srts or srts)[:5])
+
+    args.yes = ask_yes_no("Když u videa chybí potřebné stopy, automaticky přeskočit bez ptaní?", default_no=True)
+
+    print()
+    log_info(f"Metoda: {args.method} | audio-mode: {args.audio_mode}"
+             + (f" | překlad {args.translate}->{args.pivot_lang}" if getattr(args, 'translate', 'off') != 'off' else "")
+             + f" | přepis: {'ano' if args.overwrite else 'ne'} | rekurzivně: {'ano' if args.recursive else 'ne'}")
+    if not ask_yes_no("Spustit dávkové zpracování?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+
+    args.mkv = Path(directory)
+    run_batch(args)
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Opraví časování titulků podle referenčních titulků a/nebo zvukové stopy z MKV (bez alass; mkvtoolnix pro titulky, ffmpeg volitelně pro zvuk).",
+        epilog=r"""
+WORKFLOW - jak se skriptem reálně pracovat
+==========================================
+
+KROK 0 (jednou):  pip install numpy colorama
+                  (mkvtoolnix/ffmpeg si skript v případě potřeby stáhne sám)
+
+NEJJEDNODUŠŠÍ - interaktivní průvodce (skript se na VŠE postupně zeptá):
+    python sync_subtitles.py --auto                 # jeden soubor, prohledá tento adresář
+    python sync_subtitles.py --auto D:\slozka       # ... v zadaném adresáři
+    python sync_subtitles.py --auto-all D:\serial    # celá dávka, ale s otázkami předem
+  --auto nabídne titulky k opravě i zdroj reference; jako referenci umí vzít
+  i DRUHÝ TITULKOVÝ SOUBOR (.srt/.orig) úplně BEZ videa - ideální, když máš
+  jen dvoje titulky (špatně časované + správně časované). U videa nabídne
+  SKUTEČNÉ stopy (mkvmerge), sám DETEKUJE jazyky z obsahu a při různých
+  jazycích nabídne překlad jen pro párování. Výchozí metoda = combo
+  (afinní předsrovnání + warp doladění).
+
+PŘELOŽIT TITULKY DO JINÉHO JAZYKA (vytáhnout z videa a uložit .srt):
+    python sync_subtitles.py --translate-subs D:\serial
+  Pro všechna videa v adresáři: vytáhne zvolenou titulkovou stopu a uloží
+  titulky v cílovém jazyce jako <video>.<lang>.srt. Na vše se zeptá. Kvalitu
+  řeší přes: hotové LIDSKÉ titulky z OpenSubtitles (nejlepší; vyžaduje API
+  klíč a pro stahování i účet), nebo strojový překlad (DeepL = nejlepší
+  kvalita s API klíčem / Google zdarma / Argos offline) + korekturu
+  (pravidlové očištění zdarma, volitelně AI korektura přes OpenAI-kompatibilní
+  API). U strojového překladu zůstává původní časování, takže výsledek sedí
+  na video. Klíče lze dát i přes proměnné DEEPL_API_KEY / OPENSUBTITLES_API_KEY
+  / OPENAI_API_KEY.
+
+Nebo ručně, když přesně víš, co chceš:
+
+KROK 1 - podívej se, co je ve videu:
+    python sync_subtitles.py --list-tracks video.mkv
+  Vypíše titulkové i zvukové stopy s jejich ID a jazyky. Z toho zjistíš,
+  jestli má video použitelnou TEXTOVOU titulkovou stopu (SRT/ASS) jako
+  referenci a jaký má jazyk.
+
+KROK 2 - srovnej jeden soubor (nejčastější případ):
+    python sync_subtitles.py video.mkv titulky_cz.srt vystup_cz.srt
+  Ve výchozím stavu (--method auto, --audio-mode off) vezme referenční
+  titulkovou stopu z videa a srovná podle ní tvůj český .srt. Když je
+  ve videu textová reference, použije se nová obsahová metoda "warp"
+  (po větách - umí i rozsync po částech); jinak se vrátí k afinní.
+
+  - Konkrétní/vícejazyčné stopy:   --ref-lang eng    nebo    --track-id 3
+  - Žádná použitelná titulková reference (jen obrázkové PGS, nebo žádné)?
+        python sync_subtitles.py video.mkv t_cz.srt out.srt --audio-mode replace
+    -> srovná podle ZVUKU (detekce řeči, VAD). Tady jede vždy "affine".
+  - Maximální robustnost (titulky + zvuk dohromady):  --audio-mode combine
+
+KROK 3 - zkontroluj výsledek v přehrávači. Když to skoro sedí, ale některé
+  scény "ujíždějí" jinam než zbytek = rozsync po částech -> vynuť obsahovou
+  metodu:
+    python sync_subtitles.py video.mkv t_cz.srt out.srt --method warp
+  Když je naopak referenční překlad hodně odlišný (málo společných vět),
+  je jistější:  --method affine
+
+KROK 4 (volitelně) - čitelnost: prodluž titulky, co moc rychle mizí, ale
+  jen do volného místa (nikdy přes překryv):
+    ... --fix-short-duration --reading-speed slow
+
+DÁVKOVĚ (celý seriál v jednom adresáři) - videa se spárují s .srt podle názvu:
+    python sync_subtitles.py D:\serial --all --target-lang cs --overwrite
+  (--overwrite přepíše originály a udělá jednorázově .bak; bez něj vznikne
+   '<jméno>.synced.srt'. --yes = neptat se a chybějící stopy přeskočit.)
+
+JEN ČITELNOST, bez synchronizace (titulky už mají správný čas):
+    python sync_subtitles.py D:\serial --fix-readability
+
+TIPY K LADĚNÍ "warp":
+    --ca-band 60        širší hledání kotev (větší/blokový rozsync)
+    --ca-snap-win 2     opatrnější lokální dolaďování
+    --ca-min-sim 0.6    přísnější kotvy (jistější, ale méně jich bude)
+
+RŮZNÉ JAZYKY (target vs reference):
+    ... --translate google                 # online, přeloží jen pro párování
+    ... --translate argos --pivot-lang en   # offline (pip install argostranslate langdetect)
+  Bez --translate se odlišné jazyky řeší afinní metodou (časování). Text
+  titulků se nikdy nepřekládá, mění se jen časy. Překlady se kešují.
+""",
+    )
+    parser.add_argument("mkv", type=Path, nargs="?",
+                         help="Vstupní MKV/MP4 soubor (nebo s --all: adresář k prohledání, default '.')")
+    parser.add_argument("subtitle_to_fix", type=Path, nargs="?", help="SRT se špatným časováním, který chceme opravit")
+    parser.add_argument("output", type=Path, nargs="?", help="Cesta k výstupnímu opravenému SRT")
+
+    parser.add_argument("--all", action="store_true",
+                         help="Dávkový režim: zpracuje všechna videa v adresáři (1. argument, default "
+                              "aktuální adresář). Pro každé video se podle názvu souboru dohledá "
+                              "odpovídající .srt, ověří se dostupné stopy, a teprve poté se zpracuje.")
+    parser.add_argument("-r", "--recursive", action="store_true",
+                         help="S --all: prohledat i podadresáře.")
+    parser.add_argument("--target-lang", help="S --all: pokud k jednomu videu sedí víc .srt souborů "
+                                                "(různé jazyky), použít ten s tímto jazykovým tagem v názvu "
+                                                "(např. 'cs' pro 'epizoda.cs.srt').")
+    parser.add_argument("--overwrite", action="store_true",
+                         help="S --all: přepsat původní .srt přímo (vytvoří jednorázově .bak zálohu). "
+                              "Bez tohoto se výstup ukládá jako '<jméno>.synced.srt' vedle originálu.")
+    parser.add_argument("--yes", action="store_true",
+                         help="S --all: když u videa chybí potřebné stopy, automaticky přeskočit "
+                              "bez interaktivního dotazu (pro nehlídané/dávkové spouštění). "
+                              "S --fix-readability: nepoužívat výchozí hodnoty parametrů bez ptaní.")
+
+    parser.add_argument("--fix-readability", action="store_true",
+                         help="Samostatný režim (BEZ synchronizace): najde v adresáři (1. argument, "
+                              "default aktuální adresář; nebo přímo konkrétní .srt) všechny titulky, "
+                              "které už mají SPRÁVNÉ časování, a jen prodlouží ty, co zmizí příliš "
+                              "rychle na pohodlné přečtení - výhradně do volného místa, nikdy na úkor "
+                              "překryvu. Bez --min-cps/--min-duration-floor/--min-gap se na hodnoty "
+                              "interaktivně zeptá (s vysvětlením a orientačním odhadem aktuálního tempa).")
+
+    parser.add_argument("--ref-lang", help="Jazyk referenční TITULKOVÉ stopy v MKV, např. eng, cze, ces")
+    parser.add_argument("--track-id", type=int, help="ID titulkové stopy v MKV (viz --list-tracks)")
+
+    parser.add_argument(
+        "--audio-mode", choices=["off", "replace", "combine"], default="off",
+        help="off = jen titulková reference (default); replace = jen analýza zvuku (VAD), "
+             "titulková reference se nepoužije; combine = titulková reference + zvuk společně "
+             "pro maximální přesnost.",
+    )
+    parser.add_argument("--audio-lang", help="Jazyk zvukové stopy pro VAD, např. eng, cze, ces")
+    parser.add_argument("--audio-track-id", type=int, help="ID zvukové stopy v MKV (viz --list-tracks)")
+    parser.add_argument("--vad-percentile", type=float, default=55.0,
+                         help="Práh hlasitosti pro detekci řeči, percentil 0-100 (default 55; "
+                              "zvyš při hlučném pozadí/hudbě, sniž pro tišší dialogy)")
+
+    parser.add_argument(
+        "--method", choices=["auto", "affine", "warp", "combo"], default="auto",
+        help="Jak dopočítat časování. 'affine' = globální posun+rychlost (a*t+b, "
+             "jazykově nezávislé, i jen ze zvuku). 'warp' = obsahová metoda po VĚTÁCH "
+             "(opraví i rozsync po částech; potřebuje textovou referenci). 'combo' = "
+             "afinní předsrovnání + warp doladění (nejrobustnější). 'auto' (default) = "
+             "combo když je textová reference a dost kotev, jinak affine.")
+    parser.add_argument("--ca-band", type=float, default=None,
+                         help="(jen --method warp/auto) poloměr hledání kotev v sekundách (default 45)")
+    parser.add_argument("--ca-snap-win", type=float, default=None,
+                         help="(jen --method warp/auto) okno lokálního došťouchnutí v sekundách "
+                              "(default 3; menší = opatrnější)")
+    parser.add_argument("--ca-min-sim", type=float, default=None,
+                         help="(jen --method warp/auto) min. textová podobnost pro kotvu 0-1 (default 0.50)")
+    parser.add_argument("--translate", choices=["off", "google", "deepl", "argos", "claude"], default="off",
+                         help="Mezijazyčné párování (jen pro metodu warp/auto/combo): když jsou opravované a "
+                              "referenční titulky v JINÝCH jazycích, přeloží obě strany do společného "
+                              "jazyka (--pivot-lang) JEN pro účely párování - text titulků se nemění. "
+                              "'google' zdarma, 'deepl'/'claude' lepší kvalita (API klíč), 'argos' offline. "
+                              "Překlady se kešují. Bez tohoto se různé jazyky řeší afinní metodou.")
+    parser.add_argument("--pivot-lang", default="en",
+                         help="Společný jazyk pro mezijazyčné párování s --translate (default 'en').")
+
+    parser.add_argument("--list-tracks", action="store_true", help="Jen vypsat titulkové i zvukové stopy v MKV a skončit")
+    parser.add_argument("--max-shift", type=float, default=120.0, help="Maximální předpokládaný posun v sekundách (default 120)")
+    parser.add_argument("--tolerance", type=float, default=1.5, help="Tolerance v sekundách pro párování při zpřesnění (default 1.5)")
+
+    parser.add_argument("--fix-short-duration", action="store_true",
+                         help="Po synchronizaci prodloužit titulky, které zmizí příliš rychle vzhledem "
+                              "k délce textu - ale jen pokud je k tomu volné místo (mezera do dalšího "
+                              "titulku), nikdy na úkor překryvu s dalším titulkem.")
+    parser.add_argument("--reading-speed", choices=list(READING_SPEED_PRESETS.keys()),
+                         help="Rychlá volba presetu čtecí rychlosti místo ručního --min-cps/--min-duration-floor: "
+                              + "; ".join(f"'{k}' = {v[2]} ({v[0]:.0f} znaků/s, podlaha {v[1]:.1f}s)"
+                                          for k, v in READING_SPEED_PRESETS.items())
+                              + ". Explicitně zadané --min-cps/--min-duration-floor mají před presetem přednost.")
+    parser.add_argument("--min-cps", type=float, default=None,
+                         help=f"Cílová čtecí rychlost ve znacích/s pro výpočet ideální min. délky "
+                              f"zobrazení (default {DEFAULT_MIN_CPS}; nižší = delší zobrazení pro stejný text)")
+    parser.add_argument("--min-duration-floor", type=float, default=None,
+                         help=f"Absolutní minimální délka zobrazení titulku v sekundách, bez ohledu "
+                              f"na délku textu (default {DEFAULT_MIN_DURATION_FLOOR})")
+    parser.add_argument("--min-gap", type=float, default=None,
+                         help=f"Mezera v sekundách, která musí zůstat zachována před dalším titulkem "
+                              f"při prodlužování (default {DEFAULT_MIN_GAP} - cca 2 snímky při 24fps)")
+    parser.add_argument("--line-overhead", type=float, default=None,
+                         help=f"Extra sekundy navíc za KAŽDÝ řádek titulku nad první - vícero řádků "
+                              f"potřebuje navíc čas na přeskočení očí (default {DEFAULT_LINE_OVERHEAD}; "
+                              f"díky tomu jednoslovný titulek nikdy nedostane stejnou délku jako "
+                              f"víceřádková věta jen kvůli společné podlaze)")
+    parser.add_argument("--mkvmerge", help="Cesta k mkvmerge.exe nebo ke složce s ním, pokud není v PATH")
+    parser.add_argument("--mkvextract", help="Cesta k mkvextract.exe nebo ke složce s ním, pokud není v PATH")
+    parser.add_argument("--no-mkvtoolnix-download", action="store_true",
+                         help="Nezkoušet automaticky stáhnout MKVToolNix, pokud nebyl nikde nalezen")
+    parser.add_argument("--ffmpeg", help="Cesta k ffmpeg.exe nebo ke složce s ním (jen pro --audio-mode replace/combine)")
+    parser.add_argument("--no-ffmpeg-download", action="store_true",
+                         help="Nezkoušet automaticky stáhnout ffmpeg, pokud nebyl nikde nalezen")
+    parser.add_argument("--auto", action="store_true",
+                         help="Interaktivní průvodce pro JEDEN soubor: prohledá adresář, nabídne titulky k opravě i zdroj reference (video NEBO druhý titulkový soubor) a na vše se postupně zeptá.")
+    parser.add_argument("--auto-all", action="store_true",
+                         help="Interaktivní průvodce pro DÁVKU (jako --all, ale na nastavení se nejdřív zeptá): metoda, zdroj reference, jazyk, přepis, čitelnost - pak zpracuje celý adresář.")
+    parser.add_argument("--translate-subs", action="store_true",
+                         help="Interaktivní režim: pro všechna videa v adresáři vytáhne zvolenou titulkovou stopu, získá titulky v cílovém jazyce (OpenSubtitles a/nebo strojový překlad + korektura) a uloží je jako <video>.<lang>.srt.")
+    parser.add_argument("--out-lang", default=None, help="(--translate-subs) cílový jazyk překladu, např. cs")
+    parser.add_argument("--sub-source", choices=["auto", "mt", "opensubtitles"], default="auto",
+                         help="(--translate-subs) odkud vzít cílové titulky (default auto).")
+    parser.add_argument("--deepl-key", default=None, help="API klíč pro DeepL (nebo proměnná DEEPL_API_KEY).")
+    parser.add_argument("--opensubtitles-key", default=None, help="API klíč pro OpenSubtitles (nebo OPENSUBTITLES_API_KEY).")
+    parser.add_argument("--llm-key", default=None, help="API klíč pro AI korekturu (nebo OPENAI_API_KEY).")
+    parser.add_argument("--config", action="store_true",
+                         help="Interaktivní nastavení API klíčů a výchozích voleb do config.json (ptá se jen na to, co chceš zapnout). Config se při startu načítá automaticky.")
+    parser.add_argument("--config-file", default=None, help="Cesta k config.json (default vedle skriptu).")
+    parser.add_argument("--no-config", action="store_true", help="Nenačítat config.json při startu.")
+    parser.add_argument("--anthropic-key", default=None, help="Anthropic (Claude) API klíč (nebo ANTHROPIC_API_KEY).")
+    parser.add_argument("--anthropic-model", default=None, help="Model Claude (default claude-sonnet-4-6).")
+    parser.add_argument("--llm-api", default=None, help="URL OpenAI-kompatibilního API (/chat/completions).")
+    parser.add_argument("--llm-model", default=None, help="Model pro OpenAI-kompatibilní korekturu.")
+    parser.add_argument("--opensubtitles-user", default=None, help="OpenSubtitles uživatel (pro stahování).")
+    parser.add_argument("--opensubtitles-password", default=None, help="OpenSubtitles heslo (pro stahování).")
+    args = parser.parse_args()
+
+    _cfg = {} if getattr(args, "no_config", False) else load_config(resolve_config_path(args))
+    apply_config_to_args(args, _cfg)
+    if args.config:
+        run_config(args)
+        return
+
+    if args.auto_all:
+        run_auto_all(args)
+        return
+    if args.auto:
+        run_auto_single(args)
+        return
+    if args.translate_subs:
+        run_translate_subs(args)
+        return
+
+    if args.all and args.fix_readability:
+        die("--all a --fix-readability nelze použít současně (jsou to dva oddělené dávkové režimy).")
+
+    if args.fix_readability:
+        run_fix_readability(args)
+        return
+
+    if args.all:
+        run_batch(args)
+        return
+
+    if not args.mkv:
+        parser.error("the following arguments are required: mkv")
+
+    if not args.mkv.exists():
+        die(f"Vstupní soubor neexistuje: {args.mkv}")
+
+    process_single(args)
 
 
 if __name__ == "__main__":
