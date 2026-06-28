@@ -1,4 +1,4 @@
-from urllib.parse import unquote, unquote_plus
+from urllib.parse import unquote, unquote_plus, urlencode
 import requests
 import argparse
 import sys
@@ -41,6 +41,11 @@ SEGMENT_MIB = 32                  # folder mode: split each file into segments o
                                   # so freed connections flow to remaining files (work-stealing).
 BAR_NCOLS = 100                   # fixed progress-bar width so bars don't stretch across wide terminals
 BAR_DESC_WIDTH = 26               # fixed filename column width so all bars line up
+# Network timeouts (seconds). Without these a stalled connection (e.g. Google's videoplayback
+# CDN ignoring a HEAD request) would hang the whole run forever.
+CONNECT_TIMEOUT = 15              # max time to establish a TCP/TLS connection
+META_READ_TIMEOUT = 30           # read timeout for small metadata/probe/listing requests
+DOWNLOAD_READ_TIMEOUT = 120      # max gap between received chunks during an actual download
 # =============================================================================
 
 # Runtime console state (filled in by setup_console()).
@@ -259,10 +264,10 @@ def acquire_lock(lock_path: str) -> bool:
                 except OSError:
                     pass
 
-            print(f"[ERROR] Another instance is already downloading this file.")
+            print("[ERROR] Another instance is already downloading this file.")
             print(f"        Lock held by PID {owner} ({lock_path}).")
-            print(f"        Wait for it to finish, choose a different name with -o,")
-            print(f"        or delete the lock file if you are sure no other run is active.")
+            print("        Wait for it to finish, choose a different name with -o,")
+            print("        or delete the lock file if you are sure no other run is active.")
             return False
 
 
@@ -518,6 +523,248 @@ def extract_drive_target(input_str: str) -> tuple[str, str]:
     return 'file', extract_drive_id(input_str)
 
 
+# =============================================================================
+#  Patreon collection support
+#  Given a Patreon collection URL, walk its posts, pull out the Google Drive
+#  links (the "WATCH HERE" anchors, but any Drive link is picked up), and feed
+#  them into the same folder download path (incl. --select).
+# =============================================================================
+PATREON_REFERER = "https://www.patreon.com/"
+_DRIVE_URL_RE = re.compile(r'https?://drive\.google\.com/[^\s"\'<>\\)]+')
+
+
+def extract_patreon_collection_id(input_str: str):
+    """Return the collection id from a Patreon collection URL, or None if it's not one."""
+    m = re.search(r'patreon\.com/collection/(\d+)', input_str)
+    if m:
+        return m.group(1)
+    # Also accept a bare collection path, but only when it clearly is one (avoid colliding
+    # with Drive URLs, which never contain '/collection/').
+    m = re.search(r'/collection/(\d+)', input_str)
+    if m:
+        return m.group(1)
+    return None
+
+
+def get_collection_info(collection_id: str, session: requests.Session, verbose: bool):
+    """Best-effort (title, campaign_id) for a Patreon collection. Both may be None."""
+    url = (f"https://www.patreon.com/api/collection/{collection_id}"
+           f"?json-api-version=1.0&json-api-use-default-includes=false")
+    title, campaign_id = None, None
+    try:
+        r = session.get(url, headers={'Referer': PATREON_REFERER, 'Accept': 'application/json'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        d = r.json()
+        attrs = d.get('data', {}).get('attributes', {})
+        title = attrs.get('title')
+        m = re.search(r'/campaign/(\d+)/', r.text)  # campaign id appears in cover-media URLs
+        if m:
+            campaign_id = m.group(1)
+    except Exception:
+        pass
+    if verbose:
+        print(f"[INFO] Patreon collection '{title}', campaign {campaign_id}")
+    return title, campaign_id
+
+
+def list_collection_posts(collection_id: str, campaign_id, session: requests.Session,
+                          verbose: bool) -> list:
+    """Return all post objects of a collection, following cursor pagination."""
+    posts = []
+    cursor = None
+    page = 0
+    while True:
+        params = {
+            'include': 'collections,drop,primary_image,audio,video,embed',
+            'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
+            'sort': 'collection_order',
+            'filter[collection_id]': collection_id,
+            'filter[is_suspended]': 'false',
+            'filter[include_drops]': 'true',
+            'filter[is_published]': 'true',
+            'page[size]': '100',
+            'json-api-version': '1.0',
+            'json-api-use-default-includes': 'false',
+        }
+        if campaign_id:
+            params['filter[campaign_id]'] = campaign_id
+        if cursor:
+            params['page[cursor]'] = cursor
+        url = "https://www.patreon.com/api/posts?" + urlencode(params)
+        r = session.get(url, headers={'Referer': PATREON_REFERER, 'Accept': 'application/json'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        try:
+            d = r.json()
+        except Exception:
+            print(f"[ERROR] Patreon API did not return JSON (status {r.status_code}). "
+                  f"Your cookies may be missing or expired.")
+            break
+        batch = d.get('data', []) or []
+        posts.extend(batch)
+        page += 1
+        cursor = (((d.get('meta') or {}).get('pagination') or {}).get('cursors') or {}).get('next')
+        if verbose:
+            print(f"[INFO] Patreon posts page {page}: +{len(batch)} (total {len(posts)})")
+        if not cursor or not batch:
+            break
+        if page > 500:  # safety valve
+            print("[WARN] Stopping Patreon pagination after 500 pages.")
+            break
+    return posts
+
+
+def _walk_strings(obj):
+    """Yield every string found anywhere inside a nested dict/list structure."""
+    if isinstance(obj, dict):
+        for v in obj.values():
+            yield from _walk_strings(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_strings(v)
+    elif isinstance(obj, str):
+        yield obj
+
+
+def extract_drive_links_from_post(post: dict) -> list:
+    """Return an ordered, de-duplicated list of Google Drive URLs found anywhere in a post.
+
+    Looks first at the rich-text body's explicit link anchors (the usual "WATCH HERE"
+    proklik), then at any Drive URL pasted as plain text, then at HTML/teaser fields, and
+    finally scans the whole post object as a catch-all. Robust to where the link sits."""
+    a = post.get('attributes', {}) or {}
+    urls = []
+    seen = set()
+
+    def add(u):
+        u = (u or '').strip().rstrip('.,);')  # trim trailing prose punctuation
+        if u and u not in seen:
+            seen.add(u)
+            urls.append(u)
+
+    # 1) Rich-text doc: explicit link marks first, then plain-text URLs inside it.
+    cjs = a.get('content_json_string')
+    if isinstance(cjs, str) and cjs:
+        try:
+            doc = json.loads(cjs)
+        except Exception:
+            doc = None
+        if doc is not None:
+            def walk_marks(node):
+                if isinstance(node, dict):
+                    for mk in (node.get('marks') or []):
+                        if isinstance(mk, dict) and mk.get('type') == 'link':
+                            href = (mk.get('attrs') or {}).get('href') or ''
+                            if 'drive.google.com' in href:
+                                add(href)
+                    for v in node.values():
+                        walk_marks(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk_marks(v)
+            walk_marks(doc)
+            for s in _walk_strings(doc):
+                for m in _DRIVE_URL_RE.findall(s):
+                    add(m)
+
+    # 2) HTML / teaser fallbacks.
+    for fld in ('content', 'teaser_text'):
+        val = a.get(fld)
+        if isinstance(val, str):
+            for m in _DRIVE_URL_RE.findall(val):
+                add(m)
+
+    # 3) Catch-all: anything we missed (embeds, etc.).
+    for s in _walk_strings(post):
+        if 'drive.google.com' in s:
+            for m in _DRIVE_URL_RE.findall(s):
+                add(m)
+
+    return urls
+
+
+def process_patreon_collection(collection_id: str, session: requests.Session, chunk_size: int,
+                               num_threads: int, folder_workers: int, recursive: bool,
+                               verbose: bool, select: bool = False) -> None:
+    """Walk a Patreon collection, collect the Google Drive videos it links to, and download
+    them through the same pooled folder path used for Drive folders (incl. --select).
+
+    Direct file links are named after their Patreon post (Drive titles are usually generic);
+    any linked Drive *folders* are expanded recursively and keep their Drive names."""
+    print(f"[INFO] Reading Patreon collection {collection_id} ...")
+    title, campaign_id = get_collection_info(collection_id, session, verbose)
+    posts = list_collection_posts(collection_id, campaign_id, session, verbose)
+    if not posts:
+        print("[ERROR] No posts found in the collection.")
+        print("        It may be private/paid (needs your Patreon cookies), empty, or Patreon")
+        print("        changed its API. Provide cookies with --cookies or a *.json export nearby.")
+        return
+
+    print(f"[INFO] Collection '{title or collection_id}': scanning {len(posts)} post(s) for Drive links ...")
+
+    videos = []
+    seen_ids = set()
+    folder_targets = []  # (folder_id, post_title)
+    posts_with_links = 0
+
+    for post in posts:
+        a = post.get('attributes', {}) or {}
+        post_title = (a.get('title') or str(post.get('id') or '')).strip()
+        links = extract_drive_links_from_post(post)
+        if not links:
+            continue
+        posts_with_links += 1
+
+        file_ids = []
+        for url in links:
+            kind, tid = extract_drive_target(url)
+            if not tid:
+                continue
+            if kind == 'folder':
+                folder_targets.append((tid, post_title))
+            else:
+                file_ids.append(tid)
+
+        multi = len(file_ids) > 1
+        for i, fid in enumerate(file_ids, 1):
+            if fid in seen_ids:
+                continue
+            seen_ids.add(fid)
+            name = f"{post_title} [{i}]" if multi else post_title
+            # 'name' drives the saved filename; 'title' is what --select / warnings show.
+            videos.append({'id': fid, 'title': name, 'name': name})
+
+    # Expand any Drive folders linked from posts (recursive, like folder mode).
+    for folder_id, post_title in folder_targets:
+        if verbose:
+            print(f"[INFO] Expanding Drive folder linked from post '{post_title}' ...")
+        for e in list_folder_videos(folder_id, session, recursive, verbose):
+            if e['id'] in seen_ids:
+                continue
+            seen_ids.add(e['id'])
+            videos.append(e)  # folder contents keep their Drive titles
+
+    if not videos:
+        print(f"[ERROR] Found {posts_with_links} post(s) with Drive links but no downloadable "
+              f"videos (links may be images/docs, or folders were empty/private).")
+        return
+
+    print(f"[INFO] Found {len(videos)} video(s) across {posts_with_links} post(s) with Drive links.")
+
+    if select:
+        interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)()) and \
+            bool(getattr(sys.stdout, 'isatty', lambda: False)())
+        if interactive:
+            videos = _prompt_file_selection(videos)
+            if not videos:
+                print("[INFO] Nothing selected; exiting.")
+                return
+            print(f"[INFO] Selected {len(videos)} file(s).")
+        else:
+            print("[WARN] --select needs an interactive terminal; downloading all.")
+
+    download_folder_pooled(videos, session, chunk_size, verbose)
+
+
 def list_folder_entries(folder_id: str, session: requests.Session, verbose: bool) -> list[dict]:
     """List the direct children of a Drive folder via the embeddedfolderview endpoint.
 
@@ -526,7 +773,8 @@ def list_folder_entries(folder_id: str, session: requests.Session, verbose: bool
     changes the markup, only this function needs updating.
     """
     url = f'https://drive.google.com/embeddedfolderview?id={folder_id}#list'
-    resp = session.get(url, headers={'Referer': 'https://drive.google.com/'})
+    resp = session.get(url, headers={'Referer': 'https://drive.google.com/'},
+                       timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
     if resp.status_code != 200:
         print(f"[WARN] Folder listing returned status {resp.status_code} for {folder_id}")
         return []
@@ -610,7 +858,8 @@ def get_file_size(url: str, session: requests.Session) -> int:
     headers = {'Referer': 'https://drive.google.com/'}
 
     with connection_slot():
-        response = session.head(url, allow_redirects=True, headers=headers)
+        response = session.head(url, allow_redirects=True, headers=headers,
+                                timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
     size = int(response.headers.get('content-length', 0) or 0)
     if size > 0:
         return size
@@ -618,7 +867,8 @@ def get_file_size(url: str, session: requests.Session) -> int:
     # Fallback: ask for one byte and read the total from the Content-Range header.
     with connection_slot():
         with session.get(url, stream=True, allow_redirects=True,
-                         headers={**headers, 'Range': 'bytes=0-0'}) as r:
+                         headers={**headers, 'Range': 'bytes=0-0'},
+                         timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)) as r:
             content_range = r.headers.get('content-range', '')
             if '/' in content_range:
                 total = content_range.rsplit('/', 1)[-1].strip()
@@ -637,10 +887,12 @@ def download_part(url: str, session: requests.Session, thread_lock, start: int, 
     }
 
     # Support resuming individual parts
+    resuming = False
     downloaded = 0
     if os.path.exists(part_filename):
         downloaded = os.path.getsize(part_filename)
         if downloaded > 0:
+            resuming = True
             headers['Range'] = f'bytes={start + downloaded}-{end}'
 
             # Update Progress
@@ -660,11 +912,26 @@ def download_part(url: str, session: requests.Session, thread_lock, start: int, 
     # than --max-connections sockets at once, and use the response as a context
     # manager so the connection is released even when we break out early.
     with connection_slot():
-        with session.get(url, stream=True, headers=headers) as response:
+        with session.get(url, stream=True, headers=headers,
+                         timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
             if response.status_code not in (200, 206):
                 raise Exception(f"[ERROR] Failed to download part {part_filename}, status: {response.status_code}")
 
-            file_mode = 'ab' if os.path.exists(part_filename) and os.path.getsize(part_filename) > 0 else 'wb'
+            # If we asked to resume (sent a Range) but the server replied 200, it ignored the
+            # Range and is streaming the whole part from the start. Appending would corrupt
+            # the file, so restart this part from scratch and roll the progress bars back.
+            if resuming and response.status_code == 200:
+                if verbose:
+                    print(f"[WARN] Server ignored Range for {part_filename}; restarting part from scratch.")
+                with thread_lock:
+                    gpbar.update(-downloaded)
+                    if pbar is not None:
+                        pbar.update(-downloaded)
+                downloaded = 0
+                file_mode = 'wb'
+            else:
+                file_mode = 'ab' if downloaded > 0 else 'wb'
+
             with open(part_filename, file_mode) as f:
                 for chunk in response.iter_content(chunk_size=chunk_size):
                     f.write(chunk)
@@ -712,7 +979,7 @@ def merge_parts(part_files: list[str], output_filename: str, verbose: bool) -> N
         os.remove(part_file)
 
     if verbose:
-        print(f"[INFO] Merge complete. Cleaned up part files.")
+        print("[INFO] Merge complete. Cleaned up part files.")
 
 def download_file(url: str, session: requests.Session, filename: str, chunk_size: int, num_threads: int, verbose: bool, position: int = 0, show_part_bars: bool = True) -> bool:
     """Downloads the file using multiple threads, each handling a byte-range segment.
@@ -829,7 +1096,8 @@ def download_single_threaded(url: str, session: requests.Session, filename: str,
         print(f"[INFO] Starting single-threaded download from {url}")
 
     with connection_slot():
-        with session.get(url, stream=True, headers=headers) as response:
+        with session.get(url, stream=True, headers=headers,
+                         timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
             if response.status_code in (200, 206):  # 200 new, 206 partial
                 total_size = int(response.headers.get('content-length', 0)) + downloaded_size
                 with open(filename, file_mode) as file:
@@ -853,7 +1121,8 @@ def fetch_video(video_id: str, session: requests.Session, verbose: bool) -> tupl
     if verbose:
         print(f"[INFO] Accessing {drive_url}")
 
-    response = session.get(drive_url, allow_redirects=True)
+    response = session.get(drive_url, allow_redirects=True,
+                           timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
     page_content = response.text
 
     if verbose:
@@ -870,6 +1139,16 @@ def safe_filename(name: str, fallback_id: str) -> str:
     return name or f"{fallback_id}.mp4"
 
 
+def prefer_mp4_ext(name: str) -> str:
+    """Rewrite a trailing .m4v to .mp4. The two are the same MPEG-4 container (Drive often
+    serves video files named .m4v), so this is a lossless rename, not a re-encode. Other
+    real containers (.mkv, .webm, .mov, ...) are left untouched."""
+    root, ext = os.path.splitext(name)
+    if ext.lower() == '.m4v':
+        return root + '.mp4'
+    return name
+
+
 def process_single_video(video_id: str, session: requests.Session, output_file: str, chunk_size: int,
                          num_threads: int, verbose: bool, position: int = 0, show_part_bars: bool = True,
                          attempts: int = 2) -> bool:
@@ -882,7 +1161,9 @@ def process_single_video(video_id: str, session: requests.Session, output_file: 
         print(f"[WARN] Could not get a playback URL for {video_id} (not a video, private, or unavailable). Skipping.")
         return False
 
-    valid_filename = safe_filename(output_file or title or f"{video_id}.mp4", video_id)
+    # Respect an explicit -o name as-is; only normalize when the name comes from Drive.
+    chosen_name = output_file or prefer_mp4_ext(title or f"{video_id}.mp4")
+    valid_filename = safe_filename(chosen_name, video_id)
 
     lock_path = valid_filename + ".lock"
     if not acquire_lock(lock_path):
@@ -1021,13 +1302,22 @@ def _download_segment(job: '_FileJob', seg: dict, session: requests.Session, chu
             headers['Range'] = f'bytes={lo}-'
 
         try:
-            with session.get(job.url, stream=True, headers=headers) as r:
+            with session.get(job.url, stream=True, headers=headers,
+                             timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as r:
                 if r.status_code in (403, 410) and attempt < 2:
                     _refresh_job_url(job, session, verbose)
                     continue
                 if r.status_code not in (200, 206):
                     return False
-                mode = 'ab' if downloaded > 0 else 'wb'
+                # If we requested a resume (Range) but the server sent the whole segment
+                # (status 200), appending would corrupt the part. Restart from scratch and
+                # roll the progress bar back by what was already counted (via `initial=`).
+                if downloaded > 0 and r.status_code == 200:
+                    on_bytes(-downloaded)
+                    downloaded = 0
+                    mode = 'wb'
+                else:
+                    mode = 'ab' if downloaded > 0 else 'wb'
                 with open(path, mode) as f:
                     for chunk in r.iter_content(chunk_size=chunk_size):
                         if not chunk:
@@ -1059,17 +1349,40 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
     print(f"[INFO] Resolving {len(videos)} file(s)...")
     jobs = [_FileJob(v) for v in videos]
 
+    resolve_bar = make_bar(total=len(jobs), desc='Resolving', unit='file',
+                           unit_scale=False, leave=False)
+    resolve_lock = threading.Lock()
+
     def resolve(job):
-        url, title = fetch_video(job.id, session, verbose)
-        if not url:
+        # Each file is resolved independently; a network error or timeout on one must not
+        # abort the whole batch, so failures are caught and the file is simply skipped.
+        try:
+            url, title = fetch_video(job.id, session, verbose)
+            if not url:
+                job.failed = True
+            else:
+                job.url = url
+                job.size = get_file_size(url, session)
+                # A caller-supplied 'name' (e.g. a Patreon post title) wins over the often-
+                # generic Drive title. If it has no extension, borrow the Drive title's (or .mp4).
+                preferred = job.entry.get('name') if isinstance(job.entry, dict) else None
+                if preferred:
+                    if not os.path.splitext(preferred)[1]:
+                        preferred += (os.path.splitext(title or '')[1] or '.mp4')
+                    job.filename = safe_filename(prefer_mp4_ext(preferred), job.id)
+                else:
+                    job.filename = safe_filename(prefer_mp4_ext(title or f"{job.id}.mp4"), job.id)
+        except Exception as exc:
             job.failed = True
-            return
-        job.url = url
-        job.size = get_file_size(url, session)
-        job.filename = safe_filename(title or f"{job.id}.mp4", job.id)
+            if verbose:
+                tqdm.write(f"[WARN] Could not resolve {job.title}: {exc}")
+        finally:
+            with resolve_lock:
+                resolve_bar.update(1)
 
     with ThreadPoolExecutor(max_workers=min(budget, 16)) as ex:
         list(ex.map(resolve, jobs))
+    resolve_bar.close()
 
     ready = []
     for job in jobs:
@@ -1160,11 +1473,13 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             tqdm.write(f"[{n}/{len(ready)}] {tag} {job.title}")
 
     def run_segment(job, seg):
-        if job.failed:
-            return
-        sess = _segment_session(session)
-        if not _download_segment(job, seg, sess, chunk_size, on_bytes(job), verbose):
-            job.failed = True
+        # Even when the job has already failed we must still decrement `remaining` (just
+        # skip the work), otherwise the counter never reaches 0 and finalize() — which
+        # tallies the result and releases the lock — is never called for that file.
+        if not job.failed:
+            sess = _segment_session(session)
+            if not _download_segment(job, seg, sess, chunk_size, on_bytes(job), verbose):
+                job.failed = True
         with job.url_lock:
             job.remaining -= 1
             last = (job.remaining == 0)
@@ -1255,7 +1570,15 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          auto_cookies: bool = AUTO_COOKIES, select: bool = False, auto: bool = False) -> None:
     """Process a Drive file OR folder URL/ID and download the video(s)."""
     setup_console(use_color)
-    kind, target_id = extract_drive_target(id_or_url)
+    patreon_id = extract_patreon_collection_id(id_or_url)
+    if patreon_id:
+        kind, target_id = 'patreon', patreon_id
+    elif 'patreon.com' in id_or_url:
+        print("[ERROR] That looks like a Patreon URL but I couldn't find a collection id in it.")
+        print("        Expected something like https://www.patreon.com/collection/122162")
+        sys.exit(1)
+    else:
+        kind, target_id = extract_drive_target(id_or_url)
 
     # Resolve threads/connections: explicit -t/-m always win; otherwise --auto scales by CPU,
     # else the configured defaults.
@@ -1291,7 +1614,13 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         print(f"[ERROR] Failed to load cookies: {e}", file=sys.stderr)
         sys.exit(1)
 
-    if kind == 'folder':
+    if kind == 'patreon':
+        if output_file:
+            print("[WARN] -o/--output is ignored for Patreon collections; names come from the posts.")
+        process_patreon_collection(target_id, session, chunk_size, num_threads, folder_workers,
+                                   recursive, verbose, select=select)
+        session.close()
+    elif kind == 'folder':
         if output_file:
             print("[WARN] -o/--output is ignored for folders; names come from Drive.")
         process_folder(target_id, session, chunk_size, num_threads, folder_workers, recursive, verbose,
@@ -1320,21 +1649,21 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError("must be >= 0")
         return iv
 
-    parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder).")
-    parser.add_argument("video_id", type=str, help="A Drive file ID, file URL (.../file/d/ID/view), or a FOLDER URL (.../drive/folders/ID). For a folder, all videos inside are downloaded.")
+    parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder), or from a Patreon collection that links to Google Drive videos.")
+    parser.add_argument("video_id", type=str, help="A Drive file ID, file URL (.../file/d/ID/view), a FOLDER URL (.../drive/folders/ID), or a Patreon COLLECTION URL (.../collection/ID). For a folder or collection, all videos found are downloaded.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders).")
     parser.add_argument("-c", "--chunk_size", type=positive_int, default=DEFAULT_CHUNK_SIZE, help=f"Streaming chunk size in bytes. Default {DEFAULT_CHUNK_SIZE} (edit DEFAULT_CHUNK_SIZE at the top of the script).")
     parser.add_argument("-t", "--threads", type=positive_int, default=None, help=f"Download threads per file (>=1). Default {DEFAULT_THREADS}. Edit DEFAULT_THREADS at the top.")
     parser.add_argument("-w", "--folder-workers", type=nonneg_int, default=DEFAULT_FOLDER_WORKERS, help=f"How many videos to download at once for a folder. 0 = ALL at once. Default {DEFAULT_FOLDER_WORKERS}. Edit DEFAULT_FOLDER_WORKERS at the top.")
     parser.add_argument("-m", "--max-connections", type=positive_int, default=None, help=f"Hard cap on simultaneous connections regardless of workers x threads. Default {DEFAULT_MAX_CONNECTIONS}. Lower (e.g. 16) if you hit 'insufficient resources'.")
     parser.add_argument("--auto", action="store_true", help="Auto-pick threads and connections from the detected CPU. Explicit -t/-m still win.")
-    parser.add_argument("-s", "--select", action="store_true", help="For a folder: list all files first and interactively choose which to download.")
+    parser.add_argument("-s", "--select", action="store_true", help="For a folder or Patreon collection: list all files first and interactively choose which to download.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
     parser.add_argument("--cookies", type=str, help="Path to a Netscape cookies.txt file or JSON cookie export for private Google Drive files/folders.")
-    parser.add_argument("--version", action="version", version="%(prog)s 1.15.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 1.16.0")
 
     args = parser.parse_args()
     main(args.video_id, args.output, args.chunk_size, args.threads, args.verbose, args.cookies,
