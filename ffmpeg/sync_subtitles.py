@@ -1139,6 +1139,25 @@ def _translate_cache_save():
         log_warn(f"Nepodařilo se uložit cache překladů: {e}")
 
 
+class _FatalAPIError(Exception):
+    """Neopravitelná chyba API (např. 400/401/403/404) - nemá smysl opakovat."""
+
+
+def _http_error_detail(e):
+    try:
+        body = e.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    try:
+        data = json.loads(body)
+        msg = data.get("error", {})
+        if isinstance(msg, dict):
+            return (msg.get("message") or msg.get("type") or body)[:400]
+        return (data.get("message") or body)[:400]
+    except Exception:
+        return body[:400]
+
+
 def _call_with_timeout(fn, timeout):
     """Spustí fn() s časovým limitem. Vrací (výsledek, chyba). Při překročení
     limitu vrací (None, TimeoutError) a nechá vlákno doběžet na pozadí (daemon),
@@ -1287,6 +1306,14 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
             for i in range(0, total, CH):
                 chunk = uniq[i:i + CH]
                 outs, err = _call_with_timeout(lambda c=chunk: backend(c), timeout)
+                if isinstance(err, _FatalAPIError):
+                    print()
+                    log_warn(f"Překlad ({engine}) zastaven: {err}")
+                    log_warn("Zkontroluj API klíč a název modelu (--anthropic-model / --deepl-key) "
+                             "nebo zkus jiný překladač (--translate / volba v průvodci). "
+                             "Zbytek řádků zůstane v originále.")
+                    failed += (total - done)
+                    break
                 if outs is None:
                     log_warn(f"\nPřekladač neodpověděl do {timeout}s u bloku "
                              f"{i // CH + 1} - přeskakuji (řádky zůstanou v originále).")
@@ -1305,9 +1332,9 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
                       end="", flush=True)
             print()  # nový řádek po průběhu
             if failed:
-                log_warn(f"Překlad selhal u {failed}/{done} řádků (síť/limit?) - "
-                         "ty zůstanou v originále (nekešují se). U hodně selhání zkontroluj "
-                         "připojení/klíč, nebo zkus jiný překladač (DeepL/Claude/argos).")
+                log_warn(f"Překlad selhal u {failed}/{total} řádků - "
+                         "nepřeložené zůstanou v originále. Zkontroluj klíč/model/připojení, "
+                         "nebo zkus jiný překladač (DeepL/Claude/Google/argos).")
             else:
                 log_info(f"Přeloženo a uloženo do cache ({done} řádků).")
         # poskládat výstup (klíč chybí = ponech originál)
@@ -1574,9 +1601,103 @@ def match_srt_for_video(video_path, srt_candidates, target_lang):
     return matches
 
 
+# ----------------------------------------------------------------------
+# Preset - uložení/přehrání odpovědí interaktivního průvodce (--save/--load)
+# ----------------------------------------------------------------------
+_PRESET_MODE = None        # None | "save" | "load"
+_PRESET_DATA = []          # načtené odpovědi (load)
+_PRESET_IDX = 0
+_PRESET_REC = []           # zaznamenané odpovědi (save)
+_PRESET_CMD = None
+_PRESET_PATH = None
+_PRESET_SAVED = False
+_PRESET_MISS = object()
+_SECRET_HINTS = ("klíč", "klic", "key", "heslo", "password", "token")
+
+
+def _is_secret_prompt(p):
+    pl = str(p).lower()
+    return any(h in pl for h in _SECRET_HINTS)
+
+
+def _preset_replay():
+    """Vrátí další uloženou odpověď (load), nebo _PRESET_MISS když není/režim."""
+    global _PRESET_IDX
+    if _PRESET_MODE != "load" or _PRESET_IDX >= len(_PRESET_DATA):
+        return _PRESET_MISS
+    item = _PRESET_DATA[_PRESET_IDX]
+    _PRESET_IDX += 1
+    if item.get("secret"):
+        return _PRESET_MISS         # tajné se neukládají -> zeptat se / vzít z configu
+    return item.get("a")
+
+
+def _preset_record(kind, prompt, value):
+    if _PRESET_MODE == "save":
+        if _is_secret_prompt(prompt):
+            _PRESET_REC.append({"k": kind, "secret": True})
+        else:
+            _PRESET_REC.append({"k": kind, "q": str(prompt)[:60], "a": value})
+
+
+def preset_begin_save(cmd, path):
+    global _PRESET_MODE, _PRESET_REC, _PRESET_CMD, _PRESET_PATH, _PRESET_SAVED
+    _PRESET_MODE = "save"
+    _PRESET_REC = []
+    _PRESET_CMD = cmd
+    _PRESET_PATH = path
+    _PRESET_SAVED = False
+
+
+def preset_begin_load(answers):
+    global _PRESET_MODE, _PRESET_DATA, _PRESET_IDX
+    _PRESET_MODE = "load"
+    _PRESET_DATA = list(answers or [])
+    _PRESET_IDX = 0
+
+
+def preset_flush_if_save():
+    """Uloží zaznamenané odpovědi (volá se těsně před spuštěním operace)."""
+    global _PRESET_SAVED
+    if _PRESET_MODE == "save" and not _PRESET_SAVED and _PRESET_PATH:
+        try:
+            with open(_PRESET_PATH, "w", encoding="utf-8") as f:
+                json.dump({"command": _PRESET_CMD, "answers": _PRESET_REC},
+                          f, ensure_ascii=False, indent=2)
+            _PRESET_SAVED = True
+            log_done(f"Preset uložen do {_PRESET_PATH} (příště stačí --load).")
+        except Exception as e:
+            log_warn(f"Uložení presetu selhalo: {e}")
+
+
+def load_preset_file(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def default_preset_path():
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
+    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
+    return os.path.join(base, "preset.json")
+
+
+def resolve_preset_path(args):
+    return getattr(args, "preset_file", None) or default_preset_path()
+
+
 def ask_choice(prompt, options, allow_skip=True, allow_abort=True):
     """Jednoduchý textový interaktivní výběr v CLI. Vrací index (int),
     'skip', nebo 'abort'."""
+    r = _preset_replay()
+    if r is not _PRESET_MISS:
+        if isinstance(r, int) and 0 <= r < len(options):
+            return r
+        if r in ("skip", "abort"):
+            return r
+        return 0
     while True:
         print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
         for i, opt in enumerate(options, 1):
@@ -1586,12 +1707,16 @@ def ask_choice(prompt, options, allow_skip=True, allow_abort=True):
         if allow_abort:
             print("  a) zrušit celý dávkový běh")
         choice = input("Tvoje volba: ").strip().lower()
+        result = None
         if allow_skip and choice == "s":
-            return "skip"
-        if allow_abort and choice == "a":
-            return "abort"
-        if choice.isdigit() and 1 <= int(choice) <= len(options):
-            return int(choice) - 1
+            result = "skip"
+        elif allow_abort and choice == "a":
+            result = "abort"
+        elif choice.isdigit() and 1 <= int(choice) <= len(options):
+            result = int(choice) - 1
+        if result is not None:
+            _preset_record("choice", prompt, result)
+            return result
         print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
 
 
@@ -2077,11 +2202,14 @@ def filter_by_tag(srt_files, tag):
 
 
 def ask_yes_no(prompt, default_no=True):
+    r = _preset_replay()
+    if r is not _PRESET_MISS:
+        return bool(r)
     suffix = "[a/N]" if default_no else "[A/n]"
     raw = input(f"{prompt} {suffix}: ").strip().lower()
-    if not raw:
-        return not default_no
-    return raw in ("a", "y", "ano", "yes", "ja")
+    val = (not default_no) if not raw else (raw in ("a", "y", "ano", "yes", "ja"))
+    _preset_record("yesno", prompt, val)
+    return val
 
 
 def run_fix_readability(args):
@@ -2341,23 +2469,116 @@ def translate_events_to(events, engine, target_lang, api_key=None, model=None):
 
 
 def anthropic_messages(prompt, api_key, model, max_tokens=4000, timeout=180):
-    """Jedno volání Anthropic Messages API. Vrací text odpovědi nebo None."""
+    """Jedno volání Anthropic Messages API. Vrací text odpovědi nebo None.
+    Při 4xx vyhodí _FatalAPIError s konkrétní zprávou (nemá smysl opakovat)."""
     import urllib.request
+    import urllib.error
     headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
                "content-type": "application/json"}
     body = json.dumps({"model": model, "max_tokens": max_tokens,
                        "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
     req = urllib.request.Request("https://api.anthropic.com/v1/messages",
                                  data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = json.loads(r.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = _http_error_detail(e)
+        msg = f"HTTP {e.code}: {detail or e.reason}"
+        if e.code in (400, 401, 403, 404):
+            raise _FatalAPIError(msg)
+        raise RuntimeError(msg)
     parts = [b.get("text", "") for b in data.get("content", []) if b.get("type") == "text"]
     return "".join(parts) if parts else None
 
 
+_ANTHROPIC_MODEL_HINTS = (
+    ("opus", "nejvýkonnější (nejnáročnější úlohy), nejdražší za tokeny"),
+    ("fable", "špičkový model pro velmi náročné úlohy"),
+    ("sonnet", "vyvážený poměr kvalita/cena/rychlost - doporučeno"),
+    ("haiku", "nejrychlejší a nejlevnější (jednoduché úlohy)"),
+)
+_ANTHROPIC_STATIC_MODELS = [
+    ("claude-opus-4-8", "Claude Opus 4.8"),
+    ("claude-sonnet-4-6", "Claude Sonnet 4.6"),
+    ("claude-haiku-4-5", "Claude Haiku 4.5"),
+    ("claude-opus-4-5-20251101", "Claude Opus 4.5 (pinned)"),
+    ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5 (pinned)"),
+]
+
+
+def _anthropic_model_hint(mid):
+    m = (mid or "").lower()
+    for k, v in _ANTHROPIC_MODEL_HINTS:
+        if k in m:
+            return v
+    return ""
+
+
+def anthropic_list_models(api_key, timeout=30):
+    """Vrátí seznam modelů dostupných pro daný klíč (Anthropic /v1/models)."""
+    import urllib.request
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    req = urllib.request.Request("https://api.anthropic.com/v1/models?limit=100",
+                                 headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data.get("data", [])
+
+
+def anthropic_model_info(api_key, model_id, timeout=15):
+    """Detail modelu vč. token limitů (max_input_tokens, max_tokens)."""
+    import urllib.request
+    from urllib.parse import quote
+    headers = {"x-api-key": api_key, "anthropic-version": "2023-06-01",
+               "content-type": "application/json"}
+    req = urllib.request.Request(f"https://api.anthropic.com/v1/models/{quote(model_id)}",
+                                 headers=headers, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _print_anthropic_models(args=None):
+    key = (getattr(args, "anthropic_key", None) if args else None) or os.environ.get("ANTHROPIC_API_KEY")
+    models = None
+    if key:
+        try:
+            print(f"{Fore.CYAN}Načítám seznam modelů z Anthropic API...{Style.RESET_ALL}")
+            models = anthropic_list_models(key)
+        except Exception as e:
+            log_warn(f"Online seznam se nepodařilo načíst ({e}). Ukážu vestavěný přehled.")
+    else:
+        log_info("Anthropic klíč není nastaven - ukážu vestavěný přehled (online seznam vyžaduje klíč).")
+
+    print(f"{Fore.MAGENTA}Dostupné modely Claude:{Style.RESET_ALL}")
+    if models:
+        for m in models:
+            mid = m.get("id", "?")
+            name = m.get("display_name", "")
+            info = ""
+            if key:
+                try:
+                    d = anthropic_model_info(key, mid)
+                    ctx = d.get("max_input_tokens")
+                    out = d.get("max_tokens")
+                    if ctx or out:
+                        info = f" | kontext {ctx}, max. výstup {out} tok."
+                except Exception:
+                    pass
+            hint = _anthropic_model_hint(mid)
+            print(f"  {mid:<30}{name}{info}" + (f"  [{hint}]" if hint else ""))
+    else:
+        for mid, name in _ANTHROPIC_STATIC_MODELS:
+            hint = _anthropic_model_hint(mid)
+            print(f"  {mid:<30}{name}" + (f"  [{hint}]" if hint else ""))
+    print(f"{Fore.CYAN}Pozn.: Haiku = nejlevnější/nejrychlejší, Sonnet = vyvážené, Opus = "
+          f"nejdražší/nejvýkonnější. Přesné ceny za tokeny viz anthropic.com/pricing.{Style.RESET_ALL}")
+
+
 def anthropic_translate_batch(batch, target_lang, api_key, model):
     """Přeloží dávku řádků titulků do target_lang přes Claude. Vrací seznam
-    stejné délky (None u nezdaru jednotlivé položky)."""
+    stejné délky (None u nezdaru). Fatální chyby (4xx) propaguje výš."""
     numbered = "\n".join(f"{k + 1}. {t.replace(chr(10), ' / ')}" for k, t in enumerate(batch))
     prompt = (f"Přelož následující číslované řádky filmových titulků do jazyka '{target_lang}'. "
               "Překládej přirozeně a idiomaticky (ne doslovně), zachovej VÝZNAM, tón i POČET a "
@@ -2365,8 +2586,9 @@ def anthropic_translate_batch(batch, target_lang, api_key, model):
               "(číslo. překlad) ve stejném pořadí a počtu, bez komentářů.\n\n" + numbered)
     try:
         content = anthropic_messages(prompt, api_key, model)
-    except Exception as e:
-        log_warn(f"Claude překlad selhal u bloku: {e}")
+    except _FatalAPIError:
+        raise
+    except Exception:
         return [None] * len(batch)
     if not content:
         return [None] * len(batch)
@@ -2375,21 +2597,30 @@ def anthropic_translate_batch(batch, target_lang, api_key, model):
 
 
 def anthropic_proofread(events, target_lang, api_key, model, batch=40):
-    """Korektura titulků přes Claude. Vrací seznam textů stejné délky."""
+    """Korektura titulků přes Claude. Vrací seznam textů stejné délky.
+    Při fatální chybě (4xx) korekturu zastaví a zbytek nechá beze změny."""
     out = []
+    stop = None
     for i in range(0, len(events), batch):
         chunk = events[i:i + batch]
-        numbered = "\n".join(f"{k + 1}. {c['text'].replace(chr(10), ' / ')}" for k, c in enumerate(chunk))
-        prompt = (f"Jsi profesionální korektor filmových titulků v jazyce '{target_lang}'. "
-                  "Oprav gramatiku, překlepy a nepřirozené formulace strojového překladu, "
-                  "zachovej VÝZNAM, POŘADÍ i POČET položek a nepřekládej do jiného jazyka. "
-                  "Víceřádkový titulek odděl ' / '. Vrať POUZE číslované řádky ve stejném "
-                  "pořadí a počtu, bez komentářů.\n\n" + numbered)
-        try:
-            content = anthropic_messages(prompt, api_key, model)
-            fixed = _parse_numbered(content or "", len(chunk))
-        except Exception as e:
-            log_warn(f"Claude korektura selhala u bloku {i // batch + 1}: {e}")
+        if stop is None:
+            numbered = "\n".join(f"{k + 1}. {c['text'].replace(chr(10), ' / ')}" for k, c in enumerate(chunk))
+            prompt = (f"Jsi profesionální korektor filmových titulků v jazyce '{target_lang}'. "
+                      "Oprav gramatiku, překlepy a nepřirozené formulace strojového překladu, "
+                      "zachovej VÝZNAM, POŘADÍ i POČET položek a nepřekládej do jiného jazyka. "
+                      "Víceřádkový titulek odděl ' / '. Vrať POUZE číslované řádky ve stejném "
+                      "pořadí a počtu, bez komentářů.\n\n" + numbered)
+            try:
+                content = anthropic_messages(prompt, api_key, model)
+                fixed = _parse_numbered(content or "", len(chunk))
+            except _FatalAPIError as e:
+                log_warn(f"Korektura Claude zastavena: {e} (zkontroluj --anthropic-model a klíč).")
+                stop = True
+                fixed = [c["text"] for c in chunk]
+            except Exception as e:
+                log_warn(f"Claude korektura selhala u bloku {i // batch + 1}: {e}")
+                fixed = [c["text"] for c in chunk]
+        else:
             fixed = [c["text"] for c in chunk]
         for c, t in zip(chunk, fixed):
             out.append(t.replace(" / ", "\n") if t else c["text"])
@@ -2400,10 +2631,15 @@ def llm_proofread(events, target_lang, api_url, api_key, model, batch=40):
     """Korektura přes OpenAI-kompatibilní API (/chat/completions). Vrací seznam
     textů stejné délky; při chybě bloku ponechá originál."""
     import urllib.request
+    import urllib.error
     out = []
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+    stop = None
     for i in range(0, len(events), batch):
         chunk = events[i:i + batch]
+        if stop is not None:
+            out.extend(c["text"] for c in chunk)
+            continue
         numbered = "\n".join(f"{k + 1}. {c['text'].replace(chr(10), ' / ')}" for k, c in enumerate(chunk))
         prompt = (f"Jsi profesionální korektor filmových titulků v jazyce '{target_lang}'. "
                   "Oprav gramatiku, překlepy a nepřirozené formulace strojového překladu, "
@@ -2418,6 +2654,12 @@ def llm_proofread(events, target_lang, api_url, api_key, model, batch=40):
                 data = json.loads(r.read().decode("utf-8"))
             content = data["choices"][0]["message"]["content"]
             fixed = _parse_numbered(content, len(chunk))
+        except urllib.error.HTTPError as e:
+            detail = _http_error_detail(e)
+            log_warn(f"Korektura LLM zastavena: HTTP {e.code}: {detail or e.reason} "
+                     "(zkontroluj --llm-api, --llm-model a klíč).")
+            stop = True
+            fixed = [c["text"] for c in chunk]
         except Exception as e:
             log_warn(f"AI korektura selhala u bloku {i // batch + 1}: {e}")
             fixed = [c["text"] for c in chunk]
@@ -2733,7 +2975,11 @@ def run_config(args):
                          ["Anthropic (Claude)", "OpenAI-kompatibilní (OpenAI/lokální)", "oba"], default=0)
         if which in (0, 2):
             ask_secret("Anthropic API klíč", "anthropic_key")
-            ask_plain("Claude model", "anthropic_model", "claude-sonnet-4-6")
+            _am = ask_anthropic_model("Claude model", cfg.get("anthropic_model") or "claude-sonnet-4-6",
+                                      type("A", (), {"anthropic_key": cfg.get("anthropic_key")
+                                                     or os.environ.get("ANTHROPIC_API_KEY")})())
+            if _am:
+                cfg["anthropic_model"] = _am
         if which in (1, 2):
             ask_secret("OpenAI API klíč", "llm_key")
             ask_plain("API URL (chat/completions)", "llm_api", "https://api.openai.com/v1/chat/completions")
@@ -2768,6 +3014,53 @@ def run_config(args):
     if cfg.get("llm_key"):
         enabled.append("OpenAI")
     log_info("Aktivní: " + (", ".join(enabled) if enabled else "(žádné online funkce)"))
+
+
+def run_test_api(args):
+    """Rychlý test API: pošle triviální požadavek a vypíše PŘESNOU odpověď/chybu
+    (včetně těla od serveru). Pomáhá odhalit příčinu chyb jako HTTP 400."""
+    import urllib.request
+    import urllib.error
+    tested = 0
+
+    akey = getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+    amodel = getattr(args, "anthropic_model", None) or "claude-sonnet-4-6"
+    if akey:
+        tested += 1
+        log_info(f"Test Anthropic (Claude) - model '{amodel}'...")
+        try:
+            txt = anthropic_messages("Odpověz jediným slovem: OK.", akey, amodel, max_tokens=16)
+            log_done(f"Anthropic OK. Odpověď: {txt!r}")
+        except _FatalAPIError as e:
+            log_warn(f"Anthropic SELHALO: {e}")
+            log_warn("Pokud zpráva zmiňuje 'model', oprav --anthropic-model (--config). "
+                     "Jinak je problém v tomto konkrétním poli/parametru.")
+        except Exception as e:
+            log_warn(f"Anthropic SELHALO: {e}")
+    else:
+        log_info("Anthropic klíč nenastaven - přeskakuji.")
+
+    okey = getattr(args, "llm_key", None) or os.environ.get("OPENAI_API_KEY")
+    if okey:
+        tested += 1
+        url = getattr(args, "llm_api", None) or "https://api.openai.com/v1/chat/completions"
+        omodel = getattr(args, "llm_model", None) or "gpt-4o-mini"
+        log_info(f"Test OpenAI-kompatibilního API ({url}, model '{omodel}')...")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {okey}"}
+        body = json.dumps({"model": omodel, "max_tokens": 16,
+                           "messages": [{"role": "user", "content": "Reply with: OK"}]}).encode("utf-8")
+        try:
+            req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=30) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            log_done(f"OpenAI OK. Odpověď: {data['choices'][0]['message']['content']!r}")
+        except urllib.error.HTTPError as e:
+            log_warn(f"OpenAI SELHALO: HTTP {e.code}: {_http_error_detail(e)}")
+        except Exception as e:
+            log_warn(f"OpenAI SELHALO: {e}")
+
+    if not tested:
+        log_warn("Není nastaven žádný AI klíč. Nastav ho přes --config, --anthropic-key nebo --llm-key.")
 
 
 def run_translate_subs(args):
@@ -2816,7 +3109,13 @@ def run_translate_subs(args):
     si = ask_pick("Odkud vzít cílové titulky?",
                   ["auto - nejdřív zkus hotové lidské (OpenSubtitles), jinak strojový překlad",
                    "jen strojový překlad extrahované stopy",
-                   "jen stáhnout hotové z OpenSubtitles"], default=0)
+                   "jen stáhnout hotové z OpenSubtitles"], default=0,
+                  help=["auto: nejdřív zkusí stáhnout hotové lidské titulky z OpenSubtitles "
+                        "(nejlepší kvalita); když nejsou/nelze, přeloží extrahovanou stopu strojově.",
+                        "jen strojový překlad: vždy přeloží extrahovanou titulkovou stopu z videa "
+                        "(zachová původní časování, sedí na video).",
+                        "jen OpenSubtitles: použije pouze stažené lidské titulky; když nejsou, "
+                        "video se přeskočí."])
     strategy = ["auto", "mt", "opensubtitles"][si]
 
     engine = mt_key = mt_model = None
@@ -2825,7 +3124,15 @@ def run_translate_subs(args):
                       ["deepl  - výborná kvalita (API klíč)",
                        "google - zdarma, slušná kvalita",
                        "claude - překlad přes Anthropic API (klíč)",
-                       "argos  - offline (pip install argostranslate)"], default=1)
+                       "argos  - offline (pip install argostranslate)"], default=1,
+                      help=["deepl: nejlepší kvalita strojového překladu. Vyžaduje API klíč "
+                            "(placené, má i free tier ~500k znaků/měsíc).",
+                            "google: zdarma a bez klíče, slušná kvalita. U velkých dávek může "
+                            "omezovat rychlost (rate-limit).",
+                            "claude: velmi kvalitní/kontextový překlad přes Anthropic API. "
+                            "Platí se za tokeny (Haiku levné, Sonnet/Opus dražší).",
+                            "argos: plně offline, bez internetu i klíče (nainstaluj argostranslate). "
+                            "Kvalita nižší než DeepL/Claude."])
         engine = ["deepl", "google", "claude", "argos"][ei]
         if engine == "deepl":
             mt_key = (getattr(args, "deepl_key", None) or os.environ.get("DEEPL_API_KEY")
@@ -2833,7 +3140,7 @@ def run_translate_subs(args):
         elif engine == "claude":
             mt_key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
                       or ask_text("Anthropic API klíč", ""))
-            mt_model = getattr(args, "anthropic_model", None) or ask_text("Claude model", "claude-sonnet-4-6")
+            mt_model = getattr(args, "anthropic_model", None) or ask_anthropic_model("Claude model", "claude-sonnet-4-6", args)
             args.anthropic_key = args.anthropic_key or mt_key      # ať to může použít i korektura
             args.anthropic_model = args.anthropic_model or mt_model
 
@@ -2861,7 +3168,13 @@ def run_translate_subs(args):
                   ["rules  - rychlé pravidlové očištění (zdarma)",
                    "off    - žádná",
                    "claude - AI korektura přes Anthropic API (klíč)",
-                   "llm    - AI korektura přes OpenAI-kompatibilní API (klíč)"], default=0)
+                   "llm    - AI korektura přes OpenAI-kompatibilní API (klíč)"], default=0,
+                  help=["rules: zdarma, offline. Sjednotí mezery/interpunkci, rozlomí dlouhé řádky. "
+                        "Nemění význam.",
+                        "off: ponechá překlad tak, jak je.",
+                        "claude: AI korektura gramatiky a přirozenosti přes Anthropic API "
+                        "(platí se za tokeny).",
+                        "llm: AI korektura přes OpenAI-kompatibilní API (OpenAI nebo lokální server)."])
     proofread = ["rules", "off", "anthropic", "llm"][pi]
     if proofread == "llm":
         args.llm_api = (getattr(args, "llm_api", None)
@@ -2871,7 +3184,7 @@ def run_translate_subs(args):
     elif proofread == "anthropic":
         args.anthropic_key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
                               or ask_text("Anthropic API klíč", ""))
-        args.anthropic_model = getattr(args, "anthropic_model", None) or ask_text("Claude model", "claude-sonnet-4-6")
+        args.anthropic_model = getattr(args, "anthropic_model", None) or ask_anthropic_model("Claude model", "claude-sonnet-4-6", args)
 
     sync_os = (strategy != "mt") and ask_yes_no(
         "Stažené (lidské) titulky případně časově srovnat s videem (afinně)?", default_no=False)
@@ -2890,6 +3203,7 @@ def run_translate_subs(args):
     if not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
+    preset_flush_if_save()
 
     done = skipped = 0
     for vid in videos:
@@ -2916,8 +3230,17 @@ def run_translate_subs(args):
             src_events, chosen = extract_subtitle_events(args, v, args.track_id, args.ref_lang)
             if src_events:
                 log_info(f"{v.name}: překládám {len(src_events)} titulků do '{out_lang}' ({engine})...")
-                events = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
-                source_used = f"mt:{engine}"
+                translated = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
+                if translated:
+                    changed = sum(1 for a, b in zip(src_events, translated)
+                                  if a["text"].replace("\n", " ").strip() != b["text"].replace("\n", " ").strip())
+                    if changed < max(1, int(0.05 * len(translated))):
+                        log_warn(f"{v.name}: překlad se nezdařil (přeloženo {changed}/{len(translated)}) - "
+                                 f"NEUKLÁDÁM nepřeložený text jako '{out_lang}'. Zkontroluj klíč/model/engine.")
+                        skipped += 1
+                        continue
+                    events = translated
+                    source_used = f"mt:{engine}"
 
         if not events:
             log_warn(f"{v.name}: nepodařilo se získat cílové titulky - přeskakuji.")
@@ -3121,25 +3444,57 @@ def collect_subs(directory):
     return out
 
 
-def ask_pick(prompt, labels, default=0):
-    """Číslovaný výběr s výchozí volbou (Enter). Vrací index do labels."""
-    print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
-    for i, l in enumerate(labels):
-        mark = f" {Fore.CYAN}(výchozí){Style.RESET_ALL}" if i == default else ""
-        print(f"  {i + 1}) {l}{mark}")
+def ask_pick(prompt, labels, default=0, help=None):
+    """Číslovaný výběr s výchozí volbou (Enter). Vrací index do labels.
+    Když je zadán 'help' (seznam/řetězec), '?' vypíše bližší vysvětlení."""
+    r = _preset_replay()
+    if r is not _PRESET_MISS:
+        try:
+            r = int(r)
+        except Exception:
+            r = default
+        if not (0 <= r < len(labels)):
+            r = default if 0 <= default < len(labels) else 0
+        return r
+    hint = f"{Fore.CYAN} (? = více info){Style.RESET_ALL}" if help else ""
+
+    def _show():
+        print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{hint}")
+        for i, l in enumerate(labels):
+            mark = f" {Fore.CYAN}(výchozí){Style.RESET_ALL}" if i == default else ""
+            print(f"  {i + 1}) {l}{mark}")
+
+    _show()
     while True:
         raw = input(f"Volba [1-{len(labels)}, Enter = {default + 1}]: ").strip()
+        if raw == "?" and help:
+            if isinstance(help, (list, tuple)):
+                for h in help:
+                    print(f"  {Fore.CYAN}•{Style.RESET_ALL} {h}")
+            else:
+                print(f"  {help}")
+            _show()
+            continue
+        val = None
         if raw == "":
-            return default
-        if raw.isdigit() and 1 <= int(raw) <= len(labels):
-            return int(raw) - 1
+            val = default
+        elif raw.isdigit() and 1 <= int(raw) <= len(labels):
+            val = int(raw) - 1
+        if val is not None:
+            _preset_record("pick", prompt, val)
+            return val
         print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
 
 
 def ask_text(prompt, default=""):
+    r = _preset_replay()
+    if r is not _PRESET_MISS:
+        return r if r is not None else default
     suffix = f" [{default}]" if default else ""
     raw = input(f"{prompt}{suffix}: ").strip()
-    return raw or default
+    val = raw or default
+    _preset_record("text", prompt, val)
+    return val
 
 
 LANGUAGE_NAMES = {
@@ -3193,6 +3548,18 @@ def ask_language(prompt, default=""):
         return raw
 
 
+def ask_anthropic_model(prompt, default="", args=None):
+    """Jako ask_text, ale '?' vypíše seznam modelů Claude (online dle klíče,
+    s token limity a poznámkou k ceně/použití; jinak vestavěný přehled)."""
+    hint = f"{prompt} (? = seznam modelů)"
+    while True:
+        raw = ask_text(hint, default)
+        if raw.strip() == "?":
+            _print_anthropic_models(args)
+            continue
+        return raw
+
+
 def _pick_reading_speed():
     keys = list(READING_SPEED_PRESETS.keys())
     labels = [f"{k} - {READING_SPEED_PRESETS[k][2]} "
@@ -3228,7 +3595,15 @@ def _pick_method(into_args):
          "combo - afinní předsrovnání + warp doladění po větách (nejrobustnější)",
          "warp  - jen po VĚTÁCH (rychlé; potřebuje textovou referenci)",
          "affine - jen globální posun + rychlost (jazykově nezávislé, i ze zvuku)"],
-        default=0)
+        default=0,
+        help=["auto: sám zvolí nejlepší postup - když je textová reference a dost kotev, "
+              "udělá combo; jinak spadne na afinní.",
+              "combo: nejdřív srovná globální posun+rychlost (afinní), pak doladí po větách "
+              "(warp). Nejrobustnější a nejpřesnější.",
+              "warp: jen párování po větách + po částech lineární mapa. Opraví i rozsync po "
+              "částech, ale potřebuje textovou referenci.",
+              "affine: jen jeden globální posun a rychlost (a*t+b). Funguje i jen ze zvuku a "
+              "napříč jazyky, ale neopraví rozsync po částech."])
     into_args.method = ["auto", "combo", "warp", "affine"][mi]
 
 
@@ -3415,6 +3790,7 @@ def run_auto_single(args):
     if not ask_yes_no("Spustit synchronizaci?", default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
+    preset_flush_if_save()
 
     if kind == "sub":
         sync_two_subs(target, refpath, args.output, args)
@@ -3498,6 +3874,7 @@ def run_auto_all(args):
     if not ask_yes_no("Spustit dávkové zpracování?", default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
+    preset_flush_if_save()
 
     args.mkv = Path(directory)
     run_batch(args)
@@ -3713,12 +4090,59 @@ RŮZNÉ JAZYKY (target vs reference):
     parser.add_argument("--llm-model", default=None, help="Model pro OpenAI-kompatibilní korekturu.")
     parser.add_argument("--opensubtitles-user", default=None, help="OpenSubtitles uživatel (pro stahování).")
     parser.add_argument("--opensubtitles-password", default=None, help="OpenSubtitles heslo (pro stahování).")
+    parser.add_argument("--save", action="store_true",
+                         help="Jen s interaktivním příkazem (--auto/--auto-all/--translate-subs): "
+                              "po vyplnění uloží VŠECHNY volby do preset.json a operaci spustí. "
+                              "API klíče se do presetu NEUKLÁDAJÍ (ty patří do --config).")
+    parser.add_argument("--load", action="store_true",
+                         help="Načte preset.json a okamžitě spustí uloženou operaci bez dotazů "
+                              "(příkaz se vezme z presetu, nebo ho upřesni, např. --load --translate-subs).")
+    parser.add_argument("--preset-file", default=None, help="Cesta k preset.json (default vedle skriptu).")
+    parser.add_argument("--test-api", action="store_true",
+                         help="Pošle triviální požadavek na nastavené AI API (Anthropic/OpenAI) a vypíše "
+                              "přesnou odpověď nebo chybu (včetně těla od serveru) - pro ladění např. HTTP 400.")
     args = parser.parse_args()
 
     _cfg = {} if getattr(args, "no_config", False) else load_config(resolve_config_path(args))
     apply_config_to_args(args, _cfg)
     if args.config:
         run_config(args)
+        return
+    if args.test_api:
+        run_test_api(args)
+        return
+
+    # --- preset (--save / --load) pro interaktivní příkazy ---------------
+    interactive_cmd = ("auto-all" if args.auto_all else "auto" if args.auto
+                       else "translate-subs" if args.translate_subs else None)
+    if args.save and args.load:
+        die("--save a --load nelze kombinovat.")
+    if args.save and not interactive_cmd:
+        die("--save funguje jen s interaktivním příkazem (--auto / --auto-all / --translate-subs).")
+    if args.load:
+        preset = load_preset_file(resolve_preset_path(args))
+        if not preset:
+            die(f"Preset nenalezen nebo prázdný: {resolve_preset_path(args)} "
+                "(nejdřív spusť stejný příkaz s --save).")
+        cmd = interactive_cmd or preset.get("command")
+        if not cmd:
+            die("Preset neobsahuje uložený příkaz - spusť ho např. jako '--load --translate-subs'.")
+        if interactive_cmd and preset.get("command") and interactive_cmd != preset.get("command"):
+            log_warn(f"Preset je pro '{preset.get('command')}', ale spouštíš '{interactive_cmd}'.")
+        preset_begin_load(preset.get("answers", []))
+        log_info(f"Načítám preset ({len(preset.get('answers', []))} voleb) a spouštím '{cmd}' bez dotazů.")
+        interactive_cmd = cmd
+    if args.save and interactive_cmd:
+        preset_begin_save(interactive_cmd, resolve_preset_path(args))
+
+    if interactive_cmd and (args.save or args.load):
+        if interactive_cmd == "auto-all":
+            run_auto_all(args)
+        elif interactive_cmd == "auto":
+            run_auto_single(args)
+        elif interactive_cmd == "translate-subs":
+            run_translate_subs(args)
+        preset_flush_if_save()
         return
 
     if args.auto_all:
