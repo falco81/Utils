@@ -1633,7 +1633,7 @@ def _preset_replay():
 
 
 def _preset_record(kind, prompt, value):
-    if _PRESET_MODE == "save":
+    if _PRESET_MODE in ("save", "offer"):
         if _is_secret_prompt(prompt):
             _PRESET_REC.append({"k": kind, "secret": True})
         else:
@@ -1649,6 +1649,16 @@ def preset_begin_save(cmd, path):
     _PRESET_SAVED = False
 
 
+def preset_begin_offer(cmd, path):
+    """Jako save, ale uložení se na konci NABÍDNE (otázka), neukládá automaticky."""
+    global _PRESET_MODE, _PRESET_REC, _PRESET_CMD, _PRESET_PATH, _PRESET_SAVED
+    _PRESET_MODE = "offer"
+    _PRESET_REC = []
+    _PRESET_CMD = cmd
+    _PRESET_PATH = path
+    _PRESET_SAVED = False
+
+
 def preset_begin_load(answers):
     global _PRESET_MODE, _PRESET_DATA, _PRESET_IDX
     _PRESET_MODE = "load"
@@ -1656,18 +1666,35 @@ def preset_begin_load(answers):
     _PRESET_IDX = 0
 
 
+def _write_preset():
+    with open(_PRESET_PATH, "w", encoding="utf-8") as f:
+        json.dump({"command": _PRESET_CMD, "answers": _PRESET_REC},
+                  f, ensure_ascii=False, indent=2)
+
+
 def preset_flush_if_save():
-    """Uloží zaznamenané odpovědi (volá se těsně před spuštěním operace)."""
+    """Volá se těsně před spuštěním operace. Pro 'save' uloží rovnou, pro
+    'offer' se zeptá, jestli volby uložit jako preset."""
     global _PRESET_SAVED
-    if _PRESET_MODE == "save" and not _PRESET_SAVED and _PRESET_PATH:
+    if _PRESET_SAVED or not _PRESET_PATH:
+        return
+    if _PRESET_MODE == "save":
         try:
-            with open(_PRESET_PATH, "w", encoding="utf-8") as f:
-                json.dump({"command": _PRESET_CMD, "answers": _PRESET_REC},
-                          f, ensure_ascii=False, indent=2)
+            _write_preset()
             _PRESET_SAVED = True
             log_done(f"Preset uložen do {_PRESET_PATH} (příště stačí --load).")
         except Exception as e:
             log_warn(f"Uložení presetu selhalo: {e}")
+    elif _PRESET_MODE == "offer":
+        _PRESET_SAVED = True   # ať se neptá dvakrát
+        # raw vstup (mimo záznam), ať se otázka nedostane do presetu
+        raw = input("Uložit tyto volby jako preset, ať příště stačí spustit skript bez ptaní? [a/N]: ").strip().lower()
+        if raw in ("a", "y", "ano", "yes", "ja"):
+            try:
+                _write_preset()
+                log_done(f"Preset uložen do {_PRESET_PATH}. Příště se spustí sám (smaž ho pro průvodce).")
+            except Exception as e:
+                log_warn(f"Uložení presetu selhalo: {e}")
 
 
 def load_preset_file(path):
@@ -3064,8 +3091,10 @@ def run_test_api(args):
 
 
 def run_translate_subs(args):
-    """Interaktivní průvodce: extrahuje stopu, získá cílový jazyk (OpenSubtitles
-    a/nebo strojový překlad + korektura) a uloží .srt pro všechna videa."""
+    """Interaktivní průvodce: zdroj je buď titulková stopa z VIDEÍ (vytáhne se),
+    nebo přímo EXISTUJÍCÍ titulkové soubory v adresáři (jeden/několik/všechny).
+    Získá cílový jazyk (OpenSubtitles a/nebo strojový překlad + korektura),
+    volitelně opraví čitelnost a uloží .srt."""
     if args.mkv and args.mkv.is_dir():
         directory = str(args.mkv)
     elif args.mkv and args.mkv.exists():
@@ -3073,50 +3102,84 @@ def run_translate_subs(args):
     else:
         directory = "."
 
-    print(f"{Fore.MAGENTA}=== Extrahovat + přeložit titulky (uložit .srt) ==={Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}=== Přeložit titulky a uložit .srt ==={Style.RESET_ALL}")
     log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
 
     recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
-    videos = collect_videos(directory, recursive)
-    if not videos:
-        die("Žádná videa v adresáři.")
-    log_info(f"Nalezeno {len(videos)} videí.")
 
-    # 1) zdrojová stopa (ze skutečných stop vzorového videa)
-    sample = Path(videos[0])
-    mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, sample)
-    sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles") if mkvmerge_bin else []
+    src_type = ask_pick(
+        "Co chceš přeložit?",
+        ["Titulkové stopy z VIDEÍ v adresáři (vytáhnout z videa)",
+         "Existující TITULKOVÉ SOUBORY v adresáři (.srt)"],
+        default=0,
+        help=["Z videí: pro každé video vytáhne zvolenou titulkovou stopu a tu přeloží "
+              "(u 'auto' může místo překladu stáhnout hotové z OpenSubtitles).",
+              "Z titulkových souborů: přeloží přímo existující .srt v adresáři - můžeš vybrat "
+              "jeden, několik, nebo všechny. Žádné video ani nástroje nejsou potřeba."])
+
+    jobs = []  # list of (path, kind) kind = "video" | "sub"
     args.track_id = None
-    if sub_tracks:
-        labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in sub_tracks]
-        labels += ["podle jazyka (zadám kód)", "první vhodná"]
-        i = ask_pick(f"Kterou titulkovou stopu extrahovat (vzorek {sample.name})?", labels, default=0)
-        if i < len(sub_tracks):
-            args.track_id = sub_tracks[i]["id"]; args.ref_lang = None
-        elif i == len(sub_tracks):
-            args.ref_lang = norm_lang(ask_language("Jazyk zdrojové stopy (eng/cze/...)", "") or None)
+    if src_type == 0:
+        videos = collect_videos(directory, recursive)
+        if not videos:
+            die("Žádná videa v adresáři. Zvol 'titulkové soubory', nebo použij --auto pro synchronizaci.")
+        log_info(f"Nalezeno {len(videos)} videí.")
+        sample = Path(videos[0])
+        mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, sample)
+        sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles") if mkvmerge_bin else []
+        if sub_tracks:
+            labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in sub_tracks]
+            labels += ["podle jazyka (zadám kód)", "první vhodná"]
+            i = ask_pick(f"Kterou titulkovou stopu extrahovat (vzorek {sample.name})?", labels, default=0)
+            if i < len(sub_tracks):
+                args.track_id = sub_tracks[i]["id"]; args.ref_lang = None
+            elif i == len(sub_tracks):
+                args.ref_lang = norm_lang(ask_language("Jazyk zdrojové stopy (eng/cze/...)", "") or None)
+            else:
+                args.ref_lang = None
         else:
-            args.ref_lang = None
+            log_warn("Stopy vzorového videa se nepodařilo přečíst - vyberu podle jazyka/první.")
+            args.ref_lang = norm_lang(ask_language("Jazyk zdrojové titulkové stopy (eng/...; prázdné=první)", "") or None)
+        jobs = [(v, "video") for v in videos]
     else:
-        log_warn("Stopy vzorového videa se nepodařilo přečíst - vyberu podle jazyka/první.")
-        args.ref_lang = norm_lang(ask_language("Jazyk zdrojové titulkové stopy (eng/...; prázdné=první)", "") or None)
+        subs = collect_srts(directory, recursive)
+        if not subs:
+            die("V adresáři nejsou žádné .srt soubory.")
+        sel = ask_pick(f"Které titulkové soubory přeložit? (nalezeno {len(subs)})",
+                       ["všechny", "jeden", "několik (vyberu čísla)"], default=0)
+        if sel == 0:
+            chosen = subs
+        elif sel == 1:
+            idx = ask_pick("Který soubor?", [os.path.basename(s) for s in subs], default=0)
+            chosen = [subs[idx]]
+        else:
+            for k, s in enumerate(subs, 1):
+                print(f"  {k}) {os.path.basename(s)}")
+            raw = ask_text("Zadej čísla oddělená čárkou (např. 1,3,4)", "")
+            chosen = [subs[int(t) - 1] for t in raw.replace(" ", "").split(",")
+                      if t.isdigit() and 1 <= int(t) <= len(subs)] or subs
+        jobs = [(s, "sub") for s in chosen]
+        log_info(f"Vybráno {len(jobs)} titulkových souborů k překladu.")
 
-    # 2) cílový jazyk
+    # cílový jazyk
     out_lang = (ask_language("Do jakého jazyka přeložit (kód, např. cs/en/de)",
-                         getattr(args, "out_lang", None) or "cs") or "cs").lower()
+                             getattr(args, "out_lang", None) or "cs") or "cs").lower()
 
-    # 3) strategie zdroje
-    si = ask_pick("Odkud vzít cílové titulky?",
-                  ["auto - nejdřív zkus hotové lidské (OpenSubtitles), jinak strojový překlad",
-                   "jen strojový překlad extrahované stopy",
-                   "jen stáhnout hotové z OpenSubtitles"], default=0,
-                  help=["auto: nejdřív zkusí stáhnout hotové lidské titulky z OpenSubtitles "
-                        "(nejlepší kvalita); když nejsou/nelze, přeloží extrahovanou stopu strojově.",
-                        "jen strojový překlad: vždy přeloží extrahovanou titulkovou stopu z videa "
-                        "(zachová původní časování, sedí na video).",
-                        "jen OpenSubtitles: použije pouze stažené lidské titulky; když nejsou, "
-                        "video se přeskočí."])
-    strategy = ["auto", "mt", "opensubtitles"][si]
+    # strategie zdroje (OpenSubtitles dává smysl jen u videí)
+    if src_type == 0:
+        si = ask_pick("Odkud vzít cílové titulky?",
+                      ["auto - nejdřív zkus hotové lidské (OpenSubtitles), jinak strojový překlad",
+                       "jen strojový překlad extrahované stopy",
+                       "jen stáhnout hotové z OpenSubtitles"], default=0,
+                      help=["auto: nejdřív zkusí stáhnout hotové lidské titulky z OpenSubtitles "
+                            "(nejlepší kvalita); když nejsou/nelze, přeloží extrahovanou stopu strojově.",
+                            "jen strojový překlad: vždy přeloží extrahovanou titulkovou stopu z videa "
+                            "(zachová původní časování, sedí na video).",
+                            "jen OpenSubtitles: použije pouze stažené lidské titulky; když nejsou, "
+                            "video se přeskočí."])
+        strategy = ["auto", "mt", "opensubtitles"][si]
+    else:
+        strategy = "mt"  # titulkový soubor se prostě přeloží
 
     engine = mt_key = mt_model = None
     if strategy in ("auto", "mt"):
@@ -3141,12 +3204,12 @@ def run_translate_subs(args):
             mt_key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
                       or ask_text("Anthropic API klíč", ""))
             mt_model = getattr(args, "anthropic_model", None) or ask_anthropic_model("Claude model", "claude-sonnet-4-6", args)
-            args.anthropic_key = args.anthropic_key or mt_key      # ať to může použít i korektura
+            args.anthropic_key = args.anthropic_key or mt_key
             args.anthropic_model = args.anthropic_model or mt_model
 
     os_key = os_user = os_pw = None
     os_pick = "downloads"
-    if strategy in ("auto", "opensubtitles"):
+    if src_type == 0 and strategy in ("auto", "opensubtitles"):
         os_key = (getattr(args, "opensubtitles_key", None) or os.environ.get("OPENSUBTITLES_API_KEY")
                   or ask_text("OpenSubtitles API klíč (prázdné = přeskočit OpenSubtitles)", ""))
         os_user = getattr(args, "opensubtitles_user", None) or os.environ.get("OPENSUBTITLES_USER")
@@ -3186,64 +3249,92 @@ def run_translate_subs(args):
                               or ask_text("Anthropic API klíč", ""))
         args.anthropic_model = getattr(args, "anthropic_model", None) or ask_anthropic_model("Claude model", "claude-sonnet-4-6", args)
 
-    sync_os = (strategy != "mt") and ask_yes_no(
+    sync_os = (src_type == 0 and strategy != "mt") and ask_yes_no(
         "Stažené (lidské) titulky případně časově srovnat s videem (afinně)?", default_no=False)
 
     # oprava čitelnosti (prodloužení krátkých titulků) na výsledku
     args.fix_short_duration = False
-    _ask_readability(args, [])
+    _ask_readability(args, [j[0] for j in jobs if j[1] == "sub"][:5])
 
     overwrite = ask_yes_no("Přepsat existující výstupní .srt?", default_no=True)
 
     print()
-    log_info(f"Cílový jazyk: {out_lang} | zdroj: {strategy}"
+    log_info(f"Cílový jazyk: {out_lang} | zdroj: {'videa' if src_type == 0 else 'titulkové soubory'}"
+             + (f"/{strategy}" if src_type == 0 else "")
              + (f" | překladač: {engine}" if engine else "")
              + f" | korektura: {proofread}"
              + (" | čitelnost: ano" if getattr(args, "fix_short_duration", False) else ""))
-    if not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
+    if not ask_yes_no(f"Spustit pro {len(jobs)} položek?", default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
 
     done = skipped = 0
-    for vid in videos:
-        v = Path(vid)
-        out_path = v.with_name(v.stem + f".{out_lang}.srt")
+    for path, kind in jobs:
+        p = Path(path)
+        out_path = p.with_name(p.stem + f".{out_lang}.srt")
+        if kind == "sub" and out_path.resolve() == p.resolve():
+            out_path = p.with_name(p.stem + f".{out_lang}.tr.srt")
         if out_path.exists() and not overwrite:
-            log_info(f"{v.name}: výstup už existuje - přeskakuji.")
+            log_info(f"{p.name}: výstup už existuje - přeskakuji.")
             skipped += 1
             continue
 
         events = None
         source_used = None
-        if strategy in ("auto", "opensubtitles") and os_key:
-            events = fetch_opensubtitles_events(v, out_lang, os_key, os_user, os_pw, pick=os_pick)
-            if events:
-                source_used = "opensubtitles"
-                if sync_os:
-                    ref_events, _ = extract_subtitle_events(args, v, args.track_id, args.ref_lang)
-                    if ref_events:
-                        log_info(f"{v.name}: srovnávám stažené titulky s videem (affine)...")
-                        events = run_alignment(_affine_sync_args(args), ref_events, ref_events, events)
 
-        if events is None and strategy in ("auto", "mt"):
-            src_events, chosen = extract_subtitle_events(args, v, args.track_id, args.ref_lang)
-            if src_events:
-                log_info(f"{v.name}: překládám {len(src_events)} titulků do '{out_lang}' ({engine})...")
-                translated = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
-                if translated:
-                    changed = sum(1 for a, b in zip(src_events, translated)
-                                  if a["text"].replace("\n", " ").strip() != b["text"].replace("\n", " ").strip())
-                    if changed < max(1, int(0.05 * len(translated))):
-                        log_warn(f"{v.name}: překlad se nezdařil (přeloženo {changed}/{len(translated)}) - "
-                                 f"NEUKLÁDÁM nepřeložený text jako '{out_lang}'. Zkontroluj klíč/model/engine.")
-                        skipped += 1
-                        continue
-                    events = translated
-                    source_used = f"mt:{engine}"
+        if kind == "video":
+            if strategy in ("auto", "opensubtitles") and os_key:
+                events = fetch_opensubtitles_events(p, out_lang, os_key, os_user, os_pw, pick=os_pick)
+                if events:
+                    source_used = "opensubtitles"
+                    if sync_os:
+                        ref_events, _ = extract_subtitle_events(args, p, args.track_id, args.ref_lang)
+                        if ref_events:
+                            log_info(f"{p.name}: srovnávám stažené titulky s videem (affine)...")
+                            events = run_alignment(_affine_sync_args(args), ref_events, ref_events, events)
+            if events is None and strategy in ("auto", "mt"):
+                src_events, _chosen = extract_subtitle_events(args, p, args.track_id, args.ref_lang)
+                if src_events:
+                    log_info(f"{p.name}: překládám {len(src_events)} titulků do '{out_lang}' ({engine})...")
+                    translated = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
+                    if translated:
+                        changed = sum(1 for a, b in zip(src_events, translated)
+                                      if a["text"].replace("\n", " ").strip() != b["text"].replace("\n", " ").strip())
+                        if changed < max(1, int(0.05 * len(translated))):
+                            log_warn(f"{p.name}: překlad se nezdařil (přeloženo {changed}/{len(translated)}) - "
+                                     f"NEUKLÁDÁM nepřeložený text jako '{out_lang}'. Zkontroluj klíč/model/engine.")
+                            skipped += 1
+                            continue
+                        events = translated
+                        source_used = f"mt:{engine}"
+        else:  # kind == "sub"
+            try:
+                src_events = parse_srt(p)
+            except Exception as e:
+                log_warn(f"{p.name}: nelze načíst ({e}) - přeskakuji.")
+                skipped += 1
+                continue
+            sl = detect_sub_language(src_events)
+            if sl and sl == out_lang:
+                log_info(f"{p.name}: zdroj je už v jazyce '{out_lang}' - přeskakuji.")
+                skipped += 1
+                continue
+            log_info(f"{p.name}: překládám {len(src_events)} titulků do '{out_lang}' ({engine})...")
+            translated = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
+            if translated:
+                changed = sum(1 for a, b in zip(src_events, translated)
+                              if a["text"].replace("\n", " ").strip() != b["text"].replace("\n", " ").strip())
+                if changed < max(1, int(0.05 * len(translated))):
+                    log_warn(f"{p.name}: překlad se nezdařil (přeloženo {changed}/{len(translated)}) - "
+                             f"NEUKLÁDÁM nepřeložený text. Zkontroluj klíč/model/engine.")
+                    skipped += 1
+                    continue
+                events = translated
+                source_used = f"mt:{engine}"
 
         if not events:
-            log_warn(f"{v.name}: nepodařilo se získat cílové titulky - přeskakuji.")
+            log_warn(f"{p.name}: nepodařilo se získat cílové titulky - přeskakuji.")
             skipped += 1
             continue
 
@@ -3255,18 +3346,18 @@ def run_translate_subs(args):
             events, n_ext = fix_short_durations(
                 events, min_cps=cps, min_duration_floor=floor, min_gap=gap, line_overhead=overhead)
             if n_ext:
-                log_info(f"{v.name}: čitelnost - prodlouženo {n_ext} krátkých titulků")
+                log_info(f"{p.name}: čitelnost - prodlouženo {n_ext} krátkých titulků")
 
         try:
             write_srt(events, out_path)
-            log_done(f"{v.name} -> {out_path.name}  ({source_used})")
+            log_done(f"{p.name} -> {out_path.name}  ({source_used})")
             done += 1
         except Exception as e:
-            log_warn(f"{v.name}: zápis selhal: {e}")
+            log_warn(f"{p.name}: zápis selhal: {e}")
             skipped += 1
 
     print()
-    log_done(f"Hotovo: {done} uloženo, {skipped} přeskočeno (z {len(videos)}).")
+    log_done(f"Hotovo: {done} uloženo, {skipped} přeskočeno (z {len(jobs)}).")
 
 
 def process_single(args):
@@ -3880,6 +3971,62 @@ def run_auto_all(args):
     run_batch(args)
 
 
+def run_master_wizard(args):
+    """Hlavní průvodce při spuštění BEZ parametrů: zeptá se, co chceš udělat,
+    spustí příslušný dílčí průvodce a na konci nabídne uložení jako preset."""
+    print(f"{Fore.MAGENTA}=== sync_subtitles - interaktivní průvodce ==={Style.RESET_ALL}")
+    log_info("Spuštěno bez parametrů. Projdu s tebou, co se má udělat.")
+    log_info("Tip: až to vyplníš, můžeš si volby uložit jako preset - příště se to spustí samo.")
+    print()
+
+    mode = ask_pick(
+        "Co chceš udělat?",
+        ["Synchronizovat JEDNY titulky (špatně načasované) podle videa nebo druhých titulků",
+         "Synchronizovat CELOU SLOŽKU (dávka videí + jejich titulky)",
+         "Přeložit titulky z videa do jiného jazyka a uložit jako .srt",
+         "Jen opravit ČITELNOST titulků (prodloužit příliš krátké)",
+         "Nastavit API klíče a výchozí volby (config.json)",
+         "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
+        default=1,
+        help=["Synchronizace jedněch titulků: vybereš titulkový soubor se špatným časováním a "
+              "zdroj správného časování (titulková stopa z videa, nebo druhé .srt). Bez videa to "
+              "umí i mezi dvěma .srt.",
+              "Dávka celé složky: pro každé video v adresáři dopočítá časování k jeho titulkům.",
+              "Překlad titulků: vytáhne stopu z videa, přeloží do cílového jazyka (OpenSubtitles "
+              "nebo DeepL/Google/Claude/Argos) + korektura, uloží <video>.<jazyk>.srt.",
+              "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa.",
+              "Config: uloží API klíče a výchozí volby do config.json (načítá se automaticky).",
+              "Test API: pošle triviální dotaz a vypíše přesnou odpověď/chybu (ladění např. HTTP 400)."])
+
+    if mode == 4:
+        run_config(args)
+        return
+    if mode == 5:
+        run_test_api(args)
+        return
+    if mode == 3:
+        args.fix_readability = True
+        run_fix_readability(args)
+        return
+
+    cmd = ["auto", "auto-all", "translate-subs"][mode]
+    if mode == 0:
+        args.auto = True
+    elif mode == 1:
+        args.auto_all = True
+    else:
+        args.translate_subs = True
+
+    # nabídnout uložení presetu (otázka padne až na konci, těsně před spuštěním)
+    preset_begin_offer(cmd, resolve_preset_path(args))
+    if cmd == "auto":
+        run_auto_single(args)
+    elif cmd == "auto-all":
+        run_auto_all(args)
+    else:
+        run_translate_subs(args)
+
+
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -4110,6 +4257,29 @@ RŮZNÉ JAZYKY (target vs reference):
         return
     if args.test_api:
         run_test_api(args)
+        return
+
+    # Spuštění BEZ jakéhokoli parametru:
+    #   - když existuje preset.json -> rovnou spustí uloženou akci (bez dotazů)
+    #   - jinak -> hlavní interaktivní průvodce (na konci nabídne uložení presetu)
+    if len(sys.argv) <= 1 and not args.load and not args.save:
+        _ppath = resolve_preset_path(args)
+        _preset = load_preset_file(_ppath)
+        if _preset and _preset.get("command"):
+            cmd = _preset["command"]
+            log_info(f"Našel jsem preset: {_ppath}")
+            log_info(f"Spouštím uloženou akci '{cmd}' bez dotazů. (Pro průvodce smaž preset.json.)")
+            preset_begin_load(_preset.get("answers", []))
+            if cmd == "auto-all":
+                run_auto_all(args)
+            elif cmd == "auto":
+                run_auto_single(args)
+            elif cmd == "translate-subs":
+                run_translate_subs(args)
+            else:
+                die(f"Neznámý příkaz v presetu: {cmd}")
+            return
+        run_master_wizard(args)
         return
 
     # --- preset (--save / --load) pro interaktivní příkazy ---------------
