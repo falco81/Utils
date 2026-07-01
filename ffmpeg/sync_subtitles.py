@@ -1283,6 +1283,20 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
             if not isinstance(res, list) or len(res) != len(batch):
                 return [None] * len(batch)
             return res
+
+    elif engine == "gemini":
+        if not api_key:
+            log_warn("Pro překlad přes Gemini chybí Google API klíč (--gemini-key nebo "
+                     "GEMINI_API_KEY / GOOGLE_API_KEY). Zdarma na aistudio.google.com. "
+                     "Pokračuji bez Gemini.")
+            return None
+        gm_model = model or "gemini-2.0-flash"
+
+        def backend(batch):
+            res = gemini_translate_batch(batch, pivot_lang, api_key, gm_model)
+            if not isinstance(res, list) or len(res) != len(batch):
+                return [None] * len(batch)
+            return res
     else:
         return None
 
@@ -1297,7 +1311,7 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
                 seen.add(kt); uniq.append(kt)
         if uniq:
             total = len(uniq)
-            CH = 25 if engine in ("google", "deepl", "claude") else 50
+            CH = 25 if engine in ("google", "deepl", "claude", "gemini") else 50
             timeout = 90
             log_info(f"Překládám {total} unikátních řádků do '{pivot_lang}' ({engine})... "
                      f"(může chvíli trvat; průběh níže, výsledky se průběžně kešují)")
@@ -1309,8 +1323,9 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
                 if isinstance(err, _FatalAPIError):
                     print()
                     log_warn(f"Překlad ({engine}) zastaven: {err}")
-                    log_warn("Zkontroluj API klíč a název modelu (--anthropic-model / --deepl-key) "
-                             "nebo zkus jiný překladač (--translate / volba v průvodci). "
+                    log_warn("Zkontroluj API klíč a název modelu, nebo zkus jiný překladač "
+                             "(v průvodci volba 'Strojový překladač', nebo přepínač --translate). "
+                             "Google je zdarma bez klíče, Gemini zdarma s klíčem. "
                              "Zbytek řádků zůstane v originále.")
                     failed += (total - done)
                     break
@@ -1389,6 +1404,10 @@ def run_alignment(args, ref_events, ref_events_sub, target_events):
         elif engine == "claude":
             key = getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
             model = getattr(args, "anthropic_model", None)
+        elif engine == "gemini":
+            key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
+                   or os.environ.get("GOOGLE_API_KEY"))
+            model = getattr(args, "gemini_model", None)
         translator = make_translator(engine, pivot, api_key=key, model=model)
         if translator is None:
             return None, None
@@ -2483,16 +2502,92 @@ def clean_subtitle_text(text, max_line=42):
     return t
 
 
-def translate_events_to(events, engine, target_lang, api_key=None, model=None):
+_SENT_ENDERS = ".!?…:"
+
+
+def _looks_continuation(cur, nxt, gap, max_gap=2.0):
+    """Je 'nxt' pokračováním věty z 'cur'? (pro spojení fragmentů před překladem)"""
+    c = (cur or "").replace("\n", " ").strip()
+    n = (nxt or "").replace("\n", " ").strip()
+    if not c or not n or gap > max_gap:
+        return False
+    if n[:1] in "-–—":          # nový mluvčí (pomlčka) -> nespojovat
+        return False
+    last = c[-1]
+    if last in _SENT_ENDERS:
+        return False
+    if last in "\"”»)]" and len(c) >= 2 and c[-2] in _SENT_ENDERS:
+        return False
+    return True
+
+
+def _merge_sentence_groups(events, max_group=4, max_gap=2.0):
+    """Seskupí za sebou jdoucí titulky, které tvoří jednu větu."""
+    groups = []
+    i, n = 0, len(events)
+    while i < n:
+        grp = [i]
+        while (len(grp) < max_group and i + 1 < n
+               and _looks_continuation(events[i]["text"], events[i + 1]["text"],
+                                       events[i + 1]["start"] - events[i]["end"], max_gap)):
+            i += 1
+            grp.append(i)
+        groups.append(grp)
+        i += 1
+    return groups
+
+
+def _split_translation(translated, parts):
+    """Rozdělí přeloženou větu zpět na len(parts) kusů úměrně délce originálů,
+    na hranicích slov (aby časování zůstalo, ale text seděl na původní řádky)."""
+    translated = (translated or "").strip()
+    if len(parts) == 1:
+        return [translated]
+    words = translated.split()
+    if not words:
+        return [translated] + [""] * (len(parts) - 1)
+    total = sum(max(1, len(p.replace("\n", " ").strip())) for p in parts)
+    out, wi, nw = [], 0, len(words)
+    acc = 0.0
+    for k, p in enumerate(parts):
+        if k == len(parts) - 1:
+            out.append(" ".join(words[wi:]))
+            break
+        acc += max(1, len(p.replace("\n", " ").strip())) / total
+        tw = int(round(acc * nw))
+        tw = max(wi + 1, min(tw, nw - (len(parts) - 1 - k)))
+        out.append(" ".join(words[wi:tw]))
+        wi = tw
+    return out
+
+
+def translate_events_to(events, engine, target_lang, api_key=None, model=None, sentence_aware=True):
     """Přeloží text eventů do target_lang (časování beze změny). Vrací nové
-    events, nebo None když překladač není k dispozici."""
+    events, nebo None když překladač není k dispozici.
+    sentence_aware=True: spojí větné fragmenty roztržené přes víc titulků,
+    přeloží je jako CELOU větu (kvalitnější a s kontextem) a rozdělí zpět."""
     tr = make_translator(engine, target_lang, api_key=api_key, model=model)
     if tr is None:
         return None
-    src = [e["text"].replace("\n", " ") for e in events]
-    out = tr(src)
-    return [{"start": e["start"], "end": e["end"], "text": (o or e["text"])}
-            for e, o in zip(events, out)]
+
+    if not sentence_aware:
+        out = tr([e["text"].replace("\n", " ") for e in events])
+        return [{"start": e["start"], "end": e["end"], "text": (o or e["text"])}
+                for e, o in zip(events, out)]
+
+    groups = _merge_sentence_groups(events)
+    merged = [" ".join(events[i]["text"].replace("\n", " ").strip() for i in g) for g in groups]
+    translated = tr(merged)
+    result = [{"start": e["start"], "end": e["end"], "text": e["text"]} for e in events]
+    for g, tsent in zip(groups, translated):
+        parts = [events[i]["text"] for i in g]
+        if not tsent:
+            continue  # překlad selhal -> ponech originál
+        pieces = _split_translation(tsent, parts)
+        for idx, piece in zip(g, pieces):
+            if piece.strip():
+                result[idx]["text"] = piece.strip()
+    return result
 
 
 def anthropic_messages(prompt, api_key, model, max_tokens=4000, timeout=180):
@@ -2603,14 +2698,26 @@ def _print_anthropic_models(args=None):
           f"nejdražší/nejvýkonnější. Přesné ceny za tokeny viz anthropic.com/pricing.{Style.RESET_ALL}")
 
 
+def _subtitle_translate_prompt(batch, target_lang):
+    """Kvalitní prompt pro překlad titulků (laděno hlavně na češtinu)."""
+    numbered = "\n".join(f"{k + 1}. {t.replace(chr(10), ' / ')}" for k, t in enumerate(batch))
+    lang_note = ""
+    if target_lang in ("cs", "sk"):
+        lang_note = (" Používej přirozenou, hovorovou " + ("češtinu" if target_lang == "cs" else "slovenštinu")
+                     + ", správnou diakritiku a interpunkci. Udrž konzistentní oslovování (tykání/vykání) "
+                     "podle kontextu scény. Jména postav a názvy NEPŘEKLÁDEJ.")
+    return (f"Jsi zkušený překladatel filmových a seriálových titulků. Přelož následující "
+            f"číslované řádky do jazyka '{target_lang}'. Překládej PŘIROZENĚ a IDIOMATICKY "
+            f"(ne doslovně), zachovej význam, tón, rejstřík i humor.{lang_note} "
+            "Řádky jdou po sobě jako souvislý dialog - využij kontext, ale zachovej STEJNÝ "
+            "POČET a POŘADÍ položek. Víceřádkový titulek odděl ' / '. Vrať POUZE číslované "
+            "řádky ve tvaru 'číslo. překlad', bez uvozovek a bez jakýchkoli komentářů.\n\n" + numbered)
+
+
 def anthropic_translate_batch(batch, target_lang, api_key, model):
     """Přeloží dávku řádků titulků do target_lang přes Claude. Vrací seznam
     stejné délky (None u nezdaru). Fatální chyby (4xx) propaguje výš."""
-    numbered = "\n".join(f"{k + 1}. {t.replace(chr(10), ' / ')}" for k, t in enumerate(batch))
-    prompt = (f"Přelož následující číslované řádky filmových titulků do jazyka '{target_lang}'. "
-              "Překládej přirozeně a idiomaticky (ne doslovně), zachovej VÝZNAM, tón i POČET a "
-              "POŘADÍ položek. Víceřádkový titulek odděl ' / '. Vrať POUZE číslované řádky "
-              "(číslo. překlad) ve stejném pořadí a počtu, bez komentářů.\n\n" + numbered)
+    prompt = _subtitle_translate_prompt(batch, target_lang)
     try:
         content = anthropic_messages(prompt, api_key, model)
     except _FatalAPIError:
@@ -2621,6 +2728,104 @@ def anthropic_translate_batch(batch, target_lang, api_key, model):
         return [None] * len(batch)
     parsed = _parse_numbered(content, len(batch))
     return [(p.replace(" / ", "\n") if p else None) for p in parsed]
+
+
+def gemini_generate(prompt, api_key, model="gemini-2.0-flash", timeout=120):
+    """Jedno volání Google Gemini (generativelanguage). Vrací text nebo None.
+    Při 4xx vyhodí _FatalAPIError (neopakovat)."""
+    import urllib.request
+    import urllib.error
+    from urllib.parse import quote
+    url = (f"https://generativelanguage.googleapis.com/v1beta/models/{quote(model)}"
+           f":generateContent?key={quote(api_key)}")
+    body = json.dumps({"contents": [{"parts": [{"text": prompt}]}]}).encode("utf-8")
+    req = urllib.request.Request(url, data=body, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        detail = _http_error_detail(e)
+        msg = f"HTTP {e.code}: {detail or e.reason}"
+        if e.code in (400, 401, 403, 404):
+            raise _FatalAPIError(msg)
+        if e.code == 429 and ("limit: 0" in detail or "free_tier" in detail.lower() or "quota" in detail.lower()):
+            raise _FatalAPIError(msg + "  → Tenhle model nemá pro tvůj účet/region bezplatnou kvótu. "
+                                 "Zkus jiný model ('?' u modelu, nebo --gemini-model, např. "
+                                 "gemini-1.5-flash), nebo použij engine 'google' (zcela zdarma bez klíče).")
+        raise RuntimeError(msg)
+    cands = data.get("candidates", [])
+    if not cands:
+        return None
+    parts = cands[0].get("content", {}).get("parts", [])
+    text = "".join(p.get("text", "") for p in parts)
+    return text or None
+
+
+def gemini_translate_batch(batch, target_lang, api_key, model):
+    """Přeloží dávku titulků do target_lang přes Gemini (stejný prompt jako Claude)."""
+    prompt = _subtitle_translate_prompt(batch, target_lang)
+    try:
+        content = gemini_generate(prompt, api_key, model)
+    except _FatalAPIError:
+        raise
+    except Exception:
+        return [None] * len(batch)
+    if not content:
+        return [None] * len(batch)
+    parsed = _parse_numbered(content, len(batch))
+    return [(p.replace(" / ", "\n") if p else None) for p in parsed]
+
+
+_GEMINI_STATIC_MODELS = [
+    ("gemini-2.0-flash", "rychlý, kvalitní"),
+    ("gemini-2.0-flash-lite", "nejlevnější/nejrychlejší"),
+    ("gemini-1.5-flash", "starší flash - často má free kvótu"),
+    ("gemini-1.5-flash-8b", "malý, levný"),
+    ("gemini-2.5-flash", "novější flash"),
+]
+
+
+def gemini_list_models(api_key, timeout=30):
+    import urllib.request
+    from urllib.parse import quote
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={quote(api_key)}&pageSize=200"
+    req = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    return data.get("models", [])
+
+
+def _print_gemini_models(args=None):
+    key = ((getattr(args, "gemini_key", None) if args else None)
+           or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
+    models = None
+    if key:
+        try:
+            print(f"{Fore.CYAN}Načítám seznam modelů Gemini...{Style.RESET_ALL}")
+            models = gemini_list_models(key)
+        except Exception as e:
+            log_warn(f"Online seznam se nepodařilo načíst ({e}). Ukážu vestavěný přehled.")
+    else:
+        log_info("Gemini klíč není nastaven - ukážu vestavěný přehled.")
+
+    print(f"{Fore.MAGENTA}Modely Gemini pro překlad:{Style.RESET_ALL}")
+    if models:
+        for m in models:
+            if "generateContent" not in m.get("supportedGenerationMethods", []):
+                continue
+            mid = m.get("name", "").split("/")[-1]
+            if "embedding" in mid or "aqa" in mid:
+                continue
+            disp = m.get("displayName", "")
+            it = m.get("inputTokenLimit")
+            ot = m.get("outputTokenLimit")
+            lim = f" | vstup {it}, výstup {ot}" if it else ""
+            print(f"  {mid:<28}{disp}{lim}")
+    else:
+        for mid, note in _GEMINI_STATIC_MODELS:
+            print(f"  {mid:<28}{note}")
+    print(f"{Fore.CYAN}Pozn.: zdarma bývají 'flash' modely. Když některý hlásí 'limit: 0' (žádná "
+          f"free kvóta), zkus jiný flash, nebo použij engine 'google' (zdarma bez klíče).{Style.RESET_ALL}")
 
 
 def anthropic_proofread(events, target_lang, api_key, model, batch=40):
@@ -2902,6 +3107,8 @@ CONFIG_FIELDS = [
     ("opensubtitles_password", "opensubtitles_password", "OPENSUBTITLES_PASSWORD", True),
     ("anthropic_key", "anthropic_key", "ANTHROPIC_API_KEY", True),
     ("anthropic_model", "anthropic_model", None, False),
+    ("gemini_key", "gemini_key", "GEMINI_API_KEY", True),
+    ("gemini_model", "gemini_model", None, False),
     ("llm_key", "llm_key", "OPENAI_API_KEY", True),
     ("llm_api", "llm_api", None, False),
     ("llm_model", "llm_model", None, False),
@@ -2946,6 +3153,11 @@ def apply_config_to_args(args, cfg):
         val = (os.environ.get(env) if env else None) or cfg.get(ckey)
         if val:
             setattr(args, attr, val)
+    # Gemini akceptuje i GOOGLE_API_KEY
+    if not getattr(args, "gemini_key", None):
+        g = os.environ.get("GOOGLE_API_KEY")
+        if g:
+            args.gemini_key = g
 
 
 def _mask(s):
@@ -2996,7 +3208,16 @@ def run_config(args):
             ask_secret("OpenSubtitles heslo", "opensubtitles_password")
 
     # AI korektura / překlad
-    if ask_yes_no("Nastavit AI (korektura nebo překlad přes Claude / OpenAI-kompatibilní API)?",
+    if ask_yes_no("Nastavit Google Gemini (AI PŘEKLAD ZDARMA, doporučeno pro češtinu)?",
+                  default_no=not cfg.get("gemini_key")):
+        ask_secret("Gemini API klíč (zdarma na aistudio.google.com)", "gemini_key")
+        _gm = ask_gemini_model("Model Gemini", cfg.get("gemini_model") or "gemini-2.0-flash",
+                               type("A", (), {"gemini_key": cfg.get("gemini_key")
+                                              or os.environ.get("GEMINI_API_KEY")
+                                              or os.environ.get("GOOGLE_API_KEY")})())
+        if _gm:
+            cfg["gemini_model"] = _gm
+    if ask_yes_no("Nastavit AI přes Claude / OpenAI-kompatibilní API (překlad i korektura)?",
                   default_no=not (cfg.get("anthropic_key") or cfg.get("llm_key"))):
         which = ask_pick("Který AI provider nastavit?",
                          ["Anthropic (Claude)", "OpenAI-kompatibilní (OpenAI/lokální)", "oba"], default=0)
@@ -3032,6 +3253,8 @@ def run_config(args):
     print()
     log_done(f"Uloženo do {path}")
     enabled = []
+    if cfg.get("gemini_key"):
+        enabled.append("Gemini")
     if cfg.get("deepl_key"):
         enabled.append("DeepL")
     if cfg.get("opensubtitles_key"):
@@ -3066,6 +3289,22 @@ def run_test_api(args):
             log_warn(f"Anthropic SELHALO: {e}")
     else:
         log_info("Anthropic klíč nenastaven - přeskakuji.")
+
+    gkey = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
+            or os.environ.get("GOOGLE_API_KEY"))
+    gmodel = getattr(args, "gemini_model", None) or "gemini-2.0-flash"
+    if gkey:
+        tested += 1
+        log_info(f"Test Google Gemini - model '{gmodel}'...")
+        try:
+            txt = gemini_generate("Odpověz jediným slovem: OK.", gkey, gmodel)
+            log_done(f"Gemini OK. Odpověď: {txt!r}")
+        except _FatalAPIError as e:
+            log_warn(f"Gemini SELHALO: {e}")
+        except Exception as e:
+            log_warn(f"Gemini SELHALO: {e}")
+    else:
+        log_info("Gemini klíč nenastaven - přeskakuji.")
 
     okey = getattr(args, "llm_key", None) or os.environ.get("OPENAI_API_KEY")
     if okey:
@@ -3184,20 +3423,28 @@ def run_translate_subs(args):
     engine = mt_key = mt_model = None
     if strategy in ("auto", "mt"):
         ei = ask_pick("Strojový překladač:",
-                      ["deepl  - výborná kvalita (API klíč)",
-                       "google - zdarma, slušná kvalita",
-                       "claude - překlad přes Anthropic API (klíč)",
-                       "argos  - offline (pip install argostranslate)"], default=1,
-                      help=["deepl: nejlepší kvalita strojového překladu. Vyžaduje API klíč "
-                            "(placené, má i free tier ~500k znaků/měsíc).",
-                            "google: zdarma a bez klíče, slušná kvalita. U velkých dávek může "
-                            "omezovat rychlost (rate-limit).",
-                            "claude: velmi kvalitní/kontextový překlad přes Anthropic API. "
-                            "Platí se za tokeny (Haiku levné, Sonnet/Opus dražší).",
-                            "argos: plně offline, bez internetu i klíče (nainstaluj argostranslate). "
-                            "Kvalita nižší než DeepL/Claude."])
-        engine = ["deepl", "google", "claude", "argos"][ei]
-        if engine == "deepl":
+                      ["gemini - AI kvalita ZDARMA (Google AI Studio klíč) - doporučeno pro češtinu",
+                       "deepl  - výborná kvalita (API klíč, free tier)",
+                       "google - úplně zdarma bez klíče, slušná kvalita",
+                       "claude - AI přes Anthropic API (placené)",
+                       "argos  - offline, zdarma (nižší kvalita)"], default=0,
+                      help=["gemini: AI překlad od Googlu, ZDARMA s API klíčem z aistudio.google.com "
+                            "(štědrý free limit). Nejlepší poměr kvalita/cena pro češtinu.",
+                            "deepl: špičková kvalita, vyžaduje klíč (má free tier ~500k znaků/měsíc).",
+                            "google: úplně zdarma bez klíče, slušná kvalita; u velkých dávek občas "
+                            "omezuje rychlost. Se spojováním vět je výsledek slušný.",
+                            "claude: velmi kvalitní, placené (za tokeny).",
+                            "argos: plně offline, zdarma, ale znatelně nižší kvalita."])
+        engine = ["gemini", "deepl", "google", "claude", "argos"][ei]
+        if engine == "gemini":
+            mt_key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
+                      or os.environ.get("GOOGLE_API_KEY")
+                      or ask_text("Gemini API klíč (zdarma na aistudio.google.com)", ""))
+            args.gemini_key = args.gemini_key or mt_key
+            mt_model = getattr(args, "gemini_model", None) or ask_gemini_model(
+                "Model Gemini", "gemini-2.0-flash", args)
+            args.gemini_model = args.gemini_model or mt_model
+        elif engine == "deepl":
             mt_key = (getattr(args, "deepl_key", None) or os.environ.get("DEEPL_API_KEY")
                       or ask_text("DeepL API klíč", ""))
         elif engine == "claude":
@@ -3651,6 +3898,17 @@ def ask_anthropic_model(prompt, default="", args=None):
         return raw
 
 
+def ask_gemini_model(prompt, default="", args=None):
+    """Jako ask_text, ale '?' vypíše seznam modelů Gemini (online dle klíče)."""
+    hint = f"{prompt} (? = seznam modelů)"
+    while True:
+        raw = ask_text(hint, default)
+        if raw.strip() == "?":
+            _print_gemini_models(args)
+            continue
+        return raw
+
+
 def _pick_reading_speed():
     keys = list(READING_SPEED_PRESETS.keys())
     labels = [f"{k} - {READING_SPEED_PRESETS[k][2]} "
@@ -3700,13 +3958,17 @@ def _pick_method(into_args):
 
 def _enable_translate_prompt(into_args):
     ei = ask_pick("Překladač pro mezijazyčné párování:",
-                  ["google - online, zdarma (pip install deep-translator)",
+                  ["gemini - AI zdarma (Google AI Studio klíč)",
+                   "google - online, zdarma bez klíče",
                    "deepl  - lepší kvalita (API klíč)",
-                   "claude - přes Anthropic API (klíč)",
-                   "argos  - offline (pip install argostranslate langdetect)"], default=0)
-    into_args.translate = ["google", "deepl", "claude", "argos"][ei]
+                   "claude - přes Anthropic API (placené)",
+                   "argos  - offline (pip install argostranslate langdetect)"], default=1)
+    into_args.translate = ["gemini", "google", "deepl", "claude", "argos"][ei]
     into_args.pivot_lang = ask_text("Společný jazyk pro párování (pivot)", "en") or "en"
-    if into_args.translate == "deepl" and not getattr(into_args, "deepl_key", None):
+    if into_args.translate == "gemini" and not getattr(into_args, "gemini_key", None):
+        into_args.gemini_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                                or ask_text("Gemini API klíč (zdarma na aistudio.google.com)", "") or None)
+    elif into_args.translate == "deepl" and not getattr(into_args, "deepl_key", None):
         into_args.deepl_key = os.environ.get("DEEPL_API_KEY") or ask_text("DeepL API klíč", "") or None
     elif into_args.translate == "claude" and not getattr(into_args, "anthropic_key", None):
         into_args.anthropic_key = os.environ.get("ANTHROPIC_API_KEY") or ask_text("Anthropic API klíč", "") or None
@@ -4172,7 +4434,7 @@ RŮZNÉ JAZYKY (target vs reference):
                               "(default 3; menší = opatrnější)")
     parser.add_argument("--ca-min-sim", type=float, default=None,
                          help="(jen --method warp/auto) min. textová podobnost pro kotvu 0-1 (default 0.50)")
-    parser.add_argument("--translate", choices=["off", "google", "deepl", "argos", "claude"], default="off",
+    parser.add_argument("--translate", choices=["off", "google", "deepl", "argos", "claude", "gemini"], default="off",
                          help="Mezijazyčné párování (jen pro metodu warp/auto/combo): když jsou opravované a "
                               "referenční titulky v JINÝCH jazycích, přeloží obě strany do společného "
                               "jazyka (--pivot-lang) JEN pro účely párování - text titulků se nemění. "
@@ -4233,6 +4495,8 @@ RŮZNÉ JAZYKY (target vs reference):
     parser.add_argument("--no-config", action="store_true", help="Nenačítat config.json při startu.")
     parser.add_argument("--anthropic-key", default=None, help="Anthropic (Claude) API klíč (nebo ANTHROPIC_API_KEY).")
     parser.add_argument("--anthropic-model", default=None, help="Model Claude (default claude-sonnet-4-6).")
+    parser.add_argument("--gemini-key", default=None, help="Google Gemini API klíč - AI překlad ZDARMA (nebo GEMINI_API_KEY/GOOGLE_API_KEY). Získáš na aistudio.google.com.")
+    parser.add_argument("--gemini-model", default=None, help="Model Gemini (default gemini-2.0-flash).")
     parser.add_argument("--llm-api", default=None, help="URL OpenAI-kompatibilního API (/chat/completions).")
     parser.add_argument("--llm-model", default=None, help="Model pro OpenAI-kompatibilní korekturu.")
     parser.add_argument("--opensubtitles-user", default=None, help="OpenSubtitles uživatel (pro stahování).")
