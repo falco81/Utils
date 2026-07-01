@@ -302,11 +302,22 @@ def pad_field(field, counter, widths):
 #  Detekce sérií (shlukování souborů podle společné fráze)
 # --------------------------------------------------------------------------- #
 # Generická slova, která NEodlišují sérii – pro shlukování se ignorují.
+# (Použije se JEN při detekci sérií, na samotné přejmenování nemá vliv.)
 DEFAULT_STOP = {
-    "episode", "episodes", "ep", "eps", "reaction", "reactions", "react",
-    "reacts", "uncut", "full", "part", "pt", "video", "official", "hd",
-    "fhd", "uhd", "4k", "2k", "premiere", "finale", "trailer", "teaser",
-    "subbed", "sub", "dub", "raw", "movie", "series",
+    # média / reaction
+    "episode", "episodes", "episod", "ep", "eps", "reaction", "reactions",
+    "react", "reacts", "reacting", "uncut", "full", "part", "pt", "video",
+    "official", "hd", "fhd", "uhd", "4k", "2k", "premiere", "finale", "final",
+    "trailer", "teaser", "subbed", "sub", "dub", "raw", "movie", "series",
+    "season", "s", "e", "watch", "watching", "review", "recap", "highlights",
+    "clip", "clips", "cut", "edit", "compilation", "special", "bonus", "early",
+    "access", "kdrama", "drama", "anime",
+    # anglická funkční slova / zájmena
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for",
+    "with", "as", "by", "from", "into", "is", "are", "was", "were", "be",
+    "this", "that", "these", "those", "here", "there", "now", "new", "my",
+    "your", "our", "their", "his", "her", "its", "i", "im", "you", "we",
+    "they", "he", "she", "it", "vs", "ft", "feat", "no", "yes", "so", "just",
 }
 
 WORDCHARS = re.compile(r"[^\w]", re.UNICODE)
@@ -372,7 +383,7 @@ def cluster_series(word_lists, min_run):
 # --------------------------------------------------------------------------- #
 def build_plan(filenames, sep, do_pad, do_words, min_width,
                removes=(), case_mode="title", strict=False,
-               group=True, group_min=2, stop=None):
+               group=True, group_min=1, stop=None):
     """Vrátí (list dvojic (old, new), počet detekovaných sérií)."""
     join = " " if sep is None else sep
     stop = DEFAULT_STOP if stop is None else (DEFAULT_STOP | set(stop))
@@ -598,8 +609,8 @@ def main():
                     help="sjednotit VŠECHNY názvy podle společného vzoru (zahodí odlišnosti)")
     ap.add_argument("--no-group", action="store_true",
                     help="nerozdělovat soubory do sérií (zpracovat jako jednu skupinu)")
-    ap.add_argument("--group-min", type=int, default=2,
-                    help="min. počet společných slov pro spojení do série (výchozí 2)")
+    ap.add_argument("--group-min", type=int, default=1,
+                    help="min. počet společných slov pro spojení do série (výchozí 1)")
     ap.add_argument("--group-stop", action="append", default=[], metavar="SLOVO",
                     help="další generické slovo ignorované při detekci sérií (lze vícekrát)")
     ap.add_argument("--case", choices=["title", "lower", "upper", "keep"], default="title",
