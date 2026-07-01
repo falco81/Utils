@@ -50,6 +50,35 @@ DROPBOX_DEFAULT_CONNECTIONS = 8   # Dropbox rate-limits shared links hard, so un
                                   # connections (a high auto value like 80 makes them 429/truncate).
 BAR_NCOLS = 100                   # fixed progress-bar width so bars don't stretch across wide terminals
 BAR_DESC_WIDTH = 26               # fixed filename column width so all bars line up
+TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
+
+
+def _temp_dir_for(final_path: str) -> str:
+    """The sibling .temp directory next to a file's final location."""
+    d = os.path.dirname(final_path) or "."
+    return os.path.join(d, TEMP_SUBDIR)
+
+
+def _temp_artifact(final_path: str, suffix: str) -> str:
+    """Path (inside .temp) for a scratch artifact of `final_path`, e.g. suffix='.part0'.
+    Keeps the working directory clean; the finished file still lands next to .temp."""
+    tdir = _temp_dir_for(final_path)
+    try:
+        os.makedirs(tdir, exist_ok=True)
+    except OSError:
+        pass
+    return os.path.join(tdir, os.path.basename(final_path) + suffix)
+
+
+def _cleanup_temp_dir(directory: str) -> None:
+    """Remove the .temp folder if it is now empty (called after a run finishes). Leftover
+    parts from an interrupted run keep it around so a re-run can resume."""
+    tdir = os.path.join(directory or ".", TEMP_SUBDIR)
+    try:
+        if os.path.isdir(tdir) and not os.listdir(tdir):
+            os.rmdir(tdir)
+    except OSError:
+        pass
 # Network timeouts (seconds). Without these a stalled connection (e.g. Google's videoplayback
 # CDN ignoring a HEAD request) would hang the whole run forever.
 CONNECT_TIMEOUT = 15              # max time to establish a TCP/TLS connection
@@ -795,6 +824,51 @@ def dropbox_filename(url: str, fallback: str) -> str:
     return base
 
 
+def _parse_content_disposition_filename(cd: str) -> str:
+    """Extract the filename from a Content-Disposition header (handles filename*=UTF-8'')."""
+    if not cd:
+        return ''
+    m = re.search(r"filename\*\s*=\s*[^']*''([^;]+)", cd, re.IGNORECASE)
+    if m:
+        return unquote(m.group(1).strip().strip('"'))
+    m = re.search(r'filename\s*=\s*"([^"]+)"', cd, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r'filename\s*=\s*([^;]+)', cd, re.IGNORECASE)
+    if m:
+        return m.group(1).strip().strip('"')
+    return ''
+
+
+def _looks_like_dropbox_id(name: str) -> bool:
+    """True if `name` is just a bare Dropbox share id (e.g. '7fc9jqa2hb4lmjd.mp4') rather than
+    a real, human filename."""
+    stem = os.path.splitext(name)[0]
+    return bool(re.fullmatch(r'[a-z0-9]{12,}', stem))
+
+
+def _dropbox_probe(url: str, session: requests.Session):
+    """One ranged GET that returns (size_bytes, real_filename) for a Dropbox direct URL:
+    total size from Content-Range, real name from Content-Disposition (or the final URL)."""
+    size, name = 0, ''
+    try:
+        with connection_slot():
+            with session.get(url, stream=True, allow_redirects=True,
+                             headers={'User-Agent': USER_AGENT, 'Range': 'bytes=0-0'},
+                             timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)) as r:
+                cr = r.headers.get('content-range', '')
+                if '/' in cr and cr.rsplit('/', 1)[-1].strip().isdigit():
+                    size = int(cr.rsplit('/', 1)[-1].strip())
+                elif r.status_code == 200 and (r.headers.get('content-length', '') or '').isdigit():
+                    size = int(r.headers['content-length'])
+                name = _parse_content_disposition_filename(r.headers.get('Content-Disposition', ''))
+                if not name:
+                    name = unquote(os.path.basename(urlparse(r.url).path))
+    except requests.RequestException:
+        pass
+    return size, name
+
+
 def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers, recursive,
                          verbose, select, out_dir, max_connections, max_height, list_only):
     """Given a list of Patreon post objects, gather every Drive/Dropbox link and native
@@ -1209,7 +1283,7 @@ def merge_parts(part_files: list[str], output_filename: str, verbose: bool) -> N
         tqdm.write(f"[ERROR] Missing parts: {missing}")
         return
 
-    tmp_output = output_filename + ".merging"
+    tmp_output = _temp_artifact(output_filename, ".merging")
     with open(tmp_output, 'wb') as outfile:
         for part_file in part_files:
             with open(part_file, 'rb') as pf:
@@ -1279,7 +1353,7 @@ def download_file(url: str, session: requests.Session, filename: str, chunk_size
     for i in range(num_threads):
         start = i * part_size
         end = min(start + part_size - 1, total_size - 1)
-        part_filename = f"{filename}.part{i}"
+        part_filename = _temp_artifact(filename, f".part{i}")
         part_files.append(part_filename)
 
         worker_session = new_session_from(session)
@@ -1408,7 +1482,7 @@ def process_single_video(video_id: str, session: requests.Session, output_file: 
     chosen_name = output_file or prefer_mp4_ext(title or f"{video_id}.mp4")
     valid_filename = safe_filename(chosen_name, video_id)
 
-    lock_path = valid_filename + ".lock"
+    lock_path = _temp_artifact(valid_filename, ".lock")
     if not acquire_lock(lock_path):
         return False
     try:
@@ -1646,10 +1720,15 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         # abort the whole batch, so failures are caught and the file is simply skipped.
         try:
             if job.direct_url:
-                # Direct download (e.g. Dropbox): no playback URL to fetch, just size it.
+                # Direct download (e.g. Dropbox): probe size AND the real filename in one go.
                 job.url = job.direct_url
-                job.size = get_file_size(job.direct_url, session)
+                size, real = _dropbox_probe(job.direct_url, session)
+                job.size = size if size > 0 else get_file_size(job.direct_url, session)
                 preferred = (job.entry.get('name') or job.entry.get('title') or job.id)
+                # Old /s/<id> share links carry no filename in the URL, so the caller's name is
+                # just the Dropbox id. Replace it with the real name from Content-Disposition.
+                if real and (_looks_like_dropbox_id(preferred) or not os.path.splitext(preferred)[1]):
+                    preferred = real
                 if not os.path.splitext(preferred)[1]:
                     preferred += '.mp4'
                 job.filename = safe_filename(prefer_mp4_ext(preferred), job.id)
@@ -1699,7 +1778,7 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         if os.path.exists(job.filename) and os.path.getsize(job.filename) > 0:
             tqdm.write(f"[INFO] Already have {os.path.basename(job.filename)}, skipping.")
             continue
-        job.lock_path = job.filename + ".lock"
+        job.lock_path = _temp_artifact(job.filename, ".lock")
         if not acquire_lock(job.lock_path):
             tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} Already downloading elsewhere: {job.title}")
             continue
@@ -1710,9 +1789,11 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             for i in range(n):
                 s = i * seg_size
                 e = min(s + seg_size - 1, job.size - 1)
-                job.segments.append({'start': s, 'end': e, 'path': f"{job.filename}.part{i}"})
+                job.segments.append({'start': s, 'end': e,
+                                     'path': _temp_artifact(job.filename, f".part{i}")})
         else:
-            job.segments.append({'start': 0, 'end': None, 'path': f"{job.filename}.part0"})
+            job.segments.append({'start': 0, 'end': None,
+                                 'path': _temp_artifact(job.filename, ".part0")})
         job.remaining = len(job.segments)
         ready.append(job)
 
@@ -2246,7 +2327,7 @@ def _concat_stream(parts, out_file):
 
 def _ffmpeg_mux(video_file, audio_file, out_path, verbose):
     """Mux already-downloaded local stream files into out_path. Returns (ok, error_text)."""
-    tmp = out_path + ".part.mp4"
+    tmp = _temp_artifact(out_path, ".part.mp4")
     cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', video_file]
     if audio_file:
         cmd += ['-i', audio_file, '-map', '0:v:0', '-map', '1:a:0']
@@ -2274,9 +2355,9 @@ class _HlsJob:
         self.title = video['title']
         self.out_path = out_path
         self.headers = headers
-        self.lock_path = out_path + ".lock"
+        self.lock_path = _temp_artifact(out_path, ".lock")
         self.locked = False
-        self.parts_dir = out_path + ".parts"
+        self.parts_dir = _temp_artifact(out_path, ".parts")
         self.streams = {}          # 'v'/'a' -> {'parts': [paths in order]}
         self.tasks = []            # (stream_key, idx, url, path)
         self.remaining = 0
@@ -2395,17 +2476,18 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
             reason = "segment download failed"
         else:
             try:
-                vfile = job.out_path + ".video"
+                vfile = _temp_artifact(job.out_path, ".video")
                 _concat_stream(job.streams['v']['parts'], vfile)
                 afile = None
                 if 'a' in job.streams:
-                    afile = job.out_path + ".audio"
+                    afile = _temp_artifact(job.out_path, ".audio")
                     _concat_stream(job.streams['a']['parts'], afile)
                 ok, reason = _ffmpeg_mux(vfile, afile, job.out_path, verbose)
             except Exception as exc:
                 reason = str(exc)
             finally:
-                for extra in (job.out_path + ".video", job.out_path + ".audio"):
+                for extra in (_temp_artifact(job.out_path, ".video"),
+                              _temp_artifact(job.out_path, ".audio")):
                     if os.path.exists(extra):
                         try:
                             os.remove(extra)
@@ -2485,12 +2567,17 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
 #  in the same way that tool does in its --strict mode (with a preview first).
 # =============================================================================
 NUM_RE = re.compile(r"\d+")
+# Tokens for the default (sep=None) mode: runs of digits, runs of letters, or runs of
+# separators/punctuation — kept as SEPARATE tokens (including the separators) so numbers are
+# their own fields and different delimiter styles ("EP-1" vs "EP10") can be unified to one
+# template while the separators are preserved on reconstruction (join="").
+_TOKEN_RE = re.compile(r"\d+|[^\W\d_]+|[\W_]+", re.UNICODE)
 ARROW = "\u2192"  # →
 
 
 def split_fields(stem, sep):
     if sep is None:
-        return stem.split()
+        return _TOKEN_RE.findall(stem)
     return [p for p in stem.split(sep) if p != ""]
 
 
@@ -2682,32 +2769,30 @@ def longest_common_run(a, b):
 
 
 def cluster_series(word_lists, min_run):
-    n = len(word_lists)
-    parent = list(range(n))
-
-    def find(x):
-        while parent[x] != x:
-            parent[x] = parent[parent[x]]
-            x = parent[x]
-        return x
-
-    for i in range(n):
-        for j in range(i + 1, n):
-            if longest_common_run(word_lists[i], word_lists[j]) >= min_run:
-                ri, rj = find(i), find(j)
-                if ri != rj:
-                    parent[ri] = rj
+    """Group files that share the SAME set of alphabetic words (numbers/order ignored). Each
+    distinct signature is its own series. Single-linkage on any one shared word (the old
+    behaviour) wrongly chained unrelated hash-named files together and mangled their digits;
+    exact-signature grouping keeps real episode series together and leaves oddballs alone."""
     groups = defaultdict(list)
-    for i in range(n):
-        groups[find(i)].append(i)
-    return list(groups.values())
+    for i, words in enumerate(word_lists):
+        key = tuple(sorted(set(words)))
+        groups[key].append(i)
+    # Preserve first-seen order for stable output.
+    order = []
+    seen = set()
+    for i, words in enumerate(word_lists):
+        key = tuple(sorted(set(words)))
+        if key not in seen:
+            seen.add(key)
+            order.append(groups[key])
+    return order
 
 
 def build_plan(filenames, sep, do_pad, do_words, min_width,
                removes=(), case_mode="title", strict=False,
                group=True, group_min=2, stop=None):
     """Return (list of (old, new) pairs, number of detected series)."""
-    join = " " if sep is None else sep
+    join = "" if sep is None else sep
     stop = DEFAULT_STOP if stop is None else (DEFAULT_STOP | set(stop))
 
     items = []
@@ -2735,17 +2820,24 @@ def build_plan(filenames, sep, do_pad, do_words, min_width,
 
 
 def process_group(members, do_pad, do_words, min_width, strict, join):
+    if len(members) < 2:
+        # A lone file is not a series: leave it exactly as it is. This avoids case- or
+        # number-mangling unique names and Dropbox-id ("hash") filenames.
+        return [(m["name"], m["name"]) for m in members]
     widths = compute_widths([m["stem"] for m in members], min_width) if do_pad else {}
     patterns = [tuple(m["keys"]) for m in members]
     counts = Counter(patterns)
     best = max(counts.keys(), key=lambda p: (counts[p], len(p)))
     ref_keys = list(best)
     exemplar = next(m["fields"] for m, pat in zip(members, patterns) if pat == best)
+    ref_num_slots = sum(1 for k in ref_keys if k == "#")
+    ref_word_keys = {k for k in ref_keys if has_letters(k)}
 
     out = []
     for m in members:
         if strict:
-            new_stem = strict_name(m, widths)
+            new_stem = strict_name(m, ref_keys, exemplar, widths,
+                                   ref_num_slots, ref_word_keys, join)
         else:
             new_stem = consensus_name(m, ref_keys, exemplar, widths, do_words, join)
         out.append((m["name"], finalize_stem(new_stem) + m["ext"]))
@@ -2768,20 +2860,35 @@ def consensus_name(it, ref_keys, exemplar, widths, do_words, join):
     return join.join(out)
 
 
-def strict_name(it, widths):
-    """Keep this file's own words/order/separators (case already normalised by clean_stem);
-    only zero-pad each number by its group-wide positional width. Works for any separator
-    style (spaces, hyphens, underscores), e.g. 'CTLBT-EP-1-PT-1' -> 'Ctlbt-Ep-01-Pt-1' when
-    the group also contains EP-10..12."""
-    counter = [0]
+def strict_name(it, ref_keys, exemplar, widths, ref_num_slots, ref_word_keys, join):
+    """Unify a file onto the group's majority template: reuse the reference's words AND
+    separators, and drop in THIS file's numbers (zero-padded by position). This fixes mixed
+    delimiter styles in one series, e.g. both 'LND-EP-1-...' and 'LND-EP10-...' become
+    'Lnd-Ep-01-...'/'Lnd-Ep-10-...'. Files that clearly don't match the template are left as
+    their own cleaned name (only padded)."""
+    nums = NUM_RE.findall(it["stem"])
+    file_word_keys = {k for k in it["keys"] if has_letters(k)}
+    overlap = len(ref_word_keys & file_word_keys)
+    fits = (len(nums) >= ref_num_slots and
+            (not ref_word_keys or overlap >= (len(ref_word_keys) + 1) // 2))
+    if not fits:
+        # Doesn't match the template: keep its own words/separators, just pad its numbers.
+        counter = [0]
 
-    def repl(m):
-        idx = counter[0]
-        counter[0] += 1
-        w = widths.get(idx, len(m.group()))
-        return m.group().zfill(w)
+        def _pad(m):
+            idx = counter[0]
+            counter[0] += 1
+            return m.group().zfill(widths.get(idx, len(m.group())))
+        return NUM_RE.sub(_pad, it["stem"])
 
-    return NUM_RE.sub(repl, it["stem"])
+    out, ni, counter = [], 0, [0]
+    for k, field in zip(ref_keys, exemplar):
+        if k == "#":
+            out.append(pad_field(nums[ni], counter, widths))
+            ni += 1
+        else:
+            out.append(field)  # word or separator from the reference template
+    return join.join(out)
 
 
 def detect_collisions(plan, existing):
@@ -3092,6 +3199,10 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         new_files = _session_downloads_in(rename_dir)
         offer_strict_rename(rename_dir, new_files, verbose)
 
+    # Remove the .temp scratch folder if everything finished (leftover parts from an
+    # interrupted run keep it so a re-run can resume).
+    _cleanup_temp_dir(rename_dir)
+
 if __name__ == "__main__":
     def positive_int(v):
         iv = int(v)
@@ -3126,7 +3237,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.11.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.14.0")
 
     args = parser.parse_args()
     try:
