@@ -2608,64 +2608,19 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
 #  in the same way that tool does in its --strict mode (with a preview first).
 # =============================================================================
 NUM_RE = re.compile(r"\d+")
-# Tokens for the default (sep=None) mode: runs of digits, runs of letters, or runs of
-# separators/punctuation — kept as SEPARATE tokens (including the separators) so numbers are
-# their own fields and different delimiter styles ("EP-1" vs "EP10") can be unified to one
-# template while the separators are preserved on reconstruction (join="").
-_TOKEN_RE = re.compile(r"\d+|[^\W\d_]+|[\W_]+", re.UNICODE)
-ARROW = "\u2192"  # →
+ARROW = "\u2192"  # →  (used by the preview below)
+WORDCHARS = re.compile(r"[^\w]", re.UNICODE)
+# tokenization: number | word (letters, with apostrophes) | separator/punctuation
+TOKEN_RE = re.compile(r"\d+|[^\W\d_]+(?:['\u2019][^\W\d_]+)*|[\W_]+", re.UNICODE)
 
 
-def split_fields(stem, sep):
-    if sep is None:
-        return _TOKEN_RE.findall(stem)
-    return [p for p in stem.split(sep) if p != ""]
-
-
-def key_of(field):
-    """Normalised key of a field for comparison: lowercase, numbers replaced by '#'."""
-    return NUM_RE.sub("#", field.lower())
-
-
-def has_letters(key):
-    return any(c.isalpha() for c in key)
-
-
-def is_pure_word_key(key):
-    return "#" not in key and has_letters(key)
-
-
-def lcs_align(ref, other):
-    """Longest-common-subsequence alignment of two key sequences -> list of ops."""
-    n, m = len(ref), len(other)
-    dp = [[0] * (m + 1) for _ in range(n + 1)]
-    for i in range(n - 1, -1, -1):
-        for j in range(m - 1, -1, -1):
-            if ref[i] == other[j]:
-                dp[i][j] = dp[i + 1][j + 1] + 1
-            else:
-                dp[i][j] = max(dp[i + 1][j], dp[i][j + 1])
-    ops, i, j = [], 0, 0
-    while i < n and j < m:
-        if ref[i] == other[j]:
-            ops.append(("match", i, j)); i += 1; j += 1
-        elif dp[i + 1][j] >= dp[i][j + 1]:
-            ops.append(("ref", i)); i += 1
-        else:
-            ops.append(("file", j)); j += 1
-    while i < n:
-        ops.append(("ref", i)); i += 1
-    while j < m:
-        ops.append(("file", j)); j += 1
-    return ops
-
-
+# --------------------------------------------------------------------------- #
+#  Čištění názvů
+# --------------------------------------------------------------------------- #
 ILLEGAL_WIN = set('<>:"/\\|?*')
-RESERVED_WIN = {
-    "CON", "PRN", "AUX", "NUL",
-    *(f"COM{i}" for i in range(1, 10)),
-    *(f"LPT{i}" for i in range(1, 10)),
-}
+RESERVED_WIN = {"CON", "PRN", "AUX", "NUL",
+                *(f"COM{i}" for i in range(1, 10)),
+                *(f"LPT{i}" for i in range(1, 10))}
 EMOJI_RANGES = [
     (0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2300, 0x23FF),
     (0x2B00, 0x2BFF), (0x1F1E6, 0x1F1FF), (0xFE00, 0xFE0F), (0x200D, 0x200D),
@@ -2689,11 +2644,48 @@ def strip_illegal(s):
                    if ch not in ILLEGAL_WIN and unicodedata.category(ch) != "Cc")
 
 
-SMALL_WORDS = {
-    "a", "an", "the", "and", "but", "or", "nor", "for", "of", "to", "in",
-    "on", "at", "by", "vs", "with", "as", "from", "into", "over", "per",
-}
-WORDCHARS = re.compile(r"[^\w]", re.UNICODE)
+def clean_string(stem, removes):
+    """Očistí název (emoji, zakázané znaky, uživatelské --remove, sjednocení mezer)."""
+    s = strip_pictographs(stem)
+    s = strip_illegal(s)
+    for rgx in removes:
+        s = rgx.sub("", s)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def finalize_stem(stem):
+    stem = re.sub(r"[ \t]+", " ", stem).strip().strip(" .")
+    if stem.upper() in RESERVED_WIN:
+        stem += "_"
+    return stem or "_"
+
+
+# --------------------------------------------------------------------------- #
+#  Tokenizace + velikost písmen
+# --------------------------------------------------------------------------- #
+SMALL_WORDS = {"a", "an", "the", "and", "but", "or", "nor", "for", "of", "to",
+               "in", "on", "at", "by", "vs", "with", "as", "from", "into",
+               "over", "per"}
+VOWELS = set("AEIOU")
+
+
+def tokenize(s):
+    """Vrátí list (kind, text): kind = 'num' | 'word' | 'sep'."""
+    toks = []
+    for m in TOKEN_RE.finditer(s):
+        t = m.group(0)
+        if t.isdigit():
+            toks.append(("num", t))
+        elif t[0].isalpha() or t[0] in "'\u2019":
+            toks.append(("word", t))
+        else:
+            toks.append(("sep", t))
+    return toks
+
+
+def is_acronym(tok):
+    letters = [c for c in tok if c.isalpha()]
+    return len(letters) >= 3 and tok == tok.upper() and not (set(tok.upper()) & VOWELS)
 
 
 def _cap_runs(tok):
@@ -2702,94 +2694,76 @@ def _cap_runs(tok):
                   tok.lower(), flags=re.UNICODE)
 
 
-def _title_token(tok, first):
+def case_word(tok, mode, first):
+    if mode == "lower":
+        return tok.lower()
+    if mode == "upper":
+        return tok.upper()
+    if mode == "keep":
+        return tok
+    if is_acronym(tok):                      # CTLBT, LND, ...
+        return tok
     core = WORDCHARS.sub("", tok).lower()
-    if core in SMALL_WORDS and not first:
+    if core in SMALL_WORDS and not first:    # a, of, the, over, ...
         return tok.lower()
     return _cap_runs(tok)
 
 
-def apply_case(s, mode):
-    if mode == "lower":
-        return s.lower()
-    if mode == "upper":
-        return s.upper()
-    if mode == "title":
-        toks = s.split(" ")
-        out, first = [], True
-        for t in toks:
-            if t == "":
-                out.append(t)
-                continue
-            out.append(_title_token(t, first))
+def apply_case(tokens, mode):
+    out, first = [], True
+    for kind, text in tokens:
+        if kind == "word":
+            out.append((kind, case_word(text, mode, first)))
             first = False
-        return " ".join(out)
-    return s
+        else:
+            out.append((kind, text))
+    return out
 
 
-def clean_stem(stem, removes, case_mode):
-    s = strip_pictographs(stem)
-    s = strip_illegal(s)
-    for rgx in removes:
-        s = rgx.sub("", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = apply_case(s, case_mode)
-    return s
+def keys_of(tokens):
+    """Klíče slov/čísel (bez oddělovačů): číslo -> '#', slovo -> malými."""
+    return [("#" if k == "num" else t.lower()) for k, t in tokens if k != "sep"]
 
 
-def finalize_stem(stem):
-    stem = re.sub(r"\s+", " ", stem).strip()
-    stem = stem.strip(" .")
-    if stem.upper() in RESERVED_WIN:
-        stem += "_"
-    return stem or "_"
+def split_lead(tokens):
+    """Non-sep tokeny s předchozím oddělovačem + koncový oddělovač.
+    Vrací (list (lead, kind, text), trailing_sep)."""
+    res, lead = [], ""
+    for kind, text in tokens:
+        if kind == "sep":
+            lead += text
+        else:
+            res.append((lead, kind, text))
+            lead = ""
+    return res, lead
 
 
-def compute_widths(stems, min_width):
-    vals = defaultdict(list)
-    rawlen = defaultdict(list)
-    for stem in stems:
-        for idx, run in enumerate(NUM_RE.findall(stem)):
-            vals[idx].append(int(run))
-            rawlen[idx].append(len(run))
-    widths = {}
-    for idx in vals:
-        w = max(len(str(max(vals[idx]))), max(rawlen[idx]))
-        if min_width:
-            w = max(w, min_width)
-        widths[idx] = w
-    return widths
+def has_letters(key):
+    return any(c.isalpha() for c in key)
 
 
-def pad_field(field, counter, widths):
-    def repl(m):
-        idx = counter[0]
-        counter[0] += 1
-        w = widths.get(idx, len(m.group()))
-        return m.group().zfill(w)
-    return NUM_RE.sub(repl, field)
-
-
+# --------------------------------------------------------------------------- #
+#  Detekce sérií
+# --------------------------------------------------------------------------- #
 DEFAULT_STOP = {
-    "episode", "episodes", "ep", "eps", "reaction", "reactions", "react",
-    "reacts", "uncut", "full", "part", "pt", "video", "official", "hd",
-    "fhd", "uhd", "4k", "2k", "premiere", "finale", "trailer", "teaser",
-    "subbed", "sub", "dub", "raw", "movie", "series",
+    "episode", "episodes", "episod", "ep", "eps", "reaction", "reactions",
+    "react", "reacts", "reacting", "uncut", "full", "part", "pt", "video",
+    "official", "hd", "fhd", "uhd", "4k", "2k", "premiere", "finale", "final",
+    "trailer", "teaser", "subbed", "sub", "dub", "raw", "movie", "series",
+    "season", "watch", "watching", "review", "recap", "highlights", "clip",
+    "clips", "cut", "edit", "compilation", "special", "bonus", "early",
+    "access", "kdrama", "drama", "anime",
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for",
+    "with", "as", "by", "from", "into", "is", "are", "was", "were", "be",
+    "this", "that", "these", "those", "here", "there", "now", "new", "my",
+    "your", "our", "their", "his", "her", "its", "i", "im", "you", "we",
+    "they", "he", "she", "it", "vs", "ft", "feat", "no", "yes", "so", "just",
 }
 
 
-def file_words(fields, stop):
-    """Alphabetic words for series clustering. Splits inside a field too, so hyphen/underscore
-    names like 'CTLBT-EP-1-PT-1-REACTION' yield ctlbt, ep, pt, reaction (digits ignored) and
-    therefore cluster together with their siblings that differ only in numbers."""
-    out = []
-    for f in fields:
-        for w in re.findall(r'[^\W\d_]+', f, re.UNICODE):
-            w = w.lower()
-            if w in stop:
-                continue
-            out.append(w)
-    return out
+def file_words(tokens, stop):
+    return [t.lower() for k, t in tokens
+            if k == "word" and t.lower() not in stop]
 
 
 def longest_common_run(a, b):
@@ -2803,47 +2777,173 @@ def longest_common_run(a, b):
         for j in range(len(b)):
             if ai == b[j]:
                 ndp[j + 1] = dp[j] + 1
-                if ndp[j + 1] > best:
-                    best = ndp[j + 1]
+                best = max(best, ndp[j + 1])
         dp = ndp
     return best
 
 
 def cluster_series(word_lists, min_run):
-    """Group files that share the SAME set of alphabetic words (numbers/order ignored). Each
-    distinct signature is its own series. Single-linkage on any one shared word (the old
-    behaviour) wrongly chained unrelated hash-named files together and mangled their digits;
-    exact-signature grouping keeps real episode series together and leaves oddballs alone."""
+    n = len(word_lists)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if longest_common_run(word_lists[i], word_lists[j]) >= min_run:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
     groups = defaultdict(list)
-    for i, words in enumerate(word_lists):
-        key = tuple(sorted(set(words)))
-        groups[key].append(i)
-    # Preserve first-seen order for stable output.
-    order = []
-    seen = set()
-    for i, words in enumerate(word_lists):
-        key = tuple(sorted(set(words)))
-        if key not in seen:
-            seen.add(key)
-            order.append(groups[key])
-    return order
+    for i in range(n):
+        groups[find(i)].append(i)
+    return list(groups.values())
 
 
-def build_plan(filenames, sep, do_pad, do_words, min_width,
-               removes=(), case_mode="title", strict=False,
-               group=True, group_min=2, stop=None):
-    """Return (list of (old, new) pairs, number of detected series)."""
-    join = "" if sep is None else sep
+# --------------------------------------------------------------------------- #
+#  Zarovnání čísel + LCS
+# --------------------------------------------------------------------------- #
+def compute_widths(cleans, min_width):
+    vals, rawlen = defaultdict(list), defaultdict(list)
+    for s in cleans:
+        for i, run in enumerate(NUM_RE.findall(s)):
+            vals[i].append(int(run))
+            rawlen[i].append(len(run))
+    widths = {}
+    for i in vals:
+        w = max(len(str(max(vals[i]))), max(rawlen[i]))
+        if min_width:
+            w = max(w, min_width)
+        widths[i] = w
+    return widths
+
+
+def lcs_align(ref, other):
+    n, m = len(ref), len(other)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            dp[i][j] = dp[i + 1][j + 1] + 1 if ref[i] == other[j] \
+                else max(dp[i + 1][j], dp[i][j + 1])
+    ops, i, j = [], 0, 0
+    while i < n and j < m:
+        if ref[i] == other[j]:
+            ops.append(("match", i, j)); i += 1; j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            ops.append(("ref", i)); i += 1
+        else:
+            ops.append(("file", j)); j += 1
+    while i < n:
+        ops.append(("ref", i)); i += 1
+    while j < m:
+        ops.append(("file", j)); j += 1
+    return ops
+
+
+def render(out_tokens, widths, trail=""):
+    """out_tokens: list (lead, kind, text). Čísla zarovná podle widths."""
+    parts, counter = [], 0
+    for lead, kind, text in out_tokens:
+        parts.append(lead)
+        if kind == "num":
+            parts.append(text.zfill(widths.get(counter, len(text))))
+            counter += 1
+        else:
+            parts.append(text)
+    parts.append(trail)
+    return finalize_stem("".join(parts))
+
+
+# --------------------------------------------------------------------------- #
+#  Sjednocení jedné série
+# --------------------------------------------------------------------------- #
+def consensus_name(item, ref_ns, ref_keys, widths, do_words):
+    """Bezpečný režim: zachová formát souboru, doplní chybějící společná slova."""
+    file_ns = item["ns"]
+    file_keys = item["keys"]
+    ops = lcs_align(ref_keys, file_keys)
+    matched_ref = {op[1] for op in ops if op[0] == "match"}
+    file_word_only = any(op[0] == "file" and file_ns[op[1]][1] == "word" for op in ops)
+
+    out = []
+    for op in ops:
+        if op[0] == "match":
+            out.append(file_ns[op[2]])
+        elif op[0] == "file":
+            out.append(file_ns[op[1]])
+        else:                                 # ref-only – kandidát na doplnění
+            r = op[1]
+            lead, kind, text = ref_ns[r]
+            if not do_words or kind != "word" or file_word_only:
+                continue
+            # nevkládej slovo vázané na chybějící číslo (např. "Pt" bez čísla)
+            bound = ((r + 1 < len(ref_keys) and ref_keys[r + 1] == "#"
+                      and (r + 1) not in matched_ref)
+                     or (r - 1 >= 0 and ref_keys[r - 1] == "#"
+                         and (r - 1) not in matched_ref))
+            if bound:
+                continue
+            out.append((lead, kind, text))
+    return render(out, widths, item["trail"])
+
+
+def strict_name(item, ref_ns, ref_keys, ref_trail, widths, ref_num_slots, ref_word_keys):
+    """Striktní režim: přepíše soubor přesně podle vzoru série (mění se jen čísla)."""
+    nums = [t for _, k, t in item["ns"] if k == "num"]
+    file_word_keys = {k for k in item["keys"] if has_letters(k)}
+    overlap = len(ref_word_keys & file_word_keys)
+    fits = (len(nums) >= ref_num_slots
+            and (not ref_word_keys or overlap >= (len(ref_word_keys) + 1) // 2))
+    if not fits:
+        return consensus_name(item, ref_ns, ref_keys, widths, do_words=True)
+
+    out, ni = [], 0
+    for lead, kind, text in ref_ns:
+        if kind == "num":
+            out.append((lead, "num", nums[ni])); ni += 1
+        else:
+            out.append((lead, kind, text))
+    return render(out, widths, ref_trail)
+
+
+def process_group(members, do_pad, do_words, min_width, strict):
+    widths = compute_widths([m["clean"] for m in members], min_width) if do_pad else {}
+    patterns = [tuple(m["keys"]) for m in members]
+    counts = Counter(patterns)
+    best = max(counts, key=lambda p: (counts[p], len(p)))
+    ref = next(m for m, p in zip(members, patterns) if p == best)
+    ref_ns, ref_trail = ref["ns"], ref["trail"]
+    ref_keys = list(best)
+    ref_num_slots = sum(1 for k in ref_keys if k == "#")
+    ref_word_keys = {k for k in ref_keys if has_letters(k)}
+
+    out = []
+    for m in members:
+        if strict:
+            new = strict_name(m, ref_ns, ref_keys, ref_trail, widths,
+                              ref_num_slots, ref_word_keys)
+        else:
+            new = consensus_name(m, ref_ns, ref_keys, widths, do_words)
+        out.append((m["name"], new + m["ext"]))
+    return out
+
+
+def build_plan(filenames, do_pad, do_words, min_width, removes=(), case_mode="title",
+               strict=False, group=True, group_min=1, stop=None):
     stop = DEFAULT_STOP if stop is None else (DEFAULT_STOP | set(stop))
-
     items = []
     for name in filenames:
         stem, ext = os.path.splitext(name)
-        clean = clean_stem(stem, removes, case_mode)
-        fields = split_fields(clean, sep)
-        items.append({"name": name, "ext": ext, "stem": clean,
-                      "fields": fields, "keys": [key_of(f) for f in fields],
-                      "words": file_words(fields, stop)})
+        clean = clean_string(stem, removes)
+        toks = apply_case(tokenize(clean), case_mode)
+        ns, trail = split_lead(toks)
+        items.append({"name": name, "ext": ext, "clean": clean,
+                      "ns": ns, "trail": trail, "keys": keys_of(toks),
+                      "words": file_words(toks, stop)})
 
     if group:
         groups = cluster_series([it["words"] for it in items], group_min)
@@ -2851,87 +2951,12 @@ def build_plan(filenames, sep, do_pad, do_words, min_width,
         groups = [list(range(len(items)))]
 
     plan = []
-    for gidx in groups:
-        members = [items[i] for i in gidx]
-        plan.extend(process_group(members, do_pad, do_words, min_width, strict, join))
-
+    for gi in groups:
+        plan.extend(process_group([items[i] for i in gi],
+                                  do_pad, do_words, min_width, strict))
     order = {it["name"]: k for k, it in enumerate(items)}
     plan.sort(key=lambda p: order[p[0]])
     return plan, len(groups)
-
-
-def process_group(members, do_pad, do_words, min_width, strict, join):
-    if len(members) < 2:
-        # A lone file is not a series: leave it exactly as it is. This avoids case- or
-        # number-mangling unique names and Dropbox-id ("hash") filenames.
-        return [(m["name"], m["name"]) for m in members]
-    widths = compute_widths([m["stem"] for m in members], min_width) if do_pad else {}
-    patterns = [tuple(m["keys"]) for m in members]
-    counts = Counter(patterns)
-    best = max(counts.keys(), key=lambda p: (counts[p], len(p)))
-    ref_keys = list(best)
-    exemplar = next(m["fields"] for m, pat in zip(members, patterns) if pat == best)
-    ref_num_slots = sum(1 for k in ref_keys if k == "#")
-    ref_word_keys = {k for k in ref_keys if has_letters(k)}
-
-    out = []
-    for m in members:
-        if strict:
-            new_stem = strict_name(m, ref_keys, exemplar, widths,
-                                   ref_num_slots, ref_word_keys, join)
-        else:
-            new_stem = consensus_name(m, ref_keys, exemplar, widths, do_words, join)
-        out.append((m["name"], finalize_stem(new_stem) + m["ext"]))
-    return out
-
-
-def consensus_name(it, ref_keys, exemplar, widths, do_words, join):
-    ops = lcs_align(ref_keys, it["keys"])
-    file_word_only = any(op[0] == "file" and has_letters(it["keys"][op[1]]) for op in ops)
-    do_insert = do_words and not file_word_only
-    out, counter = [], [0]
-    for op in ops:
-        if op[0] == "match":
-            out.append(pad_field(it["fields"][op[2]], counter, widths))
-        elif op[0] == "file":
-            out.append(pad_field(it["fields"][op[1]], counter, widths))
-        else:
-            if do_insert and is_pure_word_key(ref_keys[op[1]]):
-                out.append(exemplar[op[1]])
-    return join.join(out)
-
-
-def strict_name(it, ref_keys, exemplar, widths, ref_num_slots, ref_word_keys, join):
-    """Unify a file onto the group's majority template: reuse the reference's words AND
-    separators, and drop in THIS file's numbers (zero-padded by position). This fixes mixed
-    delimiter styles in one series, e.g. both 'LND-EP-1-...' and 'LND-EP10-...' become
-    'Lnd-Ep-01-...'/'Lnd-Ep-10-...'. Files that clearly don't match the template are left as
-    their own cleaned name (only padded)."""
-    nums = NUM_RE.findall(it["stem"])
-    file_word_keys = {k for k in it["keys"] if has_letters(k)}
-    overlap = len(ref_word_keys & file_word_keys)
-    fits = (len(nums) >= ref_num_slots and
-            (not ref_word_keys or overlap >= (len(ref_word_keys) + 1) // 2))
-    if not fits:
-        # Doesn't match the template: keep its own words/separators, just pad its numbers.
-        counter = [0]
-
-        def _pad(m):
-            idx = counter[0]
-            counter[0] += 1
-            return m.group().zfill(widths.get(idx, len(m.group())))
-        return NUM_RE.sub(_pad, it["stem"])
-
-    out, ni, counter = [], 0, [0]
-    for k, field in zip(ref_keys, exemplar):
-        if k == "#":
-            out.append(pad_field(nums[ni], counter, widths))
-            ni += 1
-        else:
-            out.append(field)  # word or separator from the reference template
-    return join.join(out)
-
-
 def detect_collisions(plan, existing):
     changing = {old: new for old, new in plan if old != new}
     targets = Counter(changing.values())
@@ -3059,7 +3084,7 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True):
     if not interactive:
         return
     try:
-        plan, _n = build_plan(sorted(new_files), sep=None, do_pad=True, do_words=True,
+        plan, _n = build_plan(sorted(new_files), do_pad=True, do_words=True,
                               min_width=0, removes=(), case_mode="title", strict=True,
                               group=True, group_min=1, stop=[])
     except Exception as exc:
@@ -3278,7 +3303,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.15.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.16.0")
 
     args = parser.parse_args()
     try:
