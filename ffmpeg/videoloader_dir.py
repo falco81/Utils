@@ -678,6 +678,8 @@ def list_collection_posts(collection_id: str, campaign_id, session: requests.Ses
     while True:
         params = {
             'include': 'collections,drop,primary_image,audio,video,embed',
+            'fields[post]': ('post_type,title,content,teaser_text,url,embed,post_file,'
+                             'post_metadata,current_user_can_view,published_at'),
             'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
             'sort': 'collection_order',
             'filter[collection_id]': collection_id,
@@ -702,6 +704,24 @@ def list_collection_posts(collection_id: str, campaign_id, session: requests.Ses
                   f"Your cookies may be missing or expired.")
             break
         batch = d.get('data', []) or []
+        included = d.get('included', []) or []
+        if included:
+            inc_by_key = {(r.get('type'), r.get('id')): r
+                          for r in included if isinstance(r, dict)}
+            for p in batch:
+                if not isinstance(p, dict):
+                    continue
+                rels = p.get('relationships') or {}
+                mine = []
+                for relname in ('video', 'embed', 'audio', 'post_file', 'images', 'attachments_media'):
+                    rd = (rels.get(relname) or {}).get('data')
+                    items = rd if isinstance(rd, list) else ([rd] if isinstance(rd, dict) else [])
+                    for one in items:
+                        r = inc_by_key.get((one.get('type'), one.get('id')))
+                        if r:
+                            mine.append(r)
+                if mine:
+                    p['_included'] = mine
         posts.extend(batch)
         page += 1
         cursor = (((d.get('meta') or {}).get('pagination') or {}).get('cursors') or {}).get('next')
@@ -1034,6 +1054,8 @@ def fetch_patreon_post(post_id: str, session: requests.Session, verbose: bool):
     link/stream extraction can see them). Returns the post dict or None."""
     params = {
         'include': 'collections,drop,primary_image,audio,video,embed',
+        'fields[post]': ('post_type,title,content,teaser_text,url,embed,post_file,'
+                         'post_metadata,current_user_can_view,published_at'),
         'json-api-version': '1.0',
         'json-api-use-default-includes': 'false',
     }
@@ -2009,6 +2031,25 @@ def extract_streams_from_post(post: dict, verbose: bool) -> list:
         title = (emb.get('subject') or a.get('title') or m.group(1)).strip()
         out.append({'source': 'vimeo', 'title': title,
                     'vimeo_id': m.group(1), 'vimeo_hash': m.group(2)})
+        return out
+
+    # 3) Fallback: some collections don't populate the structured embed/post_file fields, but
+    #    the Mux master or Vimeo id+hash still appears somewhere in the post (embed html,
+    #    included video/embed resources, content). Scan every string, unescaping slashes.
+    title = (a.get('title') or str(post.get('id'))).strip()
+    for s in _walk_strings(post):
+        if not s or ('mux.com' not in s and 'vimeo.com' not in s):
+            continue
+        s2 = s.replace('\\/', '/')
+        mm = re.search(r'https://stream\.mux\.com/[\w\-]+\.m3u8[^\s"\\<>]*', s2)
+        if mm:
+            out.append({'source': 'mux', 'title': title, 'master_url': mm.group(0)})
+            return out
+        vm = re.search(r'vimeo\.com/(?:video/)?(\d+)(?:/|\?h=)([0-9a-zA-Z]+)', s2)
+        if vm:
+            out.append({'source': 'vimeo', 'title': title,
+                        'vimeo_id': vm.group(1), 'vimeo_hash': vm.group(2)})
+            return out
     return out
 
 
@@ -3237,7 +3278,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.14.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.15.0")
 
     args = parser.parse_args()
     try:

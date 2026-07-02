@@ -1103,6 +1103,230 @@ def warp_align(ref_events, target_events, cfg=None, ref_sim_texts=None, target_s
 
 
 # ----------------------------------------------------------------------
+# Přenos PROFESIONÁLNÍHO překladu na strojově načasované titulky
+# (stejný pořad, stejný jazyk, jiný překlad + jiné dělení epizod/času).
+# Nahradí text cílových titulků nejpodobnějším profesionálním textem,
+# ale ZACHOVÁ cílové časování.
+# ----------------------------------------------------------------------
+def _best_in_range(s, O, lo, hi):
+    """Nejpodobnější ref titulek v rozsahu [lo, hi] (přímý sken)."""
+    bj, bs = -1, 0.0
+    for j in range(lo, hi + 1):
+        sim = _ca_sim(s, O[j])
+        if sim > bs:
+            bs, bj = sim, j
+    return bj, bs
+
+
+def _transplant_accept(s, o, sim, min_sim):
+    """Přijmout náhradu? Kromě prahu vyžaduje aspoň 1 společné obsahové slovo a
+    u krátkých titulků vyšší jistotu (zabrání záměně za jinou podobnou větu)."""
+    if sim < min_sim:
+        return False
+    shared = len(s["_tk"] & o["_tk"])
+    ntk = len(s["_tk"])
+    if shared < 1:
+        return False
+    if ntk <= 1:
+        return sim >= min(0.92, min_sim + 0.28)
+    if ntk <= 2:
+        return sim >= min_sim + 0.12 and shared >= 1
+    if ntk <= 3:
+        return sim >= min_sim + 0.05
+    return True
+
+
+def _load_reference_pool(directory, recursive=False, continuous=False):
+    """Načte a spojí VŠECHNY .srt v adresáři (setříděné) do jedné zásoby eventů.
+    continuous=True: časy jednotlivých souborů posune tak, aby šly plynule za
+    sebou (nutné pro přečasování - čas musí být v celé zásobě monotónní).
+    Vrací (pool, files)."""
+    files = collect_srts(directory, recursive)
+    pool = []
+    offset = 0.0
+    for f in files:
+        try:
+            evs = parse_srt(Path(f))
+        except Exception as e:
+            log_warn(f"{os.path.basename(f)}: nelze načíst ({e}) - přeskakuji.")
+            continue
+        if continuous and evs:
+            base = offset - evs[0]["start"]
+            for e in evs:
+                pool.append({"start": e["start"] + base, "end": e["end"] + base, "text": e["text"]})
+            offset = pool[-1]["end"] + 2.0
+        else:
+            pool.extend(evs)
+    return pool, files
+
+
+def retime_professional(ref_events, pool_events, min_sim=0.5, margin=25):
+    """Přečasuje PROFESIONÁLNÍ titulky (pool_events, spojená zásoba viki) na
+    časování referenčních titulků (ref_events = tvoje strojové s dobrým
+    časováním). Zachová 100 % profesionálního textu, jen mu dá tvůj timing.
+    Vrací (new_events, n_anchors) nebo (None, n_anchors) při málu kotev."""
+    if not ref_events or not pool_events:
+        return None, 0
+    S = _ca_prepare(ref_events)
+    O = _ca_prepare(pool_events)
+    M = len(O)
+    inv = {}
+    for j, o in enumerate(O):
+        for t in o["_tk"]:
+            inv.setdefault(t, []).append(j)
+    common_cap = max(30, int(0.01 * M) + 1)
+
+    def best(i):
+        s = S[i]
+        if not s["_tk"]:
+            return -1, 0.0
+        cand = set()
+        for t in s["_tk"]:
+            post = inv.get(t)
+            if post and len(post) <= common_cap:
+                cand.update(post)
+        bj, bs = -1, 0.0
+        for j in cand:
+            sim = _ca_sim(s, O[j])
+            if sim > bs:
+                bs, bj = sim, j
+        return bj, bs
+
+    N = len(S)
+    raw = [best(i) for i in range(N)]
+    conf = [(i, raw[i][0]) for i in range(N)
+            if raw[i][0] >= 0 and raw[i][1] >= max(0.5, min_sim) and len(S[i]["_tk"]) >= 2]
+    anchors = _ca_lis(conf)
+    if len(anchors) < 3:
+        return None, len(anchors)
+
+    # výřez zásoby, který patří k tomuto dílu (od první po poslední kotvu + rezerva)
+    j_lo = max(0, anchors[0][1] - margin)
+    j_hi = min(M - 1, anchors[-1][1] + margin)
+
+    # časová deformace: body (viki_čas -> netflix_čas) z kotev
+    pts = {}
+    for (i, j) in anchors:
+        pts[pool_events[j]["start"]] = ref_events[i]["start"]
+    xs = sorted(pts)
+    ys = [pts[x] for x in xs]
+
+    def warp_time(t):
+        if t <= xs[0]:
+            slope = (ys[1] - ys[0]) / (xs[1] - xs[0]) if len(xs) >= 2 and xs[1] > xs[0] else 1.0
+            return ys[0] + (t - xs[0]) * slope
+        if t >= xs[-1]:
+            slope = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2]) if len(xs) >= 2 and xs[-1] > xs[-2] else 1.0
+            return ys[-1] + (t - xs[-1]) * slope
+        k = _bisect.bisect_right(xs, t) - 1
+        x0, x1, y0, y1 = xs[k], xs[k + 1], ys[k], ys[k + 1]
+        return y0 if x1 <= x0 else y0 + (t - x0) * (y1 - y0) / (x1 - x0)
+
+    out = []
+    for j in range(j_lo, j_hi + 1):
+        e = pool_events[j]
+        ns = warp_time(e["start"])
+        ne = warp_time(e["end"])
+        if ne <= ns:
+            ne = ns + max(0.3, e["end"] - e["start"])
+        out.append({"start": ns, "end": ne, "text": e["text"]})
+
+    out.sort(key=lambda x: x["start"])
+    # lehké zamezení překryvů (posuň konec pod začátek dalšího)
+    for k in range(len(out) - 1):
+        if out[k]["end"] > out[k + 1]["start"] - 0.02:
+            out[k]["end"] = max(out[k]["start"] + 0.3, out[k + 1]["start"] - 0.05)
+    return out, len(anchors)
+
+
+def build_transplanter(ref_events):
+    """Připraví zásobu profesionálních titulků JEDNOU a vrátí funkci, která na ni
+    napasuje libovolný cílový soubor. Vrací (transplant_fn, pocet_ref_cues)."""
+    O = _ca_prepare(ref_events)
+    M = len(O)
+    inv = {}
+    for j, o in enumerate(O):
+        for t in o["_tk"]:
+            inv.setdefault(t, []).append(j)
+    common_cap = max(30, int(0.01 * M) + 1)
+
+    def best_global(S, i):
+        s = S[i]
+        if not s["_tk"]:
+            return -1, 0.0
+        cand = set()
+        for t in s["_tk"]:
+            post = inv.get(t)
+            if post and len(post) <= common_cap:
+                cand.update(post)
+        bj, bs = -1, 0.0
+        for j in cand:
+            sim = _ca_sim(s, O[j])
+            if sim > bs:
+                bs, bj = sim, j
+        return bj, bs
+
+    def transplant(target_events, min_sim=0.55, window=40):
+        if not target_events or M == 0:
+            return ([dict(e) for e in target_events], 0, len(target_events))
+        S = _ca_prepare(target_events)
+        N = len(S)
+        raw = [best_global(S, i) for i in range(N)]
+        conf = [(i, raw[i][0]) for i in range(N)
+                if raw[i][0] >= 0 and raw[i][1] >= max(0.5, min_sim) and len(S[i]["_tk"]) >= 2]
+        anchors = _ca_lis(conf)
+        result = [{"start": e["start"], "end": e["end"], "text": e["text"]} for e in target_events]
+        n_repl = 0
+        if anchors:
+            ai = [a[0] for a in anchors]
+            aj = [a[1] for a in anchors]
+
+            def predict(i):
+                p = _bisect.bisect_left(ai, i)
+                if p == 0:
+                    return aj[0] + (i - ai[0])
+                if p >= len(ai):
+                    return aj[-1] + (i - ai[-1])
+                if ai[p] == i:
+                    return aj[p]
+                i0, i1, j0, j1 = ai[p - 1], ai[p], aj[p - 1], aj[p]
+                frac = (i - i0) / (i1 - i0) if i1 > i0 else 0.0
+                return int(round(j0 + frac * (j1 - j0)))
+
+            for i in range(N):
+                r0 = max(0, min(M - 1, predict(i)))
+                lo, hi = max(0, r0 - window), min(M - 1, r0 + window)
+                bj, bs = _best_in_range(S[i], O, lo, hi)
+                if bj >= 0 and _transplant_accept(S[i], O[bj], bs, min_sim):
+                    result[i]["text"] = O[bj]["text"]
+                    n_repl += 1
+        else:
+            for i in range(N):
+                bj, bs = raw[i]
+                if bj >= 0 and _transplant_accept(S[i], O[bj], bs, min_sim):
+                    result[i]["text"] = O[bj]["text"]
+                    n_repl += 1
+        for i in range(1, N):
+            a = result[i - 1]["text"].strip()
+            b = result[i]["text"].strip()
+            if a and a == b and b != target_events[i]["text"].strip():
+                result[i]["text"] = target_events[i]["text"]
+                n_repl -= 1
+        return result, n_repl, N
+
+    return transplant, M
+
+
+def transplant_text(target_events, ref_events, min_sim=0.55, window=40):
+    """Tenký obal nad build_transplanter (pro jednorázové/otestování)."""
+    fn, _ = build_transplanter(ref_events)
+    return fn(target_events, min_sim, window)
+
+
+
+
+
+# ----------------------------------------------------------------------
 # Strojový překlad pro mezijazyčné párování (jen pro VÝPOČET podobnosti)
 # ----------------------------------------------------------------------
 #
@@ -1178,6 +1402,46 @@ def _call_with_timeout(fn, timeout):
     return box.get("r"), box.get("e")
 
 
+# Veřejný klíč widgetu Google Translate (stejný používá i translatesubtitles.co).
+# Není to uživatelský účet - je "zapečený" do webového překladače Googlu.
+_GOOGLE_TRANSLATE_PA_KEY = "AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520"
+_GOOGLE_TRANSLATE_PA_URL = "https://translate-pa.googleapis.com/v1/translateHtml"
+
+
+def google_translatehtml(texts, target_lang, source_lang="auto", timeout=30):
+    """Přeloží dávku textů přes moderní endpoint Google Translate 'translateHtml'
+    (zdarma, bez účtu; totéž, co dělá web translatesubtitles.co a widget Google
+    Translate). Vrací seznam stejné délky (None u nezdaru), nebo None při chybě
+    celého volání (aby volající mohl přepnout na fallback)."""
+    import urllib.request
+    import urllib.error
+    import html as _html
+    escaped = [_html.escape(t if isinstance(t, str) else "", quote=True) for t in texts]
+    payload = [[escaped, source_lang, target_lang], "te"]
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Content-Type": "application/json+protobuf",
+        "X-Goog-API-Key": _GOOGLE_TRANSLATE_PA_KEY,
+        "User-Agent": "Mozilla/5.0",
+        "Referer": "https://translatesubtitles.co/",
+        "Origin": "https://translatesubtitles.co",
+    }
+    req = urllib.request.Request(_GOOGLE_TRANSLATE_PA_URL, data=body, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    # odpověď: [[<překlady>], [<detekované jazyky>]]
+    try:
+        translations = data[0]
+    except (IndexError, KeyError, TypeError):
+        return None
+    if not isinstance(translations, list) or len(translations) != len(texts):
+        return None
+    return [_html.unescape(t) if isinstance(t, str) and t else None for t in translations]
+
+
 def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=None):
     """Vrátí funkci translate_list(list[str]) -> list[str], která přeloží texty
     do pivot_lang. Dedup + disková cache. Vrací None, pokud zvolený překladač
@@ -1192,30 +1456,45 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
 
     backend = None
     if engine == "google":
+        # Primárně moderní Google endpoint 'translateHtml' (stejný, jaký používá
+        # widget Google Translate i weby jako translatesubtitles.co): zdarma, bez
+        # účtu, celá dávka jedním requestem, zachovává HTML/entity. Když selže,
+        # spadne na deep-translator (pokud je nainstalován).
+        dt = None
         try:
             from deep_translator import GoogleTranslator
-        except ImportError:
-            log_warn("Pro --translate google chybí balíček 'deep-translator'. "
-                     "Nainstaluj: pip install deep-translator. Pokračuji bez překladu.")
-            return None
-        gt = GoogleTranslator(source="auto", target=pivot_lang)
+            dt = GoogleTranslator(source="auto", target=pivot_lang)
+        except Exception:
+            dt = None
+        _gw_state = {"ok": True}
 
         def backend(batch):
+            if _gw_state["ok"]:
+                res = google_translatehtml(batch, pivot_lang)
+                if res is not None:
+                    return res
+                _gw_state["ok"] = False  # endpoint nedostupný -> dál už jen fallback
+                if dt is not None:
+                    log_warn("Google 'translateHtml' nedostupný - přepínám na deep-translator.")
+                else:
+                    log_warn("Google 'translateHtml' nedostupný a deep-translator není "
+                             "nainstalován (pip install deep-translator).")
+            if dt is None:
+                return [None] * len(batch)
             try:
-                res = gt.translate_batch(batch)
-                if isinstance(res, list) and len(res) == len(batch):
-                    return [r if isinstance(r, str) and r else None for r in res]
+                r = dt.translate_batch(batch)
+                if isinstance(r, list) and len(r) == len(batch):
+                    return [x if isinstance(x, str) and x else None for x in r]
             except Exception:
                 pass
-            # po jednom (robustnější vůči chybě v jedné položce); None = selhalo
-            res = []
+            out = []
             for t in batch:
                 try:
-                    r = gt.translate(t)
-                    res.append(r if isinstance(r, str) and r else None)
+                    x = dt.translate(t)
+                    out.append(x if isinstance(x, str) and x else None)
                 except Exception:
-                    res.append(None)
-            return res
+                    out.append(None)
+            return out
 
     elif engine == "deepl":
         if not api_key:
@@ -1290,7 +1569,7 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
                      "GEMINI_API_KEY / GOOGLE_API_KEY). Zdarma na aistudio.google.com. "
                      "Pokračuji bez Gemini.")
             return None
-        gm_model = model or "gemini-2.0-flash"
+        gm_model = model or "gemini-2.5-flash"
 
         def backend(batch):
             res = gemini_translate_batch(batch, pivot_lang, api_key, gm_model)
@@ -2730,7 +3009,7 @@ def anthropic_translate_batch(batch, target_lang, api_key, model):
     return [(p.replace(" / ", "\n") if p else None) for p in parsed]
 
 
-def gemini_generate(prompt, api_key, model="gemini-2.0-flash", timeout=120):
+def gemini_generate(prompt, api_key, model="gemini-2.5-flash", timeout=120):
     """Jedno volání Google Gemini (generativelanguage). Vrací text nebo None.
     Při 4xx vyhodí _FatalAPIError (neopakovat)."""
     import urllib.request
@@ -2777,7 +3056,7 @@ def gemini_translate_batch(batch, target_lang, api_key, model):
 
 
 _GEMINI_STATIC_MODELS = [
-    ("gemini-2.0-flash", "rychlý, kvalitní"),
+    ("gemini-2.5-flash", "rychlý, kvalitní"),
     ("gemini-2.0-flash-lite", "nejlevnější/nejrychlejší"),
     ("gemini-1.5-flash", "starší flash - často má free kvótu"),
     ("gemini-1.5-flash-8b", "malý, levný"),
@@ -3211,7 +3490,7 @@ def run_config(args):
     if ask_yes_no("Nastavit Google Gemini (AI PŘEKLAD ZDARMA, doporučeno pro češtinu)?",
                   default_no=not cfg.get("gemini_key")):
         ask_secret("Gemini API klíč (zdarma na aistudio.google.com)", "gemini_key")
-        _gm = ask_gemini_model("Model Gemini", cfg.get("gemini_model") or "gemini-2.0-flash",
+        _gm = ask_gemini_model("Model Gemini", cfg.get("gemini_model") or "gemini-2.5-flash",
                                type("A", (), {"gemini_key": cfg.get("gemini_key")
                                               or os.environ.get("GEMINI_API_KEY")
                                               or os.environ.get("GOOGLE_API_KEY")})())
@@ -3292,7 +3571,7 @@ def run_test_api(args):
 
     gkey = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
             or os.environ.get("GOOGLE_API_KEY"))
-    gmodel = getattr(args, "gemini_model", None) or "gemini-2.0-flash"
+    gmodel = getattr(args, "gemini_model", None) or "gemini-2.5-flash"
     if gkey:
         tested += 1
         log_info(f"Test Google Gemini - model '{gmodel}'...")
@@ -3425,14 +3704,15 @@ def run_translate_subs(args):
         ei = ask_pick("Strojový překladač:",
                       ["gemini - AI kvalita ZDARMA (Google AI Studio klíč) - doporučeno pro češtinu",
                        "deepl  - výborná kvalita (API klíč, free tier)",
-                       "google - úplně zdarma bez klíče, slušná kvalita",
+                       "google - úplně zdarma bez klíče, dobrá kvalita (moderní Google endpoint)",
                        "claude - AI přes Anthropic API (placené)",
                        "argos  - offline, zdarma (nižší kvalita)"], default=0,
                       help=["gemini: AI překlad od Googlu, ZDARMA s API klíčem z aistudio.google.com "
                             "(štědrý free limit). Nejlepší poměr kvalita/cena pro češtinu.",
                             "deepl: špičková kvalita, vyžaduje klíč (má free tier ~500k znaků/měsíc).",
-                            "google: úplně zdarma bez klíče, slušná kvalita; u velkých dávek občas "
-                            "omezuje rychlost. Se spojováním vět je výsledek slušný.",
+                            "google: úplně ZDARMA a bez klíče. Používá stejný moderní endpoint Google "
+                            "Translate jako web translatesubtitles.co (dávkově, HTML-aware). Se "
+                            "spojováním vět je výsledek slušný.",
                             "claude: velmi kvalitní, placené (za tokeny).",
                             "argos: plně offline, zdarma, ale znatelně nižší kvalita."])
         engine = ["gemini", "deepl", "google", "claude", "argos"][ei]
@@ -3442,7 +3722,7 @@ def run_translate_subs(args):
                       or ask_text("Gemini API klíč (zdarma na aistudio.google.com)", ""))
             args.gemini_key = args.gemini_key or mt_key
             mt_model = getattr(args, "gemini_model", None) or ask_gemini_model(
-                "Model Gemini", "gemini-2.0-flash", args)
+                "Model Gemini", "gemini-2.5-flash", args)
             args.gemini_model = args.gemini_model or mt_model
         elif engine == "deepl":
             mt_key = (getattr(args, "deepl_key", None) or os.environ.get("DEEPL_API_KEY")
@@ -3605,6 +3885,238 @@ def run_translate_subs(args):
 
     print()
     log_done(f"Hotovo: {done} uloženo, {skipped} přeskočeno (z {len(jobs)}).")
+
+
+def run_transplant(args):
+    """Průvodce: nahradí STROJOVÝ překlad (dobré časování) PROFESIONÁLNÍM textem
+    ze samostatného adresáře (jiná verze pořadu, jiné dělení epizod), časování
+    zůstává. Párování podle OBSAHU, stejný jazyk."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+
+    print(f"{Fore.MAGENTA}=== Nahradit strojový překlad profesionálním (podle obsahu) ==={Style.RESET_ALL}")
+    log_info(f"Strojové titulky (dobré časování): {os.path.abspath(directory)}")
+    log_info("Vezmu tvoje strojové/AI titulky a text nahradím profesionálním překladem stejného "
+             "pořadu z jiného adresáře. ČASOVÁNÍ zůstane tvoje (sedí na tvou verzi).")
+
+    recursive = ask_yes_no("Hledat strojové titulky i v podadresářích?", default_no=True)
+    targets = collect_srts(directory, recursive)
+    if not targets:
+        die("Ve složce nejsou žádné .srt (strojové titulky).")
+    sel = ask_pick(f"Které strojové titulky zpracovat? (nalezeno {len(targets)})",
+                   ["všechny", "jeden", "několik (vyberu čísla)"], default=0)
+    if sel == 0:
+        chosen = targets
+    elif sel == 1:
+        idx = ask_pick("Který soubor?", [os.path.basename(s) for s in targets], default=0)
+        chosen = [targets[idx]]
+    else:
+        for k, s in enumerate(targets, 1):
+            print(f"  {k}) {os.path.basename(s)}")
+        raw = ask_text("Zadej čísla oddělená čárkou (např. 1,3,4)", "")
+        chosen = [targets[int(t) - 1] for t in raw.replace(" ", "").split(",")
+                  if t.isdigit() and 1 <= int(t) <= len(targets)] or targets
+
+    # adresář s profesionálními ("viki") titulky
+    while True:
+        viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky", "").strip().strip('"')
+        if not viki_dir:
+            log_warn("Bez adresáře s profesionálními titulky to nejde. Zrušeno.")
+            return
+        if os.path.isdir(viki_dir):
+            break
+        log_warn(f"Adresář '{viki_dir}' neexistuje - zkus to znovu (nebo Enter = konec).")
+    viki_rec = ask_yes_no("Hledat 'viki' titulky i v podadresářích?", default_no=True)
+    pool, viki_files = _load_reference_pool(viki_dir, viki_rec)
+    if not pool:
+        die("V adresáři s profesionálními titulky nejsou žádné .srt.")
+    log_info(f"Profesionální zásoba: {len(pool)} titulků z {len(viki_files)} souborů "
+             f"(dělení epizod nevadí - páruje se podle obsahu).")
+
+    # kontrola jazyka (musí být stejný)
+    lp = detect_sub_language(pool)
+    lt = detect_srt_file_language(chosen[0]) if chosen else None
+    if lp and lt and lp != lt:
+        log_warn(f"Pozor: strojové titulky vypadají na '{lt}', profesionální na '{lp}'. "
+                 "Tahle funkce páruje podle textu, takže OBA musí být ve STEJNÉM jazyce. "
+                 "Když jsou různé, výsledek nebude dávat smysl.")
+        if not ask_yes_no("Přesto pokračovat?", default_no=True):
+            return
+
+    ti = ask_pick("Jak přísně párovat (kompromis kvalita vs. pokrytí)?",
+                  ["konzervativně - jen jisté shody (nejmíň chyb, míň nahrazení)",
+                   "vyváženě - rozumný kompromis (doporučeno)",
+                   "agresivně - víc nahrazení, ale vyšší riziko chyb"], default=1,
+                  help=["konzervativně: nahradí jen tam, kde je shoda velmi jistá. Nejbezpečnější, "
+                        "ale profesionálním textem pokryje míň titulků; zbytek zůstane strojový.",
+                        "vyváženě: rozumná rovnováha mezi počtem nahrazení a spolehlivostí.",
+                        "agresivně: nahradí víc titulků, ale roste šance na chybné spárování "
+                        "(hlavně u krátkých/opakujících se řádků)."])
+    min_sim = [0.65, 0.55, 0.45][ti]
+
+    args.fix_short_duration = False
+    _ask_readability(args, chosen[:5])
+
+    overwrite = ask_yes_no("Přepsat původní strojový soubor? (jinak uložím vedle jako <jméno>.pro.srt)",
+                           default_no=True)
+
+    print()
+    log_info(f"Práh párování: {min_sim:.2f} | soubory: {len(chosen)} | profi zásoba: {len(pool)} "
+             + ("| čitelnost: ano " if getattr(args, 'fix_short_duration', False) else "")
+             + ("| přepis originálu" if overwrite else "| ukládám jako .pro.srt"))
+    if not ask_yes_no(f"Spustit pro {len(chosen)} souborů?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+
+    log_info("Připravuji profesionální zásobu (jednorázově)...")
+    transplant, _M = build_transplanter(pool)
+
+    done = skipped = 0
+    tot_repl = tot_cues = 0
+    for path in chosen:
+        p = Path(path)
+        try:
+            ev = parse_srt(p)
+        except Exception as e:
+            log_warn(f"{p.name}: nelze načíst ({e}) - přeskakuji.")
+            skipped += 1
+            continue
+        new_ev, n_repl, n_tot = transplant(ev, min_sim=min_sim)
+        if getattr(args, "fix_short_duration", False):
+            cps, floor, gap, overhead = resolve_speed_params(args)
+            new_ev, _n = fix_short_durations(new_ev, min_cps=cps, min_duration_floor=floor,
+                                             min_gap=gap, line_overhead=overhead)
+        out_path = p if overwrite else p.with_name(p.stem + ".pro.srt")
+        try:
+            write_srt(new_ev, out_path)
+            pct = (100 * n_repl / n_tot) if n_tot else 0
+            log_done(f"{p.name} -> {out_path.name}: nahrazeno {n_repl}/{n_tot} ({pct:.0f}%) "
+                     f"profesionálním textem, zbytek ponechán strojový.")
+            done += 1
+            tot_repl += n_repl
+            tot_cues += n_tot
+        except Exception as e:
+            log_warn(f"{p.name}: zápis selhal: {e}")
+            skipped += 1
+
+    print()
+    pct = (100 * tot_repl / tot_cues) if tot_cues else 0
+    log_done(f"Hotovo: {done} souborů uloženo, {skipped} přeskočeno. Celkem nahrazeno "
+             f"{tot_repl}/{tot_cues} titulků ({pct:.0f}%).")
+    if pct < 20:
+        log_warn("Nízké pokrytí - buď jsou překlady dost odlišné, jde o jinou verzi/pořad, "
+                 "nebo zkus 'agresivně'. Zkontroluj i, že oba jsou ve stejném jazyce.")
+
+
+def run_resync_pro(args):
+    """Průvodce: vezme PROFESIONÁLNÍ titulky z jiného adresáře (jiná verze/dělení
+    epizod) a PŘEČASUJE je na časování tvých strojových titulků. Výsledek = 100 %
+    profesionálního textu se správným časováním pro tvé video."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+
+    print(f"{Fore.MAGENTA}=== Přečasovat profesionální titulky na moje časování (100% profi text) ==={Style.RESET_ALL}")
+    log_info(f"Tvoje titulky s dobrým časováním: {os.path.abspath(directory)}")
+    log_info("Vezmu profesionální překlad téže show z jiného adresáře a přečasuju ho na tvoje "
+             "časování. Zůstane CELÝ profesionální text, jen dostane timing tvého videa.")
+
+    recursive = ask_yes_no("Hledat tvoje titulky i v podadresářích?", default_no=True)
+    targets = collect_srts(directory, recursive)
+    if not targets:
+        die("Ve složce nejsou žádné .srt (tvoje strojové titulky s dobrým časováním).")
+    sel = ask_pick(f"Které tvoje titulky (šablona časování) použít? (nalezeno {len(targets)})",
+                   ["všechny", "jeden", "několik (vyberu čísla)"], default=0)
+    if sel == 0:
+        chosen = targets
+    elif sel == 1:
+        idx = ask_pick("Který soubor?", [os.path.basename(s) for s in targets], default=0)
+        chosen = [targets[idx]]
+    else:
+        for k, s in enumerate(targets, 1):
+            print(f"  {k}) {os.path.basename(s)}")
+        raw = ask_text("Zadej čísla oddělená čárkou (např. 1,3,4)", "")
+        chosen = [targets[int(t) - 1] for t in raw.replace(" ", "").split(",")
+                  if t.isdigit() and 1 <= int(t) <= len(targets)] or targets
+
+    while True:
+        viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky", "").strip().strip('"')
+        if not viki_dir:
+            log_warn("Bez adresáře s profesionálními titulky to nejde. Zrušeno.")
+            return
+        if os.path.isdir(viki_dir):
+            break
+        log_warn(f"Adresář '{viki_dir}' neexistuje - zkus to znovu (nebo Enter = konec).")
+    viki_rec = ask_yes_no("Hledat 'viki' titulky i v podadresářích?", default_no=True)
+    pool, viki_files = _load_reference_pool(viki_dir, viki_rec, continuous=True)
+    if not pool:
+        die("V adresáři s profesionálními titulky nejsou žádné .srt.")
+    log_info(f"Profesionální zásoba: {len(pool)} titulků z {len(viki_files)} souborů "
+             f"(jiné dělení epizod nevadí - správný výřez se najde podle obsahu).")
+
+    lp = detect_sub_language(pool)
+    lt = detect_srt_file_language(chosen[0]) if chosen else None
+    if lp and lt and lp != lt:
+        log_warn(f"Pozor: tvoje titulky vypadají na '{lt}', profesionální na '{lp}'. Přečasování "
+                 "páruje podle textu, takže OBA by měly být ve stejném jazyce.")
+        if not ask_yes_no("Přesto pokračovat?", default_no=True):
+            return
+
+    args.fix_short_duration = False
+    _ask_readability(args, chosen[:5])
+    overwrite = ask_yes_no("Přepsat můj původní soubor profesionálním? (jinak uložím vedle jako <jméno>.pro.srt)",
+                           default_no=True)
+
+    print()
+    log_info(f"Soubory: {len(chosen)} | profi zásoba: {len(pool)} "
+             + ("| čitelnost: ano " if getattr(args, 'fix_short_duration', False) else "")
+             + ("| přepis originálu" if overwrite else "| ukládám jako .pro.srt"))
+    if not ask_yes_no(f"Spustit pro {len(chosen)} souborů?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+
+    done = skipped = 0
+    for path in chosen:
+        p = Path(path)
+        try:
+            ev = parse_srt(p)
+        except Exception as e:
+            log_warn(f"{p.name}: nelze načíst ({e}) - přeskakuji.")
+            skipped += 1
+            continue
+        out, n_anchors = retime_professional(ev, pool, min_sim=0.5)
+        if out is None:
+            log_warn(f"{p.name}: málo shod ({n_anchors} kotev) - nelze spolehlivě přečasovat, "
+                     "přeskakuji. (Jsou to opravdu tytéž díly a stejný jazyk?)")
+            skipped += 1
+            continue
+        if getattr(args, "fix_short_duration", False):
+            cps, floor, gap, overhead = resolve_speed_params(args)
+            out, _n = fix_short_durations(out, min_cps=cps, min_duration_floor=floor,
+                                          min_gap=gap, line_overhead=overhead)
+        out_path = p if overwrite else p.with_name(p.stem + ".pro.srt")
+        try:
+            write_srt(out, out_path)
+            log_done(f"{p.name} -> {out_path.name}: {len(out)} profesionálních titulků "
+                     f"přečasováno na tvůj timing ({n_anchors} kotev).")
+            done += 1
+        except Exception as e:
+            log_warn(f"{p.name}: zápis selhal: {e}")
+            skipped += 1
+
+    print()
+    log_done(f"Hotovo: {done} souborů uloženo, {skipped} přeskočeno.")
+    log_info("Tip: pokud časování někde ujíždí, měj profi zásobu co nejúplnější (všechny díly "
+             "dané série), ať je dost kotev; přečasování je tím přesnější.")
 
 
 def process_single(args):
@@ -4246,6 +4758,8 @@ def run_master_wizard(args):
         ["Synchronizovat JEDNY titulky (špatně načasované) podle videa nebo druhých titulků",
          "Synchronizovat CELOU SLOŽKU (dávka videí + jejich titulky)",
          "Přeložit titulky z videa do jiného jazyka a uložit jako .srt",
+         "Nahradit STROJOVÝ překlad PROFESIONÁLNÍM (podle obsahu, časování zůstane)",
+         "Přečasovat PROFESIONÁLNÍ titulky na MOJE časování (100% profi text)",
          "Jen opravit ČITELNOST titulků (prodloužit příliš krátké)",
          "Nastavit API klíče a výchozí volby (config.json)",
          "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
@@ -4254,21 +4768,39 @@ def run_master_wizard(args):
               "zdroj správného časování (titulková stopa z videa, nebo druhé .srt). Bez videa to "
               "umí i mezi dvěma .srt.",
               "Dávka celé složky: pro každé video v adresáři dopočítá časování k jeho titulkům.",
-              "Překlad titulků: vytáhne stopu z videa, přeloží do cílového jazyka (OpenSubtitles "
-              "nebo DeepL/Google/Claude/Argos) + korektura, uloží <video>.<jazyk>.srt.",
+              "Překlad titulků: vytáhne stopu z videa nebo vezme existující .srt, přeloží do cílového "
+              "jazyka (Gemini/Google/DeepL/Claude/Argos) + korektura, uloží <jméno>.<jazyk>.srt.",
+              "Nahradit strojový překlad profesionálním: máš vlastní/AI titulky s dobrým časováním a "
+              "jinde profesionální překlad TÉŽE show (klidně jiná verze / jiný počet epizod). Podle "
+              "OBSAHU spáruje řádky a dosadí profesionální text, ale ZACHOVÁ tvoje časování. Pokryje "
+              "jen řádky, kde je jistá shoda; zbytek nechá strojový.",
+              "Přečasovat profesionální titulky na moje časování: OPAČNÝ postup - vezme CELÝ "
+              "profesionální překlad z jiného adresáře a přečasuje ho na tvoje časování. Výsledek = "
+              "100 % profesionálního textu se správným timingem. Nejlepší, když chceš profi titulky "
+              "na svou verzi videa.",
               "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa.",
               "Config: uloží API klíče a výchozí volby do config.json (načítá se automaticky).",
               "Test API: pošle triviální dotaz a vypíše přesnou odpověď/chybu (ladění např. HTTP 400)."])
 
-    if mode == 4:
+    if mode == 6:
         run_config(args)
         return
-    if mode == 5:
+    if mode == 7:
         run_test_api(args)
         return
-    if mode == 3:
+    if mode == 5:
         args.fix_readability = True
         run_fix_readability(args)
+        return
+    if mode == 4:
+        args.resync_pro = True
+        preset_begin_offer("resync-pro", resolve_preset_path(args))
+        run_resync_pro(args)
+        return
+    if mode == 3:
+        args.merge_pro = True
+        preset_begin_offer("merge-pro", resolve_preset_path(args))
+        run_transplant(args)
         return
 
     cmd = ["auto", "auto-all", "translate-subs"][mode]
@@ -4484,6 +5016,13 @@ RŮZNÉ JAZYKY (target vs reference):
     parser.add_argument("--translate-subs", action="store_true",
                          help="Interaktivní režim: pro všechna videa v adresáři vytáhne zvolenou titulkovou stopu, získá titulky v cílovém jazyce (OpenSubtitles a/nebo strojový překlad + korektura) a uloží je jako <video>.<lang>.srt.")
     parser.add_argument("--out-lang", default=None, help="(--translate-subs) cílový jazyk překladu, např. cs")
+    parser.add_argument("--merge-pro", action="store_true",
+                        help="Interaktivní režim: nahradí strojový překlad tvých titulků PROFESIONÁLNÍM "
+                             "překladem téže show z jiného adresáře (párování podle obsahu), časování "
+                             "zůstane. Zeptá se na adresář s 'viki' titulky.")
+    parser.add_argument("--resync-pro", action="store_true",
+                        help="Interaktivní režim: OPAČNĚ - vezme profesionální titulky z jiného adresáře "
+                             "a přečasuje je na tvoje časování (100%% profi text se správným timingem).")
     parser.add_argument("--sub-source", choices=["auto", "mt", "opensubtitles"], default="auto",
                          help="(--translate-subs) odkud vzít cílové titulky (default auto).")
     parser.add_argument("--deepl-key", default=None, help="API klíč pro DeepL (nebo proměnná DEEPL_API_KEY).")
@@ -4540,6 +5079,10 @@ RŮZNÉ JAZYKY (target vs reference):
                 run_auto_single(args)
             elif cmd == "translate-subs":
                 run_translate_subs(args)
+            elif cmd == "merge-pro":
+                run_transplant(args)
+            elif cmd == "resync-pro":
+                run_resync_pro(args)
             else:
                 die(f"Neznámý příkaz v presetu: {cmd}")
             return
@@ -4548,11 +5091,13 @@ RŮZNÉ JAZYKY (target vs reference):
 
     # --- preset (--save / --load) pro interaktivní příkazy ---------------
     interactive_cmd = ("auto-all" if args.auto_all else "auto" if args.auto
-                       else "translate-subs" if args.translate_subs else None)
+                       else "translate-subs" if args.translate_subs
+                       else "merge-pro" if args.merge_pro
+                       else "resync-pro" if args.resync_pro else None)
     if args.save and args.load:
         die("--save a --load nelze kombinovat.")
     if args.save and not interactive_cmd:
-        die("--save funguje jen s interaktivním příkazem (--auto / --auto-all / --translate-subs).")
+        die("--save funguje jen s interaktivním příkazem (--auto / --auto-all / --translate-subs / --merge-pro / --resync-pro).")
     if args.load:
         preset = load_preset_file(resolve_preset_path(args))
         if not preset:
@@ -4576,6 +5121,10 @@ RŮZNÉ JAZYKY (target vs reference):
             run_auto_single(args)
         elif interactive_cmd == "translate-subs":
             run_translate_subs(args)
+        elif interactive_cmd == "merge-pro":
+            run_transplant(args)
+        elif interactive_cmd == "resync-pro":
+            run_resync_pro(args)
         preset_flush_if_save()
         return
 
@@ -4587,6 +5136,12 @@ RŮZNÉ JAZYKY (target vs reference):
         return
     if args.translate_subs:
         run_translate_subs(args)
+        return
+    if args.merge_pro:
+        run_transplant(args)
+        return
+    if args.resync_pro:
+        run_resync_pro(args)
         return
 
     if args.all and args.fix_readability:
