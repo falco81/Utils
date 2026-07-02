@@ -1657,8 +1657,110 @@ def load_custom_links(path: str) -> list[dict]:
 
 # ---------- HTML generation ----------
 
+# ---------- PuTTY protocol handler helper ----------
+
+_PUTTY_REG_TEMPLATE = r"""Windows Registry Editor Version 5.00
+
+; Register ssh:// URL protocol to open with PuTTY.
+; Import this file (double-click) or run: reg import putty-ssh-handler.reg
+; Requires PuTTY at the path below - edit if yours is different.
+
+[HKEY_CLASSES_ROOT\ssh]
+@="URL:SSH Protocol"
+"URL Protocol"=""
+"EditFlags"=dword:00000002
+
+[HKEY_CLASSES_ROOT\ssh\DefaultIcon]
+@="\"__PUTTY_PATH__\",0"
+
+[HKEY_CLASSES_ROOT\ssh\shell]
+
+[HKEY_CLASSES_ROOT\ssh\shell\open]
+
+[HKEY_CLASSES_ROOT\ssh\shell\open\command]
+@="\"__PUTTY_PATH__\" \"%1\""
+
+[HKEY_CURRENT_USER\Software\Classes\ssh]
+@="URL:SSH Protocol"
+"URL Protocol"=""
+
+[HKEY_CURRENT_USER\Software\Classes\ssh\shell\open\command]
+@="\"__PUTTY_PATH__\" \"%1\""
+"""
+
+
+def generate_putty_reg(putty_path: str = r"C:\Program Files\PuTTY\putty.exe") -> str:
+    r"""Return a Windows .reg file body that binds ssh:// to PuTTY.
+
+    Escape backslashes for reg-file syntax: C:\Foo -> C:\\Foo
+    """
+    escaped = putty_path.replace("\\", "\\\\")
+    return _PUTTY_REG_TEMPLATE.replace("__PUTTY_PATH__", escaped)
+
+
+# ---------- rendering ----------
+
 def get_icon_svg(key: str) -> str:
     return ICONS.get(key) or ICONS["generic"]
+
+
+# Default SSH username per component type. Applied to ssh:// links so PuTTY
+# opens with the correct account. Users can override by right-clicking the
+# SSH button (browser context menu) or by editing the config JSON.
+_SSH_DEFAULT_USER: dict[str, str] = {
+    # VCF core
+    "sddc-manager":     "vcf",      # VCF 9.x uses 'vcf', older uses 'admin'
+    "vcenter":          "root",
+    "esxi":             "root",
+    "nsx":              "admin",
+    "nsx-alb":          "admin",
+    "hcx":              "admin",
+    # VCFMS (containerized, VCF 9.1) - all run under root
+    "vcfms-platform":   "root",
+    "vcfms-fleet":      "root",
+    "vcfms-instance":   "root",
+    # VCF fleet products (VCF Ops family, Automation, Identity Broker, License)
+    "vcf-ops":          "root",
+    "vcf-automation":   "root",
+    "identity-broker":  "root",
+    "license-server":   "root",
+    "log-insight":      "root",
+    "network-insight":  "root",
+    "aria-suite":       "root",
+    # Backup/DR & monitoring
+    "backup":           "vcf",
+    "zabbix":           "root",
+    "grafana":          "admin",
+    # Everything else: no default; ssh://host lets PuTTY prompt
+}
+
+
+def _extract_host(url: str) -> str:
+    """Return bare hostname/IP from a URL. Empty if URL has no host."""
+    if not url or "://" not in url:
+        return ""
+    rest = url.split("://", 1)[1]
+    # Strip user@ prefix, path, query, port
+    if "@" in rest:
+        rest = rest.split("@", 1)[1]
+    host = rest.split("/", 1)[0].split(":", 1)[0].split("?", 1)[0]
+    return host
+
+
+def build_ssh_url(host: str, icon: str = "") -> str | None:
+    """
+    Build ssh:// URL for a host. Returns None if host looks unsuitable
+    (empty, localhost, or lacks any dot - meaning it might be a shortcut).
+    """
+    if not host:
+        return None
+    h = host.strip().lower()
+    if h in ("localhost", "127.0.0.1", "::1") or " " in h:
+        return None
+    user = _SSH_DEFAULT_USER.get(icon)
+    if user:
+        return f"ssh://{user}@{host}"
+    return f"ssh://{host}"
 
 
 def render_html(tiles: list[dict], sddc_host: str, vcf_version: str) -> str:
@@ -1699,6 +1801,25 @@ def render_html(tiles: list[dict], sddc_host: str, vcf_version: str) -> str:
             f'</svg></button>'
         )
 
+        # SSH button (bottom-left) - links to ssh://<user>@<host>. Requires the
+        # user's OS to have a registered ssh:// protocol handler (e.g. PuTTY).
+        # Only emit if the URL has a real host (skip localhost, sftp targets etc.)
+        ssh_btn = ""
+        icon_key = t.get("icon", "")
+        host = _extract_host(t.get("url", ""))
+        ssh_url = build_ssh_url(host, icon_key)
+        if ssh_url:
+            ssh_url_e = _html_escape(ssh_url)
+            ssh_btn = (
+                f'<a class="ssh-btn" href="{ssh_url_e}" '
+                f'title="Open SSH session ({ssh_url_e})" aria-label="SSH">'
+                f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                f'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+                f'<rect x="3" y="4" width="18" height="16" rx="2"/>'
+                f'<path d="M7 9l3 3-3 3M13 15h4"/>'
+                f'</svg></a>'
+            )
+
         # Small badge showing instance (top-left corner), only if instance name set
         instance_badge = ""
         if instance:
@@ -1710,14 +1831,40 @@ def render_html(tiles: list[dict], sddc_host: str, vcf_version: str) -> str:
         # Optional node-menu button + node list (hidden by default, toggled by JS)
         nodes_ui = ""
         if nodes:
-            node_items = "".join(
-                f'<a class="node-item" href="{_html_escape(n["url"])}" '
-                f'target="_blank" rel="noopener noreferrer">'
-                f'<span class="node-name">{_html_escape(n["name"])}</span>'
-                f'<span class="node-type">{_html_escape(n.get("type", "node"))}</span>'
-                f'</a>'
-                for n in nodes
-            )
+            node_items_html = []
+            for n in nodes:
+                nurl = _html_escape(n["url"])
+                nname = _html_escape(n["name"])
+                ntype = _html_escape(n.get("type", "node"))
+                nhost = _extract_host(n["url"])
+                nssh = build_ssh_url(nhost, icon_key)
+                # Each node row has: primary link (HTTPS/UI) + small SSH icon
+                if nssh:
+                    nssh_e = _html_escape(nssh)
+                    ssh_link = (
+                        f'<a class="node-ssh" href="{nssh_e}" '
+                        f'title="SSH to {nname} ({nssh_e})" '
+                        f'aria-label="SSH to node" '
+                        f'onclick="event.stopPropagation()">'
+                        f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                        f'stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">'
+                        f'<rect x="3" y="4" width="18" height="16" rx="2"/>'
+                        f'<path d="M7 9l3 3-3 3M13 15h4"/>'
+                        f'</svg></a>'
+                    )
+                else:
+                    ssh_link = ""
+                node_items_html.append(
+                    f'<div class="node-item">'
+                    f'<a class="node-primary" href="{nurl}" '
+                    f'target="_blank" rel="noopener noreferrer">'
+                    f'<span class="node-name">{nname}</span>'
+                    f'<span class="node-type">{ntype}</span>'
+                    f'</a>'
+                    f'{ssh_link}'
+                    f'</div>'
+                )
+            node_items = "".join(node_items_html)
             nodes_ui = (
                 f'<button class="nodes-btn" '
                 f'title="Show cluster nodes ({len(nodes)})" '
@@ -1735,6 +1882,17 @@ def render_html(tiles: list[dict], sddc_host: str, vcf_version: str) -> str:
                 f'</div>'
             )
 
+        # Both bottom-right buttons (SSH + optional nodes dropdown) sit in one
+        # flex row so they align nicely even when only one of them is present.
+        actions_inner = ""
+        if ssh_btn:
+            actions_inner += ssh_btn
+        if nodes_ui:
+            actions_inner += nodes_ui
+        actions_row = ""
+        if actions_inner:
+            actions_row = f'<div class="tile-actions">{actions_inner}</div>'
+
         return (
             f'<div class="tile-wrap" data-cat="{_html_escape(cat)}" '
             f'data-instance="{instance_e}" '
@@ -1748,7 +1906,7 @@ def render_html(tiles: list[dict], sddc_host: str, vcf_version: str) -> str:
             f'</a>'
             f'{instance_badge}'
             f'{star_btn}'
-            f'{nodes_ui}'
+            f'{actions_row}'
             f'</div>'
         )
 
@@ -1885,8 +2043,9 @@ main {{ padding: 24px 32px 48px; overflow-x: hidden; }}
   line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }}
 
 /* --- cluster node dropdown --- */
-.nodes-btn {{ position: absolute; bottom: 8px; right: 8px;
-  background: var(--surface-2); border: 1px solid var(--border);
+.tile-actions {{ position: absolute; bottom: 8px; right: 8px;
+  display: flex; align-items: center; gap: 4px; z-index: 6; }}
+.nodes-btn {{ background: var(--surface-2); border: 1px solid var(--border);
   border-radius: 4px; color: var(--text-2); padding: 2px 6px;
   cursor: pointer; display: flex; align-items: center; gap: 4px;
   font-size: 10px; font-weight: 500; opacity: 0.85;
@@ -1905,14 +2064,36 @@ main {{ padding: 24px 32px 48px; overflow-x: hidden; }}
   letter-spacing: 0.5px; color: var(--text-2); padding: 6px 10px 4px;
   border-bottom: 1px solid var(--border); margin-bottom: 4px; }}
 .node-item {{ display: flex; align-items: center; justify-content: space-between;
-  gap: 10px; padding: 8px 10px; border-radius: 4px;
-  text-decoration: none; color: var(--text); font-size: 12px;
+  gap: 8px; padding: 4px; border-radius: 4px;
   transition: background 0.1s; }}
-.node-item:hover {{ background: var(--surface-2); color: var(--accent); }}
+.node-item:hover {{ background: var(--surface-2); }}
+.node-primary {{ display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 4px 8px; flex: 1;
+  text-decoration: none; color: var(--text); font-size: 12px;
+  border-radius: 4px; min-width: 0; }}
+.node-primary:hover {{ color: var(--accent); }}
 .node-name {{ font-family: ui-monospace, "SF Mono", Menlo, monospace;
-  font-size: 11px; }}
+  font-size: 11px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; }}
 .node-type {{ font-size: 10px; color: var(--text-2);
-  text-transform: uppercase; letter-spacing: 0.5px; }}
+  text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0; }}
+.node-ssh {{ display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; flex-shrink: 0;
+  border-radius: 4px; color: var(--text-2); text-decoration: none;
+  transition: all 0.1s; }}
+.node-ssh:hover {{ background: var(--accent); color: white; }}
+.node-ssh svg {{ width: 14px; height: 14px; }}
+
+/* --- SSH button on tile (in .tile-actions row) --- */
+.ssh-btn {{ display: flex; align-items: center; justify-content: center;
+  width: 26px; height: 22px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text-2);
+  text-decoration: none; transition: all 0.15s ease;
+  opacity: 0.85; }}
+.tile-wrap:hover .ssh-btn {{ opacity: 1; }}
+.ssh-btn:hover {{ color: var(--accent); border-color: var(--accent); }}
+.ssh-btn svg {{ width: 14px; height: 14px; }}
 
 .star {{ position: absolute; top: 8px; right: 8px; background: transparent;
   border: none; color: var(--text-2); padding: 3px; cursor: pointer;
@@ -2310,6 +2491,19 @@ def parse_args() -> argparse.Namespace:
                           help="Skip SDDC Manager entirely and generate HTML "
                                "from a config JSON produced by --dump-config "
                                "(possibly hand-edited). No login needed.")
+    workflow.add_argument("--emit-putty-reg", metavar="PATH",
+                          nargs="?", const="putty-ssh-handler.reg",
+                          help="Emit a Windows .reg file that registers the "
+                               "ssh:// URL protocol handler with PuTTY, then "
+                               "exit. Import it (double-click) so SSH buttons "
+                               "in the HTML dashboard open PuTTY. "
+                               "Default filename: putty-ssh-handler.reg. "
+                               "Combine with --putty-path to override the "
+                               "PuTTY location.")
+    workflow.add_argument("--putty-path",
+                          default=r"C:\Program Files\PuTTY\putty.exe",
+                          help=r"PuTTY executable path baked into --emit-putty-reg "
+                               r"[C:\Program Files\PuTTY\putty.exe]")
 
     p.add_argument("--output",
                    help="Output HTML file (default: vcf_launcher_<host>_<ts>.html "
@@ -2343,6 +2537,23 @@ def main() -> int:
 
     if args.insecure:
         requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+    # ---------- MODE: --emit-putty-reg (write .reg and exit) ----------
+    if args.emit_putty_reg:
+        reg_path = args.emit_putty_reg
+        try:
+            content = generate_putty_reg(putty_path=args.putty_path)
+            with open(reg_path, "w", encoding="utf-8") as f:
+                f.write(content)
+            ok(f"Wrote PuTTY ssh:// handler registry file to {reg_path}")
+            info(f"PuTTY path baked in: {args.putty_path}")
+            info("On Windows, double-click the .reg file to register the handler.")
+            info("After that, clicking SSH buttons in the HTML dashboard will "
+                 "open PuTTY.")
+            return 0
+        except OSError as e:
+            log.error("Failed to write %s: %s", reg_path, e)
+            return 1
 
     # ---------- MODE: --from-config (no SDDC Manager at all) ----------
     if args.from_config:
