@@ -2573,8 +2573,22 @@ def run_fix_readability(args):
         die(f"Není to ani .srt soubor, ani adresář: {target}")
 
     if not srt_files:
-        log_warn("Nenalezeny žádné .srt soubory ke zpracování.")
-        return
+        vids = [] if is_single_file else collect_videos(target, recursive)
+        if vids and (args.yes or ask_yes_no(
+                f"Nenašel jsem žádné .srt, ale je tu {len(vids)} videí. Vytáhnout z nich titulky?",
+                default_no=False)):
+            _saved = args.mkv
+            args.mkv = Path(target)
+            try:
+                run_extract_subs(args, minimal=True)
+            finally:
+                args.mkv = _saved
+            srt_files = collect_srts(target, recursive)
+            if srt_files:
+                log_info("Titulky vytažené - teď na ně použiju čitelnost.")
+        if not srt_files:
+            log_warn("Nenalezeny žádné .srt soubory ke zpracování.")
+            return
 
     # 3) jazykový/jiný filtr - jen když je víc variant a uživatel nezadal -----
     target_lang = args.target_lang
@@ -3887,6 +3901,740 @@ def run_translate_subs(args):
     log_done(f"Hotovo: {done} uloženo, {skipped} přeskočeno (z {len(jobs)}).")
 
 
+def run_extract_subs(args, minimal=False):
+    """Průvodce: vytáhne titulkové stopy z videí (mkv/mp4/...) do .srt. Stopy se
+    detekují přímo z videa; interaktivně vybereš, které (podle jazyka, konkrétní
+    stopy ze vzorku, nebo všechny textové).
+    minimal=True: čistá extrakce bez dotazů na očištění/čitelnost (používá se jako
+    mezikrok pro jiný režim, který si úpravy udělá sám)."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+
+    print(f"{Fore.MAGENTA}=== Extrahovat titulky z videí (do .srt) ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+
+    recursive = bool(getattr(args, "recursive", False)) if minimal else ask_yes_no(
+        "Prohledat i podadresáře?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("Žádná videa (mkv/mp4/...) v adresáři.")
+    log_info(f"Nalezeno {len(videos)} videí.")
+
+    # detekce stop ze vzorku
+    sample = Path(videos[0])
+    mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _is_mkv = _resolve_tools_for_extract(args, sample)
+    if not mkvmerge_bin:
+        die("Nenašel jsem mkvmerge (mkvtoolnix) pro čtení stop. Nainstaluj mkvtoolnix, "
+            "nebo zkontroluj připojení pro automatické stažení.")
+    # zapamatuj nástroje, ať se neřeší u každého videa znovu
+    args.mkvmerge = args.mkvmerge or mkvmerge_bin
+    if mkvextract_bin:
+        args.mkvextract = args.mkvextract or mkvextract_bin
+    if ffmpeg_bin:
+        args.ffmpeg = args.ffmpeg or ffmpeg_bin
+
+    sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles")
+    if not sub_tracks:
+        die(f"Vzorové video ({sample.name}) nemá žádné titulkové stopy.")
+    log_info(f"Titulkové stopy ve vzorku ({sample.name}):")
+    for t in sub_tracks:
+        txt = "text" if is_text_codec(t["codec"]) else "OBRÁZKOVÉ (nelze do .srt)"
+        print(f"    #{t['id']}  {t['lang']:4}  {t['codec']:16} {t.get('title', '')}  [{txt}]")
+    text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
+    if not text_tracks:
+        die("Vzorové video má jen obrázkové titulky (PGS/VobSub) - ty nelze vytáhnout jako text.")
+
+    mode = ask_pick("Které titulkové stopy vytáhnout?",
+                    ["podle JAZYKA (zadám kódy - robustní pro celou složku)",
+                     "konkrétní STOPY ze vzorku (podle čísla výše)",
+                     "VŠECHNY textové titulkové stopy z každého videa"], default=0,
+                    help=["podle jazyka: zadáš kódy (např. eng,cze,ger) a z KAŽDÉHO videa se "
+                          "vytáhnou stopy v těch jazycích - i když mají v různých videích jiná ID.",
+                          "konkrétní stopy: vybereš čísla stop podle vzorku výše; stejná ID se "
+                          "použijí u všech videí (vhodné, když mají všechna stejné pořadí stop).",
+                          "všechny: z každého videa vytáhne všechny textové titulkové stopy."])
+
+    want_langs = None
+    want_ids = None
+    if mode == 0:
+        raw = ask_text("Kódy jazyků oddělené čárkou (např. eng,cze,ger; prázdné = všechny)", "")
+        want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()]
+        if not want_langs:
+            want_langs = None  # = všechny textové
+    elif mode == 1:
+        labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in text_tracks]
+        for k, lab in enumerate(labels, 1):
+            print(f"  {k}) {lab}")
+        raw = ask_text("Zadej čísla stop oddělená čárkou (např. 1,3)", "1")
+        picks = [int(x) for x in raw.replace(" ", "").split(",") if x.isdigit() and 1 <= int(x) <= len(text_tracks)]
+        want_ids = [text_tracks[k - 1]["id"] for k in picks] or [text_tracks[0]["id"]]
+
+    do_clean = False if minimal else ask_yes_no(
+        "Pravidlově očistit text (mezery, interpunkce, rozlomení dlouhých řádků)?", default_no=True)
+    args.fix_short_duration = False
+    if not minimal:
+        _ask_readability(args, [])
+    overwrite = True if minimal else ask_yes_no("Přepsat existující výstupní .srt?", default_no=True)
+
+    print()
+    seltxt = ("jazyky: " + ",".join(want_langs)) if want_langs else \
+             ("stopy #" + ",".join(str(i) for i in want_ids)) if want_ids else "všechny textové"
+    log_info(f"Výběr: {seltxt} | videí: {len(videos)}"
+             + (" | očištění" if do_clean else "")
+             + (" | čitelnost" if getattr(args, 'fix_short_duration', False) else ""))
+    if not minimal and not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+
+    done = skipped = wrote = 0
+    for vid in videos:
+        v = Path(vid)
+        try:
+            vtracks = mkvmerge_tracks(args.mkvmerge, v, "subtitles")
+        except Exception as e:
+            log_warn(f"{v.name}: nelze přečíst stopy ({e}) - přeskakuji.")
+            skipped += 1
+            continue
+        vtext = [t for t in vtracks if is_text_codec(t["codec"])]
+        if want_langs is not None:
+            sel = [t for t in vtext if any(t["lang"].lower().startswith(l) for l in want_langs)]
+        elif want_ids is not None:
+            sel = [t for t in vtext if t["id"] in want_ids]
+        else:
+            sel = vtext
+        if not sel:
+            log_warn(f"{v.name}: žádná odpovídající textová stopa - přeskakuji.")
+            skipped += 1
+            continue
+
+        # kolize jazyků -> přidej ID do názvu
+        lang_counts = {}
+        for t in sel:
+            lang_counts[t["lang"]] = lang_counts.get(t["lang"], 0) + 1
+
+        any_written = False
+        for t in sel:
+            lang = t["lang"] if t["lang"] and t["lang"] != "und" else f"track{t['id']}"
+            tag = f"{lang}.{t['id']}" if lang_counts.get(t["lang"], 0) > 1 else lang
+            out_path = v.with_name(v.stem + f".{tag}.srt")
+            if out_path.exists() and not overwrite:
+                log_info(f"{out_path.name}: už existuje - přeskakuji.")
+                continue
+            events, chosen = extract_subtitle_events(args, v, track_id=t["id"])
+            if not events:
+                log_warn(f"{v.name}: stopu #{t['id']} ({t['lang']}) se nepodařilo vytáhnout.")
+                continue
+            if do_clean:
+                for e in events:
+                    e["text"] = clean_subtitle_text(e["text"])
+            if getattr(args, "fix_short_duration", False):
+                cps, floor, gap, overhead = resolve_speed_params(args)
+                events, _n = fix_short_durations(events, min_cps=cps, min_duration_floor=floor,
+                                                 min_gap=gap, line_overhead=overhead)
+            try:
+                write_srt(events, out_path)
+                log_done(f"{v.name}: stopa #{t['id']} ({t['lang']}, {t['codec']}) -> {out_path.name} "
+                         f"({len(events)} titulků)")
+                wrote += 1
+                any_written = True
+            except Exception as e:
+                log_warn(f"{v.name}: zápis {out_path.name} selhal: {e}")
+        if any_written:
+            done += 1
+        else:
+            skipped += 1
+
+    print()
+    log_done(f"Hotovo: {wrote} .srt souborů z {done} videí ({skipped} videí přeskočeno).")
+
+
+# ======================================================================
+# Práce se stopami v kontejnerech (mkv/mp4) - port samostatných skriptů:
+# import titulků, mazání stop, výchozí stopa, přejmenování titulků.
+# ======================================================================
+_LANG3_FROM2 = {
+    "en": "eng", "cs": "cze", "sk": "slo", "de": "ger", "fr": "fre", "es": "spa",
+    "it": "ita", "pt": "por", "nl": "dut", "pl": "pol", "ru": "rus", "uk": "ukr",
+    "ja": "jpn", "ko": "kor", "zh": "chi", "hu": "hun", "ro": "rum", "sv": "swe",
+    "no": "nor", "da": "dan", "fi": "fin", "el": "gre", "tr": "tur", "ar": "ara",
+    "he": "heb", "th": "tha", "vi": "vie", "id": "ind", "hi": "hin", "bg": "bul",
+    "hr": "hrv", "sr": "srp", "sl": "slv", "et": "est", "lv": "lav", "lt": "lit",
+    "fil": "fil", "ms": "msa",
+}
+_LANG3_ALIAS = {"ces": "cze", "deu": "ger", "fra": "fre", "nld": "dut", "ron": "rum",
+                "slk": "slo", "zho": "chi", "ell": "gre", "may": "msa"}
+_LANG3_NAME = {
+    "eng": "English", "cze": "Czech", "slo": "Slovak", "ger": "German", "fre": "French",
+    "spa": "Spanish", "ita": "Italian", "por": "Portuguese", "dut": "Dutch", "pol": "Polish",
+    "rus": "Russian", "ukr": "Ukrainian", "jpn": "Japanese", "kor": "Korean", "chi": "Chinese",
+    "hun": "Hungarian", "rum": "Romanian", "swe": "Swedish", "nor": "Norwegian", "dan": "Danish",
+    "fin": "Finnish", "gre": "Greek", "tur": "Turkish", "ara": "Arabic", "heb": "Hebrew",
+    "tha": "Thai", "vie": "Vietnamese", "ind": "Indonesian", "hin": "Hindi", "bul": "Bulgarian",
+    "hrv": "Croatian", "srp": "Serbian", "slv": "Slovenian", "fil": "Filipino", "msa": "Malay",
+    "und": "(neznámý)",
+}
+_EPISODE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,2})")
+_LANG_TOKEN_RE = re.compile(r"^[A-Za-z]{2,3}$")
+_FLAG_TOKENS = {"forced", "sdh", "cc", "hi", "foreign", "full", "default"}
+
+
+def _canon3(lang):
+    l = (lang or "").strip().lower()
+    if not l or l == "und":
+        return "und"
+    if l in _LANG3_ALIAS:
+        return _LANG3_ALIAS[l]
+    if len(l) == 2:
+        return _LANG3_FROM2.get(l, l)
+    return l
+
+
+def _lang3_name(code3):
+    return _LANG3_NAME.get(code3, code3.upper())
+
+
+def _episode_key(name):
+    m = _EPISODE_RE.search(name)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _fmt_ep(k):
+    return f"S{k[0]:02d}E{k[1]:02d}"
+
+
+def _find_mkvpropedit(mkvmerge_bin):
+    if mkvmerge_bin:
+        d = os.path.dirname(mkvmerge_bin)
+        for n in ("mkvpropedit", "mkvpropedit.exe"):
+            c = os.path.join(d, n)
+            if os.path.isfile(c):
+                return c
+    return find_tool(["mkvpropedit", "mkvpropedit.exe"])
+
+
+def _ensure_mkv_tools(args, target_dir, need_propedit=False):
+    """Najde mkvmerge/mkvextract/mkvpropedit; když chybí, stáhne MKVToolNix do
+    .mkvtoolnix (stejně jako ffmpeg). Vrací (mkvmerge, mkvextract, mkvpropedit)."""
+    mm = getattr(args, "mkvmerge", None) or find_tool(["mkvmerge", "mkvmerge.exe"])
+    me = getattr(args, "mkvextract", None) or find_tool(["mkvextract", "mkvextract.exe"])
+    mp = _find_mkvpropedit(mm)
+    if not mm or not me or (need_propedit and not mp):
+        try:
+            mm2, me2 = ensure_mkvtoolnix(target_dir, allow_download=not getattr(args, "no_mkvtoolnix_download", False))
+            mm = mm or mm2
+            me = me or me2
+            mp = mp or _find_mkvpropedit(mm)
+        except Exception as e:
+            log_warn(f"MKVToolNix se nepodařilo zajistit: {e}")
+    if mm:
+        args.mkvmerge = args.mkvmerge or mm
+    if me:
+        args.mkvextract = args.mkvextract or me
+    return mm, me, mp
+
+
+def _mkv_probe_full(mkvmerge_bin, video):
+    """Vrátí {'audio':[...], 'subs':[...]}; každá stopa má id, lang, name, codec,
+    default, forced, a selektor sel (a1/s1... pro mkvpropedit)."""
+    try:
+        out = subprocess.run([mkvmerge_bin, "-J", str(video)], capture_output=True, text=True)
+        data = json.loads(out.stdout or "{}")
+    except Exception:
+        return {"audio": [], "subs": []}
+    audio, subs = [], []
+    ai = si = 0
+    for t in data.get("tracks", []):
+        pr = t.get("properties", {}) or {}
+        rec = {"id": t["id"], "lang": _canon3(pr.get("language")), "name": pr.get("track_name") or "",
+               "codec": t.get("codec") or "", "default": bool(pr.get("default_track")),
+               "forced": bool(pr.get("forced_track"))}
+        if t.get("type") == "audio":
+            ai += 1
+            rec["sel"] = f"a{ai}"
+            audio.append(rec)
+        elif t.get("type") == "subtitles":
+            si += 1
+            rec["sel"] = f"s{si}"
+            subs.append(rec)
+    return {"audio": audio, "subs": subs}
+
+
+def _collect_videos_subs(directory, recursive, sub_exts=(".srt", ".ass", ".ssa", ".sup", ".sub", ".vtt")):
+    videos, subs = [], []
+    walker = os.walk(directory) if recursive else [(directory, [], os.listdir(directory))]
+    for root, _d, files in walker:
+        for f in files:
+            ext = os.path.splitext(f)[1].lower()
+            full = os.path.join(root, f)
+            if ext in (".mkv", ".mp4"):
+                videos.append(full)
+            elif ext in sub_exts:
+                subs.append(full)
+    return sorted(videos), sorted(subs)
+
+
+def _parse_sub_meta(sub_name, forced_lang=None):
+    """Z názvu titulku vytáhne (lang3, název_stopy, forced)."""
+    stem = os.path.splitext(sub_name)[0]
+    parts = stem.split(".")
+    lang = forced_lang
+    forced = sdh = False
+    tail = []
+    while parts and len(tail) < 2 and (parts[-1].lower() in _FLAG_TOKENS or _LANG_TOKEN_RE.match(parts[-1])):
+        tail.insert(0, parts.pop())
+    for tok in tail:
+        low = tok.lower()
+        if low == "forced":
+            forced = True
+        elif low in ("sdh", "cc", "hi"):
+            sdh = True
+        elif _LANG_TOKEN_RE.match(tok) and lang is None:
+            lang = low
+    lang3 = "und" if lang is None else _canon3(lang)
+    name = _lang3_name(lang3)
+    if forced:
+        name += " (Forced)"
+    elif sdh:
+        name += " (SDH)"
+    return lang3, name, forced
+
+
+# ---------------------------------------------------------------- import
+def run_import_subs(args):
+    """Vloží (mux) titulkové soubory do videí (párování přes SxxExx) pomocí
+    mkvmerge; nastaví jazyk, název stopy, forced a volitelně default. Výstup je
+    vždy MKV."""
+    directory = str(args.mkv) if args.mkv and args.mkv.is_dir() else "."
+    print(f"{Fore.MAGENTA}=== Vložit (mux) titulky do videí ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
+    mm, me, mp = _ensure_mkv_tools(args, directory)
+    if not mm:
+        die("Nenašel jsem mkvmerge (MKVToolNix) ani se ho nepodařilo stáhnout.")
+
+    videos, subs = _collect_videos_subs(directory, recursive)
+    if not videos:
+        die("Žádná videa (mkv/mp4) v adresáři.")
+    if not subs:
+        die("Žádné titulkové soubory (.srt/.ass/...) v adresáři.")
+    # párování dle epizody
+    vmap = {}
+    for v in videos:
+        k = _episode_key(os.path.basename(v))
+        if k and k not in vmap:
+            vmap[k] = v
+    pairs = {}
+    for s in subs:
+        k = _episode_key(os.path.basename(s))
+        if k and k in vmap:
+            pairs.setdefault(vmap[k], []).append(s)
+    if not pairs:
+        die("Nepodařilo se spárovat titulky s videi podle SxxExx.")
+    log_info(f"Spárováno {sum(len(x) for x in pairs.values())} titulků k {len(pairs)} videím.")
+
+    set_default = ask_yes_no("Nastavit jednu titulkovou stopu jako VÝCHOZÍ (default)?", default_no=True)
+    default_lang = None
+    if set_default:
+        default_lang = ask_language("Jazyk výchozích titulků (kód, např. cs)", "cs") or None
+    forced_lang = None
+    if ask_yes_no("Nemají soubory jazyk v názvu? Zadat jeden jazyk pro všechny?", default_no=True):
+        forced_lang = ask_language("Jazyk titulků (kód)", "cs") or None
+    replace = ask_yes_no("Přepsat původní video výsledným MKV? (jinak vedle jako <jméno>.muxed.mkv)", default_no=True)
+
+    print()
+    if not ask_yes_no(f"Spustit mux pro {len(pairs)} videí?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+
+    done = failed = 0
+    for v in sorted(pairs):
+        vp = Path(v)
+        sub_list = pairs[v]
+        metas = []
+        for s in sub_list:
+            lang3, name, forced = _parse_sub_meta(os.path.basename(s), forced_lang)
+            metas.append((s, lang3, name, forced))
+        chosen = None
+        if set_default and metas:
+            if default_lang:
+                dl = _canon3(default_lang)
+                for i, (_s, l3, _n, _f) in enumerate(metas):
+                    if l3 == dl:
+                        chosen = i
+                        break
+            if chosen is None:
+                chosen = 0
+        out_path = vp.with_suffix(".mkv") if replace else vp.with_name(vp.stem + ".muxed.mkv")
+        tmp_out = str(vp.with_name(vp.stem + ".muxing.tmp.mkv"))
+        cmd = [mm, "-o", tmp_out]
+        if chosen is not None:
+            for t in _mkv_probe_full(mm, v)["subs"]:
+                cmd += ["--default-track", f"{t['id']}:no"]
+        cmd += [str(v)]
+        for i, (subfile, lang3, name, forced) in enumerate(metas):
+            cmd += ["--language", f"0:{lang3}", "--track-name", f"0:{name}",
+                    "--default-track", "0:yes" if (chosen is not None and i == chosen) else "0:no",
+                    "--forced-track", "0:yes" if forced else "0:no", str(subfile)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode >= 2 or not os.path.exists(tmp_out):
+            tail = " | ".join([l for l in (res.stdout or "").splitlines() if l.strip()][-3:])
+            log_warn(f"{vp.name}: mkvmerge selhalo: {tail}")
+            failed += 1
+            try:
+                os.path.exists(tmp_out) and os.remove(tmp_out)
+            except OSError:
+                pass
+            continue
+        try:
+            if replace:
+                if vp.suffix.lower() != ".mkv":
+                    os.remove(str(v))  # původní mp4 nahrazujeme mkv
+                os.replace(tmp_out, str(out_path))
+            else:
+                os.replace(tmp_out, str(out_path))
+            log_done(f"{vp.name}: vloženo {len(metas)} titulků -> {out_path.name}")
+            done += 1
+        except OSError as e:
+            log_warn(f"{vp.name}: náhrada selhala: {e}")
+            failed += 1
+    print()
+    log_done(f"Hotovo: {done} videí, {failed} chyb.")
+
+
+# --------------------------------------------------------- remove tracks
+def run_remove_tracks(args):
+    """Odebere zvolené audio/titulkové stopy z MKV (mkvmerge -c copy)."""
+    directory = str(args.mkv) if args.mkv and args.mkv.is_dir() else "."
+    print(f"{Fore.MAGENTA}=== Odebrat audio/titulkové stopy z MKV ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
+    mm, me, mp = _ensure_mkv_tools(args, directory)
+    if not mm:
+        die("Nenašel jsem mkvmerge (MKVToolNix) ani se ho nepodařilo stáhnout.")
+
+    mkvs = [v for v in collect_videos(directory, recursive) if Path(v).suffix.lower() == ".mkv"]
+    if not mkvs:
+        die("Žádné .mkv soubory (tenhle režim umí jen Matroska).")
+    log_info(f"Nalezeno {len(mkvs)} MKV. Čtu stopy...")
+    infos = {v: _mkv_probe_full(mm, v) for v in mkvs}
+
+    def aggregate(kind):
+        counts, order = {}, []
+        for info in infos.values():
+            for tr in info[kind]:
+                l = tr["lang"]
+                if l not in counts:
+                    counts[l] = 0
+                    order.append(l)
+                counts[l] += 1
+        return [(l, counts[l]) for l in order]
+
+    def ask_remove_langs(kind_label, langs):
+        if not langs:
+            return set()
+        print(f"\n{Fore.CYAN}{kind_label}:{Style.RESET_ALL}")
+        for i, (l, n) in enumerate(langs, 1):
+            print(f"  {i}) {_lang3_name(l)}  ({n}×)")
+        print("  0) nic neodstraňovat")
+        raw = ask_text(f"Které {kind_label.lower()} ODSTRANIT (čísla/kódy, čárkou; 0=nic)", "0")
+        if raw.strip() in ("", "0"):
+            return set()
+        out = set()
+        for part in re.split(r"[,\s]+", raw.strip().lower()):
+            if not part:
+                continue
+            if part.isdigit() and 1 <= int(part) <= len(langs):
+                out.add(langs[int(part) - 1][0])
+            else:
+                cc = _canon3(part)
+                if cc in [l for l, _ in langs]:
+                    out.add(cc)
+        return out
+
+    a_langs = aggregate("audio")
+    s_langs = aggregate("subs")
+    rem_audio = ask_remove_langs("Audio jazyky", a_langs)
+    rem_subs = ask_remove_langs("Titulkové jazyky", s_langs)
+    if not rem_audio and not rem_subs:
+        log_warn("Nic k odstranění.")
+        return
+    replace = ask_yes_no("Přepsat originály? (jinak uložím do podsložky 'trimmed')", default_no=True)
+
+    print()
+    log_info("K odstranění -- audio: " + (",".join(_lang3_name(l) for l in rem_audio) or "nic")
+             + " | titulky: " + (",".join(_lang3_name(l) for l in rem_subs) or "nic"))
+    if not ask_yes_no(f"Spustit pro {len(mkvs)} MKV?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+
+    outdir = None
+    if not replace:
+        outdir = os.path.join(directory, "trimmed")
+        os.makedirs(outdir, exist_ok=True)
+
+    done = skipped = 0
+    for v in mkvs:
+        vp = Path(v)
+        info = infos[v]
+        a_all = [t["id"] for t in info["audio"]]
+        s_all = [t["id"] for t in info["subs"]]
+        a_keep = [t["id"] for t in info["audio"] if t["lang"] not in rem_audio]
+        s_keep = [t["id"] for t in info["subs"] if t["lang"] not in rem_subs]
+        if a_keep == a_all and s_keep == s_all:
+            log_info(f"{vp.name}: nic k odstranění - přeskakuji.")
+            skipped += 1
+            continue
+        if a_all and not a_keep:
+            log_warn(f"{vp.name}: odstranění by smazalo VŠECHNO audio - přeskakuji.")
+            skipped += 1
+            continue
+        out_path = vp if replace else Path(outdir) / vp.name
+        tmp_out = str(vp.with_name(vp.stem + ".trim.tmp.mkv"))
+        cmd = [mm, "-o", tmp_out]
+        if a_all and not a_keep:
+            cmd += ["--no-audio"]
+        elif a_keep and len(a_keep) < len(a_all):
+            cmd += ["--audio-tracks", ",".join(str(i) for i in a_keep)]
+        if s_all and not s_keep:
+            cmd += ["--no-subtitles"]
+        elif s_keep and len(s_keep) < len(s_all):
+            cmd += ["--subtitle-tracks", ",".join(str(i) for i in s_keep)]
+        cmd += [str(v)]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode >= 2 or not os.path.exists(tmp_out):
+            tail = " | ".join([l for l in (res.stdout or "").splitlines() if l.strip()][-3:])
+            log_warn(f"{vp.name}: mkvmerge selhalo: {tail}")
+            skipped += 1
+            try:
+                os.path.exists(tmp_out) and os.remove(tmp_out)
+            except OSError:
+                pass
+            continue
+        try:
+            os.replace(tmp_out, str(out_path))
+            log_done(f"{vp.name}: audio {len(a_keep)}/{len(a_all)}, titulky {len(s_keep)}/{len(s_all)} "
+                     f"-> {out_path.name if replace else 'trimmed/' + out_path.name}")
+            done += 1
+        except OSError as e:
+            log_warn(f"{vp.name}: náhrada selhala: {e}")
+            skipped += 1
+    print()
+    log_done(f"Hotovo: {done} MKV upraveno, {skipped} přeskočeno.")
+
+
+# ---------------------------------------------------- set default tracks
+def run_set_default(args):
+    """Nastaví výchozí (default) audio/titulkovou stopu podle jazyka. MKV přes
+    mkvpropedit (na místě), MP4 přes ffmpeg (přemux)."""
+    directory = str(args.mkv) if args.mkv and args.mkv.is_dir() else "."
+    print(f"{Fore.MAGENTA}=== Nastavit výchozí (default) stopu podle jazyka ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
+    mm, me, mp = _ensure_mkv_tools(args, directory, need_propedit=True)
+    if not mm:
+        die("Nenašel jsem mkvmerge (MKVToolNix) ani se ho nepodařilo stáhnout.")
+
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("Žádná videa (mkv/mp4) v adresáři.")
+    has_mp4 = any(Path(v).suffix.lower() == ".mp4" for v in videos)
+    ffmpeg_bin = None
+    if has_mp4:
+        ffmpeg_bin = getattr(args, "ffmpeg", None) or ensure_ffmpeg(directory, allow_download=not getattr(args, "no_ffmpeg_download", False))
+    log_info(f"Nalezeno {len(videos)} videí. Čtu stopy...")
+    infos = {v: _mkv_probe_full(mm, v) for v in videos}
+
+    def aggregate(kind):
+        counts, order = {}, []
+        for info in infos.values():
+            for tr in info[kind]:
+                l = tr["lang"]
+                if l not in counts:
+                    counts[l] = 0
+                    order.append(l)
+                counts[l] += 1
+        return [(l, counts[l]) for l in order]
+
+    def ask_lang(kind_label, langs, allow_none):
+        if not langs:
+            return "keep"
+        print(f"\n{Fore.CYAN}{kind_label}:{Style.RESET_ALL}")
+        for i, (l, n) in enumerate(langs, 1):
+            print(f"  {i}) {_lang3_name(l)}  ({n}×)")
+        extra = len(langs)
+        print(f"  {extra + 1}) neměnit")
+        if allow_none:
+            print(f"  {extra + 2}) žádná (zrušit všechny default flagy)")
+        raw = ask_text(f"Výchozí {kind_label.lower()} - vyber číslo nebo kód", str(extra + 1)).strip().lower()
+        if raw == str(extra + 1) or raw in ("keep", ""):
+            return "keep"
+        if allow_none and (raw == str(extra + 2) or raw == "none"):
+            return "none"
+        if raw.isdigit() and 1 <= int(raw) <= len(langs):
+            return langs[int(raw) - 1][0]
+        return _canon3(raw)
+
+    a_choice = ask_lang("Audio jazyk", aggregate("audio"), allow_none=False)
+    s_choice = ask_lang("Titulkový jazyk", aggregate("subs"), allow_none=True)
+    if a_choice == "keep" and s_choice == "keep":
+        log_warn("Nic k nastavení.")
+        return
+
+    print()
+    log_info(f"Výchozí audio: {a_choice} | výchozí titulky: {s_choice}")
+    if not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+
+    def desired_default(tracks, choice):
+        """Vrátí {sel/rel -> bool} co má být default (první stopa daného jazyka)."""
+        res = {}
+        if choice == "keep":
+            return None
+        picked = False
+        for tr in tracks:
+            want = False
+            if choice != "none" and not picked and tr["lang"] == choice:
+                want = True
+                picked = True
+            res[tr["id"]] = want
+        return res
+
+    done = failed = 0
+    for v in videos:
+        vp = Path(v)
+        info = infos[v]
+        a_want = desired_default(info["audio"], a_choice)
+        s_want = desired_default(info["subs"], s_choice)
+        if vp.suffix.lower() == ".mkv":
+            edits = []
+            for kind, want in (("audio", a_want), ("subs", s_want)):
+                if want is None:
+                    continue
+                for tr in info[kind]:
+                    d = want.get(tr["id"])
+                    if d is not None and bool(d) != bool(tr["default"]):
+                        edits += ["--edit", f"track:{tr['sel']}", "--set", f"flag-default={1 if d else 0}"]
+            if not edits:
+                log_info(f"{vp.name}: beze změny.")
+                continue
+            res = subprocess.run([mp, str(v)] + edits, capture_output=True, text=True)
+            if res.returncode >= 2:
+                log_warn(f"{vp.name}: mkvpropedit chyba.")
+                failed += 1
+            else:
+                log_done(f"{vp.name}: výchozí stopy nastaveny.")
+                done += 1
+        else:
+            if not ffmpeg_bin:
+                log_warn(f"{vp.name}: MP4 vyžaduje ffmpeg - přeskakuji.")
+                failed += 1
+                continue
+            disp = []
+            for kind, tkey, want in (("audio", "a", a_want), ("subs", "s", s_want)):
+                if want is None:
+                    continue
+                for rel, tr in enumerate(info[kind]):
+                    flags = []
+                    if want.get(tr["id"]):
+                        flags.append("default")
+                    if tr["forced"]:
+                        flags.append("forced")
+                    disp += [f"-disposition:{tkey}:{rel}", "+".join(flags) if flags else "0"]
+            tmp = str(v) + ".deftmp.mp4"
+            cmd = [ffmpeg_bin, "-y", "-i", str(v), "-map", "0", "-c", "copy"] + disp + ["-default_mode", "passthrough", tmp]
+            res = subprocess.run(cmd, capture_output=True, text=True)
+            if res.returncode != 0 or not os.path.exists(tmp):
+                log_warn(f"{vp.name}: ffmpeg chyba.")
+                failed += 1
+                if os.path.exists(tmp):
+                    try:
+                        os.remove(tmp)
+                    except OSError:
+                        pass
+                continue
+            try:
+                os.replace(tmp, str(v))
+                log_done(f"{vp.name}: výchozí stopy nastaveny (přemux).")
+                done += 1
+            except OSError as e:
+                log_warn(f"{vp.name}: náhrada selhala: {e}")
+                failed += 1
+    print()
+    log_done(f"Hotovo: {done} videí, {failed} chyb/přeskočeno.")
+
+
+# -------------------------------------------------------- rename subs
+def run_rename_subs(args):
+    """Přejmenuje titulky (.srt) podle názvů videí (párování přes SxxExx),
+    zachová jazykovou/forced koncovku."""
+    directory = str(args.mkv) if args.mkv and args.mkv.is_dir() else "."
+    print(f"{Fore.MAGENTA}=== Přejmenovat titulky podle názvů videí ==={Style.RESET_ALL}")
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
+
+    videos, subs = _collect_videos_subs(directory, recursive, sub_exts=(".srt",))
+    if not subs:
+        die("Žádné .srt titulky v adresáři.")
+    vmap = {}
+    for v in sorted(videos):
+        k = _episode_key(os.path.basename(v))
+        if k and k not in vmap:
+            vmap[k] = v
+
+    planned = []
+    used = {}
+    for s in sorted(subs):
+        sdir = os.path.dirname(s)
+        sname = os.path.basename(s)
+        k = _episode_key(sname)
+        if not k or k not in vmap:
+            continue
+        stem = sname[:-4]
+        parts = stem.split(".")
+        suffix = []
+        while parts and len(suffix) < 2 and (parts[-1].lower() in _FLAG_TOKENS or _LANG_TOKEN_RE.match(parts[-1])):
+            suffix.insert(0, parts.pop())
+        vstem = os.path.splitext(os.path.basename(vmap[k]))[0]
+        new_name = vstem + ("." + ".".join(suffix) if suffix else "") + ".srt"
+        dst = os.path.join(sdir, new_name)
+        if os.path.abspath(dst) == os.path.abspath(s) or dst in used or os.path.exists(dst):
+            continue
+        used[dst] = s
+        planned.append((s, dst))
+
+    if not planned:
+        log_warn("Nic k přejmenování (buď chybí SxxExx, videa, nebo už sedí).")
+        return
+    print(f"\nPlán přejmenování ({len(planned)}):")
+    for s, d in planned[:30]:
+        print(f"  {os.path.basename(s)}\n   -> {os.path.basename(d)}")
+    if len(planned) > 30:
+        print(f"  ... a další {len(planned) - 30}")
+    print()
+    if not ask_yes_no(f"Přejmenovat {len(planned)} titulků?", default_no=False):
+        log_warn("Zrušeno uživatelem.")
+        return
+    preset_flush_if_save()
+    done = 0
+    for s, d in planned:
+        try:
+            os.rename(s, d)
+            done += 1
+        except OSError as e:
+            log_warn(f"{os.path.basename(s)}: {e}")
+    log_done(f"Hotovo, přejmenováno {done} titulků.")
+
+
+
 def run_transplant(args):
     """Průvodce: nahradí STROJOVÝ překlad (dobré časování) PROFESIONÁLNÍM textem
     ze samostatného adresáře (jiná verze pořadu, jiné dělení epizod), časování
@@ -4758,8 +5506,13 @@ def run_master_wizard(args):
         ["Synchronizovat JEDNY titulky (špatně načasované) podle videa nebo druhých titulků",
          "Synchronizovat CELOU SLOŽKU (dávka videí + jejich titulky)",
          "Přeložit titulky z videa do jiného jazyka a uložit jako .srt",
+         "Vytáhnout (extrahovat) titulky z videí do .srt - vyber které stopy",
          "Nahradit STROJOVÝ překlad PROFESIONÁLNÍM (podle obsahu, časování zůstane)",
          "Přečasovat PROFESIONÁLNÍ titulky na MOJE časování (100% profi text)",
+         "Vložit (mux) titulky ze složky do videí (podle SxxExx)",
+         "Odebrat audio/titulkové stopy z MKV (podle jazyka)",
+         "Nastavit VÝCHOZÍ (default) stopu podle jazyka",
+         "Přejmenovat titulky podle názvů videí (SxxExx)",
          "Jen opravit ČITELNOST titulků (prodloužit příliš krátké)",
          "Nastavit API klíče a výchozí volby (config.json)",
          "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
@@ -4770,6 +5523,9 @@ def run_master_wizard(args):
               "Dávka celé složky: pro každé video v adresáři dopočítá časování k jeho titulkům.",
               "Překlad titulků: vytáhne stopu z videa nebo vezme existující .srt, přeloží do cílového "
               "jazyka (Gemini/Google/DeepL/Claude/Argos) + korektura, uloží <jméno>.<jazyk>.srt.",
+              "Extrakce titulků: z každého videa (mkv/mp4/...) vytáhne titulkové stopy do .srt. "
+              "Stopy se detekují přímo z videa; vybereš které (podle jazyka, konkrétní stopy, nebo "
+              "všechny textové). Obrázkové titulky (PGS/VobSub) nelze do textu.",
               "Nahradit strojový překlad profesionálním: máš vlastní/AI titulky s dobrým časováním a "
               "jinde profesionální překlad TÉŽE show (klidně jiná verze / jiný počet epizod). Podle "
               "OBSAHU spáruje řádky a dosadí profesionální text, ale ZACHOVÁ tvoje časování. Pokryje "
@@ -4778,29 +5534,64 @@ def run_master_wizard(args):
               "profesionální překlad z jiného adresáře a přečasuje ho na tvoje časování. Výsledek = "
               "100 % profesionálního textu se správným timingem. Nejlepší, když chceš profi titulky "
               "na svou verzi videa.",
-              "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa.",
+              "Vložit titulky do videí: .srt/.ass ze složky namuxuje do videí (párování přes SxxExx) "
+              "pomocí MKVToolNix. Nastaví jazyk, název stopy, forced a volitelně výchozí stopu. "
+              "Výstup je vždy MKV (i z MP4).",
+              "Odebrat stopy z MKV: ukáže jazyky audio/titulkových stop a vybereš, které vyhodit "
+              "(rychlý přemux -c copy). Originály se dají zachovat (podsložka 'trimmed').",
+              "Výchozí stopa: zruší staré default flagy a nastaví výchozí audio/titulky podle jazyka. "
+              "MKV na místě (mkvpropedit), MP4 přemuxem (ffmpeg).",
+              "Přejmenovat titulky: .srt přejmenuje podle názvu odpovídajícího videa (párování přes "
+              "SxxExx), zachová jazykovou/forced koncovku. Nejdřív ukáže plán.",
+              "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa. Když ve "
+              "složce nejsou .srt, nabídne extrakci z videí.",
               "Config: uloží API klíče a výchozí volby do config.json (načítá se automaticky).",
               "Test API: pošle triviální dotaz a vypíše přesnou odpověď/chybu (ladění např. HTTP 400)."])
 
-    if mode == 6:
+    if mode == 11:
         run_config(args)
         return
-    if mode == 7:
+    if mode == 12:
         run_test_api(args)
         return
-    if mode == 5:
+    if mode == 10:
         args.fix_readability = True
         run_fix_readability(args)
         return
-    if mode == 4:
+    if mode == 9:
+        args.rename_subs = True
+        preset_begin_offer("rename-subs", resolve_preset_path(args))
+        run_rename_subs(args)
+        return
+    if mode == 8:
+        args.set_default = True
+        preset_begin_offer("set-default", resolve_preset_path(args))
+        run_set_default(args)
+        return
+    if mode == 7:
+        args.remove_tracks = True
+        preset_begin_offer("remove-tracks", resolve_preset_path(args))
+        run_remove_tracks(args)
+        return
+    if mode == 6:
+        args.import_subs = True
+        preset_begin_offer("import-subs", resolve_preset_path(args))
+        run_import_subs(args)
+        return
+    if mode == 5:
         args.resync_pro = True
         preset_begin_offer("resync-pro", resolve_preset_path(args))
         run_resync_pro(args)
         return
-    if mode == 3:
+    if mode == 4:
         args.merge_pro = True
         preset_begin_offer("merge-pro", resolve_preset_path(args))
         run_transplant(args)
+        return
+    if mode == 3:
+        args.extract_subs = True
+        preset_begin_offer("extract-subs", resolve_preset_path(args))
+        run_extract_subs(args)
         return
 
     cmd = ["auto", "auto-all", "translate-subs"][mode]
@@ -5023,6 +5814,17 @@ RŮZNÉ JAZYKY (target vs reference):
     parser.add_argument("--resync-pro", action="store_true",
                         help="Interaktivní režim: OPAČNĚ - vezme profesionální titulky z jiného adresáře "
                              "a přečasuje je na tvoje časování (100%% profi text se správným timingem).")
+    parser.add_argument("--extract-subs", action="store_true",
+                        help="Interaktivní režim: vytáhne titulkové stopy z videí (mkv/mp4/...) do .srt; "
+                             "stopy detekuje z videa a vybíráš, které (podle jazyka / konkrétní / všechny).")
+    parser.add_argument("--import-subs", action="store_true",
+                        help="Interaktivní režim: vloží (mux) titulky ze složky do videí podle SxxExx (MKVToolNix).")
+    parser.add_argument("--remove-tracks", action="store_true",
+                        help="Interaktivní režim: odebere audio/titulkové stopy z MKV podle jazyka.")
+    parser.add_argument("--set-default", action="store_true",
+                        help="Interaktivní režim: nastaví výchozí (default) audio/titulkovou stopu podle jazyka.")
+    parser.add_argument("--rename-subs", action="store_true",
+                        help="Interaktivní režim: přejmenuje .srt podle názvů videí (párování SxxExx).")
     parser.add_argument("--sub-source", choices=["auto", "mt", "opensubtitles"], default="auto",
                          help="(--translate-subs) odkud vzít cílové titulky (default auto).")
     parser.add_argument("--deepl-key", default=None, help="API klíč pro DeepL (nebo proměnná DEEPL_API_KEY).")
@@ -5083,6 +5885,16 @@ RŮZNÉ JAZYKY (target vs reference):
                 run_transplant(args)
             elif cmd == "resync-pro":
                 run_resync_pro(args)
+            elif cmd == "extract-subs":
+                run_extract_subs(args)
+            elif cmd == "import-subs":
+                run_import_subs(args)
+            elif cmd == "remove-tracks":
+                run_remove_tracks(args)
+            elif cmd == "set-default":
+                run_set_default(args)
+            elif cmd == "rename-subs":
+                run_rename_subs(args)
             else:
                 die(f"Neznámý příkaz v presetu: {cmd}")
             return
@@ -5093,7 +5905,12 @@ RŮZNÉ JAZYKY (target vs reference):
     interactive_cmd = ("auto-all" if args.auto_all else "auto" if args.auto
                        else "translate-subs" if args.translate_subs
                        else "merge-pro" if args.merge_pro
-                       else "resync-pro" if args.resync_pro else None)
+                       else "resync-pro" if args.resync_pro
+                       else "extract-subs" if args.extract_subs
+                       else "import-subs" if args.import_subs
+                       else "remove-tracks" if args.remove_tracks
+                       else "set-default" if args.set_default
+                       else "rename-subs" if args.rename_subs else None)
     if args.save and args.load:
         die("--save a --load nelze kombinovat.")
     if args.save and not interactive_cmd:
@@ -5125,6 +5942,16 @@ RŮZNÉ JAZYKY (target vs reference):
             run_transplant(args)
         elif interactive_cmd == "resync-pro":
             run_resync_pro(args)
+        elif interactive_cmd == "extract-subs":
+            run_extract_subs(args)
+        elif interactive_cmd == "import-subs":
+            run_import_subs(args)
+        elif interactive_cmd == "remove-tracks":
+            run_remove_tracks(args)
+        elif interactive_cmd == "set-default":
+            run_set_default(args)
+        elif interactive_cmd == "rename-subs":
+            run_rename_subs(args)
         preset_flush_if_save()
         return
 
@@ -5142,6 +5969,21 @@ RŮZNÉ JAZYKY (target vs reference):
         return
     if args.resync_pro:
         run_resync_pro(args)
+        return
+    if args.extract_subs:
+        run_extract_subs(args)
+        return
+    if args.import_subs:
+        run_import_subs(args)
+        return
+    if args.remove_tracks:
+        run_remove_tracks(args)
+        return
+    if args.set_default:
+        run_set_default(args)
+        return
+    if args.rename_subs:
+        run_rename_subs(args)
         return
 
     if args.all and args.fix_readability:
