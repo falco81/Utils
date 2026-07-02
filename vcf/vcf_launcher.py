@@ -769,12 +769,15 @@ def _pick_vcfops_candidates(tiles: list[dict],
 def discover_components(client: SDDCClient) -> list[dict]:
     """
     Query SDDC Manager API and return a list of component tiles.
-    Each tile: {name, url, category, icon, description, order}
+    Each tile: {name, url, category, icon, description, order, instance}
 
     Every discovery block is wrapped in try/except so a single unexpected
     response cannot break the rest of the discovery.
     """
     tiles: list[dict] = []
+    # VCF 9.1 federation: one fleet may manage multiple VCF instances.
+    # Populated by _vsp() from /v1/vsp-clusters response.
+    _instances: list[dict] = []
 
     def _safe(label: str, fn):
         try:
@@ -825,32 +828,49 @@ def discover_components(client: SDDCClient) -> list[dict]:
             log.info("  %d vCenter Server(s)", len(vcs.get("elements") or []))
     _safe("vCenters", _vcenters)
 
-    # --- NSX Managers (VIP + individual nodes) ---
+    # --- NSX Managers (VIP + individual nodes consolidated into one tile) ---
     def _nsx():
         nsx = client.get("/v1/nsxt-clusters")
         if nsx:
             for el in nsx.get("elements") or []:
                 vip = el.get("vipFqdn") or el.get("vip")
+                node_entries: list[dict] = []
+                for node in el.get("nodes") or []:
+                    nfqdn = node.get("fqdn")
+                    if nfqdn and nfqdn != vip:
+                        node_entries.append({
+                            "name": _short_name(nfqdn).upper(),
+                            "url": f"https://{nfqdn}/",
+                            "type": "manager node",
+                        })
+
                 if vip:
-                    tiles.append({
+                    tile = {
                         "name": f"NSX Manager {_short_name(vip).upper()}",
                         "url": f"https://{vip}/",
                         "category": "Networking",
                         "icon": "nsx",
                         "description": f"Cluster VIP - v{el.get('version', '?')}",
                         "order": 20,
-                    })
-                for node in el.get("nodes") or []:
-                    nfqdn = node.get("fqdn")
-                    if nfqdn and nfqdn != vip:
-                        tiles.append({
-                            "name": f"NSX Node {_short_name(nfqdn).upper()}",
-                            "url": f"https://{nfqdn}/",
-                            "category": "Networking",
-                            "icon": "nsx",
-                            "description": "NSX Manager node",
-                            "order": 21,
-                        })
+                    }
+                    if node_entries:
+                        tile["nodes"] = node_entries
+                    tiles.append(tile)
+                elif node_entries:
+                    # No VIP but nodes exist: promote first node to primary
+                    first = node_entries[0]
+                    rest = node_entries[1:]
+                    tile = {
+                        "name": f"NSX Manager {first['name']}",
+                        "url": first["url"],
+                        "category": "Networking",
+                        "icon": "nsx",
+                        "description": f"NSX cluster - v{el.get('version', '?')}",
+                        "order": 20,
+                    }
+                    if rest:
+                        tile["nodes"] = rest
+                    tiles.append(tile)
             log.info("  %d NSX cluster(s)", len(nsx.get("elements") or []))
     _safe("NSX clusters", _nsx)
 
@@ -911,31 +931,65 @@ def discover_components(client: SDDCClient) -> list[dict]:
     _safe("Backup config", _backup)
 
     # --- VCF 9.1 VCFMS containerized services ---
+    # In VCF 9.1 federation model:
+    #   fleetFqdn    -> SHARED across all VCF instances (fleet-level services)
+    #   instanceFqdn -> per-VCF-instance (instance-level services)
+    #   platformFqdn -> per-VCF-instance (VCF Services Runtime)
+    # /v1/vsp-clusters may return multiple elements in federation setups,
+    # each element being one VCF instance under the same fleet.
     def _vsp():
         vsp = client.get("/v1/vsp-clusters")
-        if vsp:
-            clusters = vsp.get("elements") if isinstance(vsp, dict) else vsp
-            if isinstance(clusters, list):
-                for c in clusters:
-                    spec = c.get("spec") or c
-                    for key, label, icon, desc in [
-                        ("platformFqdn", "VCFMS Platform", "vcfms-platform",
-                         "VCF Services Runtime"),
-                        ("instanceFqdn", "VCFMS Instance", "vcfms-instance",
-                         "VCFMS Instance Component"),
-                        ("fleetFqdn", "VCFMS Fleet", "vcfms-fleet",
-                         "VCFMS Fleet Component"),
-                    ]:
-                        fqdn = spec.get(key)
-                        if fqdn:
-                            tiles.append({
-                                "name": f"{label} {_short_name(fqdn).upper()}",
-                                "url": f"https://{fqdn}/",
-                                "category": "Management",
-                                "icon": icon,
-                                "description": desc,
-                                "order": 50,
-                            })
+        if not vsp:
+            return
+        clusters = vsp.get("elements") if isinstance(vsp, dict) else vsp
+        if not isinstance(clusters, list):
+            return
+
+        # First pass: collect instance names (used later for tagging)
+        for c in clusters:
+            spec = c.get("spec") or c
+            plat = spec.get("platformFqdn")
+            inst = spec.get("instanceFqdn")
+            flt  = spec.get("fleetFqdn")
+            # Instance name preference: explicit name > short of instanceFqdn > platformFqdn
+            iname = (spec.get("name")
+                     or c.get("name")
+                     or (_short_name(inst) if inst else None)
+                     or (_short_name(plat) if plat else None)
+                     or "primary")
+            iname = str(iname).upper()
+            _instances.append({
+                "name": iname,
+                "platformFqdn": plat,
+                "instanceFqdn": inst,
+                "fleetFqdn": flt,
+            })
+
+            # Instance-specific tiles
+            if plat:
+                tiles.append({
+                    "name": f"VCFMS Platform {_short_name(plat).upper()}",
+                    "url": f"https://{plat}/", "category": "Management",
+                    "icon": "vcfms-platform",
+                    "description": "VCF Services Runtime",
+                    "order": 50, "instance": iname,
+                })
+            if inst:
+                tiles.append({
+                    "name": f"VCFMS Instance {_short_name(inst).upper()}",
+                    "url": f"https://{inst}/", "category": "Management",
+                    "icon": "vcfms-instance",
+                    "description": "VCFMS Instance Component (SDDC LCM, Salt master, telemetry)",
+                    "order": 51, "instance": iname,
+                })
+            if flt:
+                tiles.append({
+                    "name": f"VCFMS Fleet {_short_name(flt).upper()}",
+                    "url": f"https://{flt}/", "category": "Management",
+                    "icon": "vcfms-fleet",
+                    "description": "VCFMS Fleet Component (fleet LCM, Salt RaaS, depot)",
+                    "order": 52, "instance": "Fleet",   # shared across instances
+                })
     _safe("VCFMS clusters", _vsp)
 
     # --- VCF Management Components (from deployment task, VCF 9.x) ---
@@ -1044,32 +1098,34 @@ def discover_components(client: SDDCClient) -> list[dict]:
                                           "COMPLETED", "ACTIVE", "OK", ""):
                 desc_full = f"{desc} ({status})"
 
-            tiles.append({
+            tile = {
                 "name": f"{label} {_short_name(primary_fqdn).upper()}",
                 "url": f"https://{primary_fqdn}/",
                 "category": category,
                 "icon": icon,
                 "description": desc_full,
                 "order": order,
-            })
-            added += 1
+            }
 
-            # Also emit tile per node when VCF Ops HA cluster has separate FQDNs
+            # Consolidate HA cluster nodes into the same tile - they become
+            # advanced click-through targets instead of separate tiles
+            node_entries: list[dict] = []
             for node in nodes:
                 if not isinstance(node, dict):
                     continue
                 nfqdn = node.get("fqdn") or node.get("hostname")
                 if nfqdn and nfqdn != primary_fqdn:
                     ntype = node.get("type", "node")
-                    tiles.append({
-                        "name": f"{label} node {_short_name(nfqdn).upper()}",
+                    node_entries.append({
+                        "name": _short_name(nfqdn).upper(),
                         "url": f"https://{nfqdn}/",
-                        "category": category,
-                        "icon": icon,
-                        "description": f"{label} {ntype} node",
-                        "order": order + 1,
+                        "type": str(ntype),
                     })
-                    added += 1
+            if node_entries:
+                tile["nodes"] = node_entries
+
+            tiles.append(tile)
+            added += 1 + len(node_entries)
 
         if added:
             log.info("  %d VCF Management Component tile(s)", added)
@@ -1164,32 +1220,33 @@ def discover_components(client: SDDCClient) -> list[dict]:
                                              "COMPLETED", "ACTIVE", "OK"):
                     desc_full = f"{desc} ({status})"
 
-                tiles.append({
+                tile = {
                     "name": f"{label} {short}",
                     "url": f"https://{fqdn}/",
                     "category": category,
                     "icon": icon,
                     "description": desc_full,
                     "order": 35,
-                })
-                found_count += 1
+                }
 
-                # Also emit tiles for each individual node when the response
-                # has multiple nodes (e.g. VCF Ops HA cluster)
+                # Consolidate HA nodes into the same tile
+                node_entries: list[dict] = []
                 nodes = item.get("nodes") or []
                 for node in nodes:
                     if not isinstance(node, dict):
                         continue
                     nfqdn = node.get("fqdn") or node.get("hostname")
                     if nfqdn and nfqdn != fqdn:
-                        tiles.append({
-                            "name": f"{label} node {_short_name(nfqdn).upper()}",
+                        node_entries.append({
+                            "name": _short_name(nfqdn).upper(),
                             "url": f"https://{nfqdn}/",
-                            "category": category,
-                            "icon": icon,
-                            "description": f"{label} {node.get('type', 'node')}",
-                            "order": 36,
+                            "type": str(node.get("type", "node")),
                         })
+                if node_entries:
+                    tile["nodes"] = node_entries
+
+                tiles.append(tile)
+                found_count += 1 + len(node_entries)
         if found_count:
             log.info("  %d VCF 9.x fleet component(s) via singleton endpoints",
                      found_count)
@@ -1294,6 +1351,49 @@ def discover_components(client: SDDCClient) -> list[dict]:
             log.info("  %d Aria / vRealize product(s): %s",
                      len(found), ", ".join(sorted(found.keys())))
     _safe("Aria / vRealize products", _aria)
+
+    # --- Post-process: tag every tile with the VCF instance it belongs to ---
+    # Priority when deciding a tile's instance:
+    #   1. Tile already has explicit 'instance' (set by discovery block above)
+    #   2. Match tile URL hostname against known instanceFqdn/platformFqdn
+    #   3. Domain-suffix match against known instance FQDNs
+    #   4. If only one instance detected, use its name
+    #   5. Fallback: "primary" (single-instance) or "" (unknown)
+    def _url_host(url: str) -> str:
+        if not url or "://" not in url:
+            return ""
+        return url.split("://", 1)[1].rstrip("/").split("/", 1)[0]
+
+    def _pick_instance(tile: dict) -> str:
+        if tile.get("instance"):
+            return tile["instance"]
+        host = _url_host(tile.get("url", "")).lower()
+        if not host or not _instances:
+            return _instances[0]["name"] if len(_instances) == 1 else ""
+        # Exact FQDN match against instance/platform/fleet
+        for inst in _instances:
+            for key in ("instanceFqdn", "platformFqdn", "fleetFqdn"):
+                v = inst.get(key)
+                if v and v.lower() == host:
+                    return "Fleet" if key == "fleetFqdn" else inst["name"]
+        # Domain-suffix heuristic - group tiles that share a domain with an instance
+        for inst in _instances:
+            # Longest matching suffix wins
+            for key in ("instanceFqdn", "platformFqdn"):
+                v = inst.get(key)
+                if not v:
+                    continue
+                # Use parent domain (drop the leftmost host label)
+                parts = v.lower().split(".", 1)
+                if len(parts) > 1 and host.endswith("." + parts[1]):
+                    return inst["name"]
+        # Single instance detected but no match - assume same instance
+        if len(_instances) == 1:
+            return _instances[0]["name"]
+        return ""
+
+    for t in tiles:
+        t["instance"] = _pick_instance(t)
 
     # --- Deduplicate by URL, keep first ---
     seen: set[str] = set()
@@ -1581,20 +1681,75 @@ def render_html(tiles: list[dict], sddc_host: str, vcf_version: str) -> str:
         name = _html_escape(t["name"])
         desc = _html_escape(t.get("description", ""))
         url = _html_escape(t["url"])
+        instance = t.get("instance", "") or ""
+        instance_e = _html_escape(instance)
+        nodes = t.get("nodes") or []
+
+        # Search text includes node FQDNs + instance name so all bits are findable
+        search_bits = [name.lower(), desc.lower(), instance_e.lower(),
+                       cat.lower()]
+        for n in nodes:
+            search_bits.append(_html_escape(n.get("name", "")).lower())
+        search_key = " ".join(search_bits)
+
+        star_btn = (
+            f'<button class="star" data-url="{url}" title="Bookmark" aria-label="Bookmark">'
+            f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">'
+            f'<path d="M12 17.3l-6.2 3.5 1.6-7L2 9l7.1-0.6L12 2l2.9 6.4L22 9l-5.4 4.8 1.6 7z"/>'
+            f'</svg></button>'
+        )
+
+        # Small badge showing instance (top-left corner), only if instance name set
+        instance_badge = ""
+        if instance:
+            instance_badge = (
+                f'<span class="instance-badge" '
+                f'title="VCF instance: {instance_e}">{instance_e}</span>'
+            )
+
+        # Optional node-menu button + node list (hidden by default, toggled by JS)
+        nodes_ui = ""
+        if nodes:
+            node_items = "".join(
+                f'<a class="node-item" href="{_html_escape(n["url"])}" '
+                f'target="_blank" rel="noopener noreferrer">'
+                f'<span class="node-name">{_html_escape(n["name"])}</span>'
+                f'<span class="node-type">{_html_escape(n.get("type", "node"))}</span>'
+                f'</a>'
+                for n in nodes
+            )
+            nodes_ui = (
+                f'<button class="nodes-btn" '
+                f'title="Show cluster nodes ({len(nodes)})" '
+                f'aria-label="Show nodes" '
+                f'data-count="{len(nodes)}">'
+                f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+                f'stroke-width="2"><circle cx="5" cy="12" r="1.6"/>'
+                f'<circle cx="12" cy="12" r="1.6"/>'
+                f'<circle cx="19" cy="12" r="1.6"/></svg>'
+                f'<span class="nodes-badge">{len(nodes)}</span>'
+                f'</button>'
+                f'<div class="nodes-menu" role="menu">'
+                f'<div class="nodes-menu-header">Cluster nodes</div>'
+                f'{node_items}'
+                f'</div>'
+            )
+
         return (
-            f'<a class="tile" href="{url}" target="_blank" rel="noopener noreferrer" '
-            f'data-cat="{_html_escape(cat)}" data-name="{name.lower()}">'
+            f'<div class="tile-wrap" data-cat="{_html_escape(cat)}" '
+            f'data-instance="{instance_e}" '
+            f'data-name="{search_key}">'
+            f'<a class="tile" href="{url}" target="_blank" rel="noopener noreferrer">'
             f'<div class="tile-icon" style="color:{color}">{icon_svg}</div>'
             f'<div class="tile-body">'
             f'<div class="tile-name">{name}</div>'
             f'<div class="tile-desc">{desc}</div>'
             f'</div>'
-            f'<button class="star" data-url="{url}" title="Bookmark" aria-label="Bookmark">'
-            f'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6">'
-            f'<path d="M12 17.3l-6.2 3.5 1.6-7L2 9l7.1-0.6L12 2l2.9 6.4L22 9l-5.4 4.8 1.6 7z"/>'
-            f'</svg>'
-            f'</button>'
             f'</a>'
+            f'{instance_badge}'
+            f'{star_btn}'
+            f'{nodes_ui}'
+            f'</div>'
         )
 
     grid_sections = []
@@ -1706,32 +1861,90 @@ main {{ padding: 24px 32px 48px; overflow-x: hidden; }}
 .section-title .count {{ background: var(--surface-2); color: var(--text-2);
   font-size: 10px; padding: 1px 6px; border-radius: 8px; letter-spacing: 0; }}
 
-.grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
-  gap: 14px; }}
-.tile {{ background: var(--surface); border: 1px solid var(--border);
-  border-radius: 8px; padding: 16px; display: flex; align-items: center;
-  gap: 14px; transition: all 0.15s ease; cursor: pointer;
-  position: relative; min-height: 76px; }}
-.tile:hover {{ border-color: var(--accent); transform: translateY(-1px);
-  box-shadow: var(--shadow); }}
+.grid {{ display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  grid-auto-rows: 1fr;
+  gap: 14px; align-items: stretch; }}
+.tile-wrap {{ position: relative; display: flex;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  min-height: 88px; height: 100%; }}
+.tile-wrap:hover {{ border-color: var(--accent);
+  box-shadow: var(--shadow), 0 0 0 1px var(--accent); }}
+.tile {{ flex: 1; display: flex; align-items: center; gap: 14px;
+  padding: 16px 44px 16px 16px;
+  text-decoration: none; color: inherit; min-width: 0; }}
 .tile-icon {{ flex-shrink: 0; width: 44px; height: 44px;
   display: flex; align-items: center; justify-content: center;
   background: var(--surface-2); border-radius: 8px; }}
 .tile-icon svg {{ width: 24px; height: 24px; }}
-.tile-body {{ min-width: 0; flex: 1; }}
+.tile-body {{ flex: 1; min-width: 0; }}
 .tile-name {{ font-size: 13px; font-weight: 500; color: var(--text);
-  line-height: 1.35;
-  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-  overflow: hidden; word-break: break-word; }}
+  line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }}
 .tile-desc {{ font-size: 11px; color: var(--text-2); margin-top: 3px;
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+  line-height: 1.35; word-break: break-word; overflow-wrap: anywhere; }}
+
+/* --- cluster node dropdown --- */
+.nodes-btn {{ position: absolute; bottom: 8px; right: 8px;
+  background: var(--surface-2); border: 1px solid var(--border);
+  border-radius: 4px; color: var(--text-2); padding: 2px 6px;
+  cursor: pointer; display: flex; align-items: center; gap: 4px;
+  font-size: 10px; font-weight: 500; opacity: 0.85;
+  transition: all 0.15s ease; }}
+.nodes-btn:hover {{ color: var(--accent); border-color: var(--accent);
+  opacity: 1; }}
+.nodes-btn svg {{ width: 14px; height: 14px; }}
+.nodes-badge {{ line-height: 1; }}
+.nodes-menu {{ position: fixed; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow), 0 4px 12px rgba(0, 0, 0, 0.15);
+  min-width: 260px; max-width: 480px; z-index: 9999; padding: 6px;
+  display: none; }}
+.nodes-menu.open {{ display: block; }}
+.nodes-menu-header {{ font-size: 10px; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--text-2); padding: 6px 10px 4px;
+  border-bottom: 1px solid var(--border); margin-bottom: 4px; }}
+.node-item {{ display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; padding: 8px 10px; border-radius: 4px;
+  text-decoration: none; color: var(--text); font-size: 12px;
+  transition: background 0.1s; }}
+.node-item:hover {{ background: var(--surface-2); color: var(--accent); }}
+.node-name {{ font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  font-size: 11px; }}
+.node-type {{ font-size: 10px; color: var(--text-2);
+  text-transform: uppercase; letter-spacing: 0.5px; }}
+
 .star {{ position: absolute; top: 8px; right: 8px; background: transparent;
   border: none; color: var(--text-2); padding: 3px; cursor: pointer;
-  opacity: 0; transition: opacity 0.15s; border-radius: 4px; }}
+  opacity: 0; transition: opacity 0.15s; border-radius: 4px; z-index: 10; }}
 .star:hover {{ background: var(--surface-2); color: var(--accent); }}
 .star svg {{ width: 14px; height: 14px; }}
-.tile:hover .star, .star.starred {{ opacity: 1; }}
+.tile-wrap:hover .star, .star.starred {{ opacity: 1; }}
 .star.starred {{ color: #f7a400; }}
+
+/* --- instance badge on tile --- */
+.instance-badge {{ position: absolute; top: 8px; left: 8px;
+  background: var(--surface-2); color: var(--text-2);
+  border: 1px solid var(--border); border-radius: 4px;
+  padding: 2px 6px; font-size: 9px; font-weight: 600;
+  letter-spacing: 0.4px; text-transform: uppercase;
+  pointer-events: auto; z-index: 5; font-family: ui-monospace, monospace; }}
+
+/* --- instance filter chips row (above the grid) --- */
+.instance-filter {{ display: flex; flex-wrap: wrap; gap: 6px;
+  padding: 12px 0 4px; align-items: center; }}
+.instance-filter-label {{ font-size: 11px; text-transform: uppercase;
+  letter-spacing: 0.5px; color: var(--text-2); margin-right: 8px; }}
+.instance-chip {{ display: inline-flex; align-items: center; gap: 6px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; padding: 3px 10px; font-size: 11px;
+  color: var(--text); cursor: pointer; transition: all 0.15s ease;
+  font-family: ui-monospace, monospace; }}
+.instance-chip:hover {{ border-color: var(--accent); color: var(--accent); }}
+.instance-chip.active {{ background: var(--accent); color: white;
+  border-color: var(--accent); }}
+.instance-chip .chip-count {{ opacity: 0.7; font-size: 10px; }}
+.instance-chip.active .chip-count {{ opacity: 1; }}
 
 .empty {{ text-align: center; padding: 60px 24px; color: var(--text-2); }}
 .empty h3 {{ font-weight: 500; margin: 0 0 8px; color: var(--text); }}
@@ -1762,6 +1975,10 @@ footer.foot {{ padding: 24px 32px; text-align: center; color: var(--text-2);
     <ul id="cats"></ul>
   </nav>
   <main id="main">
+    <div class="instance-filter" id="instance-filter" style="display:none">
+      <span class="instance-filter-label">Instances:</span>
+      <span id="instance-chips"></span>
+    </div>
     {grid_sections}
     <div class="empty" id="empty" style="display:none">
       <h3>No matching tiles</h3>
@@ -1794,10 +2011,10 @@ footer.foot {{ padding: 24px 32px; text-align: center; color: var(--text-2);
       li.textContent = c;
       var count = 0;
       if (c === 'All') {{
-        count = document.querySelectorAll('.tile').length;
+        count = document.querySelectorAll('.tile-wrap').length;
       }} else {{
         var sec = document.querySelector('.grid-section[data-section="'+c+'"]');
-        if (sec) count = sec.querySelectorAll('.tile').length;
+        if (sec) count = sec.querySelectorAll('.tile-wrap').length;
       }}
       var badge = document.createElement('span');
       badge.className = 'cat-count';
@@ -1811,16 +2028,62 @@ footer.foot {{ padding: 24px 32px; text-align: center; color: var(--text-2);
 
   var activeCat = 'All';
   var query = '';
+  var activeInstance = 'All';
+
+  // --- Build instance filter chips based on tile data-instance attributes ---
+  var instanceFilter = document.getElementById('instance-filter');
+  var instanceChips = document.getElementById('instance-chips');
+  var allTileWraps = Array.from(document.querySelectorAll('.tile-wrap'));
+  var instanceCounts = {{}};
+  allTileWraps.forEach(function(t) {{
+    var i = t.dataset.instance || '';
+    if (i) instanceCounts[i] = (instanceCounts[i] || 0) + 1;
+  }});
+  var instanceNames = Object.keys(instanceCounts).sort(function(a, b) {{
+    // Sort "Fleet" (shared) last, then alphabetical
+    if (a === 'Fleet') return 1;
+    if (b === 'Fleet') return -1;
+    return a.localeCompare(b);
+  }});
+  // Only show filter row when >1 distinct instance detected (single-instance
+  // deployments don't need the extra UI)
+  if (instanceNames.length > 1) {{
+    instanceFilter.style.display = '';
+    var allChip = document.createElement('span');
+    allChip.className = 'instance-chip active';
+    allChip.dataset.instance = 'All';
+    allChip.innerHTML = 'All <span class="chip-count">' + allTileWraps.length + '</span>';
+    instanceChips.appendChild(allChip);
+    instanceNames.forEach(function(name) {{
+      var chip = document.createElement('span');
+      chip.className = 'instance-chip';
+      chip.dataset.instance = name;
+      chip.innerHTML = name + ' <span class="chip-count">' + instanceCounts[name] + '</span>';
+      instanceChips.appendChild(chip);
+    }});
+    Array.from(instanceChips.querySelectorAll('.instance-chip')).forEach(function(chip) {{
+      chip.addEventListener('click', function() {{
+        activeInstance = chip.dataset.instance;
+        Array.from(instanceChips.querySelectorAll('.instance-chip')).forEach(function(c) {{
+          c.classList.toggle('active', c === chip);
+        }});
+        apply();
+      }});
+    }});
+  }}
 
   function apply() {{
     var anyVisible = false;
     sections.forEach(function(sec) {{
       var showSection = (activeCat === 'All' || activeCat === sec.dataset.section);
-      var tiles = sec.querySelectorAll('.tile');
+      var tiles = sec.querySelectorAll('.tile-wrap');
       var sectionHasMatch = false;
       tiles.forEach(function(t) {{
         var matches = !query || t.dataset.name.indexOf(query) !== -1;
-        var show = showSection && matches;
+        var instanceMatches = (activeInstance === 'All' ||
+                               t.dataset.instance === activeInstance ||
+                               t.dataset.instance === 'Fleet');
+        var show = showSection && matches && instanceMatches;
         t.style.display = show ? '' : 'none';
         if (show) sectionHasMatch = true;
       }});
@@ -1866,6 +2129,60 @@ footer.foot {{ padding: 24px 32px; text-align: center; color: var(--text-2);
       catch(err) {{}}
     }});
   }});
+
+  // Cluster-node dropdown menus (portal-style: menu is moved to <body>
+  // on first open so it escapes any parent stacking context / clipping).
+  function closeAllMenus() {{
+    document.querySelectorAll('.nodes-menu.open').forEach(function(m) {{
+      m.classList.remove('open');
+    }});
+  }}
+  function positionMenu(menu, btn) {{
+    // First display the menu invisibly to measure its size
+    menu.style.visibility = 'hidden';
+    menu.classList.add('open');
+    var bRect = btn.getBoundingClientRect();
+    var mRect = menu.getBoundingClientRect();
+    var vw = window.innerWidth;
+    var vh = window.innerHeight;
+    // Prefer below-and-right of button; flip if it would overflow
+    var left = bRect.right - mRect.width;
+    if (left < 8) left = bRect.left;
+    if (left + mRect.width > vw - 8) left = vw - mRect.width - 8;
+    var top = bRect.bottom + 6;
+    if (top + mRect.height > vh - 8) {{
+      // Not enough room below - place above
+      top = bRect.top - mRect.height - 6;
+      if (top < 8) top = 8;
+    }}
+    menu.style.left = left + 'px';
+    menu.style.top = top + 'px';
+    menu.style.visibility = '';
+  }}
+  document.querySelectorAll('.nodes-btn').forEach(function(btn) {{
+    var wrap = btn.parentElement;
+    var menu = wrap.querySelector('.nodes-menu');
+    if (!menu) return;
+    // Move menu to <body> so no ancestor can clip or stack over it
+    document.body.appendChild(menu);
+    btn.addEventListener('click', function(e) {{
+      e.preventDefault();
+      e.stopPropagation();
+      var wasOpen = menu.classList.contains('open');
+      closeAllMenus();
+      if (!wasOpen) positionMenu(menu, btn);
+    }});
+  }});
+  document.addEventListener('click', function(e) {{
+    if (!e.target.closest('.nodes-menu') && !e.target.closest('.nodes-btn')) {{
+      closeAllMenus();
+    }}
+  }});
+  document.addEventListener('keydown', function(e) {{
+    if (e.key === 'Escape') closeAllMenus();
+  }});
+  window.addEventListener('scroll', closeAllMenus, true);
+  window.addEventListener('resize', closeAllMenus);
 
   apply();
 }})();
@@ -1914,14 +2231,34 @@ def load_config(path: str) -> tuple[list[dict], str, str]:
             continue
         if not t.get("url") or not t.get("name"):
             continue
-        clean.append({
+        entry: dict = {
             "name": t["name"],
             "url": t["url"],
             "category": t.get("category") or "Websites",
             "icon": t.get("icon") or "generic",
             "description": t.get("description") or "",
             "order": t.get("order", 99),
-        })
+            "instance": t.get("instance", ""),
+        }
+        # Preserve optional advanced-links list (HA cluster nodes etc.)
+        raw_nodes = t.get("nodes")
+        if isinstance(raw_nodes, list) and raw_nodes:
+            clean_nodes: list[dict] = []
+            for n in raw_nodes:
+                if not isinstance(n, dict):
+                    continue
+                nurl = n.get("url")
+                nname = n.get("name")
+                if not nurl or not nname:
+                    continue
+                clean_nodes.append({
+                    "name": nname,
+                    "url": nurl,
+                    "type": n.get("type", "node"),
+                })
+            if clean_nodes:
+                entry["nodes"] = clean_nodes
+        clean.append(entry)
     sddc_host = data.get("sddc_host") or "manual-config"
     vcf_version = data.get("vcf_version") or "custom"
     return clean, sddc_host, vcf_version
