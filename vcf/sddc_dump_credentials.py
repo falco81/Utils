@@ -1096,6 +1096,95 @@ class SDDCClient:
             page += 1
         return all_creds
 
+    def get_roles(self) -> dict[str, dict]:
+        """GET /v1/roles - returns {roleId: roleObject} for name lookup."""
+        try:
+            r = self._authed_request("GET", "/v1/roles")
+            elements = r.json().get("elements") or []
+            return {role.get("id"): role for role in elements if role.get("id")}
+        except Exception as e:
+            log.warning("Could not fetch /v1/roles: %s", e)
+            return {}
+
+    def get_users(self) -> list[dict]:
+        """
+        GET /v1/users - list all users/groups/service accounts and their roles.
+
+        This is what you need to troubleshoot PERMISSION_NOT_FOUND / 401 on
+        /v1/tokens: an account can authenticate but still be rejected if it has
+        no role mapping in SDDC Manager. Each returned record is enriched with
+        the resolved role name (ADMIN / OPERATOR / VIEWER) so you can
+        immediately spot who is missing a role.
+        """
+        roles = self.get_roles()
+        if roles:
+            log.info("Fetched %d role definition(s): %s", len(roles),
+                     ", ".join(sorted(r.get("name", "?")
+                                      for r in roles.values())))
+
+        all_users: list[dict] = []
+        page = 0
+        while True:
+            params: dict[str, Any] = {"pageNumber": page, "pageSize": 200}
+            r = self._authed_request("GET", "/v1/users", params=params)
+            body = r.json()
+            elements = body.get("elements") or []
+
+            # Enrich each record with a resolved, human-readable role name.
+            for u in elements:
+                role_ref = u.get("role") or {}
+                role_id = role_ref.get("id")
+                # Some versions already inline the role name; keep it if present
+                resolved = role_ref.get("name")
+                if not resolved and role_id and role_id in roles:
+                    resolved = roles[role_id].get("name")
+                u["resolvedRoleName"] = resolved or "(no role)"
+
+            all_users.extend(elements)
+
+            meta = body.get("pageMetadata") or {}
+            total_pages = meta.get("totalPages", 1)
+            log.info("  page %d/%d, users: %d (total so far: %d)",
+                     page + 1, total_pages, len(elements), len(all_users))
+
+            if not elements or page + 1 >= total_pages:
+                break
+            page += 1
+        return all_users
+
+
+def print_users_table(users: list[dict]) -> None:
+    """Pretty-print users to stderr so it's visible even when JSON is piped."""
+    if not users:
+        sys.stderr.write(C("No users returned.\n", Fore.YELLOW))
+        return
+
+    rows = []
+    for u in users:
+        name = u.get("name", "?")
+        domain = u.get("domain", "")
+        utype = u.get("type", "")          # USER / GROUP / SERVICE
+        role = u.get("resolvedRoleName", "(no role)")
+        rows.append((name, domain, utype, role))
+
+    w_name = max(len("NAME"), *(len(r[0]) for r in rows))
+    w_dom = max(len("DOMAIN"), *(len(r[1]) for r in rows))
+    w_type = max(len("TYPE"), *(len(r[2]) for r in rows))
+
+    header = (f"{'NAME':<{w_name}}  {'DOMAIN':<{w_dom}}  "
+              f"{'TYPE':<{w_type}}  ROLE")
+    sys.stderr.write(C(header + "\n", Fore.CYAN, bold=True))
+    sys.stderr.write("-" * len(header) + "\n")
+    for name, domain, utype, role in rows:
+        line = (f"{name:<{w_name}}  {domain:<{w_dom}}  "
+                f"{utype:<{w_type}}  {role}")
+        # Highlight accounts with no role - these cause PERMISSION_NOT_FOUND
+        if role == "(no role)":
+            sys.stderr.write(C(line + "   <-- NO ROLE\n", Fore.RED, bold=True))
+        else:
+            sys.stderr.write(line + "\n")
+    sys.stderr.write("\n")
+
 
 # ---------- output helpers ----------
 
@@ -1314,6 +1403,12 @@ def parse_args() -> argparse.Namespace:
                      help="Mask passwords in output (audit mode)")
     out.add_argument("--page-size", type=int, default=200,
                      help="API page size [200]")
+    out.add_argument("--list-users", action="store_true",
+                     help="List SDDC Manager users/groups/service accounts and "
+                          "their roles (GET /v1/users + /v1/roles) instead of "
+                          "credentials. Useful for diagnosing PERMISSION_NOT_"
+                          "FOUND / 401 on /v1/tokens. Prints a table and writes "
+                          "full JSON to --output.")
 
     misc = p.add_argument_group("misc")
     misc.add_argument("--insecure", action="store_true",
@@ -1589,6 +1684,45 @@ def main() -> int:
                                  not (args.fleet_password and
                                       args.fleet_root_password)):
             maybe_offer_fleet(args, vcf_version, sddc_client=client)
+
+        # --list-users: dump user/role mappings instead of credentials.
+        if args.list_users:
+            log.info("Fetching SDDC Manager users and roles (VCF %s) ...",
+                     client.vcf_version)
+            users = client.get_users()
+            log.info("Fetched %d user/group/service account record(s).",
+                     len(users))
+            print_users_table(users)
+
+            output_path = args.output
+            if output_path:
+                fmt = (args.format or
+                       ("csv" if output_path.lower().endswith(".csv")
+                        else "json"))
+            else:
+                fmt = args.format or "json"
+                output_path = default_output_path(args.host + "_users", fmt)
+                log.info("No --output given, using auto-generated path: %s",
+                         output_path)
+
+            if fmt == "csv":
+                # Flat, CSV-friendly subset of the user records
+                flat = [{
+                    "name": u.get("name", ""),
+                    "domain": u.get("domain", ""),
+                    "type": u.get("type", ""),
+                    "role": u.get("resolvedRoleName", ""),
+                    "id": u.get("id", ""),
+                } for u in users]
+                with open(output_path, "w", newline="", encoding="utf-8") as fh:
+                    writer = csv.DictWriter(
+                        fh, fieldnames=["name", "domain", "type", "role", "id"])
+                    writer.writeheader()
+                    writer.writerows(flat)
+            else:
+                save_json(users, output_path)
+            log.info("Saved %d user record(s) to %s", len(users), output_path)
+            return 0
 
         sddc_creds: list[dict] = []
         if not args.fleet_only:
