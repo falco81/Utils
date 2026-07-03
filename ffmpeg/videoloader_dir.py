@@ -49,13 +49,16 @@ SEGMENT_MIB = 32                  # folder mode: split each file into segments o
 DROPBOX_DEFAULT_CONNECTIONS = 8   # Dropbox rate-limits shared links hard, so unless the user
                                   # passes an explicit -m, Dropbox downloads default to this many
                                   # connections (a high auto value like 80 makes them 429/truncate).
+AUTO_RETRIES = 3                  # how many times to automatically re-download files that failed
+                                  # (resume) before giving up and recording them in resume.json.
+                                  # Set to 0 to disable automatic retries.
 BAR_NCOLS = 100                   # fixed progress-bar width so bars don't stretch across wide terminals
 BAR_DESC_WIDTH = 26               # fixed filename column width so all bars line up
 
 # ---- ntfy.sh push notifications (optional) -------------------------------- #
 # Fill NTFY_TOPIC with your channel name to enable phone push notifications (install the
 # "ntfy" app, subscribe to the same topic). Leave it EMPTY to disable notifications entirely.
-NTFY_TOPIC = "falco81"                   # your ntfy topic/channel  (EMPTY = notifications OFF)
+NTFY_TOPIC = ""                   # your ntfy topic/channel  (EMPTY = notifications OFF)
 NTFY_SERVER = "https://ntfy.sh"   # ntfy server hostname     (change for a self-hosted server)
 NTFY_TOKEN = ""                   # optional access token for private / self-hosted topics
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
@@ -1887,6 +1890,12 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             release_lock(job.lock_path)
         if ok:
             _record_download(job.filename)
+        else:
+            _record_failed({'kind': 'dropbox' if job.direct_url else 'drive',
+                            'out_dir': os.getcwd(),
+                            'filename': os.path.basename(job.filename or job.title or ''),
+                            'reason': reason or 'download failed',
+                            'video': job.entry if isinstance(job.entry, dict) else None})
         with result_lock:
             result['ok' if ok else 'fail'] += 1
             n = result['ok'] + result['fail']
@@ -2553,6 +2562,12 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
         if ok:
             shutil.rmtree(job.parts_dir, ignore_errors=True)
             _record_download(job.out_path)
+        else:
+            _record_failed({'kind': 'native', 'out_dir': os.getcwd(),
+                            'filename': os.path.basename(job.out_path or ''),
+                            'reason': reason or 'download failed',
+                            'stream': job.video if isinstance(job.video, dict) else None,
+                            'max_height': max_height})
         if job.locked:
             release_lock(job.lock_path)
         with result_lock:
@@ -3057,6 +3072,21 @@ _session_downloads_lock = threading.Lock()
 # post-download rename can name files "<Collection> <NN>" instead of the messy post titles.
 _active_collection_title = None
 
+# Jobs that FAILED this run, captured with enough info to retry them later via resume.json.
+RESUME_FILE = "resume.json"
+_failed_jobs = []          # transient: failures of the current download/retry operation
+_session_failed = []       # accumulates still-failing entries across the whole invocation
+_failed_lock = threading.Lock()
+
+
+def _record_failed(entry):
+    """Remember a failed download (enough to retry it) for resume.json. Never raises."""
+    try:
+        with _failed_lock:
+            _failed_jobs.append(entry)
+    except Exception:
+        pass
+
 
 def _record_download(path):
     """Register a file that finished downloading in this run (for the rename offer)."""
@@ -3204,7 +3234,8 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
                           conflict exists, skip the rename entirely (auto 'N'). Used by
                           --url-list so batches run unattended.
     """
-    result = {'status': 'disabled', 'changed': 0, 'conflicts': 0, 'applied': 0}
+    result = {'status': 'disabled', 'changed': 0, 'conflicts': 0, 'applied': 0,
+              'renames': [], 'conflict_names': []}
     if not enabled or not new_files:
         return result
     interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)()) and \
@@ -3244,6 +3275,8 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
         result['status'] = 'nothing'
         return result
 
+    result['conflict_names'] = list(conflicts)
+
     if rename_mode == 'auto':
         if conflicts:
             print(f"[INFO] --url-list: {len(conflicts)} naming conflict(s) detected -> "
@@ -3257,6 +3290,7 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
         apply_renames(changed, directory, use_color)
         result['status'] = 'applied'
         result['applied'] = len(changed)
+        result['renames'] = list(changed)
         return result
 
     # Interactive mode.
@@ -3277,6 +3311,7 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
         apply_renames(changed, directory, use_color)
         result['status'] = 'applied'
         result['applied'] = len(changed)
+        result['renames'] = list(changed)
     return result
 
 
@@ -3313,7 +3348,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          rename_mode: str = 'ask', return_summary: bool = False):
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
-    summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None}
+    summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
+               'failed': []}
     global FFMPEG, FFMPEG_DOWNLOAD_URL
     if ffmpeg_path:
         FFMPEG = ffmpeg_path
@@ -3383,6 +3419,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     rename_dir = os.path.abspath(out_dir) if out_dir else os.getcwd()
     with _session_downloads_lock:
         _session_downloads.clear()
+    with _failed_lock:
+        _failed_jobs.clear()
     global _active_collection_title
     _active_collection_title = None
 
@@ -3437,6 +3475,13 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                     return summary
                 session.close()
                 sys.exit(1)
+
+        # Automatically re-download anything that failed, up to AUTO_RETRIES times, before we
+        # decide what (if anything) to record in resume.json.
+        if not list_only:
+            _still_failed = _retry_loop(session, verbose, chunk_size)
+            summary['failed'] = [{'filename': e.get('filename'), 'reason': e.get('reason')}
+                                 for e in _still_failed]
     finally:
         session.close()
 
@@ -3491,34 +3536,226 @@ def notify_ntfy(message, title=None, priority=None, tags=None):
 
 
 def _notify_url_list_report(results, log_path):
-    """Push a concise ntfy summary of a --url-list run (no-op if ntfy is off)."""
+    """Push a detailed ntfy summary of a --url-list run (no-op if ntfy is off)."""
     if not _ntfy_enabled():
         return
     total = len(results)
     ok = sum(1 for r in results if r['ok'] and not r['error'])
-    failed = [r for r in results if r['error'] or not r['ok']]
+    failed_urls = [r for r in results if r['error'] or not r['ok']]
     files = sum(len(r.get('downloaded') or []) for r in results)
-    # "Needs attention" = failed, or completed but downloaded nothing.
-    problem = [r for r in results if r['error'] or not r['ok'] or not r.get('downloaded')]
+    renamed = sum(len((r.get('rename') or {}).get('renames') or []) for r in results)
+    failed_files = sum(len(r.get('failed') or []) for r in results)
+    problem = [r for r in results if r['error'] or not r['ok'] or r.get('failed')
+               or not r.get('downloaded')]
 
     title = f"videoloader: {ok}/{total} URLs OK, {files} files"
-    lines = [f"Finished {ok}/{total} URL(s) OK, {files} file(s) downloaded."]
-    if problem:
+    lines = [f"Finished {ok}/{total} URL(s) OK — {files} downloaded, {renamed} renamed"
+             + (f", {failed_files} FAILED" if failed_files else "") + "."]
+
+    for r in results:
+        rn = r.get('rename') or {}
+        fl = r.get('failed') or []
+        if r['error'] or not r['ok']:
+            st = "FAILED"
+        elif fl:
+            st = "PARTIAL"
+        elif not r.get('downloaded'):
+            st = "NOFILE"
+        else:
+            st = "OK"
+        short = r['url'].split('patreon.com/')[-1].split('?')[0]
         lines.append("")
-        lines.append("Needs attention:")
-        for r in problem[:15]:
-            st = "FAILED" if (r['error'] or not r['ok']) else "NOFILE"
-            lines.append(f"[{r['index']}] {st}  {r['url']}")
-        if len(problem) > 15:
-            lines.append(f"... and {len(problem) - 15} more")
-    else:
-        lines.append("All good \u2705")
+        lines.append(f"[{r['index']}] {st}  {short}")
+        lines.append(f"    {len(r.get('downloaded') or [])} downloaded, "
+                     f"{len(rn.get('renames') or [])} renamed")
+        if r.get('error'):
+            lines.append(f"    error: {r['error']}")
+        for fe in fl[:8]:
+            lines.append(f"    ✗ {fe.get('filename')}: {fe.get('reason')}")
+        if len(fl) > 8:
+            lines.append(f"    ...and {len(fl) - 8} more failed")
+
     lines.append("")
     lines.append(f"Report: {log_path}")
 
     notify_ntfy("\n".join(lines), title=title,
-                priority=("high" if failed else "default"),
+                priority=("high" if failed_urls or failed_files else "default"),
                 tags=("warning" if problem else "white_check_mark"))
+
+
+def _resume_path():
+    return os.path.join(os.getcwd(), RESUME_FILE)
+
+
+def _load_resume():
+    try:
+        with open(_resume_path(), encoding='utf-8') as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_resume(entries):
+    try:
+        with open(_resume_path(), 'w', encoding='utf-8') as f:
+            json.dump(entries, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"[WARN] Could not write {RESUME_FILE}: {e}")
+
+
+def _delete_resume():
+    try:
+        os.remove(_resume_path())
+    except OSError:
+        pass
+
+
+def _entry_resolved(e):
+    """True if the failed entry's final file now exists (i.e. it downloaded correctly)."""
+    fn = e.get('filename')
+    if not fn:
+        return False
+    p = os.path.join(e.get('out_dir') or os.getcwd(), fn)
+    try:
+        return os.path.exists(p) and os.path.getsize(p) > 0
+    except OSError:
+        return False
+
+
+def _update_resume_after_run():
+    """Merge this run's failures with any existing resume.json, drop the ones that are now
+    downloaded, and write (or delete) the file. Called once at the end of every run."""
+    existing = _load_resume()
+    with _failed_lock:
+        newly = list(_session_failed)
+    kept, seen = [], set()
+    for e in existing + newly:
+        if not isinstance(e, dict):
+            continue
+        key = (e.get('out_dir'), e.get('filename'), e.get('kind'))
+        if key in seen:
+            continue
+        seen.add(key)
+        if _entry_resolved(e):
+            continue                      # downloaded correctly -> remove from the list
+        kept.append(e)
+    if kept:
+        _save_resume(kept)
+        print(f"\n[INFO] {len(kept)} file(s) still failed — saved to {RESUME_FILE}.")
+        print(f"[INFO] Re-run '{os.path.basename(sys.argv[0])}' with NO arguments to retry them.")
+    elif existing or newly:
+        _delete_resume()
+        print(f"\n[INFO] Everything downloaded — removed {RESUME_FILE}.")
+
+
+def _build_retry_session(base_kwargs):
+    """Set the connection limit and open a cookie session the same way main() does."""
+    verbose = base_kwargs.get('verbose', False)
+    mc = base_kwargs.get('max_connections')
+    global _max_conn_explicit
+    _max_conn_explicit = mc is not None
+    if mc is None:
+        if base_kwargs.get('auto'):
+            _t, mc, _l = _auto_settings()
+        else:
+            mc = DEFAULT_MAX_CONNECTIONS
+    set_connection_limit(mc)
+    if base_kwargs.get('cookies_file'):
+        cookies_files = [base_kwargs['cookies_file']]
+    elif base_kwargs.get('auto_cookies', True):
+        cookies_files = auto_detect_cookies(verbose)
+    else:
+        cookies_files = []
+    return get_cookies_session(cookies_files), mc
+
+
+def _run_in_dir(directory, fn):
+    """Run fn() with CWD switched to `directory` (created if needed)."""
+    os.makedirs(directory or '.', exist_ok=True)
+    old = os.getcwd()
+    os.chdir(directory or '.')
+    try:
+        return fn()
+    finally:
+        os.chdir(old)
+
+
+def _download_failed_entries(entries, session, verbose, chunk):
+    """Re-download a list of failed-job entries once, grouped by kind/dir. Any that fail again
+    are re-recorded into _failed_jobs by the engines' finalize()."""
+    pooled = defaultdict(list)      # out_dir -> [video dicts]
+    native = defaultdict(list)      # (out_dir, max_height) -> [stream dicts]
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        od = e.get('out_dir') or os.getcwd()
+        if e.get('kind') in ('drive', 'dropbox') and isinstance(e.get('video'), dict):
+            pooled[od].append(e['video'])
+        elif e.get('kind') == 'native' and isinstance(e.get('stream'), dict):
+            native[(od, e.get('max_height', 0))].append(e['stream'])
+    for od, videos in pooled.items():
+        _run_in_dir(od, lambda videos=videos: download_folder_pooled(
+            videos, session, chunk, verbose, label="Retry"))
+    for (od, mh), streams in native.items():
+        if not ensure_ffmpeg(verbose):
+            print("[ERROR] ffmpeg is required for native videos; skipping those on retry.")
+            continue
+        _run_in_dir(od, lambda streams=streams, mh=mh: download_hls_pooled(
+            streams, session, None, _max_connections, mh, verbose))
+
+
+def _retry_loop(session, verbose, chunk):
+    """Automatically re-download whatever is in _failed_jobs, up to AUTO_RETRIES times. Files
+    that succeed drop out; whatever still fails is moved into _session_failed (for resume.json)."""
+    for attempt in range(1, max(0, AUTO_RETRIES) + 1):
+        with _failed_lock:
+            pending = list(_failed_jobs)
+            _failed_jobs.clear()
+        pending = [e for e in pending if isinstance(e, dict) and not _entry_resolved(e)]
+        if not pending:
+            return []
+        print(f"\n[INFO] Auto-retry {attempt}/{AUTO_RETRIES}: re-downloading "
+              f"{len(pending)} failed file(s)...")
+        _download_failed_entries(pending, session, verbose, chunk)
+    # Retries exhausted: whatever is still failing goes to the session accumulator.
+    with _failed_lock:
+        remaining = [e for e in _failed_jobs if isinstance(e, dict) and not _entry_resolved(e)]
+        _failed_jobs.clear()
+        _session_failed.extend(remaining)
+    if remaining:
+        print(f"[INFO] {len(remaining)} file(s) still failing after {AUTO_RETRIES} auto-retries.")
+    return remaining
+
+
+def run_resume(base_kwargs):
+    """If a resume.json exists, re-download the failed files it lists (with auto-retries),
+    then update/remove it. Returns True if a resume.json was found and processed."""
+    entries = _load_resume()
+    if not entries:
+        return False
+
+    print(f"[INFO] Found {RESUME_FILE} with {len(entries)} failed file(s) from a previous run. "
+          f"Retrying...")
+    setup_console(base_kwargs.get('use_color', True))
+    try:
+        session, _mc = _build_retry_session(base_kwargs)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[ERROR] Failed to load cookies for retry: {e}")
+        sys.exit(1)
+
+    verbose = base_kwargs.get('verbose', False)
+    chunk = base_kwargs.get('chunk_size', DEFAULT_CHUNK_SIZE)
+    try:
+        with _failed_lock:
+            _failed_jobs.clear()
+        _download_failed_entries(entries, session, verbose, chunk)
+        _retry_loop(session, verbose, chunk)
+    finally:
+        session.close()
+
+    _update_resume_after_run()
+    return True
 
 
 def _write_url_list_log(results, out_dir, started):
@@ -3538,8 +3775,11 @@ def _write_url_list_log(results, out_dir, started):
         "=" * 70,
     ]
     for r in results:
+        failed = r.get('failed') or []
         if r['error'] or not r['ok']:
             status = "FAILED"
+        elif failed:
+            status = "PARTIAL"
         elif not (r.get('downloaded')):
             status = "NOFILE"   # completed without error, but no new files (all failed/skipped)
         else:
@@ -3547,17 +3787,43 @@ def _write_url_list_log(results, out_dir, started):
         lines.append("")
         lines.append(f"[{r['index']}] {status}  {r['url']}")
         lines.append(f"      kind: {r.get('kind')}   time: {r.get('seconds', 0.0):.1f}s")
+
         dl = r.get('downloaded') or []
         lines.append(f"      downloaded: {len(dl)} file(s)")
-        for name in dl:
-            lines.append(f"          - {name}")
-        rn = r.get('rename')
+        rn = r.get('rename') or {}
+        renames = rn.get('renames') or []
+        renamed_olds = {o for o, _n in renames}
+        if renames:
+            lines.append(f"      renamed: {len(renames)} file(s)  (original -> new)")
+            width = min(60, max((len(o) for o, _n in renames), default=0))
+            for o, n in renames:
+                lines.append(f"          {o:<{width}}  ->  {n}")
+        # List downloaded files that were NOT part of the rename (so nothing is hidden).
+        rest = [name for name in dl if name not in renamed_olds]
+        if renames:
+            if rest:
+                lines.append("      unchanged:")
+                for name in rest:
+                    lines.append(f"          - {name}")
+        else:
+            for name in dl:
+                lines.append(f"          - {name}")
+
         if rn:
             lines.append(f"      rename: {rn.get('status')} "
                          f"(changed={rn.get('changed', 0)}, conflicts={rn.get('conflicts', 0)}, "
                          f"applied={rn.get('applied', 0)})")
+            for o, n in (rn.get('conflict_names') or []):
+                lines.append(f"          [conflict, skipped] {o}  ->  {n}")
         else:
             lines.append("      rename: (none)")
+
+        if failed:
+            lines.append(f"      failed: {len(failed)} file(s)")
+            for fe in failed:
+                fn = fe.get('filename') or '(unknown)'
+                rs = fe.get('reason') or 'failed'
+                lines.append(f"          - {fn}: {rs}")
         if r.get('error'):
             lines.append(f"      error: {r['error']}")
     text = "\n".join(lines) + "\n"
@@ -3602,12 +3868,12 @@ def run_url_list(list_path, base_kwargs, out_dir):
         print(f"[URL {i}/{len(urls)}] {url}")
         print("=" * 70)
         entry = {'index': i, 'url': url, 'ok': False, 'kind': None,
-                 'downloaded': [], 'rename': None, 'error': None, 'seconds': 0.0}
+                 'downloaded': [], 'rename': None, 'error': None, 'failed': [], 'seconds': 0.0}
         t0 = time.time()
         try:
             res = main(url, **base_kwargs, rename_mode='auto', return_summary=True)
             if isinstance(res, dict):
-                for k in ('ok', 'kind', 'downloaded', 'rename', 'error'):
+                for k in ('ok', 'kind', 'downloaded', 'rename', 'error', 'failed'):
                     entry[k] = res.get(k, entry[k])
         except KeyboardInterrupt:
             entry['error'] = "interrupted"
@@ -3670,7 +3936,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.20.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.23.0")
 
     args = parser.parse_args()
 
@@ -3690,8 +3956,6 @@ if __name__ == "__main__":
 
     if args.url_list and args.video_id:
         parser.error("give either a single URL or --url-list, not both.")
-    if not args.url_list and not args.video_id:
-        parser.error("provide a URL, or use --url-list FILE.")
 
     common = dict(
         chunk_size=args.chunk_size, num_threads=args.threads, verbose=args.verbose,
@@ -3704,6 +3968,22 @@ if __name__ == "__main__":
         do_rename=(not args.no_rename),
     )
 
+    # No URL and no --url-list: retry previously-failed files from resume.json, if present.
+    if not args.url_list and not args.video_id:
+        with _failed_lock:
+            _failed_jobs.clear()
+            _session_failed.clear()
+        try:
+            if run_resume(common):
+                sys.exit(0)
+        except KeyboardInterrupt:
+            print("\n[WARN] Interrupted. resume.json kept — re-run with no arguments to continue.")
+            sys.exit(130)
+        parser.error("provide a URL, or use --url-list FILE (or have a resume.json here to retry).")
+
+    with _failed_lock:
+        _failed_jobs.clear()
+        _session_failed.clear()
     try:
         if args.url_list:
             if args.output:
@@ -3711,8 +3991,10 @@ if __name__ == "__main__":
             run_url_list(args.url_list, dict(common, output_file=None), args.output_dir)
         else:
             main(args.video_id, args.output, **common)
+        _update_resume_after_run()
     except KeyboardInterrupt:
         # Locks are released by the atexit handler; partial .part files are kept so a re-run
         # resumes where this left off.
+        _update_resume_after_run()
         print("\n[WARN] Interrupted. Partial parts were kept — re-run the same command to resume.")
         sys.exit(130)
