@@ -1980,10 +1980,138 @@ _PRESET_DATA = []          # načtené odpovědi (load)
 _PRESET_IDX = 0
 _PRESET_REC = []           # zaznamenané odpovědi (save)
 _PRESET_CMD = None
-_PRESET_PATH = None
+_PRESET_KEY = None         # None = výchozí preset (auto-start), jinak název presetu
 _PRESET_SAVED = False
 _PRESET_MISS = object()
+_PRESET_LABEL = None
+_PRESET_DRYRUN = False
 _SECRET_HINTS = ("klíč", "klic", "key", "heslo", "password", "token")
+
+# ---- Jednotné úložiště: sync_subtitles.config.json (config + presety) -------
+_STORE_PATH = None
+
+
+def default_store_path():
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
+    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
+    return os.path.join(base, "sync_subtitles.config.json")
+
+
+def current_store_path():
+    return _STORE_PATH or default_store_path()
+
+
+def load_store():
+    """Načte jednotný soubor {config, presets, default_preset}."""
+    try:
+        with open(current_store_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    data.setdefault("config", {})
+    data.setdefault("presets", {})
+    data.setdefault("default_preset", None)
+    return data
+
+
+def save_store(store):
+    p = current_store_path()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+        try:
+            os.chmod(p, 0o600)   # obsahuje API klíče
+        except OSError:
+            pass
+    except Exception as e:
+        log_warn(f"Uložení {os.path.basename(p)} selhalo: {e}")
+
+
+def migrate_legacy_store():
+    """Jednorázově přenese staré config.json / preset.json / presets/*.json do
+    nového sync_subtitles.config.json (když nový ještě neexistuje)."""
+    if os.path.exists(current_store_path()):
+        return
+    base = os.path.dirname(current_store_path())
+    store = {"config": {}, "presets": {}, "default_preset": None}
+    found = False
+    old_cfg = os.path.join(base, "config.json")
+    if os.path.isfile(old_cfg):
+        try:
+            with open(old_cfg, "r", encoding="utf-8") as f:
+                store["config"] = json.load(f) or {}
+            found = True
+        except Exception:
+            pass
+    old_preset = os.path.join(base, "preset.json")
+    if os.path.isfile(old_preset):
+        try:
+            with open(old_preset, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            if d and d.get("command"):
+                store["default_preset"] = d
+                found = True
+        except Exception:
+            pass
+    old_dir = os.path.join(base, "presets")
+    if os.path.isdir(old_dir):
+        for fn in os.listdir(old_dir):
+            if not fn.lower().endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(old_dir, fn), "r", encoding="utf-8") as f:
+                    d = json.load(f)
+                if d and d.get("command"):
+                    store["presets"][os.path.splitext(fn)[0]] = d
+                    found = True
+            except Exception:
+                pass
+    if found:
+        save_store(store)
+        log_info(f"Přenesl jsem staré nastavení/presety do {os.path.basename(current_store_path())}.")
+
+
+def preset_dryrun():
+    """True, když se preset jen VYTVÁŘÍ (sbírají se odpovědi)."""
+    return _PRESET_DRYRUN
+
+
+def _safe_preset_name(name):
+    safe = re.sub(r"[^\w\-. ]+", "_", (name or "").strip()).strip().replace(" ", "_")
+    return safe or "preset"
+
+
+def list_named_presets():
+    """Vrátí [(label, key, command)]; key je název presetu, nebo None pro výchozí
+    (spouští se při startu)."""
+    store = load_store()
+    out = []
+    for name, p in sorted(store.get("presets", {}).items()):
+        if p and p.get("command"):
+            out.append((p.get("label") or name, name, p["command"]))
+    dp = store.get("default_preset")
+    if dp and dp.get("command"):
+        out.append((f"(výchozí - spouští se při startu) [{dp['command']}]", None, dp["command"]))
+    return out
+
+
+def get_preset(key):
+    """key=None -> výchozí preset, jinak pojmenovaný."""
+    store = load_store()
+    if key is None:
+        return store.get("default_preset")
+    return store.get("presets", {}).get(key)
+
+
+def delete_preset(key):
+    store = load_store()
+    if key is None:
+        store["default_preset"] = None
+    else:
+        store.get("presets", {}).pop(key, None)
+    save_store(store)
 
 
 def preset_is_replaying():
@@ -2016,79 +2144,82 @@ def _preset_record(kind, prompt, value):
             _PRESET_REC.append({"k": kind, "q": str(prompt)[:60], "a": value})
 
 
-def preset_begin_save(cmd, path):
-    global _PRESET_MODE, _PRESET_REC, _PRESET_CMD, _PRESET_PATH, _PRESET_SAVED
+def preset_begin_save(cmd, key=None, label=None, dryrun=False):
+    global _PRESET_MODE, _PRESET_REC, _PRESET_CMD, _PRESET_KEY, _PRESET_SAVED, _PRESET_LABEL, _PRESET_DRYRUN
     _PRESET_MODE = "save"
     _PRESET_REC = []
     _PRESET_CMD = cmd
-    _PRESET_PATH = path
+    _PRESET_KEY = key
     _PRESET_SAVED = False
+    _PRESET_LABEL = label
+    _PRESET_DRYRUN = dryrun
 
 
-def preset_begin_offer(cmd, path):
-    """Jako save, ale uložení se na konci NABÍDNE (otázka), neukládá automaticky."""
-    global _PRESET_MODE, _PRESET_REC, _PRESET_CMD, _PRESET_PATH, _PRESET_SAVED
+def preset_begin_offer(cmd):
+    """Jako save, ale uložení se na konci NABÍDNE (otázka)."""
+    global _PRESET_MODE, _PRESET_REC, _PRESET_CMD, _PRESET_KEY, _PRESET_SAVED, _PRESET_LABEL, _PRESET_DRYRUN
     _PRESET_MODE = "offer"
     _PRESET_REC = []
     _PRESET_CMD = cmd
-    _PRESET_PATH = path
+    _PRESET_KEY = None
     _PRESET_SAVED = False
+    _PRESET_LABEL = None
+    _PRESET_DRYRUN = False
 
 
 def preset_begin_load(answers):
-    global _PRESET_MODE, _PRESET_DATA, _PRESET_IDX
+    global _PRESET_MODE, _PRESET_DATA, _PRESET_IDX, _PRESET_DRYRUN
     _PRESET_MODE = "load"
     _PRESET_DATA = list(answers or [])
     _PRESET_IDX = 0
+    _PRESET_DRYRUN = False
 
 
 def _write_preset():
-    with open(_PRESET_PATH, "w", encoding="utf-8") as f:
-        json.dump({"command": _PRESET_CMD, "answers": _PRESET_REC},
-                  f, ensure_ascii=False, indent=2)
+    store = load_store()
+    payload = {"command": _PRESET_CMD, "answers": _PRESET_REC}
+    if _PRESET_LABEL:
+        payload["label"] = _PRESET_LABEL
+    if _PRESET_KEY is None:
+        store["default_preset"] = payload
+    else:
+        store.setdefault("presets", {})[_PRESET_KEY] = payload
+    save_store(store)
 
 
 def preset_flush_if_save():
     """Volá se těsně před spuštěním operace. Pro 'save' uloží rovnou, pro
-    'offer' se zeptá, jestli volby uložit jako preset."""
-    global _PRESET_SAVED
-    if _PRESET_SAVED or not _PRESET_PATH:
+    'offer' se zeptá, jestli volby uložit jako preset (a případně pod jménem)."""
+    global _PRESET_SAVED, _PRESET_KEY, _PRESET_LABEL
+    if _PRESET_SAVED:
         return
+    store_name = os.path.basename(current_store_path())
     if _PRESET_MODE == "save":
         try:
             _write_preset()
             _PRESET_SAVED = True
-            log_done(f"Preset uložen do {_PRESET_PATH} (příště stačí --load).")
+            log_done(f"Preset uložen do {store_name}"
+                     + (f" jako '{_PRESET_KEY}'." if _PRESET_KEY else " (výchozí, spustí se při startu)."))
         except Exception as e:
             log_warn(f"Uložení presetu selhalo: {e}")
     elif _PRESET_MODE == "offer":
         _PRESET_SAVED = True   # ať se neptá dvakrát
-        # raw vstup (mimo záznam), ať se otázka nedostane do presetu
-        raw = input("Uložit tyto volby jako preset, ať příště stačí spustit skript bez ptaní? [a/N]: ").strip().lower()
-        if raw in ("a", "y", "ano", "yes", "ja"):
-            try:
-                _write_preset()
-                log_done(f"Preset uložen do {_PRESET_PATH}. Příště se spustí sám (smaž ho pro průvodce).")
-            except Exception as e:
-                log_warn(f"Uložení presetu selhalo: {e}")
+        raw = input("Uložit tyto volby jako preset? [a/N]: ").strip().lower()
+        if raw not in ("a", "y", "ano", "yes", "ja"):
+            return
+        name = input("Název presetu (Enter = výchozí, spustí se sám při startu): ").strip()
+        if name:
+            _PRESET_KEY = name
+            _PRESET_LABEL = name
+        try:
+            _write_preset()
+            if name:
+                log_done(f"Preset '{name}' uložen do {store_name}. Najdeš ho v menu Presety.")
+            else:
+                log_done(f"Výchozí preset uložen do {store_name}. Příště se spustí sám.")
+        except Exception as e:
+            log_warn(f"Uložení presetu selhalo: {e}")
 
-
-def load_preset_file(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
-
-
-def default_preset_path():
-    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
-    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
-    return os.path.join(base, "preset.json")
-
-
-def resolve_preset_path(args):
-    return getattr(args, "preset_file", None) or default_preset_path()
 
 
 def ask_choice(prompt, options, allow_skip=True, allow_abort=True):
@@ -3577,37 +3708,21 @@ CONFIG_FIELDS = [
 ]
 
 
-def default_config_path():
-    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
-    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
-    return os.path.join(base, "config.json")
+def load_config():
+    """Vrátí config sekci z jednotného úložiště."""
+    return load_store().get("config", {})
 
 
-def resolve_config_path(args):
-    return getattr(args, "config_file", None) or default_config_path()
-
-
-def load_config(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def save_config(path, cfg):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
-    try:
-        if os.name != "nt":
-            os.chmod(path, 0o600)   # jen pro vlastníka (jsou tam klíče)
-    except Exception:
-        pass
+def save_config(cfg):
+    """Uloží config sekci do jednotného úložiště (zachová presety)."""
+    store = load_store()
+    store["config"] = cfg
+    save_store(store)
 
 
 def apply_config_to_args(args, cfg):
     """Doplní do args hodnoty, které nebyly zadané na příkazové řádce.
-    Priorita: CLI (už nastaveno) > proměnná prostředí > config.json."""
+    Priorita: CLI (už nastaveno) > proměnná prostředí > uložený config."""
     for ckey, attr, env, _secret in CONFIG_FIELDS:
         if getattr(args, attr, None):
             continue  # zadáno na CLI
@@ -3632,13 +3747,13 @@ def run_config(args):
     """Interaktivní průvodce nastavením config.json. Ptá se jen na to, co
     chceš zapnout; nevyplněné nechá být. Klíče jsou v souboru v čitelné
     podobě - drž ho v bezpečí."""
-    path = resolve_config_path(args)
-    cfg = load_config(path)
-    print(f"{Fore.MAGENTA}=== Nastavení (config.json) ==={Style.RESET_ALL}")
-    log_info(f"Soubor: {path}")
+    store_name = os.path.basename(current_store_path())
+    cfg = load_config()
+    print(f"{Fore.MAGENTA}=== Nastavení ({store_name}) ==={Style.RESET_ALL}")
+    log_info(f"Soubor: {current_store_path()}")
     if cfg:
-        log_info("Načten stávající config - prázdná odpověď ponechá současnou hodnotu.")
-    log_warn("Pozor: klíče se ukládají v čitelné podobě. Drž config.json v bezpečí.")
+        log_info("Načteno stávající nastavení - prázdná odpověď ponechá současnou hodnotu.")
+    log_warn(f"Pozor: klíče se ukládají v čitelné podobě. Drž {store_name} v bezpečí.")
 
     def ask_secret(label, ckey):
         cur = cfg.get(ckey)
@@ -3710,9 +3825,9 @@ def run_config(args):
             if idx < len(keys):
                 cfg.pop(keys[idx], None)
 
-    save_config(path, cfg)
+    save_config(cfg)
     print()
-    log_done(f"Uloženo do {path}")
+    log_done(f"Uloženo do {current_store_path()}")
     enabled = []
     if cfg.get("gemini_key"):
         enabled.append("Gemini")
@@ -3819,50 +3934,57 @@ def run_translate_subs(args):
 
     jobs = []  # list of (path, kind) kind = "video" | "sub"
     args.track_id = None
+    dry = preset_dryrun()
     if src_type == 0:
-        videos = collect_videos(directory, recursive)
-        if not videos:
+        videos = [] if dry else collect_videos(directory, recursive)
+        if not videos and not dry:
             die("Žádná videa v adresáři. Zvol 'titulkové soubory', nebo použij --auto pro synchronizaci.")
-        log_info(f"Nalezeno {len(videos)} videí.")
-        sample = Path(videos[0])
-        mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, sample)
-        try:
-            sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles") if mkvmerge_bin else []
-        except (Exception, SystemExit):
-            sub_tracks = []
-        if sub_tracks:
-            labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in sub_tracks]
-            labels += ["podle jazyka (zadám kód)", "první vhodná"]
-            i = ask_pick(f"Kterou titulkovou stopu extrahovat (vzorek {sample.name})?", labels, default=0)
-            if i < len(sub_tracks):
-                args.track_id = sub_tracks[i]["id"]; args.ref_lang = None
-            elif i == len(sub_tracks):
-                args.ref_lang = norm_lang(ask_language("Jazyk zdrojové stopy (eng/cze/...)", "") or None)
-            else:
-                args.ref_lang = None
+        if videos:
+            log_info(f"Nalezeno {len(videos)} videí.")
+            mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, Path(videos[0]))
+            try:
+                st = mkvmerge_tracks(mkvmerge_bin, Path(videos[0]), "subtitles") if mkvmerge_bin else []
+            except (Exception, SystemExit):
+                st = []
+            if st:
+                log_info(f"Stopy ve vzorku ({Path(videos[0]).name}):")
+                for t in st:
+                    print(f"    #{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}")
+        # výběr stopy - PEVNÉ volby (funguje i bez videa a je přenositelné do presetu)
+        ti = ask_pick("Kterou titulkovou stopu z videa vzít?",
+                      ["podle JAZYKA (zadám kód - robustní pro celou složku)",
+                       "první vhodná titulková stopa",
+                       "konkrétní ID stopy (zadám číslo)"], default=0,
+                      help=["Z každého videa vezme stopu v zadaném jazyce (i když má jinde jiné ID).",
+                            "Vezme první titulkovou stopu videa.",
+                            "Vytáhne stopu s konkrétním číslem ID (stejné číslo u všech videí)."])
+        if ti == 0:
+            args.ref_lang = norm_lang(ask_language("Jazyk zdrojové stopy (eng/cze/...)", "eng") or None)
+            args.track_id = None
+        elif ti == 1:
+            args.ref_lang = None
+            args.track_id = None
         else:
-            log_warn("Stopy vzorového videa se nepodařilo přečíst - vyberu podle jazyka/první.")
-            args.ref_lang = norm_lang(ask_language("Jazyk zdrojové titulkové stopy (eng/...; prázdné=první)", "") or None)
+            _tid = ask_text("ID stopy (číslo)", "2")
+            args.track_id = int(_tid) if str(_tid).strip().isdigit() else None
+            args.ref_lang = None
         jobs = [(v, "video") for v in videos]
     else:
-        subs = collect_srts(directory, recursive)
-        if not subs:
+        subs = [] if dry else collect_srts(directory, recursive)
+        if not subs and not dry:
             die("V adresáři nejsou žádné .srt soubory.")
-        sel = ask_pick(f"Které titulkové soubory přeložit? (nalezeno {len(subs)})",
-                       ["všechny", "jeden", "několik (vyberu čísla)"], default=0)
+        sel = ask_pick(f"Které titulkové soubory přeložit?{'' if dry else ' (nalezeno %d)' % len(subs)}",
+                       ["všechny v adresáři", "jen některé podle názvu (zadám filtr)"], default=0,
+                       help=["Přeloží všechny .srt v adresáři.",
+                             "Přeloží jen soubory, jejichž název obsahuje zadaný text (např. 'S01')."])
         if sel == 0:
             chosen = subs
-        elif sel == 1:
-            idx = ask_pick("Který soubor?", [os.path.basename(s) for s in subs], default=0)
-            chosen = [subs[idx]]
         else:
-            for k, s in enumerate(subs, 1):
-                print(f"  {k}) {os.path.basename(s)}")
-            raw = ask_text("Zadej čísla oddělená čárkou (např. 1,3,4)", "")
-            chosen = [subs[int(t) - 1] for t in raw.replace(" ", "").split(",")
-                      if t.isdigit() and 1 <= int(t) <= len(subs)] or subs
+            pat = (ask_text("Část názvu souboru (filtr; prázdné = všechny)", "") or "").lower()
+            chosen = [s for s in subs if pat in os.path.basename(s).lower()] or subs
         jobs = [(s, "sub") for s in chosen]
-        log_info(f"Vybráno {len(jobs)} titulkových souborů k překladu.")
+        if not dry:
+            log_info(f"Vybráno {len(jobs)} titulkových souborů k překladu.")
 
     # cílový jazyk
     out_lang = (ask_language("Do jakého jazyka přeložit (kód, např. cs/en/de)",
@@ -3976,10 +4098,14 @@ def run_translate_subs(args):
              + (f" | překladač: {engine}" if engine else "")
              + f" | korektura: {proofread}"
              + (" | čitelnost: ano" if getattr(args, "fix_short_duration", False) else ""))
-    if not ask_yes_no(f"Spustit pro {len(jobs)} položek?", default_no=False):
+    _confirm = "Uložit tento preset?" if dry else f"Spustit pro {len(jobs)} položek?"
+    if not ask_yes_no(_confirm, default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
+    if dry:
+        log_done("Preset vytvořen (nic se neprovádělo). Najdeš ho v menu Presety.")
+        return
 
     done = skipped = 0
     for path, kind in jobs:
@@ -4100,55 +4226,54 @@ def run_extract_subs(args, minimal=False):
     print(f"{Fore.MAGENTA}=== Extrahovat titulky z videí (do .srt) ==={Style.RESET_ALL}")
     log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
 
+    dry = preset_dryrun() and not minimal
     recursive = bool(getattr(args, "recursive", False)) if minimal else ask_yes_no(
         "Prohledat i podadresáře?", default_no=True)
-    videos = collect_videos(directory, recursive)
-    if not videos:
+    videos = [] if dry else collect_videos(directory, recursive)
+    if not videos and not dry:
         die("Žádná videa (mkv/mp4/...) v adresáři.")
-    log_info(f"Nalezeno {len(videos)} videí.")
-
-    # detekce stop ze vzorku (zkus videa postupně, dokud se nějaké nepřečte)
-    mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _is_mkv = _resolve_tools_for_extract(args, Path(videos[0]))
-    if not mkvmerge_bin:
-        die("Nenašel jsem mkvmerge (mkvtoolnix) pro čtení stop. Nainstaluj mkvtoolnix, "
-            "nebo zkontroluj připojení pro automatické stažení.")
-    # zapamatuj nástroje, ať se neřeší u každého videa znovu
-    args.mkvmerge = args.mkvmerge or mkvmerge_bin
-    if mkvextract_bin:
-        args.mkvextract = args.mkvextract or mkvextract_bin
-    if ffmpeg_bin:
-        args.ffmpeg = args.ffmpeg or ffmpeg_bin
-
     sample = None
     sub_tracks = []
-    for cand in videos:
-        try:
-            st = mkvmerge_tracks(mkvmerge_bin, Path(cand), "subtitles")
-        except (Exception, SystemExit):
-            continue
-        if st:
-            sample = Path(cand)
-            sub_tracks = st
-            break
-    if sample is None:
-        die("Nepodařilo se přečíst titulkové stopy ze žádného videa (poškozené soubory, "
-            "nebo videa nemají titulky).")
-    log_info(f"Titulkové stopy ve vzorku ({sample.name}):")
-    for t in sub_tracks:
-        txt = "text" if is_text_codec(t["codec"]) else "OBRÁZKOVÉ (nelze do .srt)"
-        print(f"    #{t['id']}  {t['lang']:4}  {t['codec']:16} {t.get('title', '')}  [{txt}]")
-    text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
-    if not text_tracks:
-        log_warn("Vzorové video má jen obrázkové titulky (PGS/VobSub). Můžeš přesto zkusit jiná "
-                 "videa přes výběr podle jazyka - textové stopy se vytáhnou, obrázkové přeskočí.")
+    text_tracks = []
+    if videos:
+        log_info(f"Nalezeno {len(videos)} videí.")
+        mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _is_mkv = _resolve_tools_for_extract(args, Path(videos[0]))
+        if not mkvmerge_bin:
+            die("Nenašel jsem mkvmerge (mkvtoolnix) pro čtení stop. Nainstaluj mkvtoolnix, "
+                "nebo zkontroluj připojení pro automatické stažení.")
+        args.mkvmerge = args.mkvmerge or mkvmerge_bin
+        if mkvextract_bin:
+            args.mkvextract = args.mkvextract or mkvextract_bin
+        if ffmpeg_bin:
+            args.ffmpeg = args.ffmpeg or ffmpeg_bin
+        for cand in videos:
+            try:
+                st = mkvmerge_tracks(mkvmerge_bin, Path(cand), "subtitles")
+            except (Exception, SystemExit):
+                continue
+            if st:
+                sample = Path(cand)
+                sub_tracks = st
+                break
+        if sample is None:
+            die("Nepodařilo se přečíst titulkové stopy ze žádného videa (poškozené soubory, "
+                "nebo videa nemají titulky).")
+        log_info(f"Titulkové stopy ve vzorku ({sample.name}):")
+        for t in sub_tracks:
+            txt = "text" if is_text_codec(t["codec"]) else "OBRÁZKOVÉ (nelze do .srt)"
+            print(f"    #{t['id']}  {t['lang']:4}  {t['codec']:16} {t.get('title', '')}  [{txt}]")
+        text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
+        if not text_tracks:
+            log_warn("Vzorové video má jen obrázkové titulky (PGS/VobSub). Můžeš přesto zkusit jiná "
+                     "videa přes výběr podle jazyka - textové stopy se vytáhnou, obrázkové přeskočí.")
 
     mode = ask_pick("Které titulkové stopy vytáhnout?",
                     ["podle JAZYKA (zadám kódy - robustní pro celou složku)",
-                     "konkrétní STOPY ze vzorku (podle čísla výše)",
+                     "konkrétní STOPY podle čísla (číslo stopy ze vzorku)",
                      "VŠECHNY textové titulkové stopy z každého videa"], default=0,
                     help=["podle jazyka: zadáš kódy (např. eng,cze,ger) a z KAŽDÉHO videa se "
                           "vytáhnou stopy v těch jazycích - i když mají v různých videích jiná ID.",
-                          "konkrétní stopy: vybereš čísla stop podle vzorku výše; stejná ID se "
+                          "konkrétní stopy: vybereš čísla stop podle vzorku výše; stejná čísla se "
                           "použijí u všech videí (vhodné, když mají všechna stejné pořadí stop).",
                           "všechny: z každého videa vytáhne všechny textové titulkové stopy."])
 
@@ -4156,21 +4281,13 @@ def run_extract_subs(args, minimal=False):
     want_ids = None
     if mode == 0:
         raw = ask_text("Kódy jazyků oddělené čárkou (např. eng,cze,ger; prázdné = všechny)", "")
-        want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()]
-        if not want_langs:
-            want_langs = None  # = všechny textové
+        want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()] or None
     elif mode == 1:
-        if not text_tracks:
-            log_warn("Vzorové video nemá textové stopy k výběru podle čísla - přepínám na výběr "
-                     "podle jazyka (projde se každé video zvlášť).")
-            raw = ask_text("Kódy jazyků oddělené čárkou (např. eng,cze; prázdné = všechny)", "")
-            want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()] or None
-            want_ids = None
-        else:
-            labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in text_tracks]
-            for k, lab in enumerate(labels, 1):
-                print(f"  {k}) {lab}")
-            raw = ask_text("Zadej čísla stop oddělená čárkou (např. 1,3)", "1")
+        if text_tracks:
+            for k, t in enumerate(text_tracks, 1):
+                print(f"  {k}) #{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}")
+        raw = ask_text("Zadej čísla stop oddělená čárkou (např. 1,3)", "1")
+        if text_tracks:
             picks = [int(x) for x in raw.replace(" ", "").split(",") if x.isdigit() and 1 <= int(x) <= len(text_tracks)]
             want_ids = [text_tracks[k - 1]["id"] for k in picks] or [text_tracks[0]["id"]]
 
@@ -4187,10 +4304,14 @@ def run_extract_subs(args, minimal=False):
     log_info(f"Výběr: {seltxt} | videí: {len(videos)}"
              + (" | očištění" if do_clean else "")
              + (" | čitelnost" if getattr(args, 'fix_short_duration', False) else ""))
-    if not minimal and not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
+    _cf = "Uložit tento preset?" if dry else f"Spustit pro {len(videos)} videí?"
+    if not minimal and not ask_yes_no(_cf, default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
+    if dry:
+        log_done("Preset vytvořen (nic se neprovádělo). Najdeš ho v menu Presety.")
+        return
 
     done = skipped = wrote = 0
     for vid in videos:
@@ -4420,29 +4541,31 @@ def run_import_subs(args):
     print(f"{Fore.MAGENTA}=== Vložit (mux) titulky do videí ==={Style.RESET_ALL}")
     log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
     recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
-    mm, me, mp = _ensure_mkv_tools(args, directory)
-    if not mm:
-        die("Nenašel jsem mkvmerge (MKVToolNix) ani se ho nepodařilo stáhnout.")
-
-    videos, subs = _collect_videos_subs(directory, recursive)
-    if not videos:
-        die("Žádná videa (mkv/mp4) v adresáři.")
-    if not subs:
-        die("Žádné titulkové soubory (.srt/.ass/...) v adresáři.")
-    # párování dle epizody
-    vmap = {}
-    for v in videos:
-        k = _episode_key(os.path.basename(v))
-        if k and k not in vmap:
-            vmap[k] = v
-    pairs = {}
-    for s in subs:
-        k = _episode_key(os.path.basename(s))
-        if k and k in vmap:
-            pairs.setdefault(vmap[k], []).append(s)
-    if not pairs:
-        die("Nepodařilo se spárovat titulky s videi podle SxxExx.")
-    log_info(f"Spárováno {sum(len(x) for x in pairs.values())} titulků k {len(pairs)} videím.")
+    dry = preset_dryrun()
+    if not dry:
+        mm, me, mp = _ensure_mkv_tools(args, directory)
+        if not mm:
+            die("Nenašel jsem mkvmerge (MKVToolNix) ani se ho nepodařilo stáhnout.")
+        videos, subs = _collect_videos_subs(directory, recursive)
+        if not videos:
+            die("Žádná videa (mkv/mp4) v adresáři.")
+        if not subs:
+            die("Žádné titulkové soubory (.srt/.ass/...) v adresáři.")
+        vmap = {}
+        for v in videos:
+            k = _episode_key(os.path.basename(v))
+            if k and k not in vmap:
+                vmap[k] = v
+        pairs = {}
+        for s in subs:
+            k = _episode_key(os.path.basename(s))
+            if k and k in vmap:
+                pairs.setdefault(vmap[k], []).append(s)
+        if not pairs:
+            die("Nepodařilo se spárovat titulky s videi podle SxxExx.")
+        log_info(f"Spárováno {sum(len(x) for x in pairs.values())} titulků k {len(pairs)} videím.")
+    else:
+        pairs = {}
 
     set_default = ask_yes_no("Nastavit jednu titulkovou stopu jako VÝCHOZÍ (default)?", default_no=True)
     default_lang = None
@@ -4454,10 +4577,14 @@ def run_import_subs(args):
     replace = ask_yes_no("Přepsat původní video výsledným MKV? (jinak vedle jako <jméno>.muxed.mkv)", default_no=True)
 
     print()
-    if not ask_yes_no(f"Spustit mux pro {len(pairs)} videí?", default_no=False):
+    _cf = "Uložit tento preset?" if dry else f"Spustit mux pro {len(pairs)} videí?"
+    if not ask_yes_no(_cf, default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
+    if dry:
+        log_done("Preset vytvořen (nic se neprovádělo). Najdeš ho v menu Presety.")
+        return
 
     done = failed = 0
     for v in sorted(pairs):
@@ -4788,6 +4915,12 @@ def run_rename_subs(args):
     log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
     recursive = ask_yes_no("Prohledat i podadresáře?", default_no=True)
 
+    if preset_dryrun():
+        if ask_yes_no("Uložit tento preset? (přejmenování proběhne až při spuštění ve složce)", default_no=False):
+            preset_flush_if_save()
+            log_done("Preset vytvořen (nic se neprovádělo). Najdeš ho v menu Presety.")
+        return
+
     videos, subs = _collect_videos_subs(directory, recursive, sub_exts=(".srt",))
     if not subs:
         die("Žádné .srt titulky v adresáři.")
@@ -4859,48 +4992,47 @@ def run_transplant(args):
              "pořadu z jiného adresáře. ČASOVÁNÍ zůstane tvoje (sedí na tvou verzi).")
 
     recursive = ask_yes_no("Hledat strojové titulky i v podadresářích?", default_no=True)
-    targets = collect_srts(directory, recursive)
-    if not targets:
+    dry = preset_dryrun()
+    targets = [] if dry else collect_srts(directory, recursive)
+    if not targets and not dry:
         die("Ve složce nejsou žádné .srt (strojové titulky).")
-    sel = ask_pick(f"Které strojové titulky zpracovat? (nalezeno {len(targets)})",
-                   ["všechny", "jeden", "několik (vyberu čísla)"], default=0)
+    sel = ask_pick(f"Které strojové titulky zpracovat?{'' if dry else ' (nalezeno %d)' % len(targets)}",
+                   ["všechny v adresáři", "jen některé podle názvu (zadám filtr)"], default=0)
     if sel == 0:
         chosen = targets
-    elif sel == 1:
-        idx = ask_pick("Který soubor?", [os.path.basename(s) for s in targets], default=0)
-        chosen = [targets[idx]]
     else:
-        for k, s in enumerate(targets, 1):
-            print(f"  {k}) {os.path.basename(s)}")
-        raw = ask_text("Zadej čísla oddělená čárkou (např. 1,3,4)", "")
-        chosen = [targets[int(t) - 1] for t in raw.replace(" ", "").split(",")
-                  if t.isdigit() and 1 <= int(t) <= len(targets)] or targets
+        pat = (ask_text("Část názvu (filtr; prázdné = všechny)", "") or "").lower()
+        chosen = [s for s in targets if pat in os.path.basename(s).lower()] or targets
 
     # adresář s profesionálními ("viki") titulky
-    while True:
-        viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky", "").strip().strip('"')
-        if not viki_dir:
-            log_warn("Bez adresáře s profesionálními titulky to nejde. Zrušeno.")
-            return
-        if os.path.isdir(viki_dir):
-            break
-        log_warn(f"Adresář '{viki_dir}' neexistuje - zkus to znovu (nebo Enter = konec).")
+    if dry:
+        viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky (zadej cestu; ověří se při spuštění)", "").strip().strip('"')
+    else:
+        while True:
+            viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky", "").strip().strip('"')
+            if not viki_dir:
+                log_warn("Bez adresáře s profesionálními titulky to nejde. Zrušeno.")
+                return
+            if os.path.isdir(viki_dir):
+                break
+            log_warn(f"Adresář '{viki_dir}' neexistuje - zkus to znovu (nebo Enter = konec).")
     viki_rec = ask_yes_no("Hledat 'viki' titulky i v podadresářích?", default_no=True)
-    pool, viki_files = _load_reference_pool(viki_dir, viki_rec)
-    if not pool:
-        die("V adresáři s profesionálními titulky nejsou žádné .srt.")
-    log_info(f"Profesionální zásoba: {len(pool)} titulků z {len(viki_files)} souborů "
-             f"(dělení epizod nevadí - páruje se podle obsahu).")
-
-    # kontrola jazyka (musí být stejný)
-    lp = detect_sub_language(pool)
-    lt = detect_srt_file_language(chosen[0]) if chosen else None
-    if lp and lt and lp != lt:
-        log_warn(f"Pozor: strojové titulky vypadají na '{lt}', profesionální na '{lp}'. "
-                 "Tahle funkce páruje podle textu, takže OBA musí být ve STEJNÉM jazyce. "
-                 "Když jsou různé, výsledek nebude dávat smysl.")
-        if not ask_yes_no("Přesto pokračovat?", default_no=True):
-            return
+    if not dry:
+        pool, viki_files = _load_reference_pool(viki_dir, viki_rec)
+        if not pool:
+            die("V adresáři s profesionálními titulky nejsou žádné .srt.")
+        log_info(f"Profesionální zásoba: {len(pool)} titulků z {len(viki_files)} souborů "
+                 f"(dělení epizod nevadí - páruje se podle obsahu).")
+        lp = detect_sub_language(pool)
+        lt = detect_srt_file_language(chosen[0]) if chosen else None
+        if lp and lt and lp != lt:
+            log_warn(f"Pozor: strojové titulky vypadají na '{lt}', profesionální na '{lp}'. "
+                     "Tahle funkce páruje podle textu, takže OBA musí být ve STEJNÉM jazyce. "
+                     "Když jsou různé, výsledek nebude dávat smysl.")
+            if not ask_yes_no("Přesto pokračovat?", default_no=True):
+                return
+    else:
+        pool = []
 
     ti = ask_pick("Jak přísně párovat (kompromis kvalita vs. pokrytí)?",
                   ["konzervativně - jen jisté shody (nejmíň chyb, míň nahrazení)",
@@ -4923,10 +5055,14 @@ def run_transplant(args):
     log_info(f"Práh párování: {min_sim:.2f} | soubory: {len(chosen)} | profi zásoba: {len(pool)} "
              + ("| čitelnost: ano " if getattr(args, 'fix_short_duration', False) else "")
              + ("| přepis originálu" if overwrite else "| ukládám jako .pro.srt"))
-    if not ask_yes_no(f"Spustit pro {len(chosen)} souborů?", default_no=False):
+    _cf = "Uložit tento preset?" if dry else f"Spustit pro {len(chosen)} souborů?"
+    if not ask_yes_no(_cf, default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
+    if dry:
+        log_done("Preset vytvořen (nic se neprovádělo). Najdeš ho v menu Presety.")
+        return
 
     log_info("Připravuji profesionální zásobu (jednorázově)...")
     transplant, _M = build_transplanter(pool)
@@ -4985,45 +5121,45 @@ def run_resync_pro(args):
              "časování. Zůstane CELÝ profesionální text, jen dostane timing tvého videa.")
 
     recursive = ask_yes_no("Hledat tvoje titulky i v podadresářích?", default_no=True)
-    targets = collect_srts(directory, recursive)
-    if not targets:
+    dry = preset_dryrun()
+    targets = [] if dry else collect_srts(directory, recursive)
+    if not targets and not dry:
         die("Ve složce nejsou žádné .srt (tvoje strojové titulky s dobrým časováním).")
-    sel = ask_pick(f"Které tvoje titulky (šablona časování) použít? (nalezeno {len(targets)})",
-                   ["všechny", "jeden", "několik (vyberu čísla)"], default=0)
+    sel = ask_pick(f"Které tvoje titulky (šablona časování) použít?{'' if dry else ' (nalezeno %d)' % len(targets)}",
+                   ["všechny v adresáři", "jen některé podle názvu (zadám filtr)"], default=0)
     if sel == 0:
         chosen = targets
-    elif sel == 1:
-        idx = ask_pick("Který soubor?", [os.path.basename(s) for s in targets], default=0)
-        chosen = [targets[idx]]
     else:
-        for k, s in enumerate(targets, 1):
-            print(f"  {k}) {os.path.basename(s)}")
-        raw = ask_text("Zadej čísla oddělená čárkou (např. 1,3,4)", "")
-        chosen = [targets[int(t) - 1] for t in raw.replace(" ", "").split(",")
-                  if t.isdigit() and 1 <= int(t) <= len(targets)] or targets
+        pat = (ask_text("Část názvu (filtr; prázdné = všechny)", "") or "").lower()
+        chosen = [s for s in targets if pat in os.path.basename(s).lower()] or targets
 
-    while True:
-        viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky", "").strip().strip('"')
-        if not viki_dir:
-            log_warn("Bez adresáře s profesionálními titulky to nejde. Zrušeno.")
-            return
-        if os.path.isdir(viki_dir):
-            break
-        log_warn(f"Adresář '{viki_dir}' neexistuje - zkus to znovu (nebo Enter = konec).")
+    if dry:
+        viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky (zadej cestu; ověří se při spuštění)", "").strip().strip('"')
+    else:
+        while True:
+            viki_dir = ask_text("Adresář s PROFESIONÁLNÍMI ('viki') titulky", "").strip().strip('"')
+            if not viki_dir:
+                log_warn("Bez adresáře s profesionálními titulky to nejde. Zrušeno.")
+                return
+            if os.path.isdir(viki_dir):
+                break
+            log_warn(f"Adresář '{viki_dir}' neexistuje - zkus to znovu (nebo Enter = konec).")
     viki_rec = ask_yes_no("Hledat 'viki' titulky i v podadresářích?", default_no=True)
-    pool, viki_files = _load_reference_pool(viki_dir, viki_rec, continuous=True)
-    if not pool:
-        die("V adresáři s profesionálními titulky nejsou žádné .srt.")
-    log_info(f"Profesionální zásoba: {len(pool)} titulků z {len(viki_files)} souborů "
-             f"(jiné dělení epizod nevadí - správný výřez se najde podle obsahu).")
-
-    lp = detect_sub_language(pool)
-    lt = detect_srt_file_language(chosen[0]) if chosen else None
-    if lp and lt and lp != lt:
-        log_warn(f"Pozor: tvoje titulky vypadají na '{lt}', profesionální na '{lp}'. Přečasování "
-                 "páruje podle textu, takže OBA by měly být ve stejném jazyce.")
-        if not ask_yes_no("Přesto pokračovat?", default_no=True):
-            return
+    if not dry:
+        pool, viki_files = _load_reference_pool(viki_dir, viki_rec, continuous=True)
+        if not pool:
+            die("V adresáři s profesionálními titulky nejsou žádné .srt.")
+        log_info(f"Profesionální zásoba: {len(pool)} titulků z {len(viki_files)} souborů "
+                 f"(jiné dělení epizod nevadí - správný výřez se najde podle obsahu).")
+        lp = detect_sub_language(pool)
+        lt = detect_srt_file_language(chosen[0]) if chosen else None
+        if lp and lt and lp != lt:
+            log_warn(f"Pozor: tvoje titulky vypadají na '{lt}', profesionální na '{lp}'. Přečasování "
+                     "páruje podle textu, takže OBA by měly být ve stejném jazyce.")
+            if not ask_yes_no("Přesto pokračovat?", default_no=True):
+                return
+    else:
+        pool = []
 
     args.fix_short_duration = False
     _ask_readability(args, chosen[:5])
@@ -5031,13 +5167,18 @@ def run_resync_pro(args):
                            default_no=True)
 
     print()
-    log_info(f"Soubory: {len(chosen)} | profi zásoba: {len(pool)} "
-             + ("| čitelnost: ano " if getattr(args, 'fix_short_duration', False) else "")
-             + ("| přepis originálu" if overwrite else "| ukládám jako .pro.srt"))
-    if not ask_yes_no(f"Spustit pro {len(chosen)} souborů?", default_no=False):
+    if not dry:
+        log_info(f"Soubory: {len(chosen)} | profi zásoba: {len(pool)} "
+                 + ("| čitelnost: ano " if getattr(args, 'fix_short_duration', False) else "")
+                 + ("| přepis originálu" if overwrite else "| ukládám jako .pro.srt"))
+    _cf = "Uložit tento preset?" if dry else f"Spustit pro {len(chosen)} souborů?"
+    if not ask_yes_no(_cf, default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
+    if dry:
+        log_done("Preset vytvořen (nic se neprovádělo). Najdeš ho v menu Presety.")
+        return
 
     done = skipped = 0
     for path in chosen:
@@ -5700,6 +5841,104 @@ def run_auto_all(args):
     run_batch(args)
 
 
+_INTERACTIVE_COMMANDS = {
+    "auto": ("Synchronizovat jedny titulky", "run_auto_single"),
+    "auto-all": ("Synchronizovat celou složku", "run_auto_all"),
+    "translate-subs": ("Přeložit titulky", "run_translate_subs"),
+    "extract-subs": ("Extrahovat titulky z videí", "run_extract_subs"),
+    "merge-pro": ("Nahradit strojový překlad profi textem", "run_transplant"),
+    "resync-pro": ("Přečasovat profi titulky na moje časování", "run_resync_pro"),
+    "import-subs": ("Vložit titulky do videí", "run_import_subs"),
+    "remove-tracks": ("Odebrat stopy z MKV", "run_remove_tracks"),
+    "set-default": ("Nastavit výchozí stopu", "run_set_default"),
+    "rename-subs": ("Přejmenovat titulky", "run_rename_subs"),
+}
+
+
+def dispatch_interactive_command(cmd, args):
+    """Spustí interaktivní režim podle názvu příkazu (sdílené pro bare-run,
+    --load i menu Presety)."""
+    fn = {
+        "auto": run_auto_single, "auto-all": run_auto_all,
+        "translate-subs": run_translate_subs, "extract-subs": run_extract_subs,
+        "merge-pro": run_transplant, "resync-pro": run_resync_pro,
+        "import-subs": run_import_subs, "remove-tracks": run_remove_tracks,
+        "set-default": run_set_default, "rename-subs": run_rename_subs,
+    }.get(cmd)
+    if not fn:
+        die(f"Neznámý příkaz v presetu: {cmd}")
+    fn(args)
+
+
+def _create_new_preset(args):
+    """Nechá vybrat režim, projít průvodce a uložit jako pojmenovaný preset."""
+    cmds = list(_INTERACTIVE_COMMANDS.items())
+    labels = [f"{desc}" for _cmd, (desc, _fn) in cmds]
+    i = ask_pick("Jaký režim uložit jako preset?", labels, default=1)
+    cmd = cmds[i][0]
+    dry_ok = {"translate-subs", "extract-subs", "rename-subs", "import-subs", "merge-pro", "resync-pro"}
+    if cmd not in dry_ok:
+        log_info("Tenhle režim potřebuje vidět reálné stopy/soubory (vybírá se z nich), takže ho "
+                 "nelze nastavit bez nich.")
+        log_info("Vytvoř preset takhle: spusť tenhle režim normálně ve složce s videi/titulky a na "
+                 "úplném konci u otázky na uložení presetu zadej NÁZEV - uloží se do knihovny Presety.")
+        return
+    name = ask_text("Název presetu (jak se bude jmenovat v menu)", "") or cmds[i][1][0]
+    if name in load_store().get("presets", {}) and not ask_yes_no(
+            f"Preset '{name}' už existuje - přepsat?", default_no=True):
+        return
+    log_info(f"Projdi průvodce - jen se posbírají volby a uloží jako preset '{name}'. "
+             "Nemusíš být ve složce s videi/titulky, nic se teď neprovede.")
+    preset_begin_save(cmd, key=name, label=name, dryrun=True)
+    dispatch_interactive_command(cmd, args)
+
+
+def _delete_preset(presets):
+    if not presets:
+        log_warn("Žádné presety k smazání.")
+        return
+    labels = [f"{lbl}  ({cmd})" for lbl, _k, cmd in presets] + ["zpět"]
+    i = ask_pick("Který preset smazat?", labels, default=len(presets))
+    if i >= len(presets):
+        return
+    lbl, key, _cmd = presets[i]
+    if ask_yes_no(f"Opravdu smazat preset '{lbl}'?", default_no=True):
+        delete_preset(key)
+        log_done(f"Preset '{lbl}' smazán.")
+
+
+def run_presets_menu(args):
+    """Hlavní menu Presety: spusť uložené nastavení jedním výběrem, nebo si
+    vytvoř/smaž preset."""
+    while True:
+        presets = list_named_presets()
+        print(f"{Fore.MAGENTA}=== Presety (uložená nastavení) ==={Style.RESET_ALL}")
+        if presets:
+            log_info("Vyber preset - spustí se rovnou s uloženým nastavením.")
+        else:
+            log_info("Zatím nemáš žádný preset. Vytvoř si první přes 'Vytvořit nový preset'.")
+        labels = [f"▶ {lbl}  ({cmd})" for lbl, _k, cmd in presets]
+        labels += ["+ Vytvořit nový preset", "Smazat preset", "Zpět do hlavního menu"]
+        i = ask_pick("Presety:", labels, default=0 if presets else len(presets))
+        if i < len(presets):
+            lbl, key, cmd = presets[i]
+            data = get_preset(key)
+            if not data:
+                log_warn("Preset nelze načíst (poškozený?).")
+                continue
+            log_info(f"Spouštím preset '{lbl}' ({cmd})...")
+            preset_begin_load(data.get("answers", []))
+            dispatch_interactive_command(cmd, args)
+            return
+        elif i == len(presets):
+            _create_new_preset(args)
+            return
+        elif i == len(presets) + 1:
+            _delete_preset(presets)
+        else:
+            return
+
+
 def run_master_wizard(args):
     """Hlavní průvodce při spuštění BEZ parametrů: zeptá se, co chceš udělat,
     spustí příslušný dílčí průvodce a na konci nabídne uložení jako preset."""
@@ -5720,8 +5959,9 @@ def run_master_wizard(args):
          "Odebrat audio/titulkové stopy z MKV (podle jazyka)",
          "Nastavit VÝCHOZÍ (default) stopu podle jazyka",
          "Přejmenovat titulky podle názvů videí (SxxExx)",
+         "Presety - spustit uložené nastavení jedním výběrem (nebo si nějaké vytvořit)",
          "Jen opravit ČITELNOST titulků (prodloužit příliš krátké)",
-         "Nastavit API klíče a výchozí volby (config.json)",
+         "Nastavit API klíče a výchozí volby (sync_subtitles.config.json)",
          "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
         default=1,
         help=["Synchronizace jedněch titulků: vybereš titulkový soubor se špatným časováním a "
@@ -5750,54 +5990,60 @@ def run_master_wizard(args):
               "MKV na místě (mkvpropedit), MP4 přemuxem (ffmpeg).",
               "Přejmenovat titulky: .srt přejmenuje podle názvu odpovídajícího videa (párování přes "
               "SxxExx), zachová jazykovou/forced koncovku. Nejdřív ukáže plán.",
+              "Presety: uložená nastavení průvodců pojmenovaná podle tebe. Vybereš preset a operace "
+              "se rovnou spustí s uloženými volbami. Můžeš si tu preset vytvořit i smazat. (Preset "
+              "se dá uložit i na konci každého průvodce přes otázku 'Uložit jako preset?'.)",
               "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa. Když ve "
               "složce nejsou .srt, nabídne extrakci z videí.",
-              "Config: uloží API klíče a výchozí volby do config.json (načítá se automaticky).",
+              "Config: uloží API klíče a výchozí volby do sync_subtitles.config.json (načítá se automaticky).",
               "Test API: pošle triviální dotaz a vypíše přesnou odpověď/chybu (ladění např. HTTP 400)."])
 
-    if mode == 11:
+    if mode == 12:
         run_config(args)
         return
-    if mode == 12:
+    if mode == 13:
         run_test_api(args)
         return
-    if mode == 10:
+    if mode == 11:
         args.fix_readability = True
         run_fix_readability(args)
         return
+    if mode == 10:
+        run_presets_menu(args)
+        return
     if mode == 9:
         args.rename_subs = True
-        preset_begin_offer("rename-subs", resolve_preset_path(args))
+        preset_begin_offer("rename-subs")
         run_rename_subs(args)
         return
     if mode == 8:
         args.set_default = True
-        preset_begin_offer("set-default", resolve_preset_path(args))
+        preset_begin_offer("set-default")
         run_set_default(args)
         return
     if mode == 7:
         args.remove_tracks = True
-        preset_begin_offer("remove-tracks", resolve_preset_path(args))
+        preset_begin_offer("remove-tracks")
         run_remove_tracks(args)
         return
     if mode == 6:
         args.import_subs = True
-        preset_begin_offer("import-subs", resolve_preset_path(args))
+        preset_begin_offer("import-subs")
         run_import_subs(args)
         return
     if mode == 5:
         args.resync_pro = True
-        preset_begin_offer("resync-pro", resolve_preset_path(args))
+        preset_begin_offer("resync-pro")
         run_resync_pro(args)
         return
     if mode == 4:
         args.merge_pro = True
-        preset_begin_offer("merge-pro", resolve_preset_path(args))
+        preset_begin_offer("merge-pro")
         run_transplant(args)
         return
     if mode == 3:
         args.extract_subs = True
-        preset_begin_offer("extract-subs", resolve_preset_path(args))
+        preset_begin_offer("extract-subs")
         run_extract_subs(args)
         return
 
@@ -5810,13 +6056,44 @@ def run_master_wizard(args):
         args.translate_subs = True
 
     # nabídnout uložení presetu (otázka padne až na konci, těsně před spuštěním)
-    preset_begin_offer(cmd, resolve_preset_path(args))
+    preset_begin_offer(cmd)
     if cmd == "auto":
         run_auto_single(args)
     elif cmd == "auto-all":
         run_auto_all(args)
     else:
         run_translate_subs(args)
+
+
+def _pause_for_menu(seconds=3.0):
+    """Krátké čekání před spuštěním výchozího presetu. Vrátí True, když uživatel
+    stihne stisknout ENTER (chce menu). V neinteraktivním běhu (plán/roura) hned
+    vrátí False, aby automatika nečekala."""
+    try:
+        if not sys.stdin.isatty():
+            return False
+    except Exception:
+        return False
+    try:
+        if os.name == "nt":
+            import msvcrt
+            import time
+            end = time.time() + seconds
+            while time.time() < end:
+                if msvcrt.kbhit():
+                    msvcrt.getch()
+                    return True
+                time.sleep(0.05)
+            return False
+        else:
+            import select
+            r, _, _ = select.select([sys.stdin], [], [], seconds)
+            if r:
+                sys.stdin.readline()
+                return True
+            return False
+    except Exception:
+        return False
 
 
 def main():
@@ -6032,15 +6309,19 @@ RŮZNÉ JAZYKY (target vs reference):
                         help="Interaktivní režim: nastaví výchozí (default) audio/titulkovou stopu podle jazyka.")
     parser.add_argument("--rename-subs", action="store_true",
                         help="Interaktivní režim: přejmenuje .srt podle názvů videí (párování SxxExx).")
+    parser.add_argument("--presets", action="store_true",
+                        help="Otevře menu Presety (spustit/vytvořit/smazat uložená nastavení) - funguje i když je nastavený výchozí preset.")
+    parser.add_argument("--no-preset", action="store_true",
+                        help="Ignoruje výchozí preset a rovnou spustí průvodce (i když je výchozí preset nastavený).")
     parser.add_argument("--sub-source", choices=["auto", "mt", "opensubtitles"], default="auto",
                          help="(--translate-subs) odkud vzít cílové titulky (default auto).")
     parser.add_argument("--deepl-key", default=None, help="API klíč pro DeepL (nebo proměnná DEEPL_API_KEY).")
     parser.add_argument("--opensubtitles-key", default=None, help="API klíč pro OpenSubtitles (nebo OPENSUBTITLES_API_KEY).")
     parser.add_argument("--llm-key", default=None, help="API klíč pro AI korekturu (nebo OPENAI_API_KEY).")
     parser.add_argument("--config", action="store_true",
-                         help="Interaktivní nastavení API klíčů a výchozích voleb do config.json (ptá se jen na to, co chceš zapnout). Config se při startu načítá automaticky.")
-    parser.add_argument("--config-file", default=None, help="Cesta k config.json (default vedle skriptu).")
-    parser.add_argument("--no-config", action="store_true", help="Nenačítat config.json při startu.")
+                         help="Interaktivní nastavení API klíčů a výchozích voleb do sync_subtitles.config.json (ptá se jen na to, co chceš zapnout). Načítá se při startu automaticky.")
+    parser.add_argument("--config-file", default=None, help="Cesta k jednotnému souboru sync_subtitles.config.json (config + presety; default vedle skriptu).")
+    parser.add_argument("--no-config", action="store_true", help="Nenačítat uložené nastavení (config) při startu.")
     parser.add_argument("--anthropic-key", default=None, help="Anthropic (Claude) API klíč (nebo ANTHROPIC_API_KEY).")
     parser.add_argument("--anthropic-model", default=None, help="Model Claude (default claude-sonnet-4-6).")
     parser.add_argument("--gemini-key", default=None, help="Google Gemini API klíč - AI překlad ZDARMA (nebo GEMINI_API_KEY/GOOGLE_API_KEY). Získáš na aistudio.google.com.")
@@ -6056,13 +6337,17 @@ RŮZNÉ JAZYKY (target vs reference):
     parser.add_argument("--load", action="store_true",
                          help="Načte preset.json a okamžitě spustí uloženou operaci bez dotazů "
                               "(příkaz se vezme z presetu, nebo ho upřesni, např. --load --translate-subs).")
-    parser.add_argument("--preset-file", default=None, help="Cesta k preset.json (default vedle skriptu).")
+    parser.add_argument("--preset-file", default=None, help="(zastaralé) Alias k --config-file; presety jsou teď v sync_subtitles.config.json.")
     parser.add_argument("--test-api", action="store_true",
                          help="Pošle triviální požadavek na nastavené AI API (Anthropic/OpenAI) a vypíše "
                               "přesnou odpověď nebo chybu (včetně těla od serveru) - pro ladění např. HTTP 400.")
     args = parser.parse_args()
 
-    _cfg = {} if getattr(args, "no_config", False) else load_config(resolve_config_path(args))
+    global _STORE_PATH
+    _STORE_PATH = getattr(args, "config_file", None) or getattr(args, "preset_file", None) or None
+    migrate_legacy_store()
+
+    _cfg = {} if getattr(args, "no_config", False) else load_config()
     apply_config_to_args(args, _cfg)
     if args.config:
         run_config(args)
@@ -6071,40 +6356,35 @@ RŮZNÉ JAZYKY (target vs reference):
         run_test_api(args)
         return
 
+    if getattr(args, "presets", False):
+        run_presets_menu(args)
+        return
+
     # Spuštění BEZ jakéhokoli parametru:
-    #   - když existuje preset.json -> rovnou spustí uloženou akci (bez dotazů)
+    #   - když existuje výchozí preset -> rovnou spustí uloženou akci (bez dotazů)
     #   - jinak -> hlavní interaktivní průvodce (na konci nabídne uložení presetu)
     if len(sys.argv) <= 1 and not args.load and not args.save:
-        _ppath = resolve_preset_path(args)
-        _preset = load_preset_file(_ppath)
+        _preset = get_preset(None)
         if _preset and _preset.get("command"):
             cmd = _preset["command"]
-            log_info(f"Našel jsem preset: {_ppath}")
-            log_info(f"Spouštím uloženou akci '{cmd}' bez dotazů. (Pro průvodce smaž preset.json.)")
+            store_name = os.path.basename(current_store_path())
+            log_info(f"Našel jsem VÝCHOZÍ preset ({cmd}) v {store_name}.")
+            log_info("Stiskni ENTER do 3 s pro menu Presety (spustit jiný / SMAZAT / průvodce), "
+                     "jinak ho rovnou spustím...")
+            if _pause_for_menu(3.0):
+                run_presets_menu(args)
+                return
+            log_info(f"Spouštím '{cmd}' bez dotazů. (Správa: spusť s --presets, nebo --no-preset pro průvodce.)")
             preset_begin_load(_preset.get("answers", []))
-            if cmd == "auto-all":
-                run_auto_all(args)
-            elif cmd == "auto":
-                run_auto_single(args)
-            elif cmd == "translate-subs":
-                run_translate_subs(args)
-            elif cmd == "merge-pro":
-                run_transplant(args)
-            elif cmd == "resync-pro":
-                run_resync_pro(args)
-            elif cmd == "extract-subs":
-                run_extract_subs(args)
-            elif cmd == "import-subs":
-                run_import_subs(args)
-            elif cmd == "remove-tracks":
-                run_remove_tracks(args)
-            elif cmd == "set-default":
-                run_set_default(args)
-            elif cmd == "rename-subs":
-                run_rename_subs(args)
-            else:
-                die(f"Neznámý příkaz v presetu: {cmd}")
+            dispatch_interactive_command(cmd, args)
             return
+        run_master_wizard(args)
+        return
+
+    if getattr(args, "no_preset", False) and not any([
+            args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
+            args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
+            args.rename_subs, args.fix_readability]):
         run_master_wizard(args)
         return
 
@@ -6123,10 +6403,10 @@ RŮZNÉ JAZYKY (target vs reference):
     if args.save and not interactive_cmd:
         die("--save funguje jen s interaktivním příkazem (--auto / --auto-all / --translate-subs / --merge-pro / --resync-pro).")
     if args.load:
-        preset = load_preset_file(resolve_preset_path(args))
+        preset = get_preset(None)
         if not preset:
-            die(f"Preset nenalezen nebo prázdný: {resolve_preset_path(args)} "
-                "(nejdřív spusť stejný příkaz s --save).")
+            die(f"Výchozí preset nenalezen v {os.path.basename(current_store_path())} "
+                "(nejdřív spusť stejný příkaz s --save, nebo si preset vytvoř v menu Presety).")
         cmd = interactive_cmd or preset.get("command")
         if not cmd:
             die("Preset neobsahuje uložený příkaz - spusť ho např. jako '--load --translate-subs'.")
@@ -6136,7 +6416,7 @@ RŮZNÉ JAZYKY (target vs reference):
         log_info(f"Načítám preset ({len(preset.get('answers', []))} voleb) a spouštím '{cmd}' bez dotazů.")
         interactive_cmd = cmd
     if args.save and interactive_cmd:
-        preset_begin_save(interactive_cmd, resolve_preset_path(args))
+        preset_begin_save(interactive_cmd)
 
     if interactive_cmd and (args.save or args.load):
         if interactive_cmd == "auto-all":
