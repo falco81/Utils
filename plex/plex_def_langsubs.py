@@ -148,7 +148,8 @@ def _read_key():
         if ch in (b"\x00", b"\xe0"):
             c2 = msvcrt.getch()
             return {b"H": "up", b"P": "down", b"K": "left", b"M": "right",
-                    b"G": "home", b"O": "end", b"I": "pgup", b"Q": "pgdn"}.get(c2, "other")
+                    b"G": "home", b"O": "end", b"I": "pgup", b"Q": "pgdn",
+                    b"?": "f5"}.get(c2, "other")  # F5 = scan code 0x3F ('?')
         if ch in (b"\r", b"\n"):
             return "enter"
         if ch == b"\x08":
@@ -166,9 +167,18 @@ def _read_key():
     else:
         ch = sys.stdin.read(1)
         if ch == "\x1b":
-            seq = sys.stdin.read(2)
-            return {"[A": "up", "[B": "down", "[C": "right", "[D": "left",
-                    "[H": "home", "[F": "end", "[5": "pgup", "[6": "pgdn"}.get(seq, "esc")
+            c1 = sys.stdin.read(1)
+            if c1 not in ("[", "O"):
+                return "esc"
+            seq = ""
+            while True:
+                c = sys.stdin.read(1)
+                seq += c
+                if c.isalpha() or c == "~" or len(seq) > 6:
+                    break
+            return {"A": "up", "B": "down", "C": "right", "D": "left",
+                    "H": "home", "F": "end", "1~": "home", "4~": "end",
+                    "5~": "pgup", "6~": "pgdn", "15~": "f5"}.get(seq, "esc")
         if ch in ("\r", "\n"):
             return "enter"
         if ch in ("\x7f", "\x08"):
@@ -196,17 +206,32 @@ def _tui_supported():
     return _HAS_RAW and sys.stdin.isatty() and sys.stdout.isatty()
 
 
-def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None):
+def clear_screen():
+    """Smaže obrazovku (aplikační režim). Bez TTY nic nedělá."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\x1b[2J\x1b[H")
+        sys.stdout.flush()
+
+
+def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
+                     refresh_cb=None, header=None):
     """Menu ovládané šipkami + psaní pro hledání. Vrátí index, nebo None (zrušeno).
-    Když terminál nepodporuje raw vstup, spadne na číselné menu."""
+    Chová se jako aplikace: na začátku smaže obrazovku a překresluje jen aktuální
+    pohled (žádné rolování). header = řádky kontextu nad nabídkou.
+    refresh_cb(current_index) -> hláška (str): volá se na F5 (např. sken knihovny)."""
     if not _tui_supported():
+        for h in (header or []):
+            print(h)
         return _ask_choice_classic(prompt, labels, default)
 
     n = len(labels)
     plain = [strip_ansi(l) for l in labels]
+    header = list(header or [])
     filt = ""
+    status = ""  # stavový řádek (např. výsledek F5) - zobrazí se UVNITŘ okna
     sel_pos = default if 0 <= default < n else 0
     prev_lines = 0  # počet řádků předchozího snímku
+    first = True    # první vykreslení smaže obrazovku
 
     def visible_order():
         if not filt:
@@ -227,19 +252,25 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None):
         return s
 
     def render(order, sel_pos):
-        nonlocal prev_lines
+        nonlocal prev_lines, first
         cols, rows_total = term_size()
         maxw = max(10, cols - 2)
-        # kolik položek se vejde: nech místo na prompt+hint+footer(+2 indikátory)
-        page_rows = max(3, rows_total - 5)
+        # kolik položek se vejde: rezervuj prompt+hint+footer+status(+2 indik.)+hlavičku
+        reserve = 6 + len(header)
+        page_rows = max(3, rows_total - reserve)
 
         buf = []
-        # posun kurzoru na začátek předchozího snímku a smazání dolů
-        if prev_lines > 0:
+        if first:
+            buf.append("\x1b[2J\x1b[H")  # smaž obrazovku + kurzor domů (aplikační režim)
+            first = False
+        elif prev_lines > 0:
             up = prev_lines - 1
             buf.append((f"\x1b[{up}F" if up > 0 else "\r") + "\x1b[J")
 
         vis_lines = []  # jednotlivé řádky snímku (bez \n)
+        for h in header:
+            sp = strip_ansi(h)
+            vis_lines.append(h if len(sp) <= maxw else trunc(sp, maxw))
         vis_lines.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
         if filt:
             hint = "↑↓ pohyb · Enter = vybrat · Esc = smazat hledání"
@@ -247,6 +278,8 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None):
             hint = "↑↓ pohyb · piš = hledat · Enter = vybrat · Esc = zpět"
         else:
             hint = "↑↓ pohyb · piš = hledat · Enter = vybrat"
+        if refresh_cb is not None:
+            hint += " · F5 = sken knihovny"
         vis_lines.append(f"{Fore.CYAN}{trunc(hint, maxw)}{Style.RESET_ALL}")
 
         if not order:
@@ -273,6 +306,10 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None):
         else:
             footer = f"{Fore.CYAN}{trunc('(začni psát pro hledání)' + pos_info, maxw)}{Style.RESET_ALL}"
         vis_lines.append(footer)
+        # stavový řádek uvnitř okna (překresluje se na místě, nepřidává řádky)
+        if status:
+            sp = strip_ansi(status)
+            vis_lines.append(status if len(sp) <= maxw else trunc(sp, maxw))
 
         buf.append("\n".join(vis_lines))
         sys.stdout.write("".join(buf))
@@ -287,6 +324,8 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None):
         page_rows = render(order, sel_pos)
         while True:
             key = _read_key()
+            if key != "f5" and status:
+                status = ""  # stavová hláška zmizí po dalším stisku
             if key == "up" and order:
                 sel_pos = (sel_pos - 1) % len(order)
             elif key == "down" and order:
@@ -299,6 +338,15 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None):
                 sel_pos = 0
             elif key == "end" and order:
                 sel_pos = len(order) - 1
+            elif key == "f5" and refresh_cb is not None:
+                cur = order[sel_pos] if order else None
+                status = f"{Fore.CYAN}Spouštím Scan Library Files…{Style.RESET_ALL}"
+                render(order, sel_pos)  # okamžitá zpětná vazba (na místě)
+                try:
+                    status = refresh_cb(cur) or ""
+                except Exception as ex:
+                    status = f"{Fore.RED}Scan Library Files selhal: {ex}{Style.RESET_ALL}"
+                # závěrečný render (na konci smyčky) ukáže výsledek ve stejném okně
             elif key in ("enter", "right"):
                 if order:
                     result = order[sel_pos]
@@ -641,6 +689,14 @@ class PlexClient:
         j = self.get_json(f"/library/metadata/{show_key}/allLeaves")
         return j.get("MediaContainer", {}).get("Metadata", [])
 
+    def refresh_section(self, section_key):
+        """Spustí 'Scan Library Files' nad knihovnou (GET .../refresh)."""
+        st, _ = http_raw("GET", self._url(f"/library/sections/{section_key}/refresh"),
+                         headers=self._headers(), verify=self.verify, timeout=self.timeout)
+        if st >= 400:
+            raise RuntimeError(f"HTTP {st}")
+        return st
+
 
 # ---------------------------------------------------------------------------
 # Pomůcky pro adresu serveru
@@ -804,12 +860,6 @@ def iter_parts(md):
             yield part.get("id"), part.get("Stream", [])
 
 
-def lang_key(stream):
-    code = (stream.get("languageCode") or stream.get("languageTag") or "").lower()
-    name = stream.get("language") or stream.get("displayTitle") or code or "?"
-    return code, name
-
-
 def _new_variant(s, ordinal):
     return {"key": (stream_signature(s), ordinal), "sig": stream_signature(s),
             "ordinal": ordinal, "code": (s.get("languageCode") or "").lower(),
@@ -909,7 +959,7 @@ def item_available_variants(item, stream_type):
 # ---------------------------------------------------------------------------
 # Výběr stopy
 # ---------------------------------------------------------------------------
-def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=False):
+def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=False, header=None):
     labels = [v["label"] for v in variants]
     off_idx = keep_idx = None
     all_labels = list(labels)
@@ -924,7 +974,7 @@ def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=
         return ("keep", None)
     default_idx = keep_idx if keep_idx is not None else 0
     idx = interactive_menu(f"Vyber výchozí {kind}:", all_labels,
-                           default=default_idx, allow_cancel=allow_back)
+                           default=default_idx, allow_cancel=allow_back, header=header)
     if idx is None:
         return ("back", None)
     if idx < len(variants):
@@ -965,10 +1015,6 @@ def ep_label(it):
     return it["title"]
 
 
-def item_has_lang(item, stream_type, variant):
-    return item_has_variant(item, stream_type, variant)
-
-
 def resolve_coverage(kind, action, items_data, stream_type, allow_off, interactive):
     """Vrátí per-položkový plán (délka jako items_data), prvek:
        ('var', variant) | ('off', None) | ('skip', None).
@@ -992,11 +1038,10 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
     if not missing:
         return plan
 
-    log_warn(f"{len(missing)} z {n} položek nemá {kind}: {variant['label']}")
-    lbls = [ep_label(items_data[i]) for i in missing]
-    print("   " + ", ".join(lbls[:30]) + (" …" if len(lbls) > 30 else ""))
-
     if not interactive:
+        log_warn(f"{len(missing)} z {n} položek nemá {kind}: {variant['label']}")
+        lbls = [ep_label(items_data[i]) for i in missing]
+        print("   " + ", ".join(lbls[:30]) + (" …" if len(lbls) > 30 else ""))
         log_info(f"Neinteraktivní režim: těchto {len(missing)} položek ponechávám beze změny.")
         return plan
 
@@ -1019,8 +1064,17 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
         if allow_off:
             extra.append(f"{Fore.MAGENTA}— VYPNOUT titulky u chybějících —{Style.RESET_ALL}")
         extra.append(f"{Fore.MAGENTA}— nechat chybějící beze změny (přeskočit) —{Style.RESET_ALL}")
-        idx = ask_choice(f"Čím nahradit {kind} u chybějících dílů?",
-                         labels + extra, default=len(labels) + len(extra) - 1)
+        mlbls = [ep_label(items_data[i]) for i in missing]
+        header = [
+            f"{Fore.YELLOW}{len(missing)} z {n} položek nemá {kind}: {variant['label']}{Style.RESET_ALL}",
+            "  " + ", ".join(mlbls[:40]) + (" …" if len(mlbls) > 40 else ""),
+            "",
+        ]
+        idx = interactive_menu(f"Čím nahradit {kind} u chybějících dílů?",
+                               labels + extra, default=len(labels) + len(extra) - 1,
+                               header=header)
+        if idx is None:
+            break
         if idx < len(opts):
             alt = opts[idx]
             still, applied = [], 0
@@ -1292,19 +1346,20 @@ def _target_from_md(client, md):
 
 
 def scan_target(client, target):
-    """Načte streamy cíle a vypíše dostupné stopy. Vrátí (items_data, audio, subs)."""
+    """Načte streamy cíle. Vrátí (items_data, audio, subs, header_lines)."""
     its, label, ff = target
+    clear_screen()
     log_info(f"Cíl: {Fore.CYAN}{label}{Style.RESET_ALL}")
     if ff:
         log_info("Skenuji dostupné stopy napříč epizodami...")
     idata, audio, subs = collect_streams(client, its, ff)
-    print()
-    log_info("Dostupné ZVUKOVÉ stopy: " +
-             (" | ".join(v["label"] for v in audio) or "(žádné)"))
-    log_info("Dostupné TITULKY:       " +
-             (" | ".join(v["label"] for v in subs) or "(žádné)"))
-    print()
-    return idata, audio, subs
+    header = [
+        f"{Fore.CYAN}Cíl:{Style.RESET_ALL} {label}",
+        f"{Fore.CYAN}Audio:{Style.RESET_ALL}   " + (" | ".join(v["label"] for v in audio) or "(žádné)"),
+        f"{Fore.CYAN}Titulky:{Style.RESET_ALL} " + (" | ".join(v["label"] for v in subs) or "(žádné)"),
+        "",
+    ]
+    return idata, audio, subs, header
 
 
 def select_and_configure(client, args):
@@ -1346,11 +1401,19 @@ def select_and_configure(client, args):
     LIB, ITEM, AUDIO, SUBS = range(4)
     sec = secs[0] if single_lib else None
     scan_cache = {}
-    idata = audio_vars = sub_vars = None
+    idata = audio_vars = sub_vars = header = None
     audio_action = sub_action = None
 
+    def scan_lib(section):
+        try:
+            client.refresh_section(section["key"])
+            return (f"{Fore.GREEN}» Scan Library Files spuštěn nad knihovnou "
+                    f"'{section['title']}'.{Style.RESET_ALL}")
+        except Exception as ex:
+            return f"{Fore.RED}Scan Library Files selhal: {ex}{Style.RESET_ALL}"
+
     if fixed:
-        idata, audio_vars, sub_vars = scan_target(client, fixed)
+        idata, audio_vars, sub_vars, header = scan_target(client, fixed)
         step = AUDIO
     else:
         step = ITEM if single_lib else LIB
@@ -1358,7 +1421,8 @@ def select_and_configure(client, args):
     while True:
         if step == LIB:
             labels = [f"{s['title']}  [{s['type']}]" for s in secs]
-            i = interactive_menu("Vyber knihovnu:", labels, allow_cancel=True)
+            i = interactive_menu("Vyber knihovnu:", labels, allow_cancel=True,
+                                 refresh_cb=lambda idx: scan_lib(secs[idx]) if idx is not None else None)
             if i is None:
                 return None
             sec = secs[i]
@@ -1374,7 +1438,8 @@ def select_and_configure(client, args):
                 continue
             items.sort(key=lambda x: (x["title"] or "").lower())
             labels = [f"{it['title']} ({it['year']})" if it["year"] else it["title"] for it in items]
-            i = interactive_menu("Vyber seriál/film:", labels, allow_cancel=True)
+            i = interactive_menu(f"Vyber seriál/film z '{sec['title']}':", labels, allow_cancel=True,
+                                 refresh_cb=lambda idx: scan_lib(sec))
             if i is None:
                 if single_lib:
                     return None
@@ -1385,7 +1450,7 @@ def select_and_configure(client, args):
             if rk not in scan_cache:
                 target = _target_from_item(client, chosen)
                 scan_cache[rk] = (target, scan_target(client, target))
-            _t, (idata, audio_vars, sub_vars) = scan_cache[rk]
+            _t, (idata, audio_vars, sub_vars, header) = scan_cache[rk]
             step = AUDIO
 
         elif step == AUDIO:
@@ -1393,7 +1458,8 @@ def select_and_configure(client, args):
                 audio_action = resolve_variant_arg(args.audio, audio_vars, "zvuk", False)
                 step = SUBS
                 continue
-            audio_action = choose_variant("zvuk (audio)", audio_vars, allow_off=False, allow_back=True)
+            audio_action = choose_variant("zvuk (audio)", audio_vars, allow_off=False,
+                                          allow_back=True, header=header)
             if audio_action[0] == "back":
                 if have_item_step:
                     step = ITEM
@@ -1405,7 +1471,8 @@ def select_and_configure(client, args):
             if not subs_interactive:
                 sub_action = resolve_variant_arg(args.subs, sub_vars, "titulky", True)
                 break
-            sub_action = choose_variant("titulky", sub_vars, allow_off=True, allow_back=True)
+            sub_action = choose_variant("titulky", sub_vars, allow_off=True,
+                                        allow_back=True, header=header)
             if sub_action[0] == "back":
                 if audio_interactive:
                     step = AUDIO
@@ -1490,7 +1557,7 @@ def main():
         log_warn("Nakonec není co měnit. Končím.")
         return
 
-    print()
+    clear_screen()
     log_info(f"Nastavím u {len(items_data)} položek:")
     print(f"    audio:   {plan_summary(audio_plan)}")
     print(f"    titulky: {plan_summary(sub_plan)}")
