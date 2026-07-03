@@ -51,6 +51,13 @@ DROPBOX_DEFAULT_CONNECTIONS = 8   # Dropbox rate-limits shared links hard, so un
                                   # connections (a high auto value like 80 makes them 429/truncate).
 BAR_NCOLS = 100                   # fixed progress-bar width so bars don't stretch across wide terminals
 BAR_DESC_WIDTH = 26               # fixed filename column width so all bars line up
+
+# ---- ntfy.sh push notifications (optional) -------------------------------- #
+# Fill NTFY_TOPIC with your channel name to enable phone push notifications (install the
+# "ntfy" app, subscribe to the same topic). Leave it EMPTY to disable notifications entirely.
+NTFY_TOPIC = "falco81"                   # your ntfy topic/channel  (EMPTY = notifications OFF)
+NTFY_SERVER = "https://ntfy.sh"   # ntfy server hostname     (change for a self-hosted server)
+NTFY_TOKEN = ""                   # optional access token for private / self-hosted topics
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
 
 
@@ -1034,6 +1041,8 @@ def process_patreon_collection(collection_id: str, session: requests.Session, ch
     Honors --select (a single combined chooser) and --list."""
     print(f"[INFO] Reading Patreon collection {collection_id} ...")
     title, campaign_id = get_collection_info(collection_id, session, verbose)
+    global _active_collection_title
+    _active_collection_title = (title or '').strip() or None
     posts = list_collection_posts(collection_id, campaign_id, session, verbose)
     if not posts:
         print("[ERROR] No posts found in the collection.")
@@ -3044,6 +3053,9 @@ _RENAME_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.m4v', '.mov', '.avi', '.ts')
 # offer works only over these, never over unrelated files already sitting in the directory.
 _session_downloads = []
 _session_downloads_lock = threading.Lock()
+# When a Patreon collection is being processed, its (clean) title is stored here so the
+# post-download rename can name files "<Collection> <NN>" instead of the messy post titles.
+_active_collection_title = None
 
 
 def _record_download(path):
@@ -3081,6 +3093,108 @@ def _list_video_files(directory):
         return set()
 
 
+def _series_display_name(name):
+    """Clean, Title-cased (acronym-aware) form of a collection name, e.g. 'My Demon'."""
+    toks = apply_case(tokenize(clean_string(name or "", ())), 'title')
+    return finalize_stem("".join(t for _k, t in toks)) or (name or "").strip() or "video"
+
+
+def build_collection_plan(files, collection_name):
+    """Name files as '<Collection> <episode-number>' (zero-padded), taking the episode number
+    from each original filename. When several files map to the same name (a collision), append
+    distinguishing text pulled from the original name (extra numbers/words), so nothing is lost.
+
+    Returns a list of (old_name, new_name) pairs, or None if it can't do anything useful
+    (e.g. no filename has a number to use as an episode id)."""
+    series = _series_display_name(collection_name)
+    series_words = {w.lower() for w in re.findall(r"[^\W\d_]+", collection_name or "", re.UNICODE)}
+
+    items = []
+    for name in files:
+        stem, ext = os.path.splitext(name)
+        toks = tokenize(clean_string(stem, ()))
+        first_idx = next((i for i, (k, _t) in enumerate(toks) if k == 'num'), None)
+        first = toks[first_idx][1] if first_idx is not None else None
+        after = toks[first_idx + 1:] if first_idx is not None else list(toks)
+        suffix = [(k, t) for (k, t) in after
+                  if not (k == 'word' and t.lower() in series_words)]
+        items.append({'name': name, 'ext': ext, 'first': first, 'suffix': suffix})
+
+    ep_nums = [it['first'] for it in items if it['first'] is not None]
+    if not ep_nums:
+        return None  # nothing numeric to key on -> let the generic renamer handle it
+    ep_w = max([len(str(int(n))) for n in ep_nums] + [len(n) for n in ep_nums])
+
+    for it in items:
+        if it['first'] is not None:
+            it['base'] = f"{series} {it['first'].zfill(ep_w)}"
+        else:
+            it['base'] = _series_display_name(os.path.splitext(it['name'])[0])
+
+    def suffix_parts(it, keep_stop):
+        out, first_word = [], True
+        for k, t in it['suffix']:
+            if k == 'num':
+                out.append(('num', t))
+            elif k == 'word':
+                if (not keep_stop) and t.lower() in DEFAULT_STOP:
+                    continue
+                out.append(('word', case_word(t, 'title', first_word)))
+                first_word = False
+        return out
+
+    by_base = defaultdict(list)
+    for it in items:
+        by_base[it['base']].append(it)
+
+    used = set()
+    for base, grp in by_base.items():
+        if len(grp) == 1:
+            used.add(finalize_stem(grp[0]['base']).lower())
+
+    plan = []
+    for base, grp in by_base.items():
+        if len(grp) == 1:
+            it = grp[0]
+            plan.append((it['name'], finalize_stem(it['base']) + it['ext']))
+            continue
+        # Collision: build a distinguishing suffix. Try compact (drop filler words) first,
+        # then the full text (keep them), then a numeric counter as a last resort.
+        resolved = None
+        for keep_stop in (False, True):
+            swidth = {}
+            for it in grp:
+                si = 0
+                for kind, val in suffix_parts(it, keep_stop):
+                    if kind == 'num':
+                        swidth[si] = max(swidth.get(si, 0), len(val), len(str(int(val))))
+                        si += 1
+            cand = []
+            for it in grp:
+                pieces, si = [], 0
+                for kind, val in suffix_parts(it, keep_stop):
+                    if kind == 'num':
+                        pieces.append(val.zfill(swidth.get(si, len(val))))
+                        si += 1
+                    else:
+                        pieces.append(val)
+                s = " ".join(pieces)
+                cand.append((it, f"{it['base']} {s}".strip() if s else it['base']))
+            names = [finalize_stem(n).lower() for _it, n in cand]
+            if len(set(names)) == len(names) and not (set(names) & used):
+                resolved = cand
+                break
+        if resolved is None:
+            resolved = [(it, f"{it['base']} ({i})") for i, it in enumerate(grp, 1)]
+        for it, n in resolved:
+            used.add(finalize_stem(n).lower())
+            plan.append((it['name'], finalize_stem(n) + it['ext']))
+
+    order = {name: i for i, name in enumerate(files)}
+    plan.sort(key=lambda p: order.get(p[0], 0))
+    return plan
+
+
 def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode='ask'):
     """Preview and (optionally) apply an intelligent --strict rename of freshly downloaded
     files. Returns a small result dict for logging.
@@ -3099,9 +3213,13 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
         result['status'] = 'non-interactive'
         return result
     try:
-        plan, _n = build_plan(sorted(new_files), do_pad=True, do_words=True,
-                              min_width=0, removes=(), case_mode="title", strict=True,
-                              group=True, group_min=1, stop=[])
+        plan = None
+        if _active_collection_title:
+            plan = build_collection_plan(sorted(new_files), _active_collection_title)
+        if plan is None:
+            plan, _n = build_plan(sorted(new_files), do_pad=True, do_words=True,
+                                  min_width=0, removes=(), case_mode="title", strict=True,
+                                  group=True, group_min=1, stop=[])
     except Exception as exc:
         if verbose:
             print(f"[WARN] Renamer could not build a plan: {exc}")
@@ -3265,6 +3383,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     rename_dir = os.path.abspath(out_dir) if out_dir else os.getcwd()
     with _session_downloads_lock:
         _session_downloads.clear()
+    global _active_collection_title
+    _active_collection_title = None
 
     try:
         if kind == 'patreon':
@@ -3338,6 +3458,69 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         return summary
     return None
 
+def _ntfy_enabled():
+    return bool((NTFY_TOPIC or "").strip())
+
+
+def notify_ntfy(message, title=None, priority=None, tags=None):
+    """Send a push notification via ntfy.sh. No-op when NTFY_TOPIC is empty. Never raises —
+    a failed notification must never break a download."""
+    if not _ntfy_enabled():
+        return False
+    url = f"{(NTFY_SERVER or 'https://ntfy.sh').rstrip('/')}/{NTFY_TOPIC.strip()}"
+    headers = {}
+    if title:
+        # HTTP headers must be ASCII; unicode lives in the message body instead.
+        headers['Title'] = str(title).encode('ascii', 'replace').decode('ascii')
+    if priority:
+        headers['Priority'] = str(priority)
+    if tags:
+        headers['Tags'] = tags
+    if (NTFY_TOKEN or "").strip():
+        headers['Authorization'] = f"Bearer {NTFY_TOKEN.strip()}"
+    try:
+        r = requests.post(url, data=(message or "").encode('utf-8'), headers=headers,
+                          timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if r.status_code >= 400:
+            print(f"[WARN] ntfy notification failed (HTTP {r.status_code}).")
+            return False
+        return True
+    except requests.RequestException as e:
+        print(f"[WARN] ntfy notification could not be sent: {e}")
+        return False
+
+
+def _notify_url_list_report(results, log_path):
+    """Push a concise ntfy summary of a --url-list run (no-op if ntfy is off)."""
+    if not _ntfy_enabled():
+        return
+    total = len(results)
+    ok = sum(1 for r in results if r['ok'] and not r['error'])
+    failed = [r for r in results if r['error'] or not r['ok']]
+    files = sum(len(r.get('downloaded') or []) for r in results)
+    # "Needs attention" = failed, or completed but downloaded nothing.
+    problem = [r for r in results if r['error'] or not r['ok'] or not r.get('downloaded')]
+
+    title = f"videoloader: {ok}/{total} URLs OK, {files} files"
+    lines = [f"Finished {ok}/{total} URL(s) OK, {files} file(s) downloaded."]
+    if problem:
+        lines.append("")
+        lines.append("Needs attention:")
+        for r in problem[:15]:
+            st = "FAILED" if (r['error'] or not r['ok']) else "NOFILE"
+            lines.append(f"[{r['index']}] {st}  {r['url']}")
+        if len(problem) > 15:
+            lines.append(f"... and {len(problem) - 15} more")
+    else:
+        lines.append("All good \u2705")
+    lines.append("")
+    lines.append(f"Report: {log_path}")
+
+    notify_ntfy("\n".join(lines), title=title,
+                priority=("high" if failed else "default"),
+                tags=("warning" if problem else "white_check_mark"))
+
+
 def _write_url_list_log(results, out_dir, started):
     """Write a plain-text report of a --url-list run and return its path."""
     directory = os.path.abspath(out_dir) if out_dir else os.getcwd()
@@ -3408,6 +3591,8 @@ def run_url_list(list_path, base_kwargs, out_dir):
 
     print(f"[INFO] --url-list: {len(urls)} URL(s) from '{list_path}'. Rename runs automatically "
           f"(applies when there are no conflicts, otherwise it's skipped).")
+    if _ntfy_enabled():
+        print(f"[INFO] ntfy notifications ON -> {(NTFY_SERVER or 'https://ntfy.sh').rstrip('/')}/{NTFY_TOPIC}")
     results = []
     started = datetime.now()
     interrupted = False
@@ -3439,6 +3624,7 @@ def run_url_list(list_path, base_kwargs, out_dir):
         results.append(entry)
 
     log_path = _write_url_list_log(results, out_dir, started)
+    _notify_url_list_report(results, log_path)
     ok_n = sum(1 for r in results if r['ok'] and not r['error'])
     print("\n" + "=" * 70)
     print(f"[INFO] --url-list done: {ok_n}/{len(results)} URL(s) OK.")
@@ -3483,9 +3669,24 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.18.0")
+    parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.20.0")
 
     args = parser.parse_args()
+
+    if args.test_notify:
+        if not _ntfy_enabled():
+            print("[ERROR] ntfy is not configured. Set NTFY_TOPIC (and NTFY_SERVER if self-hosting)")
+            print("        near the top of the script, then run --test-notify again.")
+            sys.exit(1)
+        target = f"{(NTFY_SERVER or 'https://ntfy.sh').rstrip('/')}/{NTFY_TOPIC}"
+        print(f"[INFO] Sending a test notification to {target} ...")
+        ok = notify_ntfy(
+            "Test notification from videoloader_dir.py. If you can read this on your phone, "
+            "notifications work \u2705",
+            title="videoloader test", priority="default", tags="tada")
+        print("[INFO] Sent - check your phone." if ok else "[WARN] Could not send (see above).")
+        sys.exit(0 if ok else 1)
 
     if args.url_list and args.video_id:
         parser.error("give either a single URL or --url-list, not both.")
