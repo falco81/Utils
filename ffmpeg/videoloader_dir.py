@@ -12,6 +12,7 @@ import json
 import subprocess
 import time
 import atexit
+from datetime import datetime
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
@@ -678,8 +679,6 @@ def list_collection_posts(collection_id: str, campaign_id, session: requests.Ses
     while True:
         params = {
             'include': 'collections,drop,primary_image,audio,video,embed',
-            'fields[post]': ('post_type,title,content,teaser_text,url,embed,post_file,'
-                             'post_metadata,current_user_can_view,published_at'),
             'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
             'sort': 'collection_order',
             'filter[collection_id]': collection_id,
@@ -1054,8 +1053,6 @@ def fetch_patreon_post(post_id: str, session: requests.Session, verbose: bool):
     link/stream extraction can see them). Returns the post dict or None."""
     params = {
         'include': 'collections,drop,primary_image,audio,video,embed',
-        'fields[post]': ('post_type,title,content,teaser_text,url,embed,post_file,'
-                         'post_metadata,current_user_can_view,published_at'),
         'json-api-version': '1.0',
         'json-api-use-default-includes': 'false',
     }
@@ -2032,6 +2029,14 @@ def extract_streams_from_post(post: dict, verbose: bool) -> list:
         out.append({'source': 'vimeo', 'title': title,
                     'vimeo_id': m.group(1), 'vimeo_hash': m.group(2)})
         return out
+    # 2b) Vimeo without a privacy hash (public/unlisted): just the numeric id.
+    mid = re.search(r'vimeo\.com/(\d+)(?:[/?#]|$)', url_field) or \
+        re.search(r'player\.vimeo\.com/video/(\d+)', html)
+    if mid:
+        title = (emb.get('subject') or a.get('title') or mid.group(1)).strip()
+        out.append({'source': 'vimeo', 'title': title,
+                    'vimeo_id': mid.group(1), 'vimeo_hash': ''})
+        return out
 
     # 3) Fallback: some collections don't populate the structured embed/post_file fields, but
     #    the Mux master or Vimeo id+hash still appears somewhere in the post (embed html,
@@ -2207,7 +2212,9 @@ def _extract_player_config(html):
 
 def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     """Return (hls_master_url, title, duration_seconds) or (None, None, 0)."""
-    embed = f"https://player.vimeo.com/video/{vimeo_id}?h={vimeo_hash}"
+    embed = f"https://player.vimeo.com/video/{vimeo_id}"
+    if vimeo_hash:
+        embed += f"?h={vimeo_hash}"
     try:
         r = session.get(embed, headers={'Referer': PATREON_REFERER, 'User-Agent': USER_AGENT},
                         timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
@@ -3074,15 +3081,23 @@ def _list_video_files(directory):
         return set()
 
 
-def offer_strict_rename(directory, new_files, verbose, enabled=True):
-    """Preview an intelligent --strict rename of the freshly downloaded files and, if the
-    user confirms, apply it. Silent when non-interactive or nothing was downloaded."""
+def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode='ask'):
+    """Preview and (optionally) apply an intelligent --strict rename of freshly downloaded
+    files. Returns a small result dict for logging.
+
+    rename_mode='ask'  -> interactive prompt (default; needs a TTY).
+    rename_mode='auto' -> apply automatically when there are NO naming conflicts; if any
+                          conflict exists, skip the rename entirely (auto 'N'). Used by
+                          --url-list so batches run unattended.
+    """
+    result = {'status': 'disabled', 'changed': 0, 'conflicts': 0, 'applied': 0}
     if not enabled or not new_files:
-        return
+        return result
     interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)()) and \
         bool(getattr(sys.stdout, 'isatty', lambda: False)())
-    if not interactive:
-        return
+    if rename_mode == 'ask' and not interactive:
+        result['status'] = 'non-interactive'
+        return result
     try:
         plan, _n = build_plan(sorted(new_files), do_pad=True, do_words=True,
                               min_width=0, removes=(), case_mode="title", strict=True,
@@ -3090,27 +3105,61 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True):
     except Exception as exc:
         if verbose:
             print(f"[WARN] Renamer could not build a plan: {exc}")
-        return
+        result['status'] = 'error'
+        return result
     try:
         existing = set(os.listdir(directory))
     except OSError:
         existing = set()
     skip = detect_collisions(plan, existing)
     use_color = bool(CLR.RESET)
+    changed = [(o, n) for o, n in plan if o != n and o not in skip]
+    conflicts = [(o, n) for o, n in plan if o in skip]
+    result['changed'] = len(changed)
+    result['conflicts'] = len(conflicts)
+
     print(f"\n[INFO] {len(new_files)} file(s) downloaded. Intelligent --strict rename preview:")
-    changed = print_preview(plan, skip, True, use_color)
+    print_preview(plan, skip, True, use_color)
+
+    if not changed and not conflicts:
+        print("[INFO] Filenames are already consistent; nothing to rename.")
+        result['status'] = 'nothing'
+        return result
+
+    if rename_mode == 'auto':
+        if conflicts:
+            print(f"[INFO] --url-list: {len(conflicts)} naming conflict(s) detected -> "
+                  f"skipping rename automatically (auto N).")
+            result['status'] = 'conflict-skipped'
+            return result
+        if not changed:
+            result['status'] = 'nothing'
+            return result
+        print("[INFO] --url-list: no conflicts -> applying renames automatically (auto Y).")
+        apply_renames(changed, directory, use_color)
+        result['status'] = 'applied'
+        result['applied'] = len(changed)
+        return result
+
+    # Interactive mode.
     if not changed:
         print("[INFO] Filenames are already consistent; nothing to rename.")
-        return
+        result['status'] = 'nothing'
+        return result
     try:
         ans = input("\nApply these renames? [Y/n] ").strip().lower()
     except (EOFError, KeyboardInterrupt):
         print("")
-        return
+        result['status'] = 'declined'
+        return result
     if ans in ("n", "no", "ne"):
         print("[INFO] Left the filenames unchanged.")
+        result['status'] = 'declined'
     else:
         apply_renames(changed, directory, use_color)
+        result['status'] = 'applied'
+        result['applied'] = len(changed)
+    return result
 
 
 def _classify_input(id_or_url: str):
@@ -3142,9 +3191,11 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          max_connections: int = None, use_color: bool = USE_COLOR,
          auto_cookies: bool = AUTO_COOKIES, select: bool = False, auto: bool = False,
          out_dir: str = None, max_height: int = DEFAULT_MAX_HEIGHT, list_only: bool = False,
-         ffmpeg_path: str = None, ffmpeg_url: str = None, do_rename: bool = True) -> None:
+         ffmpeg_path: str = None, ffmpeg_url: str = None, do_rename: bool = True,
+         rename_mode: str = 'ask', return_summary: bool = False):
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
+    summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None}
     global FFMPEG, FFMPEG_DOWNLOAD_URL
     if ffmpeg_path:
         FFMPEG = ffmpeg_path
@@ -3153,10 +3204,14 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     setup_console(use_color)
 
     kind, target_id = _classify_input(id_or_url)
+    summary['kind'] = kind
     if kind == 'patreon_bad':
         print("[ERROR] That looks like a Patreon URL but I couldn't find a collection or post id.")
         print("        Expected a collection like https://www.patreon.com/collection/122162")
         print("        or a post like https://www.patreon.com/<creator>/posts/<slug>-162557660")
+        summary['error'] = "invalid Patreon URL (no collection/post id)"
+        if return_summary:
+            return summary
         sys.exit(1)
 
     # Resolve threads/connections: explicit -t/-m always win; otherwise --auto scales by CPU,
@@ -3236,6 +3291,9 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         elif kind == 'vimeo':
             if not ensure_ffmpeg(verbose):
                 print("[ERROR] Vimeo videos are HLS and need ffmpeg to mux audio+video into MP4.")
+                summary['error'] = "ffmpeg not available for Vimeo/HLS"
+                if return_summary:
+                    return summary
                 sys.exit(1)
             if output_file:
                 target_id['title'] = os.path.splitext(os.path.basename(output_file))[0]
@@ -3254,20 +3312,141 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             if not ok:
                 if not cookies_files:
                     print("Tip: For private files, use --cookies to provide a cookies.txt/JSON export.")
+                summary['error'] = "download failed (file not accessible?)"
+                if return_summary:
+                    return summary
                 session.close()
                 sys.exit(1)
     finally:
         session.close()
 
     # After a successful download, offer to tidy up ONLY the files this run downloaded
-    # (never unrelated files already present in the directory).
+    # (never unrelated files already present in the directory). Capture the list BEFORE the
+    # rename, since renaming changes the names on disk.
+    downloaded = _session_downloads_in(rename_dir)
+    summary['downloaded'] = downloaded
     if do_rename and not list_only:
-        new_files = _session_downloads_in(rename_dir)
-        offer_strict_rename(rename_dir, new_files, verbose)
+        summary['rename'] = offer_strict_rename(rename_dir, downloaded, verbose,
+                                                rename_mode=rename_mode)
 
     # Remove the .temp scratch folder if everything finished (leftover parts from an
     # interrupted run keep it so a re-run can resume).
     _cleanup_temp_dir(rename_dir)
+
+    summary['ok'] = True
+    if return_summary:
+        return summary
+    return None
+
+def _write_url_list_log(results, out_dir, started):
+    """Write a plain-text report of a --url-list run and return its path."""
+    directory = os.path.abspath(out_dir) if out_dir else os.getcwd()
+    try:
+        os.makedirs(directory, exist_ok=True)
+    except OSError:
+        directory = os.getcwd()
+    path = os.path.join(directory, f"videoloader_report_{started.strftime('%Y%m%d_%H%M%S')}.log")
+    ok_n = sum(1 for r in results if r['ok'] and not r['error'])
+    lines = [
+        "videoloader_dir.py  --url-list report",
+        f"Started : {started.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"Result  : {ok_n}/{len(results)} URL(s) succeeded",
+        "=" * 70,
+    ]
+    for r in results:
+        if r['error'] or not r['ok']:
+            status = "FAILED"
+        elif not (r.get('downloaded')):
+            status = "NOFILE"   # completed without error, but no new files (all failed/skipped)
+        else:
+            status = "OK    "
+        lines.append("")
+        lines.append(f"[{r['index']}] {status}  {r['url']}")
+        lines.append(f"      kind: {r.get('kind')}   time: {r.get('seconds', 0.0):.1f}s")
+        dl = r.get('downloaded') or []
+        lines.append(f"      downloaded: {len(dl)} file(s)")
+        for name in dl:
+            lines.append(f"          - {name}")
+        rn = r.get('rename')
+        if rn:
+            lines.append(f"      rename: {rn.get('status')} "
+                         f"(changed={rn.get('changed', 0)}, conflicts={rn.get('conflicts', 0)}, "
+                         f"applied={rn.get('applied', 0)})")
+        else:
+            lines.append("      rename: (none)")
+        if r.get('error'):
+            lines.append(f"      error: {r['error']}")
+    text = "\n".join(lines) + "\n"
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(text)
+    except OSError as e:
+        print(f"[WARN] Could not write report log: {e}")
+        return "(not written)"
+    return path
+
+
+def run_url_list(list_path, base_kwargs, out_dir):
+    """Read one URL per line from `list_path` and download each in turn (auto-rename mode),
+    then write a report log. Blank lines and lines starting with '#' are ignored."""
+    try:
+        with open(list_path, encoding='utf-8') as f:
+            raw = f.readlines()
+    except OSError as e:
+        print(f"[ERROR] Cannot read --url-list file '{list_path}': {e}")
+        sys.exit(1)
+
+    urls = []
+    for line in raw:
+        s = line.strip()
+        if s and not s.startswith('#'):
+            urls.append(s)
+    if not urls:
+        print(f"[ERROR] --url-list file '{list_path}' contains no URLs.")
+        sys.exit(1)
+
+    print(f"[INFO] --url-list: {len(urls)} URL(s) from '{list_path}'. Rename runs automatically "
+          f"(applies when there are no conflicts, otherwise it's skipped).")
+    results = []
+    started = datetime.now()
+    interrupted = False
+
+    for i, url in enumerate(urls, 1):
+        print("\n" + "=" * 70)
+        print(f"[URL {i}/{len(urls)}] {url}")
+        print("=" * 70)
+        entry = {'index': i, 'url': url, 'ok': False, 'kind': None,
+                 'downloaded': [], 'rename': None, 'error': None, 'seconds': 0.0}
+        t0 = time.time()
+        try:
+            res = main(url, **base_kwargs, rename_mode='auto', return_summary=True)
+            if isinstance(res, dict):
+                for k in ('ok', 'kind', 'downloaded', 'rename', 'error'):
+                    entry[k] = res.get(k, entry[k])
+        except KeyboardInterrupt:
+            entry['error'] = "interrupted"
+            entry['seconds'] = time.time() - t0
+            results.append(entry)
+            print("\n[WARN] Interrupted during --url-list. Writing a partial report...")
+            interrupted = True
+            break
+        except SystemExit as e:
+            entry['error'] = entry['error'] or f"exited (code {getattr(e, 'code', None)})"
+        except Exception as e:
+            entry['error'] = f"{type(e).__name__}: {e}"
+        entry['seconds'] = time.time() - t0
+        results.append(entry)
+
+    log_path = _write_url_list_log(results, out_dir, started)
+    ok_n = sum(1 for r in results if r['ok'] and not r['error'])
+    print("\n" + "=" * 70)
+    print(f"[INFO] --url-list done: {ok_n}/{len(results)} URL(s) OK.")
+    print(f"[INFO] Report saved to: {log_path}")
+    print("=" * 70)
+    if interrupted or ok_n != len(urls):
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     def positive_int(v):
@@ -3283,7 +3462,8 @@ if __name__ == "__main__":
         return iv
 
     parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder), Dropbox, Vimeo, or a Patreon collection. A Patreon collection is fully mined: Google Drive links, Dropbox links, AND native Patreon/Vimeo/Mux videos are all downloaded.")
-    parser.add_argument("video_id", type=str, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, or a Patreon COLLECTION URL (.../collection/ID). Folders and collections download every video found.")
+    parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, or a Patreon COLLECTION/POST URL. Folders and collections download every video found. Omit when using --url-list.")
+    parser.add_argument("--url-list", type=str, default=None, help="Path to a text file with ONE URL per line (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders/collections).")
     parser.add_argument("-d", "--output-dir", type=str, default=None, help="Directory to save into (applies to any mode; created if missing). Default: current directory.")
     parser.add_argument("-c", "--chunk_size", type=positive_int, default=DEFAULT_CHUNK_SIZE, help=f"Streaming chunk size in bytes. Default {DEFAULT_CHUNK_SIZE} (edit DEFAULT_CHUNK_SIZE at the top of the script).")
@@ -3303,17 +3483,33 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.16.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.18.0")
 
     args = parser.parse_args()
+
+    if args.url_list and args.video_id:
+        parser.error("give either a single URL or --url-list, not both.")
+    if not args.url_list and not args.video_id:
+        parser.error("provide a URL, or use --url-list FILE.")
+
+    common = dict(
+        chunk_size=args.chunk_size, num_threads=args.threads, verbose=args.verbose,
+        cookies_file=args.cookies, folder_workers=args.folder_workers,
+        recursive=(not args.no_recursive and DEFAULT_RECURSIVE),
+        max_connections=args.max_connections, use_color=(USE_COLOR and not args.no_color),
+        auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), select=args.select,
+        auto=(not args.no_auto), out_dir=args.output_dir, max_height=args.max_height,
+        list_only=args.list, ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
+        do_rename=(not args.no_rename),
+    )
+
     try:
-        main(args.video_id, args.output, args.chunk_size, args.threads, args.verbose, args.cookies,
-             folder_workers=args.folder_workers, recursive=(not args.no_recursive and DEFAULT_RECURSIVE),
-             max_connections=args.max_connections, use_color=(USE_COLOR and not args.no_color),
-             auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), select=args.select,
-             auto=(not args.no_auto), out_dir=args.output_dir, max_height=args.max_height,
-             list_only=args.list, ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
-             do_rename=(not args.no_rename))
+        if args.url_list:
+            if args.output:
+                print("[WARN] -o/--output is ignored with --url-list; names come from each source.")
+            run_url_list(args.url_list, dict(common, output_file=None), args.output_dir)
+        else:
+            main(args.video_id, args.output, **common)
     except KeyboardInterrupt:
         # Locks are released by the atexit handler; partial .part files are kept so a re-run
         # resumes where this left off.

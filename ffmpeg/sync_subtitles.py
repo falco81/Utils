@@ -2222,9 +2222,9 @@ def preset_flush_if_save():
 
 
 
-def ask_choice(prompt, options, allow_skip=True, allow_abort=True):
-    """Jednoduchý textový interaktivní výběr v CLI. Vrací index (int),
-    'skip', nebo 'abort'."""
+def ask_choice(prompt, options, allow_skip=True, allow_abort=True, header=None):
+    """Výběr v CLI (šipkové menu / číselný fallback). Vrací index (int),
+    'skip', nebo 'abort'. Esc = zpět (WizardBack)."""
     r = _preset_replay()
     if r is not _PRESET_MISS:
         if isinstance(r, int) and 0 <= r < len(options):
@@ -2232,26 +2232,32 @@ def ask_choice(prompt, options, allow_skip=True, allow_abort=True):
         if r in ("skip", "abort"):
             return r
         return 0
-    while True:
-        print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
-        for i, opt in enumerate(options, 1):
-            print(f"  {i}) {opt}")
-        if allow_skip:
-            print("  s) přeskočit tento soubor")
-        if allow_abort:
-            print("  a) zrušit celý dávkový běh")
-        choice = input("Tvoje volba: ").strip().lower()
-        result = None
-        if allow_skip and choice == "s":
-            result = "skip"
-        elif allow_abort and choice == "a":
-            result = "abort"
-        elif choice.isdigit() and 1 <= int(choice) <= len(options):
-            result = int(choice) - 1
-        if result is not None:
-            _preset_record("choice", prompt, result)
-            return result
-        print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
+    got, v = _back_get()
+    if got:
+        _preset_record("choice", prompt, v)
+        return v
+    n = len(options)
+    labels = list(options)
+    extra = []
+    if allow_skip:
+        labels.append(f"{Fore.MAGENTA}— přeskočit tento soubor —{Style.RESET_ALL}")
+        extra.append("skip")
+    if allow_abort:
+        labels.append(f"{Fore.MAGENTA}— zrušit celý dávkový běh —{Style.RESET_ALL}")
+        extra.append("abort")
+    if _tui_supported():
+        idx = interactive_menu(prompt, labels, default=0, allow_cancel=True, header=header)
+    else:
+        for h in (header or []):
+            if strip_ansi(h).strip():
+                print(h)
+        idx = _ask_pick_classic(prompt, labels, 0, allow_back=True)
+    if idx is None:
+        raise _StepBack()
+    result = idx if idx < n else extra[idx - n]
+    _back_put(result)
+    _preset_record("choice", prompt, result)
+    return result
 
 
 def try_list_tracks(mkvmerge_bin, video_path):
@@ -2541,30 +2547,17 @@ def ask_readability_params(srt_files):
     """Interaktivně se zeptá na parametry prodlužování titulků, s jasným
     vysvětlením, k čemu každý slouží, a s orientačním údajem o aktuálním
     tempu titulků (pokud se podaří spočítat). Vrací (cps, floor, gap, line_overhead)."""
-    print()
-    print(f"{Fore.CYAN}Nastavení prodlužování titulků pro pohodlnější čtení{Style.RESET_ALL}")
-    print(
-        "Tohle NEMĚNÍ začátek žádného titulku a nikdy nezasáhne do dalšího "
-        "titulku - jen tam, kde je volné místo (ticho/mezera), prodlouží konec "
-        "zobrazení, pokud je text na danou dobu zobrazení příliš dlouhý. "
-        "ČASOVÁNÍ MÁ VŽDY PŘEDNOST před tímto nastavením."
-    )
-
     avg_cps = estimate_avg_cps(srt_files)
-    if avg_cps:
-        print(f"  (Pro srovnání: tvoje aktuální titulky mají typické tempo ~{avg_cps:.1f} znaků/s.)")
-    print()
-
-    print(
-        "1) Čtecí rychlost - kolik znaků titulku má čtenář v průměru přečíst "
-        "za 1 sekundu. Nižší číslo = titulky zůstanou na obrazovce déle. "
-        "(Krátká slova/věty stejně nikdy nedostanou stejnou délku jako dlouhé "
-        "víceřádkové věty - délka se vždy počítá podle skutečné délky textu.)"
-    )
     preset_keys = list(READING_SPEED_PRESETS.keys())
     options = [f"{READING_SPEED_PRESETS[k][2]} ({READING_SPEED_PRESETS[k][0]:.0f} znaků/s)" for k in preset_keys]
     options.append("Zadat vlastní čtecí tempo (znaků/s)")
-    choice = ask_choice("Zvol cílové čtecí tempo:", options, allow_skip=False, allow_abort=True)
+    _rh = [f"{Fore.CYAN}Nastavení prodlužování titulků pro pohodlnější čtení{Style.RESET_ALL}",
+           "Prodlouží konec zobrazení jen tam, kde je volné místo (ticho/mezera); nikdy nemění",
+           "začátek titulku ani nezasáhne do dalšího. ČASOVÁNÍ MÁ VŽDY PŘEDNOST."]
+    if avg_cps:
+        _rh.append(f"(Pro srovnání: tvoje titulky mají teď typické tempo ~{avg_cps:.1f} znaků/s.)")
+    _rh += ["", "Čtecí rychlost = kolik znaků má čtenář přečíst za 1 s. Nižší číslo = déle na obrazovce.", ""]
+    choice = ask_choice("Zvol cílové čtecí tempo:", options, allow_skip=False, allow_abort=True, header=_rh)
     if choice == "abort":
         return None
 
@@ -2739,9 +2732,17 @@ def ask_yes_no(prompt, default_no=True):
     r = _preset_replay()
     if r is not _PRESET_MISS:
         return bool(r)
+    got, v = _back_get()
+    if got:
+        _preset_record("yesno", prompt, bool(v))
+        return bool(v)
     suffix = "[a/N]" if default_no else "[A/n]"
-    raw = input(f"{prompt} {suffix}: ").strip().lower()
+    if _tui_supported():
+        raw = _read_line_tui(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} {suffix}: ", "").strip().lower()
+    else:
+        raw = input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} {suffix}: ").strip().lower()
     val = (not default_no) if not raw else (raw in ("a", "y", "ano", "yes", "ja"))
+    _back_put(val)
     _preset_record("yesno", prompt, val)
     return val
 
@@ -3052,8 +3053,11 @@ def extract_with_fallback(args, video, initial_track, text_tracks, done_ids=None
                  "nečitelná (možná obrázkové titulky nebo poškozená).")
         labels = [f"#{t['id']}  {t['lang']:4} {t['codec']}  {t.get('title', '')}".rstrip() for t in alts]
         labels += ["přeskočit toto video", "u dalších videí se už neptat (jen přeskakovat)"]
+        _fh = [f"{Fore.YELLOW}{vname}:{Style.RESET_ALL}",
+               f"{Fore.YELLOW}Stopa #{track['id']} ({track.get('lang', '?')}) je prázdná/nečitelná "
+               f"(obrázkové titulky nebo poškozená).{Style.RESET_ALL}", ""]
         i = ask_pick(f"{vname}: zkusit jinou titulkovou stopu?", labels,
-                     default=0 if alts else len(alts),
+                     default=0 if alts else len(alts), header=_fh, allow_back=False,
                      help=([f"Vytáhne místo toho stopu #{t['id']} ({t['lang']}, {t['codec']})."
                             for t in alts]
                            + ["Tohle video přeskočí (žádný .srt se z něj neuloží).",
@@ -3939,6 +3943,7 @@ def run_translate_subs(args):
         videos = [] if dry else collect_videos(directory, recursive)
         if not videos and not dry:
             die("Žádná videa v adresáři. Zvol 'titulkové soubory', nebo použij --auto pro synchronizaci.")
+        _hdr = []
         if videos:
             log_info(f"Nalezeno {len(videos)} videí.")
             mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, Path(videos[0]))
@@ -3947,14 +3952,15 @@ def run_translate_subs(args):
             except (Exception, SystemExit):
                 st = []
             if st:
-                log_info(f"Stopy ve vzorku ({Path(videos[0]).name}):")
+                _hdr.append(f"{Fore.CYAN}Titulkové stopy ve vzorku ({Path(videos[0]).name}):{Style.RESET_ALL}")
                 for t in st:
-                    print(f"    #{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}")
+                    _hdr.append(f"   #{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}")
+                _hdr.append("")
         # výběr stopy - PEVNÉ volby (funguje i bez videa a je přenositelné do presetu)
         ti = ask_pick("Kterou titulkovou stopu z videa vzít?",
                       ["podle JAZYKA (zadám kód - robustní pro celou složku)",
                        "první vhodná titulková stopa",
-                       "konkrétní ID stopy (zadám číslo)"], default=0,
+                       "konkrétní ID stopy (zadám číslo)"], default=0, header=_hdr or None,
                       help=["Z každého videa vezme stopu v zadaném jazyce (i když má jinde jiné ID).",
                             "Vezme první titulkovou stopu videa.",
                             "Vytáhne stopu s konkrétním číslem ID (stejné číslo u všech videí)."])
@@ -4267,10 +4273,19 @@ def run_extract_subs(args, minimal=False):
             log_warn("Vzorové video má jen obrázkové titulky (PGS/VobSub). Můžeš přesto zkusit jiná "
                      "videa přes výběr podle jazyka - textové stopy se vytáhnou, obrázkové přeskočí.")
 
+    _hdr = [f"{Fore.MAGENTA}=== Extrahovat titulky z videí ==={Style.RESET_ALL}"]
+    if videos:
+        _hdr.append(f"{Fore.CYAN}Nalezeno {len(videos)} videí. Titulkové stopy ve vzorku "
+                    f"({sample.name}):{Style.RESET_ALL}")
+        for t in sub_tracks:
+            _kind = "text" if is_text_codec(t["codec"]) else f"{Fore.YELLOW}OBRÁZKOVÉ (nelze do .srt){Style.RESET_ALL}"
+            _hdr.append(f"   #{t['id']}  {t['lang']:4} {t['codec']:16} {t.get('title', '')}  [{_kind}]")
+    _hdr.append("")
     mode = ask_pick("Které titulkové stopy vytáhnout?",
                     ["podle JAZYKA (zadám kódy - robustní pro celou složku)",
                      "konkrétní STOPY podle čísla (číslo stopy ze vzorku)",
                      "VŠECHNY textové titulkové stopy z každého videa"], default=0,
+                    header=_hdr,
                     help=["podle jazyka: zadáš kódy (např. eng,cze,ger) a z KAŽDÉHO videa se "
                           "vytáhnou stopy v těch jazycích - i když mají v různých videích jiná ID.",
                           "konkrétní stopy: vybereš čísla stop podle vzorku výše; stejná čísla se "
@@ -5390,18 +5405,338 @@ def collect_subs(directory):
     return out
 
 
-def ask_pick(prompt, labels, default=0, help=None):
-    """Číslovaný výběr s výchozí volbou (Enter). Vrací index do labels.
-    Když je zadán 'help' (seznam/řetězec), '?' vypíše bližší vysvětlení."""
-    r = _preset_replay()
-    if r is not _PRESET_MISS:
+class WizardBack(Exception):
+    """Vyhozeno, když se má odejít z průvodce do hlavního menu."""
+    pass
+
+
+class _StepBack(WizardBack):
+    """Vyhozeno při Esc v otázce - vrátí se o JEDNU otázku zpět (obsluhuje
+    run_with_back). Když už není kam, chová se jako WizardBack (hlavní menu)."""
+    pass
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def strip_ansi(s):
+    return _ANSI_RE.sub("", s)
+
+
+_TUI_WINDOWS = os.name == "nt"
+try:
+    if _TUI_WINDOWS:
+        import msvcrt as _msvcrt
+    else:
+        import termios as _termios
+        import tty as _tty
+    _HAS_RAW = True
+except Exception:
+    _HAS_RAW = False
+
+
+def _tui_supported():
+    try:
+        return _HAS_RAW and sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def clear_screen():
+    """Smaže obrazovku (aplikační režim). Bez TTY nedělá nic."""
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+    except Exception:
+        pass
+
+
+# --- krok zpět v průvodci (Esc): pamatuje odpovědi a přehraje je k předchozí --
+_BACK_ACTIVE = False
+_BACK_REPLAY = []   # odpovědi k přehrání z minula (do "frontieru")
+_BACK_NEW = []      # nové odpovědi zadané v tomto průchodu
+_BACK_POS = 0
+
+
+def _back_get():
+    """Během přehrávání (po Esc) vrátí (True, uložená_odpověď), jinak (False, None)."""
+    global _BACK_POS
+    if _BACK_ACTIVE and _BACK_POS < len(_BACK_REPLAY):
+        v = _BACK_REPLAY[_BACK_POS]
+        _BACK_POS += 1
+        return True, v
+    return False, None
+
+
+def _back_put(v):
+    if _BACK_ACTIVE:
+        _BACK_NEW.append(v)
+
+
+def run_with_back(fn, args):
+    """Spustí interaktivního průvodce fn(args) s podporou 'krok zpět' (Esc).
+    Odpovědi se nahrávají; Esc v otázce vyhodí _StepBack a průvodce se přehraje
+    znovu až k PŘEDCHOZÍ otázce. Esc na první otázce -> WizardBack (hlavní menu).
+    Během přehrávání presetu (--load) je to jen průchod bez změn."""
+    global _BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW
+    if preset_is_replaying():
+        return fn(args)
+    saved = (_BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW)
+    tape = []
+    try:
+        while True:
+            _BACK_REPLAY = tape
+            _BACK_NEW = []
+            _BACK_POS = 0
+            _BACK_ACTIVE = True
+            if _PRESET_MODE in ("save", "offer"):
+                _PRESET_REC.clear()   # čistý záznam presetu pro (finální) průchod
+            try:
+                return fn(args)
+            except _StepBack:
+                full = list(_BACK_REPLAY[:_BACK_POS]) + _BACK_NEW
+                if not full:
+                    raise WizardBack()
+                tape = full[:-1]      # zahoď poslední odpověď -> o otázku zpět
+    finally:
+        _BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW = saved
+
+
+def _read_line_tui(prompt_str, default="", secret=False):
+    """Řádkový vstup v raw režimu s podporou Esc (= krok zpět). Vrací text nebo
+    default (Enter). Esc vyhodí _StepBack."""
+    sys.stdout.write(prompt_str)
+    sys.stdout.flush()
+    buf = []
+    with _RawMode():
+        while True:
+            key = _read_key()
+            if key == "enter":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return "".join(buf) if buf else default
+            if key == "esc":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                raise _StepBack()
+            if key == "backspace":
+                if buf:
+                    buf.pop()
+                    sys.stdout.write("\b \b")
+                    sys.stdout.flush()
+            elif isinstance(key, tuple) and key[0] == "char" and key[1].isprintable():
+                buf.append(key[1])
+                sys.stdout.write("*" if secret else key[1])
+                sys.stdout.flush()
+
+
+def _read_key():
+    """Přečte jednu klávesu; vrátí akci ('up'/'down'/…/'enter'/'esc'/…) nebo
+    ('char', znak)."""
+    if _TUI_WINDOWS:
+        ch = _msvcrt.getch()
+        if ch in (b"\x00", b"\xe0"):
+            c2 = _msvcrt.getch()
+            return {b"H": "up", b"P": "down", b"K": "left", b"M": "right",
+                    b"G": "home", b"O": "end", b"I": "pgup", b"Q": "pgdn"}.get(c2, "other")
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch == b"\x08":
+            return "backspace"
+        if ch == b"\x1b":
+            return "esc"
+        if ch == b"\x03":
+            raise KeyboardInterrupt
+        for enc in ("utf-8", "cp1250", "latin-1"):
+            try:
+                return ("char", ch.decode(enc))
+            except Exception:
+                continue
+        return "other"
+    else:
+        ch = sys.stdin.read(1)
+        if ch == "\x1b":
+            c1 = sys.stdin.read(1)
+            if c1 not in ("[", "O"):
+                return "esc"
+            seq = ""
+            while True:
+                c = sys.stdin.read(1)
+                seq += c
+                if c.isalpha() or c == "~" or len(seq) > 6:
+                    break
+            return {"A": "up", "B": "down", "C": "right", "D": "left",
+                    "H": "home", "F": "end", "1~": "home", "4~": "end",
+                    "5~": "pgup", "6~": "pgdn"}.get(seq, "esc")
+        if ch in ("\r", "\n"):
+            return "enter"
+        if ch in ("\x7f", "\x08"):
+            return "backspace"
+        if ch == "\x03":
+            raise KeyboardInterrupt
+        return ("char", ch)
+
+
+class _RawMode:
+    """Kontextový manažer pro raw režim terminálu (jen Unix)."""
+    def __enter__(self):
+        if not _TUI_WINDOWS:
+            self.fd = sys.stdin.fileno()
+            self.old = _termios.tcgetattr(self.fd)
+            _tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, *a):
+        if not _TUI_WINDOWS:
+            _termios.tcsetattr(self.fd, _termios.TCSADRAIN, self.old)
+
+
+def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, header=None):
+    """Menu ovládané šipkami ↑↓ (+ psaní = hledání). Vrací index, nebo None
+    (zrušeno přes Esc, jen když allow_cancel). Kreslí se na místě pod dosavadní
+    výstup. '?' ukáže nápovědu k aktuální položce. Bez TTY vrací None (volající
+    použije číselný fallback)."""
+    if not _tui_supported() or not labels:
+        return None
+    n = len(labels)
+    plain = [strip_ansi(l) for l in labels]
+    header = list(header or [])
+    helplist = None
+    if isinstance(help, (list, tuple)):
+        helplist = list(help)
+    elif isinstance(help, str):
+        helplist = [help] * n
+    filt = ""
+    status = ""
+    sel_pos = default if 0 <= default < n else 0
+    prev_lines = 0
+    first = True
+
+    def visible_order():
+        if not filt:
+            return list(range(n))
+        f = filt.lower()
+        return [i for i in range(n) if f in plain[i].lower()]
+
+    def term_size():
         try:
-            r = int(r)
+            sz = os.get_terminal_size()
+            return sz.columns, sz.lines
         except Exception:
-            r = default
-        if not (0 <= r < len(labels)):
-            r = default if 0 <= default < len(labels) else 0
-        return r
+            return 80, 24
+
+    def trunc(s, width):
+        return s[:max(1, width - 1)] + "…" if len(s) > width else s
+
+    def render(order, sel_pos):
+        nonlocal prev_lines, first
+        cols, rows_total = term_size()
+        maxw = max(10, cols - 2)
+        reserve = 6 + len(header)
+        page_rows = max(3, rows_total - reserve)
+        buf = []
+        if first:
+            buf.append("\x1b[2J\x1b[H")   # smaž obrazovku + kurzor domů (aplikační režim, jako Plex)
+            first = False
+        elif prev_lines > 0:
+            up = prev_lines - 1
+            buf.append((f"\x1b[{up}F" if up > 0 else "\r") + "\x1b[J")
+        vis = []
+        for h in header:
+            sp = strip_ansi(h)
+            vis.append(h if len(sp) <= maxw else trunc(sp, maxw))
+        vis.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
+        if filt:
+            hint = "↑↓ pohyb · Enter = vybrat · Esc = smazat hledání"
+        elif allow_cancel:
+            hint = "↑↓ pohyb · piš = hledat · Enter = vybrat · Esc = zpět"
+        else:
+            hint = "↑↓ pohyb · piš = hledat · Enter = vybrat"
+        if helplist:
+            hint += " · ? = nápověda"
+        vis.append(f"{Fore.CYAN}{trunc(hint, maxw)}{Style.RESET_ALL}")
+        if not order:
+            vis.append(f"  {Fore.RED}(žádná shoda){Style.RESET_ALL}")
+        else:
+            start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
+            window = order[start:start + page_rows]
+            if start > 0:
+                vis.append(f"  {Fore.CYAN}▲ ({start} výše){Style.RESET_ALL}")
+            for pos, i in enumerate(window, start):
+                text = trunc(plain[i], maxw - 2)
+                if pos == sel_pos:
+                    vis.append(f"{Fore.GREEN}{Style.BRIGHT}›{Style.RESET_ALL} "
+                               f"{Fore.GREEN}{Style.BRIGHT}{text}{Style.RESET_ALL}")
+                else:
+                    vis.append(f"  {text}")
+            rest = len(order) - (start + len(window))
+            if rest > 0:
+                vis.append(f"  {Fore.CYAN}▼ ({rest} níže){Style.RESET_ALL}")
+        pos_info = f" [{sel_pos + 1}/{len(order)}]" if order else ""
+        if filt:
+            vis.append(f"{Fore.MAGENTA}{trunc('Hledání: ' + filt + pos_info, maxw)}{Style.RESET_ALL}")
+        else:
+            vis.append(f"{Fore.CYAN}{trunc('(začni psát pro hledání)' + pos_info, maxw)}{Style.RESET_ALL}")
+        if status:
+            for line in status.split("\n"):
+                sp = strip_ansi(line)
+                vis.append(line if len(sp) <= maxw else trunc(sp, maxw))
+        buf.append("\n".join(vis))
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+        prev_lines = len(vis)
+        return page_rows
+
+    with _RawMode():
+        order = visible_order()
+        if sel_pos >= len(order):
+            sel_pos = max(0, len(order) - 1)
+        page_rows = render(order, sel_pos)
+        while True:
+            key = _read_key()
+            if key != "other" and status:
+                status = ""
+            if key == "up" and order:
+                sel_pos = (sel_pos - 1) % len(order)
+            elif key == "down" and order:
+                sel_pos = (sel_pos + 1) % len(order)
+            elif key == "pgup" and order:
+                sel_pos = max(0, sel_pos - page_rows)
+            elif key == "pgdn" and order:
+                sel_pos = min(len(order) - 1, sel_pos + page_rows)
+            elif key == "home":
+                sel_pos = 0
+            elif key == "end" and order:
+                sel_pos = len(order) - 1
+            elif isinstance(key, tuple) and key[0] == "char" and key[1] == "?" and helplist and order:
+                status = f"{Fore.CYAN}ℹ {helplist[order[sel_pos]]}{Style.RESET_ALL}"
+            elif key in ("enter", "right"):
+                if order:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return order[sel_pos]
+            elif key in ("esc", "left"):
+                if filt:
+                    filt = ""
+                    order = visible_order()
+                    sel_pos = 0
+                elif allow_cancel:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return None
+            elif key == "backspace" and filt:
+                filt = filt[:-1]
+                order = visible_order()
+                sel_pos = 0
+            elif isinstance(key, tuple) and key[0] == "char" and key[1].isprintable():
+                filt += key[1]
+                order = visible_order()
+                sel_pos = 0
+            page_rows = render(order, sel_pos)
+
+
+def _ask_pick_classic(prompt, labels, default=0, help=None, allow_back=False):
     hint = f"{Fore.CYAN} (? = více info){Style.RESET_ALL}" if help else ""
 
     def _show():
@@ -5411,8 +5746,9 @@ def ask_pick(prompt, labels, default=0, help=None):
             print(f"  {i + 1}) {l}{mark}")
 
     _show()
+    back_hint = ", z = zpět" if allow_back else ""
     while True:
-        raw = input(f"Volba [1-{len(labels)}, Enter = {default + 1}]: ").strip()
+        raw = input(f"Volba [1-{len(labels)}, Enter = {default + 1}{back_hint}]: ").strip()
         if raw == "?" and help:
             if isinstance(help, (list, tuple)):
                 for h in help:
@@ -5421,24 +5757,75 @@ def ask_pick(prompt, labels, default=0, help=None):
                 print(f"  {help}")
             _show()
             continue
-        val = None
+        if allow_back and raw.lower() in ("z", "q", "zpet", "zpět"):
+            return None
         if raw == "":
-            val = default
-        elif raw.isdigit() and 1 <= int(raw) <= len(labels):
-            val = int(raw) - 1
-        if val is not None:
-            _preset_record("pick", prompt, val)
-            return val
+            return default
+        if raw.isdigit() and 1 <= int(raw) <= len(labels):
+            return int(raw) - 1
         print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
+
+
+def ask_pick(prompt, labels, default=0, help=None, allow_back=None, header=None):
+    """Výběr z nabídky. Na terminálu šipkové menu (↑↓, hledání psaním, ? =
+    nápověda, Esc = zpět), jinak číslovaný fallback (z = zpět). Vrací index.
+    allow_back: None (výchozí) = Esc vyhodí WizardBack (probublá do hlavního
+    menu); True = Esc vrátí None (volající si zpět obslouží sám); False = Esc
+    nedělá nic (jen maže hledání). Zachovává ukládání/přehrávání presetů."""
+    r = _preset_replay()
+    if r is not _PRESET_MISS:
+        try:
+            r = int(r)
+        except Exception:
+            r = default
+        if not (0 <= r < len(labels)):
+            r = default if 0 <= default < len(labels) else 0
+        return r
+    got, v = _back_get()
+    if got:
+        try:
+            v = int(v)
+        except Exception:
+            v = default
+        if not (0 <= v < len(labels)):
+            v = default if 0 <= default < len(labels) else 0
+        _preset_record("pick", prompt, v)
+        return v
+    can_esc = allow_back is not False
+    if _tui_supported():
+        idx = interactive_menu(prompt, labels, default=default, help=help,
+                               allow_cancel=can_esc, header=header)
+    else:
+        for h in (header or []):
+            if strip_ansi(h).strip():
+                print(h)
+        idx = _ask_pick_classic(prompt, labels, default, help, allow_back=can_esc)
+    if idx is None:
+        if allow_back is True:
+            return None
+        if allow_back is False:
+            idx = default if 0 <= default < len(labels) else 0
+        else:
+            raise _StepBack()
+    _back_put(idx)
+    _preset_record("pick", prompt, idx)
+    return idx
 
 
 def ask_text(prompt, default=""):
     r = _preset_replay()
     if r is not _PRESET_MISS:
         return r if r is not None else default
+    got, v = _back_get()
+    if got:
+        _preset_record("text", prompt, v)
+        return v
     suffix = f" [{default}]" if default else ""
-    raw = input(f"{prompt}{suffix}: ").strip()
-    val = raw or default
+    if _tui_supported():
+        val = _read_line_tui(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{suffix}: ", default)
+    else:
+        val = input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{suffix}: ").strip() or default
+    _back_put(val)
     _preset_record("text", prompt, val)
     return val
 
@@ -5874,7 +6261,9 @@ def _create_new_preset(args):
     """Nechá vybrat režim, projít průvodce a uložit jako pojmenovaný preset."""
     cmds = list(_INTERACTIVE_COMMANDS.items())
     labels = [f"{desc}" for _cmd, (desc, _fn) in cmds]
-    i = ask_pick("Jaký režim uložit jako preset?", labels, default=1)
+    i = ask_pick("Jaký režim uložit jako preset?", labels, default=1, allow_back=True)
+    if i is None:
+        return
     cmd = cmds[i][0]
     dry_ok = {"translate-subs", "extract-subs", "rename-subs", "import-subs", "merge-pro", "resync-pro"}
     if cmd not in dry_ok:
@@ -5890,7 +6279,7 @@ def _create_new_preset(args):
     log_info(f"Projdi průvodce - jen se posbírají volby a uloží jako preset '{name}'. "
              "Nemusíš být ve složce s videi/titulky, nic se teď neprovede.")
     preset_begin_save(cmd, key=name, label=name, dryrun=True)
-    dispatch_interactive_command(cmd, args)
+    run_with_back(lambda a: dispatch_interactive_command(cmd, a), args)
 
 
 def _delete_preset(presets):
@@ -5898,8 +6287,8 @@ def _delete_preset(presets):
         log_warn("Žádné presety k smazání.")
         return
     labels = [f"{lbl}  ({cmd})" for lbl, _k, cmd in presets] + ["zpět"]
-    i = ask_pick("Který preset smazat?", labels, default=len(presets))
-    if i >= len(presets):
+    i = ask_pick("Který preset smazat?", labels, default=len(presets), allow_back=True)
+    if i is None or i >= len(presets):
         return
     lbl, key, _cmd = presets[i]
     if ask_yes_no(f"Opravdu smazat preset '{lbl}'?", default_no=True):
@@ -5908,18 +6297,22 @@ def _delete_preset(presets):
 
 
 def run_presets_menu(args):
-    """Hlavní menu Presety: spusť uložené nastavení jedním výběrem, nebo si
-    vytvoř/smaž preset."""
+    """Menu Presety: spusť uložené nastavení jedním výběrem, nebo si vytvoř/smaž
+    preset. Esc nebo 'Zpět' vrací do hlavního menu."""
     while True:
         presets = list_named_presets()
-        print(f"{Fore.MAGENTA}=== Presety (uložená nastavení) ==={Style.RESET_ALL}")
-        if presets:
-            log_info("Vyber preset - spustí se rovnou s uloženým nastavením.")
-        else:
-            log_info("Zatím nemáš žádný preset. Vytvoř si první přes 'Vytvořit nový preset'.")
         labels = [f"▶ {lbl}  ({cmd})" for lbl, _k, cmd in presets]
         labels += ["+ Vytvořit nový preset", "Smazat preset", "Zpět do hlavního menu"]
-        i = ask_pick("Presety:", labels, default=0 if presets else len(presets))
+        header = [
+            f"{Fore.MAGENTA}=== Presety (uložená nastavení) ==={Style.RESET_ALL}",
+            (f"{Fore.CYAN}Vyber preset - spustí se rovnou.{Style.RESET_ALL}" if presets
+             else f"{Fore.CYAN}Zatím žádný preset - vytvoř si první.{Style.RESET_ALL}"),
+            "",
+        ]
+        i = ask_pick("Presety:", labels, default=0 if presets else len(presets),
+                     allow_back=True, header=header)
+        if i is None:                     # Esc = zpět do hlavního menu
+            return
         if i < len(presets):
             lbl, key, cmd = presets[i]
             data = get_preset(key)
@@ -5931,138 +6324,161 @@ def run_presets_menu(args):
             dispatch_interactive_command(cmd, args)
             return
         elif i == len(presets):
-            _create_new_preset(args)
-            return
+            try:
+                _create_new_preset(args)
+            except WizardBack:
+                pass
+            continue                      # zpět do menu presetů
         elif i == len(presets) + 1:
-            _delete_preset(presets)
-        else:
+            _delete_preset(presets)       # smyčka pokračuje (zpět do menu presetů)
+        else:                             # "Zpět do hlavního menu"
             return
 
 
 def run_master_wizard(args):
     """Hlavní průvodce při spuštění BEZ parametrů: zeptá se, co chceš udělat,
     spustí příslušný dílčí průvodce a na konci nabídne uložení jako preset."""
-    print(f"{Fore.MAGENTA}=== sync_subtitles - interaktivní průvodce ==={Style.RESET_ALL}")
-    log_info("Spuštěno bez parametrů. Projdu s tebou, co se má udělat.")
-    log_info("Tip: až to vyplníš, můžeš si volby uložit jako preset - příště se to spustí samo.")
-    print()
+    _orig_mkv = getattr(args, "mkv", None)
+    _mode_flags = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
+                   "extract_subs", "import_subs", "remove_tracks", "set_default",
+                   "rename_subs", "fix_readability")
+    while True:
+        # čistý stav pro každou návštěvu hlavního menu
+        args.mkv = _orig_mkv
+        for _f in _mode_flags:
+            if hasattr(args, _f):
+                setattr(args, _f, False)
+        for _a in ("_extract_skip_prompts",):
+            if hasattr(args, _a):
+                setattr(args, _a, False)
+        global _PRESET_MODE, _PRESET_SAVED
+        _PRESET_MODE = None
+        _PRESET_SAVED = False
+        mode = ask_pick(
+            "Co chceš udělat?",
+            ["Synchronizovat JEDNY titulky (špatně načasované) podle videa nebo druhých titulků",
+             "Synchronizovat CELOU SLOŽKU (dávka videí + jejich titulky)",
+             "Přeložit titulky z videa do jiného jazyka a uložit jako .srt",
+             "Vytáhnout (extrahovat) titulky z videí do .srt - vyber které stopy",
+             "Nahradit STROJOVÝ překlad PROFESIONÁLNÍM (podle obsahu, časování zůstane)",
+             "Přečasovat PROFESIONÁLNÍ titulky na MOJE časování (100% profi text)",
+             "Vložit (mux) titulky ze složky do videí (podle SxxExx)",
+             "Odebrat audio/titulkové stopy z MKV (podle jazyka)",
+             "Nastavit VÝCHOZÍ (default) stopu podle jazyka",
+             "Přejmenovat titulky podle názvů videí (SxxExx)",
+             "Presety - spustit uložené nastavení jedním výběrem (nebo si nějaké vytvořit)",
+             "Jen opravit ČITELNOST titulků (prodloužit příliš krátké)",
+             "Nastavit API klíče a výchozí volby (sync_subtitles.config.json)",
+             "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
+            default=1,
+            allow_back=True,
+            header=[f"{Fore.MAGENTA}=== sync_subtitles - interaktivní průvodce ==={Style.RESET_ALL}",
+                    f"{Fore.CYAN}Tip:{Style.RESET_ALL} vyber akci šipkami (piš = hledat, ? = nápověda, Esc = konec). "
+                    "Na konci si volby uložíš jako preset.",
+                    ""],
+            help=["Synchronizace jedněch titulků: vybereš titulkový soubor se špatným časováním a "
+                  "zdroj správného časování (titulková stopa z videa, nebo druhé .srt). Bez videa to "
+                  "umí i mezi dvěma .srt.",
+                  "Dávka celé složky: pro každé video v adresáři dopočítá časování k jeho titulkům.",
+                  "Překlad titulků: vytáhne stopu z videa nebo vezme existující .srt, přeloží do cílového "
+                  "jazyka (Gemini/Google/DeepL/Claude/Argos) + korektura, uloží <jméno>.<jazyk>.srt.",
+                  "Extrakce titulků: z každého videa (mkv/mp4/...) vytáhne titulkové stopy do .srt. "
+                  "Stopy se detekují přímo z videa; vybereš které (podle jazyka, konkrétní stopy, nebo "
+                  "všechny textové). Obrázkové titulky (PGS/VobSub) nelze do textu.",
+                  "Nahradit strojový překlad profesionálním: máš vlastní/AI titulky s dobrým časováním a "
+                  "jinde profesionální překlad TÉŽE show (klidně jiná verze / jiný počet epizod). Podle "
+                  "OBSAHU spáruje řádky a dosadí profesionální text, ale ZACHOVÁ tvoje časování. Pokryje "
+                  "jen řádky, kde je jistá shoda; zbytek nechá strojový.",
+                  "Přečasovat profesionální titulky na moje časování: OPAČNÝ postup - vezme CELÝ "
+                  "profesionální překlad z jiného adresáře a přečasuje ho na tvoje časování. Výsledek = "
+                  "100 % profesionálního textu se správným timingem. Nejlepší, když chceš profi titulky "
+                  "na svou verzi videa.",
+                  "Vložit titulky do videí: .srt/.ass ze složky namuxuje do videí (párování přes SxxExx) "
+                  "pomocí MKVToolNix. Nastaví jazyk, název stopy, forced a volitelně výchozí stopu. "
+                  "Výstup je vždy MKV (i z MP4).",
+                  "Odebrat stopy z MKV: ukáže jazyky audio/titulkových stop a vybereš, které vyhodit "
+                  "(rychlý přemux -c copy). Originály se dají zachovat (podsložka 'trimmed').",
+                  "Výchozí stopa: zruší staré default flagy a nastaví výchozí audio/titulky podle jazyka. "
+                  "MKV na místě (mkvpropedit), MP4 přemuxem (ffmpeg).",
+                  "Přejmenovat titulky: .srt přejmenuje podle názvu odpovídajícího videa (párování přes "
+                  "SxxExx), zachová jazykovou/forced koncovku. Nejdřív ukáže plán.",
+                  "Presety: uložená nastavení průvodců pojmenovaná podle tebe. Vybereš preset a operace "
+                  "se rovnou spustí s uloženými volbami. Můžeš si tu preset vytvořit i smazat. (Preset "
+                  "se dá uložit i na konci každého průvodce přes otázku 'Uložit jako preset?'.)",
+                  "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa. Když ve "
+                  "složce nejsou .srt, nabídne extrakci z videí.",
+                  "Config: uloží API klíče a výchozí volby do sync_subtitles.config.json (načítá se automaticky).",
+                  "Test API: pošle triviální dotaz a vypíše přesnou odpověď/chybu (ladění např. HTTP 400)."])
 
-    mode = ask_pick(
-        "Co chceš udělat?",
-        ["Synchronizovat JEDNY titulky (špatně načasované) podle videa nebo druhých titulků",
-         "Synchronizovat CELOU SLOŽKU (dávka videí + jejich titulky)",
-         "Přeložit titulky z videa do jiného jazyka a uložit jako .srt",
-         "Vytáhnout (extrahovat) titulky z videí do .srt - vyber které stopy",
-         "Nahradit STROJOVÝ překlad PROFESIONÁLNÍM (podle obsahu, časování zůstane)",
-         "Přečasovat PROFESIONÁLNÍ titulky na MOJE časování (100% profi text)",
-         "Vložit (mux) titulky ze složky do videí (podle SxxExx)",
-         "Odebrat audio/titulkové stopy z MKV (podle jazyka)",
-         "Nastavit VÝCHOZÍ (default) stopu podle jazyka",
-         "Přejmenovat titulky podle názvů videí (SxxExx)",
-         "Presety - spustit uložené nastavení jedním výběrem (nebo si nějaké vytvořit)",
-         "Jen opravit ČITELNOST titulků (prodloužit příliš krátké)",
-         "Nastavit API klíče a výchozí volby (sync_subtitles.config.json)",
-         "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
-        default=1,
-        help=["Synchronizace jedněch titulků: vybereš titulkový soubor se špatným časováním a "
-              "zdroj správného časování (titulková stopa z videa, nebo druhé .srt). Bez videa to "
-              "umí i mezi dvěma .srt.",
-              "Dávka celé složky: pro každé video v adresáři dopočítá časování k jeho titulkům.",
-              "Překlad titulků: vytáhne stopu z videa nebo vezme existující .srt, přeloží do cílového "
-              "jazyka (Gemini/Google/DeepL/Claude/Argos) + korektura, uloží <jméno>.<jazyk>.srt.",
-              "Extrakce titulků: z každého videa (mkv/mp4/...) vytáhne titulkové stopy do .srt. "
-              "Stopy se detekují přímo z videa; vybereš které (podle jazyka, konkrétní stopy, nebo "
-              "všechny textové). Obrázkové titulky (PGS/VobSub) nelze do textu.",
-              "Nahradit strojový překlad profesionálním: máš vlastní/AI titulky s dobrým časováním a "
-              "jinde profesionální překlad TÉŽE show (klidně jiná verze / jiný počet epizod). Podle "
-              "OBSAHU spáruje řádky a dosadí profesionální text, ale ZACHOVÁ tvoje časování. Pokryje "
-              "jen řádky, kde je jistá shoda; zbytek nechá strojový.",
-              "Přečasovat profesionální titulky na moje časování: OPAČNÝ postup - vezme CELÝ "
-              "profesionální překlad z jiného adresáře a přečasuje ho na tvoje časování. Výsledek = "
-              "100 % profesionálního textu se správným timingem. Nejlepší, když chceš profi titulky "
-              "na svou verzi videa.",
-              "Vložit titulky do videí: .srt/.ass ze složky namuxuje do videí (párování přes SxxExx) "
-              "pomocí MKVToolNix. Nastaví jazyk, název stopy, forced a volitelně výchozí stopu. "
-              "Výstup je vždy MKV (i z MP4).",
-              "Odebrat stopy z MKV: ukáže jazyky audio/titulkových stop a vybereš, které vyhodit "
-              "(rychlý přemux -c copy). Originály se dají zachovat (podsložka 'trimmed').",
-              "Výchozí stopa: zruší staré default flagy a nastaví výchozí audio/titulky podle jazyka. "
-              "MKV na místě (mkvpropedit), MP4 přemuxem (ffmpeg).",
-              "Přejmenovat titulky: .srt přejmenuje podle názvu odpovídajícího videa (párování přes "
-              "SxxExx), zachová jazykovou/forced koncovku. Nejdřív ukáže plán.",
-              "Presety: uložená nastavení průvodců pojmenovaná podle tebe. Vybereš preset a operace "
-              "se rovnou spustí s uloženými volbami. Můžeš si tu preset vytvořit i smazat. (Preset "
-              "se dá uložit i na konci každého průvodce přes otázku 'Uložit jako preset?'.)",
-              "Čitelnost: jen prodlouží příliš krátce zobrazené titulky do volného místa. Když ve "
-              "složce nejsou .srt, nabídne extrakci z videí.",
-              "Config: uloží API klíče a výchozí volby do sync_subtitles.config.json (načítá se automaticky).",
-              "Test API: pošle triviální dotaz a vypíše přesnou odpověď/chybu (ladění např. HTTP 400)."])
+        if mode is None:
+            log_info("Konec.")
+            return
+        if mode == 10:
+            try:
+                run_presets_menu(args)
+            except WizardBack:
+                pass
+            continue
 
-    if mode == 12:
-        run_config(args)
-        return
-    if mode == 13:
-        run_test_api(args)
-        return
-    if mode == 11:
-        args.fix_readability = True
-        run_fix_readability(args)
-        return
-    if mode == 10:
-        run_presets_menu(args)
-        return
-    if mode == 9:
-        args.rename_subs = True
-        preset_begin_offer("rename-subs")
-        run_rename_subs(args)
-        return
-    if mode == 8:
-        args.set_default = True
-        preset_begin_offer("set-default")
-        run_set_default(args)
-        return
-    if mode == 7:
-        args.remove_tracks = True
-        preset_begin_offer("remove-tracks")
-        run_remove_tracks(args)
-        return
-    if mode == 6:
-        args.import_subs = True
-        preset_begin_offer("import-subs")
-        run_import_subs(args)
-        return
-    if mode == 5:
-        args.resync_pro = True
-        preset_begin_offer("resync-pro")
-        run_resync_pro(args)
-        return
-    if mode == 4:
-        args.merge_pro = True
-        preset_begin_offer("merge-pro")
-        run_transplant(args)
-        return
-    if mode == 3:
-        args.extract_subs = True
-        preset_begin_offer("extract-subs")
-        run_extract_subs(args)
-        return
-
-    cmd = ["auto", "auto-all", "translate-subs"][mode]
-    if mode == 0:
-        args.auto = True
-    elif mode == 1:
-        args.auto_all = True
-    else:
-        args.translate_subs = True
-
-    # nabídnout uložení presetu (otázka padne až na konci, těsně před spuštěním)
-    preset_begin_offer(cmd)
-    if cmd == "auto":
-        run_auto_single(args)
-    elif cmd == "auto-all":
-        run_auto_all(args)
-    else:
-        run_translate_subs(args)
+        try:
+            if mode == 12:
+                run_with_back(run_config, args)
+            elif mode == 13:
+                run_test_api(args)
+            elif mode == 11:
+                args.fix_readability = True
+                run_with_back(run_fix_readability, args)
+            elif mode == 9:
+                args.rename_subs = True
+                preset_begin_offer("rename-subs")
+                run_with_back(run_rename_subs, args)
+            elif mode == 8:
+                args.set_default = True
+                preset_begin_offer("set-default")
+                run_with_back(run_set_default, args)
+            elif mode == 7:
+                args.remove_tracks = True
+                preset_begin_offer("remove-tracks")
+                run_with_back(run_remove_tracks, args)
+            elif mode == 6:
+                args.import_subs = True
+                preset_begin_offer("import-subs")
+                run_with_back(run_import_subs, args)
+            elif mode == 5:
+                args.resync_pro = True
+                preset_begin_offer("resync-pro")
+                run_with_back(run_resync_pro, args)
+            elif mode == 4:
+                args.merge_pro = True
+                preset_begin_offer("merge-pro")
+                run_with_back(run_transplant, args)
+            elif mode == 3:
+                args.extract_subs = True
+                preset_begin_offer("extract-subs")
+                run_with_back(run_extract_subs, args)
+            else:
+                cmd = ["auto", "auto-all", "translate-subs"][mode]
+                if mode == 0:
+                    args.auto = True
+                elif mode == 1:
+                    args.auto_all = True
+                else:
+                    args.translate_subs = True
+                preset_begin_offer(cmd)
+                if cmd == "auto":
+                    run_with_back(run_auto_single, args)
+                elif cmd == "auto-all":
+                    run_with_back(run_auto_all, args)
+                else:
+                    run_with_back(run_translate_subs, args)
+        except WizardBack:
+            continue   # Esc na první otázce průvodce -> zpět do hlavního menu
+        # po dokončení akce počkej (ať zůstane výsledek vidět), pak zpět do menu
+        try:
+            input(f"\n{Fore.CYAN}Hotovo - stiskni Enter pro návrat do hlavního menu (Ctrl+C = konec)...{Style.RESET_ALL}")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
 
 
 def _pause_for_menu(seconds=3.0):
@@ -6494,4 +6910,11 @@ RŮZNÉ JAZYKY (target vs reference):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except WizardBack:
+        log_info("Zpět/konec.")
+    except KeyboardInterrupt:
+        print()
+        log_warn("Přerušeno uživatelem.")
+        sys.exit(130)
