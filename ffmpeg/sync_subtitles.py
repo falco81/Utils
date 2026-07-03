@@ -694,8 +694,79 @@ def seconds_to_srt_time(t: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
-def parse_srt(path: Path):
-    raw = path.read_text(encoding="utf-8-sig", errors="replace")
+def _decode_subtitle_bytes(data):
+    """Rozumně dekóduje titulky s neznámým kódováním: BOM, čisté UTF-8, UTF-16
+    bez BOM, a pak podle vzoru vysokých bajtů rozliší evropské (cp1250) vs
+    asijské (Big5/GBK/EUC-KR) kódování - u asijských použije detektor, když je."""
+    if not data:
+        return ""
+    ts = re.compile(r"\d\d:\d\d:\d\d[,.]\d{3}")
+    # 1) BOM
+    if data[:3] == b"\xef\xbb\xbf":
+        return data[3:].decode("utf-8", errors="replace")
+    if data[:2] == b"\xff\xfe" or data[:2] == b"\xfe\xff":
+        try:
+            return data.decode("utf-16", errors="replace")
+        except Exception:
+            pass
+    # 2) čisté UTF-8 s časovými značkami (nejčastější případ)
+    try:
+        t = data.decode("utf-8")
+        if ts.search(t):
+            return t
+    except Exception:
+        pass
+    # 3) UTF-16 bez BOM (hodně nulových bajtů)
+    if data.count(b"\x00") > len(data) // 4:
+        for enc in ("utf-16-le", "utf-16-be"):
+            try:
+                t = data.decode(enc)
+                if ts.search(t):
+                    return t
+            except Exception:
+                pass
+    # 4) vysoké bajty: v běhu (CJK) vs izolované (evropské jednobajtové)
+    hi = [i for i, b in enumerate(data) if b >= 0x80]
+    cjk_like = False
+    if hi:
+        s = set(hi)
+        adj = sum(1 for i in hi if (i - 1) in s or (i + 1) in s)
+        cjk_like = (adj / len(hi)) > 0.6
+    if cjk_like:
+        for libname in ("charset_normalizer", "chardet"):
+            try:
+                lib = __import__(libname)
+                if libname == "charset_normalizer":
+                    b = lib.from_bytes(data).best()
+                    if b is not None and ts.search(str(b)):
+                        return str(b)
+                else:
+                    enc = (lib.detect(data) or {}).get("encoding")
+                    if enc:
+                        t = data.decode(enc, errors="replace")
+                        if ts.search(t):
+                            return t
+            except Exception:
+                pass
+        order = ("gb18030", "big5", "euc-kr", "shift_jis", "cp1250", "cp1252", "latin-1")
+    else:
+        order = ("cp1250", "cp1252", "latin-1", "gb18030", "big5")
+    best, best_score = None, -1
+    for enc in order:
+        try:
+            txt = data.decode(enc)
+        except Exception:
+            continue
+        score = len(ts.findall(txt))
+        if score > best_score:
+            best, best_score = txt, score
+    if best is None or best_score <= 0:
+        best = data.decode("utf-8", errors="replace")
+    return best
+
+
+def parse_srt(path: Path, strict=True):
+    raw = _decode_subtitle_bytes(Path(path).read_bytes())
     blocks = re.split(r"\r?\n\r?\n+", raw.strip())
     events = []
     for block in blocks:
@@ -715,7 +786,9 @@ def parse_srt(path: Path):
         text = "\n".join(lines[time_line_idx + 1:]).strip()
         events.append({"start": start, "end": end, "text": text})
     if not events:
-        die(f"Z souboru {path} se nepodařilo načíst žádné titulky (chybný formát?).")
+        if strict:
+            die(f"Z souboru {path} se nepodařilo načíst žádné titulky (chybný formát?).")
+        return []
     return events
 
 
@@ -1146,7 +1219,7 @@ def _load_reference_pool(directory, recursive=False, continuous=False):
     offset = 0.0
     for f in files:
         try:
-            evs = parse_srt(Path(f))
+            evs = parse_srt(Path(f), strict=False)
         except Exception as e:
             log_warn(f"{os.path.basename(f)}: nelze načíst ({e}) - přeskakuji.")
             continue
@@ -1913,6 +1986,11 @@ _PRESET_MISS = object()
 _SECRET_HINTS = ("klíč", "klic", "key", "heslo", "password", "token")
 
 
+def preset_is_replaying():
+    """True, když právě běží preset z --load (žádný interaktivní uživatel)."""
+    return _PRESET_MODE == "load"
+
+
 def _is_secret_prompt(p):
     pl = str(p).lower()
     return any(h in pl for h in _SECRET_HINTS)
@@ -2500,7 +2578,7 @@ def detect_sub_language(events, max_lines=400):
 
 def detect_srt_file_language(path):
     try:
-        return detect_sub_language(parse_srt(Path(path)))
+        return detect_sub_language(parse_srt(Path(path), strict=False))
     except Exception:
         return None
 
@@ -2737,7 +2815,11 @@ def extract_subtitle_events(args, video, track_id=None, ref_lang=None):
     if not mkvmerge_bin:
         log_warn(f"{video.name}: mkvmerge nenalezen - přeskakuji.")
         return None, None
-    sub_tracks = mkvmerge_tracks(mkvmerge_bin, video, "subtitles")
+    try:
+        sub_tracks = mkvmerge_tracks(mkvmerge_bin, video, "subtitles")
+    except (Exception, SystemExit) as e:
+        log_warn(f"{video.name}: nelze přečíst stopy ({e}) - přeskakuji.")
+        return None, None
     if not sub_tracks:
         log_warn(f"{video.name}: žádné titulkové stopy.")
         return None, None
@@ -2761,12 +2843,98 @@ def extract_subtitle_events(args, video, track_id=None, ref_lang=None):
                 return None, None
             pos = [t["id"] for t in sub_tracks].index(chosen["id"])
             extract_subtitle_via_ffmpeg(ffmpeg_bin, video, pos, outp)
-        return parse_srt(outp), chosen
-    except Exception as e:
-        log_warn(f"{video.name}: extrakce selhala: {e}")
+        ev = parse_srt(outp, strict=False)
+        # Fallback: stopa nemusí být SubRip (ASS/SSA/jiné kódování) - když je
+        # výsledek prázdný a máme ffmpeg, necháme ho převést na SRT.
+        if not ev and ffmpeg_bin:
+            try:
+                pos = [t["id"] for t in sub_tracks].index(chosen["id"])
+                outp2 = Path(tmpd) / "track_ff.srt"
+                extract_subtitle_via_ffmpeg(ffmpeg_bin, video, pos, outp2)
+                ev = parse_srt(outp2, strict=False)
+            except Exception:
+                pass
+        if not ev:
+            return None, chosen
+        return ev, chosen
+    except (Exception, SystemExit) as e:
+        log_warn(f"{video.name}: extrakce stopy selhala: {e}")
         return None, None
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
+
+
+def _track_tag(track, all_text_tracks):
+    """Deterministické pojmenování: první stopa daného jazyka -> '<jazyk>',
+    další téhož jazyka -> '<jazyk>.2', '.3'... (nezávislé na pořadí extrakce)."""
+    lang = track["lang"] if track.get("lang") and track["lang"] != "und" else f"track{track['id']}"
+    same = [t for t in all_text_tracks if (t.get("lang") or "") == (track.get("lang") or "")]
+    if len(same) <= 1:
+        return lang
+    try:
+        pos = same.index(track) + 1
+    except ValueError:
+        pos = 1
+    return lang if pos == 1 else f"{lang}.{pos}"
+
+
+def probe_text_subtitle_tracks(args, video):
+    """Bezpečně (nikdy neumře) vrátí seznam TEXTOVÝCH titulkových stop videa."""
+    mm = getattr(args, "mkvmerge", None)
+    if not mm:
+        mm, me, ff, _ = _resolve_tools_for_extract(args, Path(video))
+        if mm:
+            args.mkvmerge = args.mkvmerge or mm
+    if not mm:
+        return []
+    try:
+        tracks = mkvmerge_tracks(mm, Path(video), "subtitles")
+    except (Exception, SystemExit):
+        return []
+    return [t for t in tracks if is_text_codec(t["codec"])]
+
+
+def extract_with_fallback(args, video, initial_track, text_tracks, done_ids=None,
+                          interactive=True):
+    """Vytáhne 'initial_track'; když stopa selže (prázdná/nečitelná/obrázková) a
+    jsme interaktivně, NASKENUJE video a nabídne jinou stopu k výběru (nebo
+    přeskočení). Vrací (events, chosen_track) nebo (None, None).
+    Nastavuje args._extract_skip_prompts, když uživatel zvolí 'už se neptat'."""
+    done_ids = done_ids or set()
+    tried = set()
+    track = initial_track
+    vname = Path(video).name
+    while track is not None:
+        tried.add(track["id"])
+        events, chosen = extract_subtitle_events(args, video, track_id=track["id"])
+        if events:
+            return events, (chosen or track)
+
+        # stopa selhala
+        if not interactive or getattr(args, "_extract_skip_prompts", False):
+            log_warn(f"{vname}: stopa #{track['id']} ({track.get('lang', '?')}) "
+                     "je prázdná/nečitelná - přeskakuji.")
+            return None, None
+
+        alts = [t for t in text_tracks if t["id"] not in tried and t["id"] not in done_ids]
+        log_warn(f"{vname}: stopa #{track['id']} ({track.get('lang', '?')}) je prázdná nebo "
+                 "nečitelná (možná obrázkové titulky nebo poškozená).")
+        labels = [f"#{t['id']}  {t['lang']:4} {t['codec']}  {t.get('title', '')}".rstrip() for t in alts]
+        labels += ["přeskočit toto video", "u dalších videí se už neptat (jen přeskakovat)"]
+        i = ask_pick(f"{vname}: zkusit jinou titulkovou stopu?", labels,
+                     default=0 if alts else len(alts),
+                     help=([f"Vytáhne místo toho stopu #{t['id']} ({t['lang']}, {t['codec']})."
+                            for t in alts]
+                           + ["Tohle video přeskočí (žádný .srt se z něj neuloží).",
+                              "U všech dalších selhaných stop se už nebude ptát a rovnou je přeskočí."]))
+        if i < len(alts):
+            track = alts[i]
+        elif i == len(alts):
+            return None, None
+        else:
+            args._extract_skip_prompts = True
+            return None, None
+    return None, None
 
 
 def clean_subtitle_text(text, max_line=42):
@@ -3313,7 +3481,7 @@ class OpenSubtitles:
         try:
             import urllib.request
             with urllib.request.urlopen(url, timeout=60) as r:
-                return r.read().decode("utf-8", "replace")
+                return _decode_subtitle_bytes(r.read())
         except Exception as e:
             log_warn(f"OpenSubtitles stažení souboru selhalo: {e}")
             return None
@@ -3368,7 +3536,7 @@ def fetch_opensubtitles_events(video, lang, api_key, username=None, password=Non
     try:
         p = Path(tmp) / "dl.srt"
         p.write_text(srt_text, encoding="utf-8")
-        return parse_srt(p)
+        return parse_srt(p, strict=False)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -3658,7 +3826,10 @@ def run_translate_subs(args):
         log_info(f"Nalezeno {len(videos)} videí.")
         sample = Path(videos[0])
         mkvmerge_bin, _, _, _ = _resolve_tools_for_extract(args, sample)
-        sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles") if mkvmerge_bin else []
+        try:
+            sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles") if mkvmerge_bin else []
+        except (Exception, SystemExit):
+            sub_tracks = []
         if sub_tracks:
             labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in sub_tracks]
             labels += ["podle jazyka (zadám kód)", "první vhodná"]
@@ -3835,7 +4006,19 @@ def run_translate_subs(args):
                             log_info(f"{p.name}: srovnávám stažené titulky s videem (affine)...")
                             events = run_alignment(_affine_sync_args(args), ref_events, ref_events, events)
             if events is None and strategy in ("auto", "mt"):
-                src_events, _chosen = extract_subtitle_events(args, p, args.track_id, args.ref_lang)
+                _vtext = probe_text_subtitle_tracks(args, p)
+                _init = None
+                if args.track_id is not None:
+                    _init = next((t for t in _vtext if t["id"] == args.track_id), None)
+                if _init is None and args.ref_lang:
+                    _init = next((t for t in _vtext if t["lang"].lower().startswith(str(args.ref_lang).lower())), None)
+                if _init is None and _vtext:
+                    _init = _vtext[0]
+                if _init is not None:
+                    src_events, _chosen = extract_with_fallback(args, p, _init, _vtext,
+                                                                interactive=not preset_is_replaying())
+                else:
+                    src_events = None
                 if src_events:
                     log_info(f"{p.name}: překládám {len(src_events)} titulků do '{out_lang}' ({engine})...")
                     translated = translate_events_to(src_events, engine, out_lang, mt_key, mt_model)
@@ -3851,7 +4034,7 @@ def run_translate_subs(args):
                         source_used = f"mt:{engine}"
         else:  # kind == "sub"
             try:
-                src_events = parse_srt(p)
+                src_events = parse_srt(p, strict=False)
             except Exception as e:
                 log_warn(f"{p.name}: nelze načíst ({e}) - přeskakuji.")
                 skipped += 1
@@ -3924,9 +4107,8 @@ def run_extract_subs(args, minimal=False):
         die("Žádná videa (mkv/mp4/...) v adresáři.")
     log_info(f"Nalezeno {len(videos)} videí.")
 
-    # detekce stop ze vzorku
-    sample = Path(videos[0])
-    mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _is_mkv = _resolve_tools_for_extract(args, sample)
+    # detekce stop ze vzorku (zkus videa postupně, dokud se nějaké nepřečte)
+    mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _is_mkv = _resolve_tools_for_extract(args, Path(videos[0]))
     if not mkvmerge_bin:
         die("Nenašel jsem mkvmerge (mkvtoolnix) pro čtení stop. Nainstaluj mkvtoolnix, "
             "nebo zkontroluj připojení pro automatické stažení.")
@@ -3937,16 +4119,28 @@ def run_extract_subs(args, minimal=False):
     if ffmpeg_bin:
         args.ffmpeg = args.ffmpeg or ffmpeg_bin
 
-    sub_tracks = mkvmerge_tracks(mkvmerge_bin, sample, "subtitles")
-    if not sub_tracks:
-        die(f"Vzorové video ({sample.name}) nemá žádné titulkové stopy.")
+    sample = None
+    sub_tracks = []
+    for cand in videos:
+        try:
+            st = mkvmerge_tracks(mkvmerge_bin, Path(cand), "subtitles")
+        except (Exception, SystemExit):
+            continue
+        if st:
+            sample = Path(cand)
+            sub_tracks = st
+            break
+    if sample is None:
+        die("Nepodařilo se přečíst titulkové stopy ze žádného videa (poškozené soubory, "
+            "nebo videa nemají titulky).")
     log_info(f"Titulkové stopy ve vzorku ({sample.name}):")
     for t in sub_tracks:
         txt = "text" if is_text_codec(t["codec"]) else "OBRÁZKOVÉ (nelze do .srt)"
         print(f"    #{t['id']}  {t['lang']:4}  {t['codec']:16} {t.get('title', '')}  [{txt}]")
     text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
     if not text_tracks:
-        die("Vzorové video má jen obrázkové titulky (PGS/VobSub) - ty nelze vytáhnout jako text.")
+        log_warn("Vzorové video má jen obrázkové titulky (PGS/VobSub). Můžeš přesto zkusit jiná "
+                 "videa přes výběr podle jazyka - textové stopy se vytáhnou, obrázkové přeskočí.")
 
     mode = ask_pick("Které titulkové stopy vytáhnout?",
                     ["podle JAZYKA (zadám kódy - robustní pro celou složku)",
@@ -3966,12 +4160,19 @@ def run_extract_subs(args, minimal=False):
         if not want_langs:
             want_langs = None  # = všechny textové
     elif mode == 1:
-        labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in text_tracks]
-        for k, lab in enumerate(labels, 1):
-            print(f"  {k}) {lab}")
-        raw = ask_text("Zadej čísla stop oddělená čárkou (např. 1,3)", "1")
-        picks = [int(x) for x in raw.replace(" ", "").split(",") if x.isdigit() and 1 <= int(x) <= len(text_tracks)]
-        want_ids = [text_tracks[k - 1]["id"] for k in picks] or [text_tracks[0]["id"]]
+        if not text_tracks:
+            log_warn("Vzorové video nemá textové stopy k výběru podle čísla - přepínám na výběr "
+                     "podle jazyka (projde se každé video zvlášť).")
+            raw = ask_text("Kódy jazyků oddělené čárkou (např. eng,cze; prázdné = všechny)", "")
+            want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()] or None
+            want_ids = None
+        else:
+            labels = [f"#{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}" for t in text_tracks]
+            for k, lab in enumerate(labels, 1):
+                print(f"  {k}) {lab}")
+            raw = ask_text("Zadej čísla stop oddělená čárkou (např. 1,3)", "1")
+            picks = [int(x) for x in raw.replace(" ", "").split(",") if x.isdigit() and 1 <= int(x) <= len(text_tracks)]
+            want_ids = [text_tracks[k - 1]["id"] for k in picks] or [text_tracks[0]["id"]]
 
     do_clean = False if minimal else ask_yes_no(
         "Pravidlově očistit text (mezery, interpunkce, rozlomení dlouhých řádků)?", default_no=True)
@@ -3996,7 +4197,7 @@ def run_extract_subs(args, minimal=False):
         v = Path(vid)
         try:
             vtracks = mkvmerge_tracks(args.mkvmerge, v, "subtitles")
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             log_warn(f"{v.name}: nelze přečíst stopy ({e}) - přeskakuji.")
             skipped += 1
             continue
@@ -4012,23 +4213,28 @@ def run_extract_subs(args, minimal=False):
             skipped += 1
             continue
 
-        # kolize jazyků -> přidej ID do názvu
-        lang_counts = {}
-        for t in sel:
-            lang_counts[t["lang"]] = lang_counts.get(t["lang"], 0) + 1
-
+        done_ids = set()
         any_written = False
         for t in sel:
-            lang = t["lang"] if t["lang"] and t["lang"] != "und" else f"track{t['id']}"
-            tag = f"{lang}.{t['id']}" if lang_counts.get(t["lang"], 0) > 1 else lang
-            out_path = v.with_name(v.stem + f".{tag}.srt")
+            if t["id"] in done_ids:
+                continue
+            out_path = v.with_name(v.stem + f".{_track_tag(t, vtext)}.srt")
             if out_path.exists() and not overwrite:
                 log_info(f"{out_path.name}: už existuje - přeskakuji.")
+                done_ids.add(t["id"])
                 continue
-            events, chosen = extract_subtitle_events(args, v, track_id=t["id"])
+            events, chosen = extract_with_fallback(args, v, t, vtext, done_ids=done_ids,
+                                                   interactive=not minimal and not preset_is_replaying())
             if not events:
-                log_warn(f"{v.name}: stopu #{t['id']} ({t['lang']}) se nepodařilo vytáhnout.")
                 continue
+            # když fallback vybral jinou stopu, pojmenuj podle skutečné stopy
+            if chosen and chosen["id"] != t["id"]:
+                out_path = v.with_name(v.stem + f".{_track_tag(chosen, vtext)}.srt")
+                if out_path.exists() and not overwrite:
+                    log_info(f"{out_path.name}: už existuje - přeskakuji.")
+                    done_ids.add(chosen["id"])
+                    continue
+            done_ids.add(chosen["id"] if chosen else t["id"])
             if do_clean:
                 for e in events:
                     e["text"] = clean_subtitle_text(e["text"])
@@ -4036,9 +4242,10 @@ def run_extract_subs(args, minimal=False):
                 cps, floor, gap, overhead = resolve_speed_params(args)
                 events, _n = fix_short_durations(events, min_cps=cps, min_duration_floor=floor,
                                                  min_gap=gap, line_overhead=overhead)
+            ch = chosen or t
             try:
                 write_srt(events, out_path)
-                log_done(f"{v.name}: stopa #{t['id']} ({t['lang']}, {t['codec']}) -> {out_path.name} "
+                log_done(f"{v.name}: stopa #{ch['id']} ({ch['lang']}, {ch['codec']}) -> {out_path.name} "
                          f"({len(events)} titulků)")
                 wrote += 1
                 any_written = True
@@ -4729,7 +4936,7 @@ def run_transplant(args):
     for path in chosen:
         p = Path(path)
         try:
-            ev = parse_srt(p)
+            ev = parse_srt(p, strict=False)
         except Exception as e:
             log_warn(f"{p.name}: nelze načíst ({e}) - přeskakuji.")
             skipped += 1
@@ -4836,7 +5043,7 @@ def run_resync_pro(args):
     for path in chosen:
         p = Path(path)
         try:
-            ev = parse_srt(p)
+            ev = parse_srt(p, strict=False)
         except Exception as e:
             log_warn(f"{p.name}: nelze načíst ({e}) - přeskakuji.")
             skipped += 1
