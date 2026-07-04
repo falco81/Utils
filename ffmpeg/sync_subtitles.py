@@ -33,7 +33,9 @@ Použité nástroje
 Instalace na Windows 10
 ------------------------
 1) Python 3.9+  (https://www.python.org/downloads/)
-2) pip install numpy colorama
+2) pip install numpy colorama charset-normalizer deep-translator
+   (kompletní seznam závislostí vč. volitelných a instalace na Linuxu/AlmaLinuxu
+    je v `python sync_subtitles.py --help`)
 3) MKVToolNix - NEMUSÍŠ řešit ručně. Skript hledá v tomto pořadí (stažení
    je AŽ POSLEDNÍ MOŽNOST):
      1. PATH / --mkvmerge,--mkvextract
@@ -184,6 +186,30 @@ def log_done(msg: str):
 def die(msg: str, code: int = 1):
     print(f"{Fore.RED}[CHYBA]{Style.RESET_ALL} {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def _linux_install_hint(tool):
+    """Na Linuxu poradí, jak nástroj doinstalovat balíčkovačem (nestahujeme
+    Windows buildy). Na Windows se nevolá."""
+    if tool == "ffmpeg":
+        log_warn("ffmpeg nenalezen v PATH. Nainstaluj ho balíčkovačem:")
+        log_info("  Debian/Ubuntu:  sudo apt install ffmpeg")
+        log_info("  Fedora:         sudo dnf install ffmpeg")
+        log_info("  AlmaLinux/Rocky/RHEL (EPEL + CRB + RPM Fusion):")
+        log_info("     sudo dnf install epel-release")
+        log_info("     sudo dnf config-manager --set-enabled crb")
+        log_info("     sudo dnf install --nogpgcheck https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm")
+        log_info("     sudo dnf install ffmpeg   (nebo z EPEL: sudo dnf install ffmpeg-free)")
+        log_info("  Arch:           sudo pacman -S ffmpeg")
+    else:  # mkvtoolnix
+        log_warn("mkvtoolnix (mkvmerge/mkvextract) nenalezen v PATH. Nainstaluj ho balíčkovačem:")
+        log_info("  Debian/Ubuntu:  sudo apt install mkvtoolnix")
+        log_info("  Fedora:         sudo dnf install mkvtoolnix")
+        log_info("  AlmaLinux/Rocky/RHEL - oficiální repo bunkus.org (zjisti verzi: rpm -E %rhel):")
+        log_info("     EL8:     sudo rpm -Uhv https://mkvtoolnix.download/almalinux/bunkus-org-repo-2-4.noarch.rpm")
+        log_info("     EL9/10:  sudo rpm -Uhv https://mkvtoolnix.download/centosstream/bunkus-org-repo-2-4.noarch.rpm")
+        log_info("     sudo dnf install mkvtoolnix")
+        log_info("  Arch:           sudo pacman -S mkvtoolnix-cli")
 
 
 def find_tool(names):
@@ -463,7 +489,7 @@ def ensure_ffmpeg(target_dir, allow_download):
             ff = _find_cached("ffmpeg", broad_dirs, max_depth=3)
         if not _try_ff(ff):
             ff = None
-    if ff is None and allow_download and FFMPEG_DOWNLOAD_URL:
+    if ff is None and allow_download and FFMPEG_DOWNLOAD_URL and os.name == "nt":
         try:
             _download_ffmpeg(FFMPEG_DOWNLOAD_URL)
         except Exception as e:
@@ -471,6 +497,8 @@ def ensure_ffmpeg(target_dir, allow_download):
         ff = _find_cached("ffmpeg", cache_dirs)
         if not _try_ff(ff):
             ff = None
+    elif ff is None and os.name != "nt":
+        _linux_install_hint("ffmpeg")
     return ff
 
 
@@ -561,8 +589,9 @@ def ensure_mkvtoolnix(target_dir, allow_download):
             me = _find_cached("mkvextract", broad_dirs, max_depth=3)
             me = me if _try_ff(me) else None
 
-    # 4) teprve teď, jako poslední možnost, stažení
-    if (mm is None or me is None) and allow_download:
+    # 4) teprve teď, jako poslední možnost, stažení (jen Windows - portable .7z
+    #    je Windows build; na Linuxu poradíme instalaci balíčkovačem)
+    if (mm is None or me is None) and allow_download and os.name == "nt":
         try:
             url = _resolve_mkvtoolnix_url()
             if not url:
@@ -576,6 +605,8 @@ def ensure_mkvtoolnix(target_dir, allow_download):
         if me is None:
             me = _find_cached("mkvextract", [cache])
             me = me if _try_ff(me) else None
+    elif (mm is None or me is None) and os.name != "nt":
+        _linux_install_hint("mkvtoolnix")
 
     return mm, me
 
@@ -5464,6 +5495,19 @@ def _tui_supported():
         return False
 
 
+def _flush_input():
+    """Zahodí nepřečtené bajty ve vstupu (zbytky escape sekvencí od šipek, extra
+    Enter apod.) - jinak by je další prompt přečetl jako neúmyslný vstup."""
+    try:
+        if _TUI_WINDOWS:
+            while _msvcrt.kbhit():
+                _msvcrt.getch()
+        else:
+            _termios.tcflush(sys.stdin.fileno(), _termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
 def clear_screen():
     """Smaže obrazovku (aplikační režim). Bez TTY nedělá nic."""
     try:
@@ -5551,6 +5595,7 @@ def _read_line_tui(prompt_str, default="", secret=False, prefill=""):
         sys.stdout.write(("*" * len(buf)) if secret else "".join(buf))
     sys.stdout.flush()
     with _RawMode():
+        _flush_input()
         while True:
             key = _read_key()
             if key == "enter":
@@ -5596,36 +5641,79 @@ def _read_key():
                 continue
         return "other"
     else:
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            c1 = sys.stdin.read(1)
-            if c1 not in ("[", "O"):
+        import select
+        fd = sys.stdin.fileno()
+
+        def _avail(timeout=0.12):
+            try:
+                r, _, _ = select.select([fd], [], [], timeout)
+                return bool(r)
+            except Exception:
+                return False
+
+        def _rd():
+            try:
+                return os.read(fd, 1)
+            except Exception:
+                return b""
+
+        b = _rd()
+        if not b:
+            return "other"
+        c0 = b[0]
+        if c0 == 0x1b:                      # ESC nebo začátek escape sekvence
+            if not _avail():                # nic dalšího nepřišlo -> samotné Esc
                 return "esc"
-            seq = ""
+            b2 = _rd()
+            if b2 not in (b"[", b"O"):
+                return "esc"
+            seq = b""
             while True:
-                c = sys.stdin.read(1)
-                seq += c
-                if c.isalpha() or c == "~" or len(seq) > 6:
+                c = _rd()
+                if not c:
                     break
+                seq += c
+                if c.isalpha() or c == b"~" or len(seq) > 6:
+                    break
+                if not _avail(0.02):
+                    break
+            s = seq.decode("ascii", "ignore")
             return {"A": "up", "B": "down", "C": "right", "D": "left",
                     "H": "home", "F": "end", "1~": "home", "4~": "end",
-                    "5~": "pgup", "6~": "pgdn"}.get(seq, "esc")
-        if ch in ("\r", "\n"):
+                    "5~": "pgup", "6~": "pgdn"}.get(s, "esc")
+        if c0 in (0x0d, 0x0a):
             return "enter"
-        if ch in ("\x7f", "\x08"):
+        if c0 in (0x7f, 0x08):
             return "backspace"
-        if ch == "\x03":
+        if c0 == 0x03:
             raise KeyboardInterrupt
-        return ("char", ch)
+        # sestav UTF-8 vícebajtový znak (např. české znaky při hledání)
+        n_more = 3 if c0 >= 0xF0 else 2 if c0 >= 0xE0 else 1 if c0 >= 0xC0 else 0
+        data = b
+        for _ in range(n_more):
+            if not _avail(0.05):
+                break
+            data += _rd()
+        for enc in ("utf-8", "cp1250", "latin-1"):
+            try:
+                return ("char", data.decode(enc))
+            except Exception:
+                continue
+        return "other"
 
 
 class _RawMode:
-    """Kontextový manažer pro raw režim terminálu (jen Unix)."""
+    """Kontextový manažer pro znakový (cbreak) režim terminálu (jen Unix).
+    Použit cbreak (ne úplný raw), aby zůstalo zpracování výstupu (ONLCR) - jinak
+    by se '\\n' neposouval na začátek řádku a menu by se rozsypalo."""
     def __enter__(self):
         if not _TUI_WINDOWS:
             self.fd = sys.stdin.fileno()
             self.old = _termios.tcgetattr(self.fd)
-            _tty.setraw(self.fd)
+            try:
+                _tty.setcbreak(self.fd)
+            except Exception:
+                _tty.setraw(self.fd)
         return self
 
     def __exit__(self, *a):
@@ -5734,6 +5822,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, h
         if sel_pos >= len(order):
             sel_pos = max(0, len(order) - 1)
         page_rows = render(order, sel_pos)
+        _flush_input()
         while True:
             key = _read_key()
             if key != "other" and status:
@@ -5840,6 +5929,7 @@ def interactive_checklist(prompt, item_labels, action_labels, header=None, check
 
     with _RawMode():
         render()
+        _flush_input()
         while True:
             key = _read_key()
             if key == "up":
@@ -6736,16 +6826,77 @@ def _pause_for_menu(seconds=3.0):
         return False
 
 
+def _colorize_help_text(text):
+    """Programově obarví WORKFLOW text pro --help (nadpisy, oddělovače, příkazy).
+    Text zůstává v plaintextu (snadná údržba), barvy se přidají tady. Bez colorama
+    jsou Fore/Style prázdné, takže se vrátí čistý text."""
+    Y, C, M, B, R = Fore.YELLOW, Fore.CYAN, Fore.MAGENTA, Style.BRIGHT, Style.RESET_ALL
+    out = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if s and set(s) <= set("=-") and len(s) >= 3:          # ==== / ---- oddělovač
+            out.append(f"{M}{line}{R}")
+        elif line and not line[0].isspace():                    # nadpis (nezaodsazený)
+            out.append(f"{Y}{B}{line}{R}")
+        elif re.match(r"^\s+python\b", line):                   # příkaz
+            out.append(f"{C}{line}{R}")
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _dependency_help():
+    """Barevná sekce se závislostmi do --help. Když tu něco přibude/ubude,
+    aktualizuj TADY (jedno místo pravdy pro --help i README)."""
+    C, Y, G, M = Fore.CYAN, Fore.YELLOW, Fore.GREEN, Fore.MAGENTA
+    B, R = Style.BRIGHT, Style.RESET_ALL
+    return f"""
+{M}{B}=== ZÁVISLOSTI / INSTALACE ==={R}
+
+{Y}Python balíčky (pip):{R}
+  {G}Povinné:{R}      pip install numpy
+  {G}Doporučené:{R}   pip install numpy colorama charset-normalizer deep-translator
+  {G}Vše/optional:{R} pip install numpy colorama charset-normalizer deep-translator argostranslate langdetect py7zr
+
+    numpy               {C}POVINNÉ{R} - bez něj se skript nespustí
+    colorama            barevný výstup (na Windows nutné pro barvy; na Linuxu barva i bez něj)
+    charset-normalizer  detekce kódování titulků (VIU/CJK/UTF-16); alternativa: chardet
+    deep-translator     překlad přes Google a DeepL
+    argostranslate      offline překlad (velké - stáhne jazykové modely)   [volitelné]
+    langdetect          detekce jazyka (skript má i vlastní fallback)       [volitelné]
+    py7zr               jen Windows: auto-stažení MKVToolNix (.7z)           [volitelné]
+  (AI překlad Claude/Gemini/OpenAI i OpenSubtitles jedou přes HTTP - žádné SDK netřeba.)
+
+{Y}Systémové nástroje (NE přes pip):{R}
+  {G}MKVToolNix{R} (mkvmerge/mkvextract/mkvpropedit) - práce s MKV stopami (extrakce, mux, default/remove)
+  {G}ffmpeg{R} - jen pro synchronizaci podle ZVUKU (VAD) a pro MP4; na běžnou práci s titulky netřeba
+
+  {C}Windows:{R}              skript si MKVToolNix i ffmpeg v případě potřeby stáhne sám
+  {C}Debian/Ubuntu:{R}        sudo apt install mkvtoolnix ffmpeg
+  {C}Fedora:{R}               sudo dnf install mkvtoolnix ffmpeg
+  {C}Arch:{R}                 sudo pacman -S mkvtoolnix-cli ffmpeg
+  {C}AlmaLinux/Rocky/RHEL:{R} (verze: rpm -E %rhel)
+     MKVToolNix (oficiální repo bunkus.org):
+        EL8:     sudo rpm -Uhv https://mkvtoolnix.download/almalinux/bunkus-org-repo-2-4.noarch.rpm
+        EL9/10:  sudo rpm -Uhv https://mkvtoolnix.download/centosstream/bunkus-org-repo-2-4.noarch.rpm
+        sudo dnf install mkvtoolnix
+     ffmpeg (EPEL + CRB + RPM Fusion):
+        sudo dnf install epel-release
+        sudo dnf config-manager --set-enabled crb
+        sudo dnf install --nogpgcheck https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm
+        sudo dnf install ffmpeg
+"""
+
+
 def main():
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        description="Opraví časování titulků podle referenčních titulků a/nebo zvukové stopy z MKV (bez alass; mkvtoolnix pro titulky, ffmpeg volitelně pro zvuk).",
-        epilog=r"""
+        description=f"{Fore.CYAN}{Style.BRIGHT}sync_subtitles{Style.RESET_ALL} - synchronizace, překlad, extrakce a údržba titulků "
+                    f"(MKVToolNix pro stopy, ffmpeg volitelně pro zvuk/MP4).\n"
+                    f"{Fore.YELLOW}Spusť bez parametrů pro interaktivního průvodce s šipkovým menu.{Style.RESET_ALL}",
+        epilog=_dependency_help() + _colorize_help_text(r"""
 WORKFLOW - jak se skriptem reálně pracovat
 ==========================================
-
-KROK 0 (jednou):  pip install numpy colorama
-                  (mkvtoolnix/ffmpeg si skript v případě potřeby stáhne sám)
 
 NEJJEDNODUŠŠÍ - interaktivní průvodce (skript se na VŠE postupně zeptá):
     python sync_subtitles.py --auto                 # jeden soubor, prohledá tento adresář
@@ -6820,7 +6971,7 @@ RŮZNÉ JAZYKY (target vs reference):
     ... --translate argos --pivot-lang en   # offline (pip install argostranslate langdetect)
   Bez --translate se odlišné jazyky řeší afinní metodou (časování). Text
   titulků se nikdy nepřekládá, mění se jen časy. Překlady se kešují.
-""",
+"""),
     )
     parser.add_argument("mkv", type=Path, nargs="?",
                          help="Vstupní MKV/MP4 soubor (nebo s --all: adresář k prohledání, default '.')")
