@@ -6889,6 +6889,81 @@ def _colorize_help_text(text):
     return "\n".join(out)
 
 
+def run_p1(args):
+    """PEVNÝ PRESET (--p1), zabudovaný přímo ve skriptu (bez preset souboru):
+    z videí v adresáři vytáhne ČESKÉ titulky (bere aliasy cze/ces/cz/cs) a rovnou
+    na ně aplikuje opravu čitelnosti (9 znaků/s, min 2.5s, mezera 0.084s, příplatek
+    0.20s). Na nic se neptá, přepíše <video>.cze.srt bez zálohy."""
+    print(f"{Fore.MAGENTA}=== Preset --p1: extrakce ČESKÝCH titulků + oprava čitelnosti (bez otázek) ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    recursive = bool(getattr(args, "recursive", False))
+    log_info(f"Pracovní adresář: {os.path.abspath(directory)}")
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("Žádná videa v adresáři.")
+    log_info(f"Nalezeno {len(videos)} videí.")
+
+    mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _ = _resolve_tools_for_extract(args, Path(videos[0]))
+    if not mkvmerge_bin:
+        die("Nenašel jsem mkvmerge (MKVToolNix). Nainstaluj MKVToolNix (viz --help).")
+    args.mkvmerge = getattr(args, "mkvmerge", None) or mkvmerge_bin
+    if mkvextract_bin:
+        args.mkvextract = getattr(args, "mkvextract", None) or mkvextract_bin
+    if ffmpeg_bin:
+        args.ffmpeg = getattr(args, "ffmpeg", None) or ffmpeg_bin
+
+    cz_aliases = {"cze", "ces", "cz", "cs", "czech", "cesky", "český", "česky"}
+
+    def _is_czech(lang):
+        l = (lang or "").strip().lower()
+        if l in cz_aliases:
+            return True
+        try:
+            return _canon3(l) == "cze"
+        except Exception:
+            return False
+
+    # oprava čitelnosti - přesně hodnoty z logu
+    RS = dict(min_cps=9.0, min_duration_floor=2.5, min_gap=0.084, line_overhead=0.2)
+
+    done = skipped = 0
+    for v in videos:
+        vp = Path(v)
+        try:
+            tracks = mkvmerge_tracks(mkvmerge_bin, vp, "subtitles")
+        except (Exception, SystemExit) as e:
+            log_warn(f"{vp.name}: nelze číst stopy ({e}) - přeskakuji.")
+            skipped += 1
+            continue
+        cz = [t for t in tracks if is_text_codec(t["codec"]) and _is_czech(t.get("lang"))]
+        if not cz:
+            log_warn(f"{vp.name}: žádná česká textová titulková stopa - přeskakuji.")
+            skipped += 1
+            continue
+        chosen = cz[0]
+        events, _ch = extract_subtitle_events(args, vp, track_id=chosen["id"])
+        if not events:
+            log_warn(f"{vp.name}: extrakce stopy #{chosen['id']} selhala - přeskakuji.")
+            skipped += 1
+            continue
+        fixed, n_ext = fix_short_durations(events, **RS)
+        out = vp.with_name(vp.stem + ".cze.srt")
+        try:
+            write_srt(fixed, out)
+        except Exception as e:
+            log_warn(f"{vp.name}: zápis selhal ({e}) - přeskakuji.")
+            skipped += 1
+            continue
+        log_done(f"{vp.name}: stopa #{chosen['id']} (cze, {chosen.get('codec','')}) -> {out.name} "
+                 f"({len(fixed)} titulků, prodlouženo {n_ext})")
+        done += 1
+
+    print()
+    log_done(f"Hotovo: {done} .cze.srt z {len(videos)} videí ({skipped} přeskočeno).")
+
+
 def _dependency_help():
     """Barevná sekce se závislostmi do --help. Když tu něco přibude/ubude,
     aktualizuj TADY (jedno místo pravdy pro --help i README)."""
@@ -7147,6 +7222,10 @@ RŮZNÉ JAZYKY (target vs reference):
                         help="Interaktivní režim: nastaví výchozí (default) audio/titulkovou stopu podle jazyka.")
     parser.add_argument("--rename-subs", action="store_true",
                         help="Interaktivní režim: přejmenuje .srt podle názvů videí (párování SxxExx).")
+    parser.add_argument("--p1", action="store_true",
+                        help="PEVNÝ PRESET zabudovaný ve skriptu: z videí v adresáři vytáhne ČESKÉ titulky "
+                             "(aliasy cze/ces/cz/cs) a rovnou opraví čitelnost (9 zn/s, min 2.5s). Bez ptaní, "
+                             "přepíše <video>.cze.srt. Volitelně cesta k adresáři jako poziční argument.")
     parser.add_argument("--presets", action="store_true",
                         help="Otevře menu Presety (spustit/vytvořit/smazat uložená nastavení) - funguje i když je nastavený výchozí preset.")
     parser.add_argument("--no-preset", action="store_true",
@@ -7194,6 +7273,10 @@ RŮZNÉ JAZYKY (target vs reference):
         return
     if args.test_api:
         run_test_api(args)
+        return
+
+    if getattr(args, "p1", False):
+        run_p1(args)
         return
 
     if getattr(args, "presets", False):
