@@ -1,46 +1,52 @@
 #!/usr/bin/env python3
 """
-plex_def_langsubs.py  (Windows 10 CLI, barevné UI přes colorama)
-================================================================
+plex_def_langsubs.py  (Windows 10 CLI, colored UI via colorama)
+===============================================================
 
-Hromadně nastaví VÝCHOZÍ (default) zvukovou stopu a titulky na Plex Media
-Serveru - u všech dílů seriálu, nebo u filmu. Přihlásí se přes tvůj Plex
-účet a přepne se na konkrétního Plex Home uživatele (s jeho PINem), pak
-tě nechá procházet/hledat knihovny (seriály i filmy), načte dostupné
-jazyky a nabídne výběr.
+Bulk-sets the DEFAULT audio track and subtitles on a Plex Media Server -
+for every episode of a show, or for a movie. Signs in with your Plex
+account and switches to a specific Plex Home user (with their PIN), then
+lets you browse/search libraries (shows and movies), scans the available
+tracks and offers a selection.
 
-První spuštění se zeptá na:
-  - FQDN (adresu) tvého Plex serveru, např. https://plex.falco81.net
-  - přihlášení k Plex účtu (jméno+heslo, nebo kód na plex.tv/link)
-  - kterého Plex Home uživatele použít a jeho PIN (pokud ho má)
-Vše se uloží do plex_def_langsubs.config.json vedle skriptu (adresa +
-získané tokeny), takže PŘI DALŠÍCH SPUŠTĚNÍCH SE UŽ NA NIC NEPTÁ.
-Odhlášení / reset: --logout (smaže tokeny), --relogin (nové přihlášení),
---switch-user (znovu vybrat Home uživatele).
+On first run it asks for:
+  - the FQDN (address) of your Plex server, e.g. https://plex.falco81.net
+  - Plex account sign-in (username+password, or a code on plex.tv/link)
+  - which Plex Home user to use and its PIN (if it has one)
+Everything is saved to the config (address + obtained tokens), so ON
+SUBSEQUENT RUNS IT ASKS FOR NOTHING. The config is searched (first
+existing one wins): path from --config / the PLEX_DEF_LANGSUBS_CONFIG
+variable, then next to the script (plex_def_langsubs.config.json), then a
+.config folder next to the script and in parent folders (works from a
+network/samba drive too), finally ~/.config. A new config is created NEXT
+TO THE SCRIPT (so it travels with it to another drive/OS). Show the
+current path with --where-config, force a custom path with --config.
+Logout / reset: --logout (delete tokens), --relogin (fresh sign-in),
+--switch-user (pick the Home user again).
 
-Jak to funguje (ověřeno proti Plex API dokumentaci)
----------------------------------------------------
-- Přihlášení účtu:   POST https://plex.tv/api/v2/users/signin  (login/
-                     password/verificationCode) NEBO PIN na plex.tv/link.
-- Home uživatelé:    GET  https://plex.tv/api/v2/home/users     (XML)
-- Přepnutí + PIN:    POST https://plex.tv/api/home/users/{id}/switch?pin=..
-                     -> vrátí uživatelský token (authenticationToken),
-                        ten se uloží a příště se použije rovnou.
-- Nastavení stopy:   PUT  {server}/library/parts/{partId}
+How it works (verified against the Plex API documentation)
+----------------------------------------------------------
+- Account sign-in:   POST https://plex.tv/api/v2/users/signin  (login/
+                     password/verificationCode) OR a PIN on plex.tv/link.
+- Home users:        GET  https://plex.tv/api/v2/home/users     (XML)
+- Switch + PIN:      POST https://plex.tv/api/home/users/{id}/switch?pin=..
+                     -> returns a user token (authenticationToken),
+                        which is saved and reused next time.
+- Setting a track:   PUT  {server}/library/parts/{partId}
                         ?audioStreamID=A&subtitleStreamID=T&allParts=1
-  subtitleStreamID=0 = titulky vypnout. Mění se JEN výběr výchozí stopy,
-  soubory ani text titulků se nedotýká. ID stop se dohledávají za běhu
-  podle jazyka (Plex je po refreshi metadat přečísluje).
+  subtitleStreamID=0 = turn subtitles off. Only the default-track choice
+  changes; files and subtitle text are untouched. Stream IDs are resolved
+  at run time by track (Plex renumbers them after a metadata refresh).
 
-Instalace
----------
+Installation
+------------
 1) Python 3.8+
-2) (volitelně) pip install colorama   -> barvy na Windows CLI (bez ní jede
-   skript stejně). Žádné jiné závislosti - vše přes standardní knihovnu.
+2) (optional) pip install colorama   -> colors on Windows CLI (the script
+   runs fine without it). No other dependencies - all via the stdlib.
 
-Použití
--------
-    python plex_def_langsubs.py                 # interaktivní průvodce
+Usage
+-----
+    python plex_def_langsubs.py                 # interactive wizard
     python plex_def_langsubs.py --show 32800 --audio kor --subs cze --yes
     python plex_def_langsubs.py --show "Recipe for Love" --subs off --dry-run
     python plex_def_langsubs.py --logout | --relogin | --switch-user
@@ -61,7 +67,7 @@ import uuid
 import xml.etree.ElementTree as ET
 
 # ---------------------------------------------------------------------------
-# Barevný výstup (Windows CLI friendly přes colorama, bez pádu i bez něj)
+# Colored output (Windows-CLI friendly via colorama, no crash even without it)
 # ---------------------------------------------------------------------------
 try:
     import colorama
@@ -75,9 +81,9 @@ except ImportError:
     Style = _NoColor()
 
 
-# truststore (volitelné): ověřuje HTTPS přes systémové úložiště certifikátů
-# OS (Windows si umí dostáhnout chybějící intermediate certifikát). Když není,
-# skript si u vlastního serveru poradí automatickým fallbackem (viz _connect).
+# truststore (optional): verifies HTTPS via the OS certificate store
+# (Windows can fetch a missing intermediate certificate). If absent,
+# the script falls back automatically for your own server (see _connect).
 try:
     import truststore
     truststore.inject_into_ssl()
@@ -91,25 +97,99 @@ def log_info(msg):
 
 
 def log_warn(msg):
-    print(f"{Fore.YELLOW}[VAROVÁNÍ]{Style.RESET_ALL} {msg}")
+    print(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {msg}")
 
 
 def log_done(msg):
-    print(f"{Fore.GREEN}[HOTOVO]{Style.RESET_ALL} {msg}")
+    print(f"{Fore.GREEN}[DONE]{Style.RESET_ALL} {msg}")
 
 
 def die(msg, code=1):
-    print(f"{Fore.RED}[CHYBA]{Style.RESET_ALL} {msg}", file=sys.stderr)
+    print(f"{Fore.RED}[ERROR]{Style.RESET_ALL} {msg}", file=sys.stderr)
     sys.exit(code)
 
 
-CONFIG_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "plex_def_langsubs.config.json"
-)
+# --- config file location --------------------------------------------------
+# The script searches for the config in several places (first existing one
+# is used for reading):
+#   1) path from --config or the PLEX_DEF_LANGSUBS_CONFIG variable
+#   2) next to the script:       <script_dir>/plex_def_langsubs.config.json
+#   3) .config next to script:   <script_dir>/.config/plex_def_langsubs/config.json
+#      and in PARENT folders     (works from a network/samba drive too - portable)
+#   4) home ~/.config:           ~/.config/plex_def_langsubs/config.json
+# A new config is created NEXT TO THE SCRIPT (portable - travels with it to
+# another OS/drive); if a config already exists there, it keeps being used.
+CONFIG_FILENAME = "plex_def_langsubs.config.json"
+_CONFIG_OVERRIDE = None   # set by --config
+CONFIG_PATH = None        # current path (resolved at run time)
 
-# streamType v Plex API
+
+def _script_dir():
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _script_config_path():
+    return os.path.join(_script_dir(), CONFIG_FILENAME)
+
+
+def _xdg_config_dir():
+    return os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+
+
+def _dotconfig_paths(base):
+    """Candidates inside the .config folder at the given path."""
+    return [os.path.join(base, ".config", "plex_def_langsubs", "config.json"),
+            os.path.join(base, ".config", CONFIG_FILENAME)]
+
+
+def _config_read_candidates():
+    cands = []
+    env = _CONFIG_OVERRIDE or os.environ.get("PLEX_DEF_LANGSUBS_CONFIG")
+    if env:
+        cands.append(os.path.expanduser(env))
+    cands.append(_script_config_path())
+    # .config next to the script and in parent folders (portable, incl. samba drive)
+    d = _script_dir()
+    for _ in range(40):
+        cands += _dotconfig_paths(d)
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    # home ~/.config
+    cands += _dotconfig_paths(os.path.expanduser("~"))  # ~/.config/...
+    cands.append(os.path.join(_xdg_config_dir(), "plex_def_langsubs", "config.json"))
+    cands.append(os.path.join(_xdg_config_dir(), CONFIG_FILENAME))
+    # dedup, keep order
+    seen, out = set(), []
+    for p in cands:
+        if p not in seen:
+            seen.add(p)
+            out.append(p)
+    return out
+
+
+def resolve_config_path():
+    """Resolve the config path (first existing candidate; otherwise the write default)."""
+    global CONFIG_PATH
+    override = _CONFIG_OVERRIDE or os.environ.get("PLEX_DEF_LANGSUBS_CONFIG")
+    if override:
+        CONFIG_PATH = os.path.expanduser(override)
+        return CONFIG_PATH
+    for p in _config_read_candidates():
+        if os.path.isfile(p):
+            CONFIG_PATH = p
+            return p
+    # nothing exists -> new one NEXT TO THE SCRIPT (portable; goes with it to a
+    # network drive too). If writing next to the script fails, save_config tries ~/.config.
+    CONFIG_PATH = _script_config_path()
+    return CONFIG_PATH
+
+
+# streamType in the Plex API
 ST_VIDEO, ST_AUDIO, ST_SUBTITLE = 1, 2, 3
 SECTION_TYPE_NUM = {"movie": 1, "show": 2}
+STATUS_AUTOHIDE = 4.0  # s: jak dlouho zůstane hláška (např. výsledek F5), než sama zmizí
 
 PRODUCT = "plex_def_langsubs"
 PLEX_TV = "https://plex.tv"
@@ -120,9 +200,9 @@ SWITCH_URL = f"{PLEX_TV}/api/home/users/{{uid}}/switch"
 
 
 # ---------------------------------------------------------------------------
-# Interaktivní pomůcky
+# Interactive helpers
 # ---------------------------------------------------------------------------
-# --- detekce klávesnicového vstupu (šipky) napříč platformami --------------
+# --- keyboard input detection (arrow keys) across platforms ----------------
 _WINDOWS = os.name == "nt"
 try:
     if _WINDOWS:
@@ -141,55 +221,94 @@ def strip_ansi(s):
     return _ANSI_RE.sub("", s)
 
 
-def _read_key():
-    """Přečte jednu klávesu. Vrátí řetězec akce nebo ('char', znak)."""
+def _read_key(timeout=None):
+    """Read a single key. Returns an action string or ('char', char) with a
+    proper Unicode character (incl. Czech diacritics). With timeout (seconds),
+    returns 'timeout' if nothing arrives in time. Works on Windows and Linux."""
     if _WINDOWS:
-        ch = msvcrt.getch()
-        if ch in (b"\x00", b"\xe0"):
-            c2 = msvcrt.getch()
-            return {b"H": "up", b"P": "down", b"K": "left", b"M": "right",
-                    b"G": "home", b"O": "end", b"I": "pgup", b"Q": "pgdn",
-                    b"?": "f5"}.get(c2, "other")  # F5 = scan code 0x3F ('?')
-        if ch in (b"\r", b"\n"):
+        if timeout is not None:
+            end = time.monotonic() + timeout
+            while not msvcrt.kbhit():
+                if time.monotonic() >= end:
+                    return "timeout"
+                time.sleep(0.02)
+        ch = msvcrt.getwch()  # wide char -> correct Unicode input (incl. diacritics)
+        if ch in ("\x00", "\xe0"):
+            c2 = msvcrt.getwch()
+            return {"H": "up", "P": "down", "K": "left", "M": "right",
+                    "G": "home", "O": "end", "I": "pgup", "Q": "pgdn",
+                    "?": "f5"}.get(c2, "other")  # F5 = scan code 0x3F ('?')
+        if ch in ("\r", "\n"):
             return "enter"
-        if ch == b"\x08":
+        if ch == "\x08":
             return "backspace"
-        if ch == b"\x1b":
+        if ch == "\x1b":
             return "esc"
-        if ch == b"\x03":
+        if ch == "\x03":
             raise KeyboardInterrupt
-        for enc in ("utf-8", "cp1250", "latin-1"):
-            try:
-                return ("char", ch.decode(enc))
-            except Exception:
-                continue
+        if ch and ord(ch) >= 32:
+            return ("char", ch)
         return "other"
     else:
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            c1 = sys.stdin.read(1)
-            if c1 not in ("[", "O"):
+        import select
+        fd = sys.stdin.fileno()
+        if timeout is not None:
+            r, _, _ = select.select([fd], [], [], timeout)
+            if not r:
+                return "timeout"
+        b0 = os.read(fd, 1)
+        if not b0:
+            return "other"
+        c = b0[0]
+        if c == 0x1b:  # ESC alone, or start of an escape sequence (arrows, ...)
+            r, _, _ = select.select([fd], [], [], 0.05)  # follow-up byte within 50 ms?
+            if not r:
+                return "esc"
+            c1 = os.read(fd, 1)
+            if c1 not in (b"[", b"O"):
                 return "esc"
             seq = ""
             while True:
-                c = sys.stdin.read(1)
-                seq += c
-                if c.isalpha() or c == "~" or len(seq) > 6:
+                nb = os.read(fd, 1)
+                if not nb:
+                    break
+                seq += nb.decode("latin-1")
+                if nb.isalpha() or nb == b"~" or len(seq) > 6:
                     break
             return {"A": "up", "B": "down", "C": "right", "D": "left",
                     "H": "home", "F": "end", "1~": "home", "4~": "end",
                     "5~": "pgup", "6~": "pgdn", "15~": "f5"}.get(seq, "esc")
-        if ch in ("\r", "\n"):
+        if c in (0x0d, 0x0a):
             return "enter"
-        if ch in ("\x7f", "\x08"):
+        if c in (0x7f, 0x08):
             return "backspace"
-        if ch == "\x03":
+        if c == 0x03:
             raise KeyboardInterrupt
-        return ("char", ch)
+        if c < 0x80:
+            return ("char", chr(c))
+        # UTF-8 multi-byte: read continuation bytes based on the lead byte
+        if c >= 0xf0:
+            n = 3
+        elif c >= 0xe0:
+            n = 2
+        elif c >= 0xc0:
+            n = 1
+        else:
+            return "other"  # stray continuation byte
+        rest = b""
+        for _ in range(n):
+            rb = os.read(fd, 1)
+            if not rb:
+                break
+            rest += rb
+        try:
+            return ("char", (b0 + rest).decode("utf-8"))
+        except Exception:
+            return "other"
 
 
 class _RawMode:
-    """Kontextový manažer pro raw režim terminálu (jen Unix)."""
+    """Context manager for terminal raw mode (Unix only)."""
     def __enter__(self):
         if not _WINDOWS:
             self.fd = sys.stdin.fileno()
@@ -207,7 +326,7 @@ def _tui_supported():
 
 
 def clear_screen():
-    """Smaže obrazovku (aplikační režim). Bez TTY nic nedělá."""
+    """Clear the screen (app mode). Does nothing without a TTY."""
     if sys.stdout.isatty():
         sys.stdout.write("\x1b[2J\x1b[H")
         sys.stdout.flush()
@@ -215,10 +334,10 @@ def clear_screen():
 
 def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
                      refresh_cb=None, header=None):
-    """Menu ovládané šipkami + psaní pro hledání. Vrátí index, nebo None (zrušeno).
-    Chová se jako aplikace: na začátku smaže obrazovku a překresluje jen aktuální
-    pohled (žádné rolování). header = řádky kontextu nad nabídkou.
-    refresh_cb(current_index) -> hláška (str): volá se na F5 (např. sken knihovny)."""
+    """Arrow-key menu + type-to-search. Returns an index, or None (cancelled).
+    Behaves like an app: clears the screen up front and redraws only the current
+    view (no scrolling). header = context lines above the list.
+    refresh_cb(current_index) -> message (str): called on F5 (e.g. library scan)."""
     if not _tui_supported():
         for h in (header or []):
             print(h)
@@ -228,10 +347,10 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
     plain = [strip_ansi(l) for l in labels]
     header = list(header or [])
     filt = ""
-    status = ""  # stavový řádek (např. výsledek F5) - zobrazí se UVNITŘ okna
+    status = ""  # status line (e.g. F5 result) - shown INSIDE the window
     sel_pos = default if 0 <= default < n else 0
-    prev_lines = 0  # počet řádků předchozího snímku
-    first = True    # první vykreslení smaže obrazovku
+    prev_lines = 0  # number of lines in the previous frame
+    first = True    # first render clears the screen
 
     def visible_order():
         if not filt:
@@ -255,40 +374,40 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
         nonlocal prev_lines, first
         cols, rows_total = term_size()
         maxw = max(10, cols - 2)
-        # kolik položek se vejde: rezervuj prompt+hint+footer+status(+2 indik.)+hlavičku
+        # how many rows fit: reserve prompt+hint+footer+status(+2 indicators)+header
         reserve = 6 + len(header)
         page_rows = max(3, rows_total - reserve)
 
         buf = []
         if first:
-            buf.append("\x1b[2J\x1b[H")  # smaž obrazovku + kurzor domů (aplikační režim)
+            buf.append("\x1b[2J\x1b[H")  # clear screen + cursor home (app mode)
             first = False
         elif prev_lines > 0:
             up = prev_lines - 1
             buf.append((f"\x1b[{up}F" if up > 0 else "\r") + "\x1b[J")
 
-        vis_lines = []  # jednotlivé řádky snímku (bez \n)
+        vis_lines = []  # individual frame lines (without \n)
         for h in header:
             sp = strip_ansi(h)
             vis_lines.append(h if len(sp) <= maxw else trunc(sp, maxw))
         vis_lines.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
         if filt:
-            hint = "↑↓ pohyb · Enter = vybrat · Esc = smazat hledání"
+            hint = "↑↓ move · Enter = select · Esc = clear search"
         elif allow_cancel:
-            hint = "↑↓ pohyb · piš = hledat · Enter = vybrat · Esc = zpět"
+            hint = "↑↓ move · type = search · Enter = select · Esc = back"
         else:
-            hint = "↑↓ pohyb · piš = hledat · Enter = vybrat"
+            hint = "↑↓ move · type = search · Enter = select"
         if refresh_cb is not None:
-            hint += " · F5 = sken knihovny"
+            hint += " · F5 = scan library"
         vis_lines.append(f"{Fore.CYAN}{trunc(hint, maxw)}{Style.RESET_ALL}")
 
         if not order:
-            vis_lines.append(f"  {Fore.RED}(žádná shoda){Style.RESET_ALL}")
+            vis_lines.append(f"  {Fore.RED}(no match){Style.RESET_ALL}")
         else:
             start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
             window = order[start:start + page_rows]
             if start > 0:
-                vis_lines.append(f"  {Fore.CYAN}▲ ({start} výše){Style.RESET_ALL}")
+                vis_lines.append(f"  {Fore.CYAN}▲ ({start} above){Style.RESET_ALL}")
             for pos, i in enumerate(window, start):
                 text = trunc(plain[i], maxw - 2)
                 if pos == sel_pos:
@@ -298,20 +417,21 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
                     vis_lines.append(f"  {text}")
             rest = len(order) - (start + len(window))
             if rest > 0:
-                vis_lines.append(f"  {Fore.CYAN}▼ ({rest} níže){Style.RESET_ALL}")
+                vis_lines.append(f"  {Fore.CYAN}▼ ({rest} below){Style.RESET_ALL}")
 
         pos_info = f" [{sel_pos + 1}/{len(order)}]" if order else ""
         if filt:
-            footer = f"{Fore.MAGENTA}{trunc('Hledání: ' + filt + pos_info, maxw)}{Style.RESET_ALL}"
+            footer = f"{Fore.MAGENTA}{trunc('Search: ' + filt + pos_info, maxw)}{Style.RESET_ALL}"
         else:
-            footer = f"{Fore.CYAN}{trunc('(začni psát pro hledání)' + pos_info, maxw)}{Style.RESET_ALL}"
+            footer = f"{Fore.CYAN}{trunc('(type to search)' + pos_info, maxw)}{Style.RESET_ALL}"
         vis_lines.append(footer)
-        # stavový řádek uvnitř okna (překresluje se na místě, nepřidává řádky)
+        # status line inside the window (redraws in place, no extra lines)
         if status:
             sp = strip_ansi(status)
             vis_lines.append(status if len(sp) <= maxw else trunc(sp, maxw))
 
-        buf.append("\n".join(vis_lines))
+        # \r\n (not just \n) for raw mode on Linux where \n does not return to column 0
+        buf.append("\r\n".join(vis_lines))
         sys.stdout.write("".join(buf))
         sys.stdout.flush()
         prev_lines = len(vis_lines)
@@ -323,9 +443,15 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
             sel_pos = max(0, len(order) - 1)
         page_rows = render(order, sel_pos)
         while True:
-            key = _read_key()
+            # když je zobrazená hláška (např. výsledek F5), čti s timeoutem,
+            # ať sama zmizí i bez stisku klávesy
+            key = _read_key(STATUS_AUTOHIDE if status else None)
+            if key == "timeout":
+                status = ""
+                render(order, sel_pos)
+                continue
             if key != "f5" and status:
-                status = ""  # stavová hláška zmizí po dalším stisku
+                status = ""  # status message also disappears on any keypress
             if key == "up" and order:
                 sel_pos = (sel_pos - 1) % len(order)
             elif key == "down" and order:
@@ -340,17 +466,17 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
                 sel_pos = len(order) - 1
             elif key == "f5" and refresh_cb is not None:
                 cur = order[sel_pos] if order else None
-                status = f"{Fore.CYAN}Spouštím Scan Library Files…{Style.RESET_ALL}"
-                render(order, sel_pos)  # okamžitá zpětná vazba (na místě)
+                status = f"{Fore.CYAN}Running Scan Library Files…{Style.RESET_ALL}"
+                render(order, sel_pos)  # immediate feedback (in place)
                 try:
                     status = refresh_cb(cur) or ""
                 except Exception as ex:
-                    status = f"{Fore.RED}Scan Library Files selhal: {ex}{Style.RESET_ALL}"
-                # závěrečný render (na konci smyčky) ukáže výsledek ve stejném okně
+                    status = f"{Fore.RED}Scan Library Files failed: {ex}{Style.RESET_ALL}"
+                # final render (at loop end) shows the result in the same window
             elif key in ("enter", "right"):
                 if order:
                     result = order[sel_pos]
-                    sys.stdout.write("\n")
+                    sys.stdout.write("\r\n")
                     sys.stdout.flush()
                     return result
             elif key in ("esc", "left"):
@@ -359,7 +485,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
                     order = visible_order()
                     sel_pos = 0
                 elif allow_cancel:
-                    sys.stdout.write("\n")
+                    sys.stdout.write("\r\n")
                     sys.stdout.flush()
                     return None
             elif key == "backspace":
@@ -378,17 +504,17 @@ def _ask_choice_classic(prompt, labels, default=0):
     def _show():
         print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
         for i, l in enumerate(labels):
-            mark = f" {Fore.CYAN}(výchozí){Style.RESET_ALL}" if i == default else ""
+            mark = f" {Fore.CYAN}(default){Style.RESET_ALL}" if i == default else ""
             print(f"  {i + 1}) {l}{mark}")
 
     _show()
     while True:
-        raw = input(f"Volba [1-{len(labels)}, Enter = {default + 1}]: ").strip()
+        raw = input(f"Choice [1-{len(labels)}, Enter = {default + 1}]: ").strip()
         if raw == "":
             return default
         if raw.isdigit() and 1 <= int(raw) <= len(labels):
             return int(raw) - 1
-        print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
+        print(f"{Fore.RED}Invalid choice, try again.{Style.RESET_ALL}")
 
 
 def ask_choice(prompt, labels, default=0):
@@ -410,17 +536,19 @@ def ask_secret(prompt):
 
 
 def ask_yes(prompt, default=True):
-    d = "A/n" if default else "a/N"
+    d = "Y/n" if default else "y/N"
     raw = input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} [{d}]: ").strip().lower()
     if raw == "":
         return default
-    return raw in ("a", "ano", "y", "yes")
+    return raw in ("y", "yes")
 
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 def load_config():
+    if CONFIG_PATH is None:
+        resolve_config_path()
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
             return json.load(f)
@@ -429,15 +557,26 @@ def load_config():
 
 
 def save_config(cfg):
-    try:
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    global CONFIG_PATH
+    if CONFIG_PATH is None:
+        resolve_config_path()
+    home_cfg = os.path.join(_xdg_config_dir(), "plex_def_langsubs", "config.json")
+    for target in (CONFIG_PATH, _script_config_path(), home_cfg):
         try:
-            os.chmod(CONFIG_PATH, 0o600)  # jen vlastník (kde to jde)
+            d = os.path.dirname(target)
+            if d:
+                os.makedirs(d, exist_ok=True)
+            with open(target, "w", encoding="utf-8") as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            try:
+                os.chmod(target, 0o600)  # owner only (where supported)
+            except Exception:
+                pass
+            CONFIG_PATH = target
+            return
         except Exception:
-            pass
-    except Exception as ex:
-        log_warn(f"Nepodařilo se uložit config: {ex}")
+            continue  # try the next location
+    log_warn("Could not save config (neither next to the script nor to ~/.config).")
 
 
 def get_client_id(cfg):
@@ -450,7 +589,7 @@ def get_client_id(cfg):
 
 
 # ---------------------------------------------------------------------------
-# Nízkoúrovňové HTTP (stdlib)
+# Low-level HTTP (stdlib)
 # ---------------------------------------------------------------------------
 def _ssl_ctx(verify):
     ctx = ssl.create_default_context()
@@ -461,7 +600,7 @@ def _ssl_ctx(verify):
 
 
 def http_raw(method, url, headers=None, data=None, verify=True, timeout=30):
-    """Vrátí (status, text). HTTP chyby NEVYHazuje (vrátí je), síťové ano."""
+    """Returns (status, text). Does NOT raise on HTTP errors (returns them); raises on network errors."""
     req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
     ctx = _ssl_ctx(verify) if url.lower().startswith("https") else None
     try:
@@ -476,22 +615,22 @@ def http_raw(method, url, headers=None, data=None, verify=True, timeout=30):
     except urllib.error.URLError as ex:
         hint = ""
         if isinstance(ex.reason, ssl.SSLError) or "CERTIFICATE" in str(ex.reason).upper():
-            hint = "  (zkus --insecure)"
-        raise RuntimeError(f"Spojení selhalo: {ex.reason}{hint}")
+            hint = "  (try --insecure)"
+        raise RuntimeError(f"Connection failed: {ex.reason}{hint}")
 
 
 def http_json(method, url, headers=None, data=None, verify=True, timeout=30):
     st, text = http_raw(method, url, headers, data, verify, timeout)
     if st >= 400:
-        raise RuntimeError(f"HTTP {st} u {method} {url.split('?')[0]} - {text[:200]}")
+        raise RuntimeError(f"HTTP {st} at {method} {url.split('?')[0]} - {text[:200]}")
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        raise RuntimeError(f"Neočekávaná odpověď (není JSON) z {url.split('?')[0]}")
+        raise RuntimeError(f"Unexpected response (not JSON) from {url.split('?')[0]}")
 
 
 # ---------------------------------------------------------------------------
-# Plex účet (plex.tv): přihlášení + Home uživatelé + switch s PINem
+# Plex account (plex.tv): sign-in + Home users + switch with PIN
 # ---------------------------------------------------------------------------
 class PlexAccount:
     def __init__(self, client_id, token=None):
@@ -510,7 +649,7 @@ class PlexAccount:
             h["X-Plex-Token"] = self.token
         return h
 
-    # --- přihlášení jménem a heslem (+2FA) ---------------------------------
+    # --- sign in with username and password (+2FA) -------------------------
     def signin_password(self, login, password, code=None):
         body = {"login": login, "password": password, "rememberMe": "true"}
         if code:
@@ -523,15 +662,15 @@ class PlexAccount:
             j = json.loads(text)
             tok = j.get("authToken") or j.get("authenticationToken")
             if not tok:
-                raise RuntimeError("Přihlášení proběhlo, ale token chybí.")
+                raise RuntimeError("Signed in, but the token is missing.")
             self.token = tok
             return tok
         if st == 401:
-            # buď špatné heslo, nebo chybí 2FA kód
+            # either a wrong password, or a missing 2FA code
             raise RuntimeError("UNAUTHORIZED")
-        raise RuntimeError(f"Přihlášení selhalo (HTTP {st}): {text[:200]}")
+        raise RuntimeError(f"Sign-in failed (HTTP {st}): {text[:200]}")
 
-    # --- přihlášení párovacím kódem na plex.tv/link ------------------------
+    # --- sign in with a pairing code on plex.tv/link -----------------------
     def pin_login(self, wait_timeout=300, poll=2):
         data = urllib.parse.urlencode({"strong": "false"}).encode()
         j = http_json("POST", PINS_URL,
@@ -540,13 +679,13 @@ class PlexAccount:
                       data=data)
         pin_id, code = j.get("id"), j.get("code")
         if not pin_id or not code:
-            raise RuntimeError("Plex nevrátil PIN.")
+            raise RuntimeError("Plex did not return a PIN.")
         print()
         print(f"{Fore.MAGENTA}==============================================={Style.RESET_ALL}")
-        print(f"  1) Otevři:  {Fore.CYAN}https://plex.tv/link{Style.RESET_ALL}")
-        print(f"  2) Zadej kód:  {Fore.GREEN}{Style.BRIGHT}{code}{Style.RESET_ALL}")
+        print(f"  1) Open:  {Fore.CYAN}https://plex.tv/link{Style.RESET_ALL}")
+        print(f"  2) Enter code:  {Fore.GREEN}{Style.BRIGHT}{code}{Style.RESET_ALL}")
         print(f"{Fore.MAGENTA}==============================================={Style.RESET_ALL}")
-        print("Čekám na potvrzení", end="", flush=True)
+        print("Waiting for confirmation", end="", flush=True)
         deadline = time.time() + wait_timeout
         while time.time() < deadline:
             time.sleep(poll)
@@ -561,9 +700,9 @@ class PlexAccount:
                 self.token = r["authToken"]
                 return self.token
         print()
-        raise RuntimeError("Přihlášení vypršelo (PIN nebyl potvrzen).")
+        raise RuntimeError("Sign-in timed out (PIN was not confirmed).")
 
-    # --- Home uživatelé (XML) ---------------------------------------------
+    # --- Home users (XML) -------------------------------------------------
     def home_users(self):
         st, text = http_raw("GET",
                             f"{HOMEUSERS_URL}?X-Plex-Client-Identifier={self.client_id}",
@@ -571,11 +710,11 @@ class PlexAccount:
         if st == 401:
             raise RuntimeError("UNAUTHORIZED")
         if st >= 400:
-            raise RuntimeError(f"HTTP {st} u home/users - {text[:200]}")
+            raise RuntimeError(f"HTTP {st} at home/users - {text[:200]}")
         try:
             root = ET.fromstring(text)
         except ET.ParseError:
-            raise RuntimeError("Neočekávaná odpověď u home/users (nešlo naparsovat XML).")
+            raise RuntimeError("Unexpected response at home/users (could not parse XML).")
         users = []
         for u in root.iter("user"):
             a = u.attrib
@@ -589,7 +728,7 @@ class PlexAccount:
             })
         return users
 
-    # --- přepnutí na uživatele s PINem -> uživatelský token ----------------
+    # --- switch to a user with a PIN -> user token -------------------------
     def switch_user(self, user_id, pin=None):
         params = {}
         if pin:
@@ -601,23 +740,23 @@ class PlexAccount:
         if st in (401, 403):
             raise RuntimeError("PIN_INVALID")
         if st >= 400:
-            raise RuntimeError(f"Přepnutí uživatele selhalo (HTTP {st}): {text[:200]}")
+            raise RuntimeError(f"Switching user failed (HTTP {st}): {text[:200]}")
         try:
             root = ET.fromstring(text)
         except ET.ParseError:
-            raise RuntimeError("Přepnutí: neočekávaná odpověď (XML).")
+            raise RuntimeError("Switch: unexpected response (XML).")
         tok = root.attrib.get("authenticationToken") or root.attrib.get("authToken")
         if not tok:
             el = root.find(".//user")
             if el is not None:
                 tok = el.attrib.get("authenticationToken") or el.attrib.get("authToken")
         if not tok:
-            raise RuntimeError("Přepnutí: token v odpovědi chybí.")
+            raise RuntimeError("Switch: token missing in the response.")
         return tok
 
 
 # ---------------------------------------------------------------------------
-# Plex server klient
+# Plex server client
 # ---------------------------------------------------------------------------
 class PlexClient:
     def __init__(self, base_url, token, client_id, verify=True, timeout=30):
@@ -645,11 +784,11 @@ class PlexClient:
         if st == 401:
             raise RuntimeError("UNAUTHORIZED")
         if st >= 400:
-            raise RuntimeError(f"HTTP {st} u {path} - {text[:200]}")
+            raise RuntimeError(f"HTTP {st} at {path} - {text[:200]}")
         try:
             return json.loads(text)
         except json.JSONDecodeError:
-            raise RuntimeError(f"Server nevrátil JSON u {path}.")
+            raise RuntimeError(f"Server did not return JSON at {path}.")
 
     def put(self, path, params=None):
         st, text = http_raw("PUT", self._url(path, params), headers=self._headers(),
@@ -690,7 +829,7 @@ class PlexClient:
         return j.get("MediaContainer", {}).get("Metadata", [])
 
     def refresh_section(self, section_key):
-        """Spustí 'Scan Library Files' nad knihovnou (GET .../refresh)."""
+        """Trigger 'Scan Library Files' on the library (GET .../refresh)."""
         st, _ = http_raw("GET", self._url(f"/library/sections/{section_key}/refresh"),
                          headers=self._headers(), verify=self.verify, timeout=self.timeout)
         if st >= 400:
@@ -699,7 +838,7 @@ class PlexClient:
 
 
 # ---------------------------------------------------------------------------
-# Pomůcky pro adresu serveru
+# Server-address helpers
 # ---------------------------------------------------------------------------
 def normalize_base_url(s):
     s = (s or "").strip().rstrip("/")
@@ -711,7 +850,7 @@ def normalize_base_url(s):
 
 
 def verify_for(base_url, verify_pref):
-    # holé https na IP nemá platný certifikát
+    # bare https to an IP has no valid certificate
     if verify_pref and base_url.lower().startswith("https") and \
             re.search(r"//\d+\.\d+\.\d+\.\d+(:\d+)?", base_url):
         return False
@@ -734,54 +873,54 @@ def parse_show_ref(ref):
 
 
 # ---------------------------------------------------------------------------
-# Streamy
+# Streams
 # ---------------------------------------------------------------------------
-# Čitelné názvy jazyků podle ISO kódu (aby se nezobrazovaly znaky v cizím
-# písmu, které konzole neumí vykreslit - např. korejština/čínština jako ☐☐☐).
+# Human-readable language names by ISO code (so foreign-script characters the
+# console cannot render - e.g. Korean/Chinese as boxes - are avoided).
 LANG_NAMES = {
-    "eng": "Angličtina", "en": "Angličtina",
-    "cze": "Čeština", "ces": "Čeština", "cs": "Čeština",
-    "slo": "Slovenština", "slk": "Slovenština", "sk": "Slovenština",
-    "ger": "Němčina", "deu": "Němčina", "de": "Němčina",
-    "fre": "Francouzština", "fra": "Francouzština", "fr": "Francouzština",
-    "spa": "Španělština", "es": "Španělština",
-    "ita": "Italština", "it": "Italština",
-    "por": "Portugalština", "pt": "Portugalština",
-    "rus": "Ruština", "ru": "Ruština",
-    "ukr": "Ukrajinština", "uk": "Ukrajinština",
-    "pol": "Polština", "pl": "Polština",
-    "kor": "Korejština", "ko": "Korejština",
-    "jpn": "Japonština", "ja": "Japonština",
-    "chi": "Čínština", "zho": "Čínština", "zh": "Čínština",
-    "dan": "Dánština", "da": "Dánština",
-    "dut": "Nizozemština", "nld": "Nizozemština", "nl": "Nizozemština",
-    "swe": "Švédština", "sv": "Švédština",
-    "nor": "Norština", "no": "Norština",
-    "fin": "Finština", "fi": "Finština",
-    "hun": "Maďarština", "hu": "Maďarština",
-    "gre": "Řečtina", "ell": "Řečtina", "el": "Řečtina",
-    "tur": "Turečtina", "tr": "Turečtina",
-    "ara": "Arabština", "ar": "Arabština",
-    "heb": "Hebrejština", "he": "Hebrejština",
-    "hin": "Hindština", "hi": "Hindština",
-    "tha": "Thajština", "th": "Thajština",
-    "vie": "Vietnamština", "vi": "Vietnamština",
-    "ron": "Rumunština", "rum": "Rumunština", "ro": "Rumunština",
-    "bul": "Bulharština", "bg": "Bulharština",
-    "hrv": "Chorvatština", "hr": "Chorvatština",
-    "srp": "Srbština", "sr": "Srbština",
-    "slv": "Slovinština", "sl": "Slovinština",
+    "eng": "English", "en": "English",
+    "cze": "Czech", "ces": "Czech", "cs": "Czech",
+    "slo": "Slovak", "slk": "Slovak", "sk": "Slovak",
+    "ger": "German", "deu": "German", "de": "German",
+    "fre": "French", "fra": "French", "fr": "French",
+    "spa": "Spanish", "es": "Spanish",
+    "ita": "Italian", "it": "Italian",
+    "por": "Portuguese", "pt": "Portuguese",
+    "rus": "Russian", "ru": "Russian",
+    "ukr": "Ukrainian", "uk": "Ukrainian",
+    "pol": "Polish", "pl": "Polish",
+    "kor": "Korean", "ko": "Korean",
+    "jpn": "Japanese", "ja": "Japanese",
+    "chi": "Chinese", "zho": "Chinese", "zh": "Chinese",
+    "dan": "Danish", "da": "Danish",
+    "dut": "Dutch", "nld": "Dutch", "nl": "Dutch",
+    "swe": "Swedish", "sv": "Swedish",
+    "nor": "Norwegian", "no": "Norwegian",
+    "fin": "Finnish", "fi": "Finnish",
+    "hun": "Hungarian", "hu": "Hungarian",
+    "gre": "Greek", "ell": "Greek", "el": "Greek",
+    "tur": "Turkish", "tr": "Turkish",
+    "ara": "Arabic", "ar": "Arabic",
+    "heb": "Hebrew", "he": "Hebrew",
+    "hin": "Hindi", "hi": "Hindi",
+    "tha": "Thai", "th": "Thai",
+    "vie": "Vietnamese", "vi": "Vietnamese",
+    "ron": "Romanian", "rum": "Romanian", "ro": "Romanian",
+    "bul": "Bulgarian", "bg": "Bulgarian",
+    "hrv": "Croatian", "hr": "Croatian",
+    "srp": "Serbian", "sr": "Serbian",
+    "slv": "Slovenian", "sl": "Slovenian",
 }
 
 
 def _is_latin(s):
-    """True, pokud text neobsahuje písmena mimo latinku (tj. konzole ho zvládne)."""
+    """True if the text has no non-Latin letters (i.e. the console can render it)."""
     return all((ord(ch) < 0x250) or (not ch.isalpha()) for ch in s)
 
 
 def lang_name(code, plex_name=None):
-    """Čitelný název jazyka: primárně podle ISO kódu, jinak Plexův název
-    (jen pokud je v latince), jinak samotný kód."""
+    """Human-readable language name: primarily by ISO code, otherwise Plex's name
+    (only if Latin), otherwise the code itself."""
     c = (code or "").lower()
     if c in LANG_NAMES:
         return LANG_NAMES[c]
@@ -791,13 +930,13 @@ def lang_name(code, plex_name=None):
 
 
 def stream_is_external(s):
-    """Externí (sidecar) titulek pozná podle přítomnosti 'key' nebo příznaku."""
+    """Detects an external (sidecar) subtitle by the presence of 'key' or a flag."""
     return bool(s.get("key")) or str(s.get("external", "")).lower() in ("1", "true")
 
 
 def stream_signature(s):
-    """Stabilní 'podpis' stopy napříč díly (ID se u dílů liší, tohle ne).
-    Rozlišuje jazyk, kodek, externí/vložené, forced, SDH, region i title."""
+    """A stable track 'signature' across episodes (IDs differ per episode, this does not).
+    Distinguishes language, codec, external/embedded, forced, SDH, region and title."""
     code = (s.get("languageCode") or s.get("languageTag") or "").lower()
     codec = (s.get("codec") or "").lower()
     ext = stream_is_external(s)
@@ -809,18 +948,18 @@ def stream_signature(s):
 
 
 def variant_label(s):
-    """Čitelný popis stopy. Přednostně použije Plexův displayTitle (to, co je
-    vidět v Plexu), aby šly rozlišit i multiple externí titulky; jinak sestaví
-    popis z komponent. Jazyk v cizím písmu nahradí českým názvem."""
+    """Human-readable track description. Prefers Plex's displayTitle (what you see
+    in Plex) so multiple external subtitles can be told apart; otherwise builds the
+    description from components. A foreign-script language is replaced by a Latin name."""
     code = (s.get("languageCode") or "").lower()
-    # 1) Plexův vlastní popis (např. "Czech (SRT External)", "English (SRT, SDH)")
+    # 1) Plex's own description (e.g. "Czech (SRT External)", "English (SRT, SDH)")
     disp = (s.get("extendedDisplayTitle") or s.get("displayTitle") or "").strip()
     if disp and _is_latin(disp):
         label = disp
         if code and f"[{code}]" not in label and f"({code})" not in label:
             label += f" [{code}]"
         return label
-    # 2) fallback: sestav z komponent
+    # 2) fallback: build from components
     base = lang_name(code, s.get("language"))
     raw = (s.get("language") or "").strip()
     if raw and _is_latin(raw) and raw.lower() != base.lower() and ("(" in raw or len(raw.split()) > 1):
@@ -830,7 +969,7 @@ def variant_label(s):
     if codec:
         quals.append(codec)
     if stream_is_external(s):
-        quals.append("externí")
+        quals.append("external")
     if str(s.get("forced", "")).lower() in ("1", "true"):
         quals.append("forced")
     if str(s.get("hearingImpaired", "")).lower() in ("1", "true"):
@@ -845,7 +984,7 @@ def variant_label(s):
 
 
 def variant_short(v):
-    """Krátký identifikátor do souhrnu: 'ces', 'eng#2', 'ces·ext'."""
+    """Short identifier for the summary: 'ces', 'eng#2', 'ces·ext'."""
     parts = [v.get("code") or "?"]
     if v.get("ordinal", 0) > 0:
         parts[0] += f"#{v['ordinal'] + 1}"
@@ -867,7 +1006,7 @@ def _new_variant(s, ordinal):
 
 
 def _finalize_variants(reg):
-    """Z registru {key: variant} udělá seřazený seznam a odliší duplicitní popisky."""
+    """Turn a {key: variant} registry into a sorted list and disambiguate duplicate labels."""
     from collections import Counter
     vs = list(reg.values())
     lab = Counter(v["label"] for v in vs)
@@ -879,7 +1018,7 @@ def _finalize_variants(reg):
 
 
 def streams_variants(streams, stream_type):
-    """Varianty (konkrétní stopy) daného typu v jednom partu, s pořadím u shodných."""
+    """Variants (concrete tracks) of the given type within one part, ordinal for duplicates."""
     reg = {}
     seen = {}
     for s in streams:
@@ -895,8 +1034,8 @@ def streams_variants(streams, stream_type):
 
 
 def collect_streams(client, items, fetch_full):
-    """Vrátí (items_data, audio_variants, sub_variants), kde varianty jsou
-    seznamy konkrétních stop (ne jen jazyků) sloučené napříč díly podle podpisu."""
+    """Returns (items_data, audio_variants, sub_variants), where variants are
+    lists of concrete tracks (not just languages) merged across episodes by signature."""
     items_data = []
     audio_reg, sub_reg = {}, {}
     total = len(items)
@@ -920,7 +1059,7 @@ def collect_streams(client, items, fetch_full):
         })
         if total > 1:
             pct = i * 100 // total
-            print(f"\r  {Fore.CYAN}skenuji streamy: {pct:3d}%{Style.RESET_ALL} "
+            print(f"\r  {Fore.CYAN}scanning streams: {pct:3d}%{Style.RESET_ALL} "
                   f"({i}/{total})   ", end="", flush=True)
     if total > 1:
         print()
@@ -928,7 +1067,7 @@ def collect_streams(client, items, fetch_full):
 
 
 def pick_variant_id(streams, stream_type, variant):
-    """ID konkrétní stopy v tomto partu podle podpisu+pořadí (ID se u dílů liší)."""
+    """ID of a concrete track in this part by signature+ordinal (IDs differ per episode)."""
     sig, ordinal = variant["key"]
     cnt = 0
     for s in streams:
@@ -957,7 +1096,7 @@ def item_available_variants(item, stream_type):
 
 
 # ---------------------------------------------------------------------------
-# Výběr stopy
+# Track selection
 # ---------------------------------------------------------------------------
 def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=False, header=None):
     labels = [v["label"] for v in variants]
@@ -965,15 +1104,15 @@ def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=
     all_labels = list(labels)
     if allow_off:
         off_idx = len(all_labels)
-        all_labels.append(f"{Fore.MAGENTA}— VYPNOUT (žádné titulky) —{Style.RESET_ALL}")
+        all_labels.append(f"{Fore.MAGENTA}— turn OFF (no subtitles) —{Style.RESET_ALL}")
     if allow_keep:
         keep_idx = len(all_labels)
-        all_labels.append(f"{Fore.MAGENTA}— nechat beze změny —{Style.RESET_ALL}")
+        all_labels.append(f"{Fore.MAGENTA}— leave unchanged —{Style.RESET_ALL}")
     if not all_labels:
-        log_warn(f"Žádné {kind} stopy nenalezeny.")
+        log_warn(f"No {kind} tracks found.")
         return ("keep", None)
     default_idx = keep_idx if keep_idx is not None else 0
-    idx = interactive_menu(f"Vyber výchozí {kind}:", all_labels,
+    idx = interactive_menu(f"Select default {kind}:", all_labels,
                            default=default_idx, allow_cancel=allow_back, header=header)
     if idx is None:
         return ("back", None)
@@ -985,13 +1124,13 @@ def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=
 
 
 def resolve_variant_arg(arg, variants, kind, allow_off):
-    """CLI --audio/--subs: 'keep'/'off'/'0', jazykový kód, nebo část popisku."""
+    """CLI --audio/--subs: 'keep'/'off'/'0', a language code, or part of the label."""
     if arg is None:
         return None
     a = arg.strip().lower()
-    if a in ("keep", "-", "nechat"):
+    if a in ("keep", "-"):
         return ("keep", None)
-    if allow_off and a in ("off", "none", "vypnout", "0"):
+    if allow_off and a in ("off", "none", "0"):
         return ("off", None)
     cands = [v for v in variants if v["code"] == a]
     if not cands:
@@ -999,12 +1138,12 @@ def resolve_variant_arg(arg, variants, kind, allow_off):
     if cands:
         cands.sort(key=lambda v: -v.get("count", 0))
         return ("var", cands[0])
-    die(f"{kind}: '{arg}' není dostupné. Kódy: "
-        + (", ".join(sorted({v['code'] for v in variants})) or "(žádné)"))
+    die(f"{kind}: '{arg}' not available. Codes: "
+        + (", ".join(sorted({v['code'] for v in variants})) or "(none)"))
 
 
 # ---------------------------------------------------------------------------
-# Aplikace změn
+# Applying changes
 # ---------------------------------------------------------------------------
 def ep_label(it):
     if it["s"] is not None and it["e"] is not None:
@@ -1016,9 +1155,9 @@ def ep_label(it):
 
 
 def resolve_coverage(kind, action, items_data, stream_type, allow_off, interactive):
-    """Vrátí per-položkový plán (délka jako items_data), prvek:
+    """Returns a per-item plan (length == items_data), each element:
        ('var', variant) | ('off', None) | ('skip', None).
-    Když nějaké díly danou stopu nemají a běžíme interaktivně, zeptá se na náhradu."""
+    If some episodes lack the track and we run interactively, ask for a replacement."""
     n = len(items_data)
     if action[0] == "keep":
         return [("skip", None)] * n
@@ -1039,14 +1178,14 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
         return plan
 
     if not interactive:
-        log_warn(f"{len(missing)} z {n} položek nemá {kind}: {variant['label']}")
+        log_warn(f"{len(missing)} of {n} items lack {kind}: {variant['label']}")
         lbls = [ep_label(items_data[i]) for i in missing]
         print("   " + ", ".join(lbls[:30]) + (" …" if len(lbls) > 30 else ""))
-        log_info(f"Neinteraktivní režim: těchto {len(missing)} položek ponechávám beze změny.")
+        log_info(f"Non-interactive mode: leaving these {len(missing)} items unchanged.")
         return plan
 
     while missing:
-        # dostupné náhradní varianty napříč chybějícími (dedup podle key)
+        # available replacement variants across the missing ones (dedup by key)
         avail = {}
         cnt = {}
         for i in missing:
@@ -1056,21 +1195,21 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
                 avail.setdefault(v["key"], v)
                 cnt[v["key"]] = cnt.get(v["key"], 0) + 1
         if not avail:
-            log_info("Chybějící položky nemají žádnou jinou stopu — ponechávám je beze změny.")
+            log_info("Missing items have no other track — leaving them unchanged.")
             break
         opts = sorted(avail.values(), key=lambda v: (-cnt[v["key"]], v["label"].lower()))
-        labels = [f"{v['label']}  (má {cnt[v['key']]}/{len(missing)} chybějících)" for v in opts]
+        labels = [f"{v['label']}  (has {cnt[v['key']]}/{len(missing)} missing)" for v in opts]
         extra = []
         if allow_off:
-            extra.append(f"{Fore.MAGENTA}— VYPNOUT titulky u chybějících —{Style.RESET_ALL}")
-        extra.append(f"{Fore.MAGENTA}— nechat chybějící beze změny (přeskočit) —{Style.RESET_ALL}")
+            extra.append(f"{Fore.MAGENTA}— turn subtitles OFF on missing —{Style.RESET_ALL}")
+        extra.append(f"{Fore.MAGENTA}— leave missing unchanged (skip) —{Style.RESET_ALL}")
         mlbls = [ep_label(items_data[i]) for i in missing]
         header = [
-            f"{Fore.YELLOW}{len(missing)} z {n} položek nemá {kind}: {variant['label']}{Style.RESET_ALL}",
+            f"{Fore.YELLOW}{len(missing)} of {n} items lack {kind}: {variant['label']}{Style.RESET_ALL}",
             "  " + ", ".join(mlbls[:40]) + (" …" if len(mlbls) > 40 else ""),
             "",
         ]
-        idx = interactive_menu(f"Čím nahradit {kind} u chybějících dílů?",
+        idx = interactive_menu(f"Replace {kind} on missing episodes with?",
                                labels + extra, default=len(labels) + len(extra) - 1,
                                header=header)
         if idx is None:
@@ -1084,18 +1223,18 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
                     applied += 1
                 else:
                     still.append(i)
-            log_done(f"Nastaveno '{alt['label']}' u {applied} dílů.")
+            log_done(f"Set '{alt['label']}' on {applied} episodes.")
             missing = still
             if missing:
-                log_info(f"{len(missing)} dílů tuto náhradu nemá — vyber další.")
+                log_info(f"{len(missing)} episodes lack this replacement — pick another.")
         else:
             sel = extra[idx - len(opts)]
-            if allow_off and "VYPNOUT" in sel:
+            if allow_off and "OFF" in sel:
                 for i in missing:
                     plan[i] = ("off", None)
-                log_done(f"Titulky u {len(missing)} chybějících dílů vypnuty.")
+                log_done(f"Subtitles turned OFF on {len(missing)} missing episodes.")
             else:
-                log_info(f"{len(missing)} dílů ponecháno beze změny.")
+                log_info(f"{len(missing)} episodes left unchanged.")
             break
     return plan
 
@@ -1107,9 +1246,9 @@ def plan_summary(plan):
         if p[0] == "var":
             c[variant_short(p[1])] += 1
         elif p[0] == "off":
-            c["VYPNUTO"] += 1
+            c["OFF"] += 1
         else:
-            c["beze změny"] += 1
+            c["unchanged"] += 1
     return ", ".join(f"{k}: {v}×" for k, v in c.items())
 
 
@@ -1124,27 +1263,27 @@ def apply_changes(client, items_data, audio_plan, sub_plan, dry_run):
             params = {"allParts": 1}
             notes = []
             if a[0] == "var":
-                aid = pick_variant_id(streams, ST_AUDIO, a[1])  # ID se hledá PER DÍL
+                aid = pick_variant_id(streams, ST_AUDIO, a[1])  # ID resolved PER EPISODE
                 if aid is not None:
                     params["audioStreamID"] = aid
                     notes.append(f"audio->{variant_short(a[1])}")
                 else:
-                    notes.append(f"{Fore.YELLOW}audio '{variant_short(a[1])}' chybí{Style.RESET_ALL}")
+                    notes.append(f"{Fore.YELLOW}audio '{variant_short(a[1])}' missing{Style.RESET_ALL}")
             if s[0] == "off":
                 params["subtitleStreamID"] = 0
-                notes.append("titulky->OFF")
+                notes.append("subs->OFF")
             elif s[0] == "var":
-                tid = pick_variant_id(streams, ST_SUBTITLE, s[1])  # ID se hledá PER DÍL
+                tid = pick_variant_id(streams, ST_SUBTITLE, s[1])  # ID resolved PER EPISODE
                 if tid is not None:
                     params["subtitleStreamID"] = tid
-                    notes.append(f"titulky->{variant_short(s[1])}")
+                    notes.append(f"subs->{variant_short(s[1])}")
                 else:
-                    notes.append(f"{Fore.YELLOW}titulky '{variant_short(s[1])}' chybí{Style.RESET_ALL}")
+                    notes.append(f"{Fore.YELLOW}subs '{variant_short(s[1])}' missing{Style.RESET_ALL}")
             if "audioStreamID" not in params and "subtitleStreamID" not in params:
                 continue
             label = f"{se}{it['title']} (part {part_id}): " + ", ".join(notes)
             if dry_run:
-                print(f"  {Fore.CYAN}[plán]{Style.RESET_ALL} {label}")
+                print(f"  {Fore.CYAN}[plan]{Style.RESET_ALL} {label}")
                 changed += 1
                 continue
             try:
@@ -1159,72 +1298,72 @@ def apply_changes(client, items_data, audio_plan, sub_plan, dry_run):
 
 
 # ---------------------------------------------------------------------------
-# Přihlášení / získání tokenu (uloží do configu)
+# Sign-in / obtaining a token (saved to the config)
 # ---------------------------------------------------------------------------
 def account_login(acct):
-    """Interaktivně získá účtový token (heslo nebo plex.tv/link). Uloží do acct.token."""
-    idx = ask_choice("Přihlášení k Plex účtu:", [
-        "Jméno/email + heslo",
-        "Kód na plex.tv/link (bez hesla)",
+    """Interactively obtain an account token (password or plex.tv/link). Stored in acct.token."""
+    idx = ask_choice("Sign in to Plex account:", [
+        "Username/email + password",
+        "Code on plex.tv/link (no password)",
     ])
     if idx == 0:
-        login = ask_text("Plex jméno nebo email")
-        pw = ask_secret("Heslo")
+        login = ask_text("Plex username or email")
+        pw = ask_secret("Password")
         try:
             acct.signin_password(login, pw)
         except RuntimeError as ex:
             if "UNAUTHORIZED" in str(ex):
-                code = ask_text("Dvoufázový (2FA) kód, pokud ho máš zapnutý (jinak Enter)")
+                code = ask_text("Two-factor (2FA) code, if you have it enabled (otherwise Enter)")
                 if code:
                     try:
                         acct.signin_password(login, pw, code=code)
                     except RuntimeError:
-                        die("Přihlášení selhalo (špatné jméno/heslo nebo 2FA kód).")
+                        die("Sign-in failed (wrong username/password or 2FA code).")
                 else:
-                    die("Přihlášení selhalo (špatné jméno/heslo, nebo chybí 2FA kód).")
+                    die("Sign-in failed (wrong username/password, or missing 2FA code).")
             else:
                 die(str(ex))
     else:
         acct.pin_login()
-    log_done("Přihlášeno k účtu.")
+    log_done("Signed in to account.")
     return acct.token
 
 
 def choose_home_user(acct, cfg):
-    """Vybere Home uživatele a získá jeho token (přes switch + PIN). Uloží do cfg."""
+    """Pick a Home user and obtain its token (via switch + PIN). Saved to cfg."""
     users = acct.home_users()
     if not users:
-        die("Účet nemá žádné Home uživatele.")
+        die("The account has no Home users.")
     if len(users) == 1:
         chosen = users[0]
     else:
         labels = [u["title"] + (" (admin)" if u["admin"] else "")
-                  + (" 🔒PIN" if u["protected"] else "") for u in users]
-        chosen = users[ask_choice("Vyber Plex Home uživatele:", labels)]
+                  + (" [PIN]" if u["protected"] else "") for u in users]
+        chosen = users[ask_choice("Select a Plex Home user:", labels)]
 
     pin = None
     if chosen["protected"]:
-        pin = ask_text(f"PIN uživatele '{chosen['title']}'")
+        pin = ask_text(f"PIN for user '{chosen['title']}'")
     while True:
         try:
             user_token = acct.switch_user(chosen["id"], pin=pin)
             break
         except RuntimeError as ex:
             if "PIN_INVALID" in str(ex):
-                log_warn("Neplatný PIN.")
-                pin = ask_text(f"PIN uživatele '{chosen['title']}' (znovu)")
+                log_warn("Invalid PIN.")
+                pin = ask_text(f"PIN for user '{chosen['title']}' (again)")
                 continue
             die(str(ex))
     cfg["home_user"] = {"id": chosen["id"], "uuid": chosen["uuid"],
                         "title": chosen["title"], "protected": chosen["protected"]}
     cfg["user_token"] = user_token
     save_config(cfg)
-    log_done(f"Přepnuto na uživatele: {chosen['title']}")
+    log_done(f"Switched to user: {chosen['title']}")
     return user_token
 
 
 def full_login(cfg, client_id):
-    """Kompletní přihlášení: účet -> Home uživatel + PIN. Vrátí user_token."""
+    """Full sign-in: account -> Home user + PIN. Returns user_token."""
     acct = PlexAccount(client_id)
     account_login(acct)
     cfg["account_token"] = acct.token
@@ -1233,27 +1372,27 @@ def full_login(cfg, client_id):
 
 
 def reswitch(cfg, client_id):
-    """Když vyprší user_token: přepni znovu (PIN) přes uložený account_token."""
+    """When user_token expires: switch again (PIN) using the saved account_token."""
     acct = PlexAccount(client_id, cfg.get("account_token"))
     hu = cfg.get("home_user") or {}
     try:
-        pin = ask_text(f"PIN uživatele '{hu.get('title','?')}'") if hu.get("protected") else None
+        pin = ask_text(f"PIN for user '{hu.get('title','?')}'") if hu.get("protected") else None
         while True:
             try:
                 tok = acct.switch_user(hu["id"], pin=pin)
                 break
             except RuntimeError as ex:
                 if "PIN_INVALID" in str(ex):
-                    log_warn("Neplatný PIN.")
-                    pin = ask_text("PIN (znovu)")
+                    log_warn("Invalid PIN.")
+                    pin = ask_text("PIN (again)")
                     continue
                 raise
         cfg["user_token"] = tok
         save_config(cfg)
         return tok
     except RuntimeError:
-        # account token asi taky neplatný -> celé znovu
-        log_warn("Uložené přihlášení vypršelo, přihlas se znovu.")
+        # the account token is probably invalid too -> start over
+        log_warn("Saved sign-in expired, please sign in again.")
         return full_login(cfg, client_id)
 
 
@@ -1261,13 +1400,13 @@ def build_client(args, cfg):
     client_id = get_client_id(cfg)
     verify_pref = not args.insecure
 
-    # adresa serveru: arg -> config -> zeptat se (a uložit)
+    # server address: arg -> config -> ask (and save)
     base_url = normalize_base_url(args.base_url) if args.base_url else cfg.get("base_url")
     if not base_url:
         base_url = normalize_base_url(
-            ask_text("Zadej FQDN / adresu Plex serveru (např. https://plex.falco81.net)"))
+            ask_text("Enter the FQDN / address of the Plex server (e.g. https://plex.falco81.net)"))
         if not base_url:
-            die("Adresa serveru je povinná.")
+            die("Server address is required.")
         cfg["base_url"] = base_url
         save_config(cfg)
     elif args.base_url:
@@ -1275,8 +1414,8 @@ def build_client(args, cfg):
         save_config(cfg)
 
     def _connect(token):
-        """Připojí se k serveru. Při chybě certifikátu automaticky přepne na
-        nezabezpečené HTTPS (vlastní server) a zapamatuje si to. Vrací (client, name)."""
+        """Connect to the server. On a certificate error, automatically switch to
+        insecure HTTPS (your own server) and remember it. Returns (client, name)."""
         v = False if cfg.get("insecure_server") else verify_for(base_url, verify_pref)
         client = PlexClient(base_url, token, client_id, verify=v)
         try:
@@ -1284,114 +1423,114 @@ def build_client(args, cfg):
         except RuntimeError as ex:
             msg = str(ex).upper()
             if v and ("CERTIFIC" in msg or "SSL" in msg):
-                log_warn("Certifikát serveru nešel ověřit (nekompletní řetěz / "
-                         "chybí CA) — přepínám na nezabezpečené HTTPS pro tvůj server.")
-                log_info("Tip: `pip install truststore` umožní bezpečné ověření přes "
-                         "úložiště certifikátů Windows.")
+                log_warn("Could not verify the server certificate (incomplete chain / "
+                         "missing CA) — switching to insecure HTTPS for your server.")
+                log_info("Tip: `pip install truststore` enables secure verification via "
+                         "the Windows certificate store.")
                 cfg["insecure_server"] = True
                 save_config(cfg)
                 client = PlexClient(base_url, token, client_id, verify=False)
                 return client, client.check()
             raise
 
-    # přímý token (power-user override)
+    # direct token (power-user override)
     if args.token:
         client, name = _connect(args.token)
-        log_done(f"Připojeno k serveru: {name}")
+        log_done(f"Connected to server: {name}")
         return client
 
-    # už máme uložený uživatelský token? -> zkus rovnou
+    # already have a saved user token? -> try it directly
     user_token = cfg.get("user_token")
     if user_token:
         try:
             client, name = _connect(user_token)
-            log_done(f"Připojeno jako '{(cfg.get('home_user') or {}).get('title','?')}' k serveru: {name}")
+            log_done(f"Connected as '{(cfg.get('home_user') or {}).get('title','?')}' to server: {name}")
             return client
         except RuntimeError as ex:
             if "UNAUTHORIZED" in str(ex):
-                log_warn("Uložený uživatelský token vypršel - obnovuji.")
+                log_warn("Saved user token expired - refreshing.")
                 user_token = reswitch(cfg, client_id)
                 client, name = _connect(user_token)
-                log_done(f"Připojeno k serveru: {name}")
+                log_done(f"Connected to server: {name}")
                 return client
-            die(f"Server nedostupný: {ex}")
+            die(f"Server unreachable: {ex}")
 
-    # první přihlášení
+    # first sign-in
     user_token = full_login(cfg, client_id)
     client, name = _connect(user_token)
-    log_done(f"Připojeno k serveru: {name}")
+    log_done(f"Connected to server: {name}")
     return client
 
 
 # ---------------------------------------------------------------------------
-# Výběr cíle (seriál -> epizody, film -> sám sebe)
+# Target selection (show -> episodes, movie -> itself)
 # ---------------------------------------------------------------------------
 def _target_from_item(client, item):
     if item["type"] == "show":
         eps = client.all_episodes(item["ratingKey"])
         if not eps:
-            die("Seriál nemá epizody.")
-        return eps, f"seriál '{item['title']}' ({len(eps)} epizod)", True
+            die("The show has no episodes.")
+        return eps, f"show '{item['title']}' ({len(eps)} episodes)", True
     md = client.get_metadata(item["ratingKey"])
     md["_md"] = md
-    return [md], f"film '{item['title']}'", False
+    return [md], f"movie '{item['title']}'", False
 
 
 def _target_from_md(client, md):
     if md.get("type") == "show":
         eps = client.all_episodes(md.get("ratingKey"))
-        return eps, f"seriál '{md.get('title')}' ({len(eps)} epizod)", True
+        return eps, f"show '{md.get('title')}' ({len(eps)} episodes)", True
     md["_md"] = md
     return [md], f"'{md.get('title')}'", False
 
 
 def scan_target(client, target):
-    """Načte streamy cíle. Vrátí (items_data, audio, subs, header_lines)."""
+    """Scan the target's streams. Returns (items_data, audio, subs, header_lines)."""
     its, label, ff = target
     clear_screen()
-    log_info(f"Cíl: {Fore.CYAN}{label}{Style.RESET_ALL}")
+    log_info(f"Target: {Fore.CYAN}{label}{Style.RESET_ALL}")
     if ff:
-        log_info("Skenuji dostupné stopy napříč epizodami...")
+        log_info("Scanning available tracks across episodes...")
     idata, audio, subs = collect_streams(client, its, ff)
     header = [
-        f"{Fore.CYAN}Cíl:{Style.RESET_ALL} {label}",
-        f"{Fore.CYAN}Audio:{Style.RESET_ALL}   " + (" | ".join(v["label"] for v in audio) or "(žádné)"),
-        f"{Fore.CYAN}Titulky:{Style.RESET_ALL} " + (" | ".join(v["label"] for v in subs) or "(žádné)"),
+        f"{Fore.CYAN}Target:{Style.RESET_ALL} {label}",
+        f"{Fore.CYAN}Audio:{Style.RESET_ALL}   " + (" | ".join(v["label"] for v in audio) or "(none)"),
+        f"{Fore.CYAN}Subtitles:{Style.RESET_ALL} " + (" | ".join(v["label"] for v in subs) or "(none)"),
         "",
     ]
     return idata, audio, subs, header
 
 
 def select_and_configure(client, args):
-    """Průvodce: knihovna -> položka -> audio -> titulky, s návratem o krok zpět
-    (Esc). Vrátí (items_data, audio_action, sub_action) nebo None."""
-    # --show: pevně daná položka (bez kroků knihovna/položka)
+    """Wizard: library -> item -> audio -> subtitles, with step-back (Esc).
+    Returns (items_data, audio_action, sub_action) or None."""
+    # --show: fixed item (skips the library/item steps)
     fixed = None
     if args.show:
         rk = parse_show_ref(args.show)
         if rk:
             md = client.get_metadata(rk)
             if not md:
-                die(f"ratingKey {rk} nenalezen.")
+                die(f"ratingKey {rk} not found.")
             fixed = _target_from_md(client, md)
         else:
             found = []
             for sec in client.sections():
                 found += client.items_in_section(sec["key"], sec["type"], query=args.show)
             if not found:
-                die(f"'{args.show}' nenalezeno.")
+                die(f"'{args.show}' not found.")
             if len(found) == 1:
                 fixed = _target_from_item(client, found[0])
             else:
                 labels = [f"{f['title']} ({f['year']}) [{f['type']}]" for f in found]
-                i = interactive_menu("Nalezeno více - vyber:", labels, allow_cancel=True)
+                i = interactive_menu("Multiple found - select:", labels, allow_cancel=True)
                 if i is None:
                     return None
                 fixed = _target_from_item(client, found[i])
 
     secs = client.sections()
     if not secs:
-        die("Server nemá žádné knihovny.")
+        die("The server has no libraries.")
     single_lib = len(secs) == 1
     have_item_step = fixed is None
 
@@ -1407,10 +1546,10 @@ def select_and_configure(client, args):
     def scan_lib(section):
         try:
             client.refresh_section(section["key"])
-            return (f"{Fore.GREEN}» Scan Library Files spuštěn nad knihovnou "
+            return (f"{Fore.GREEN}» Scan Library Files started on library "
                     f"'{section['title']}'.{Style.RESET_ALL}")
         except Exception as ex:
-            return f"{Fore.RED}Scan Library Files selhal: {ex}{Style.RESET_ALL}"
+            return f"{Fore.RED}Scan Library Files failed: {ex}{Style.RESET_ALL}"
 
     if fixed:
         idata, audio_vars, sub_vars, header = scan_target(client, fixed)
@@ -1421,7 +1560,7 @@ def select_and_configure(client, args):
     while True:
         if step == LIB:
             labels = [f"{s['title']}  [{s['type']}]" for s in secs]
-            i = interactive_menu("Vyber knihovnu:", labels, allow_cancel=True,
+            i = interactive_menu("Select a library:", labels, allow_cancel=True,
                                  refresh_cb=lambda idx: scan_lib(secs[idx]) if idx is not None else None)
             if i is None:
                 return None
@@ -1431,14 +1570,14 @@ def select_and_configure(client, args):
         elif step == ITEM:
             items = client.items_in_section(sec["key"], sec["type"])
             if not items:
-                log_warn("Knihovna je prázdná.")
+                log_warn("The library is empty.")
                 if single_lib:
                     return None
                 step = LIB
                 continue
             items.sort(key=lambda x: (x["title"] or "").lower())
             labels = [f"{it['title']} ({it['year']})" if it["year"] else it["title"] for it in items]
-            i = interactive_menu(f"Vyber seriál/film z '{sec['title']}':", labels, allow_cancel=True,
+            i = interactive_menu(f"Select a show/movie from '{sec['title']}':", labels, allow_cancel=True,
                                  refresh_cb=lambda idx: scan_lib(sec))
             if i is None:
                 if single_lib:
@@ -1455,10 +1594,10 @@ def select_and_configure(client, args):
 
         elif step == AUDIO:
             if not audio_interactive:
-                audio_action = resolve_variant_arg(args.audio, audio_vars, "zvuk", False)
+                audio_action = resolve_variant_arg(args.audio, audio_vars, "audio", False)
                 step = SUBS
                 continue
-            audio_action = choose_variant("zvuk (audio)", audio_vars, allow_off=False,
+            audio_action = choose_variant("audio", audio_vars, allow_off=False,
                                           allow_back=True, header=header)
             if audio_action[0] == "back":
                 if have_item_step:
@@ -1469,9 +1608,9 @@ def select_and_configure(client, args):
 
         elif step == SUBS:
             if not subs_interactive:
-                sub_action = resolve_variant_arg(args.subs, sub_vars, "titulky", True)
+                sub_action = resolve_variant_arg(args.subs, sub_vars, "subtitles", True)
                 break
-            sub_action = choose_variant("titulky", sub_vars, allow_off=True,
+            sub_action = choose_variant("subtitles", sub_vars, allow_off=True,
                                         allow_back=True, header=header)
             if sub_action[0] == "back":
                 if audio_interactive:
@@ -1484,7 +1623,7 @@ def select_and_configure(client, args):
             break
 
     if audio_action[0] == "keep" and sub_action[0] == "keep":
-        log_warn("Žádná změna nevybrána. Končím.")
+        log_warn("No change selected. Exiting.")
         return None
     return idata, audio_action, sub_action
 
@@ -1494,19 +1633,31 @@ def select_and_configure(client, args):
 # ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(
-        description="Hromadně nastaví výchozí audio/titulky u seriálu nebo filmu na Plexu.")
-    ap.add_argument("--base-url", help="Adresa/FQDN serveru (jinak se použije uložená / zeptá se)")
-    ap.add_argument("--token", help="Přímo X-Plex-Token (přeskočí přihlášení)")
-    ap.add_argument("--show", help="ratingKey, Plex URL, nebo název seriálu/filmu")
-    ap.add_argument("--audio", help="Kód/název audio jazyka nebo 'keep'")
-    ap.add_argument("--subs", help="Kód/název titulků, 'off' nebo 'keep'")
-    ap.add_argument("--insecure", action="store_true", help="Nevalidovat HTTPS certifikát")
-    ap.add_argument("--dry-run", action="store_true", help="Jen ukázat plán")
-    ap.add_argument("--yes", action="store_true", help="Neptat se na potvrzení")
-    ap.add_argument("--logout", action="store_true", help="Smazat uložené tokeny a skončit")
-    ap.add_argument("--relogin", action="store_true", help="Vynutit nové přihlášení")
-    ap.add_argument("--switch-user", action="store_true", help="Znovu vybrat Home uživatele")
+        description="Bulk-set default audio/subtitles for a show or movie on Plex.")
+    ap.add_argument("--base-url", help="Server address/FQDN (otherwise the saved one is used / it asks)")
+    ap.add_argument("--token", help="X-Plex-Token directly (skips sign-in)")
+    ap.add_argument("--show", help="ratingKey, Plex URL, or show/movie title")
+    ap.add_argument("--audio", help="Audio language code/name or 'keep'")
+    ap.add_argument("--subs", help="Subtitle code/name, 'off' or 'keep'")
+    ap.add_argument("--insecure", action="store_true", help="Do not validate the HTTPS certificate")
+    ap.add_argument("--dry-run", action="store_true", help="Only show the plan")
+    ap.add_argument("--yes", action="store_true", help="Do not ask for confirmation")
+    ap.add_argument("--logout", action="store_true", help="Delete saved tokens and exit")
+    ap.add_argument("--relogin", action="store_true", help="Force a fresh sign-in")
+    ap.add_argument("--switch-user", action="store_true", help="Pick the Home user again")
+    ap.add_argument("--config", help="Path to the config file (otherwise searched next to the script, in .config next to the script and parent folders, and in ~/.config)")
+    ap.add_argument("--where-config", action="store_true",
+                    help="Print the path of the config file in use and exit")
     args = ap.parse_args()
+
+    global _CONFIG_OVERRIDE
+    if args.config:
+        _CONFIG_OVERRIDE = args.config
+    resolve_config_path()
+    if args.where_config:
+        exists = "exists" if (CONFIG_PATH and os.path.isfile(CONFIG_PATH)) else "does not exist yet"
+        print(f"Config: {CONFIG_PATH}  ({exists})")
+        return
 
     cfg = load_config()
     client_id = get_client_id(cfg)
@@ -1515,7 +1666,7 @@ def main():
         for k in ("account_token", "user_token", "home_user"):
             cfg.pop(k, None)
         save_config(cfg)
-        log_done("Odhlášeno (tokeny smazány). Adresa serveru zůstala uložená.")
+        log_done("Logged out (tokens deleted). The server address is kept.")
         return
 
     if args.relogin:
@@ -1534,54 +1685,54 @@ def main():
             else:
                 die(str(ex))
 
-    print(f"{Fore.MAGENTA}=== plex_def_langsubs - výchozí audio/titulky ==={Style.RESET_ALL}")
+    print(f"{Fore.MAGENTA}=== plex_def_langsubs - default audio/subtitles ==={Style.RESET_ALL}")
 
     client = build_client(args, cfg)
 
     result = select_and_configure(client, args)
     if result is None:
-        log_info("Zrušeno.")
+        log_info("Cancelled.")
         return
     items_data, audio_action, sub_action = result
 
-    # sestav per-díl plán; když nějaké díly stopu nemají, zeptej se na náhradu
+    # build a per-episode plan; if some episodes lack the track, ask for a replacement
     interactive = not args.yes
     print()
     audio_plan = resolve_coverage("audio", audio_action, items_data, ST_AUDIO,
                                   allow_off=False, interactive=interactive)
-    sub_plan = resolve_coverage("titulky", sub_action, items_data, ST_SUBTITLE,
+    sub_plan = resolve_coverage("subtitles", sub_action, items_data, ST_SUBTITLE,
                                 allow_off=True, interactive=interactive)
 
-    # je vůbec co dělat?
+    # is there anything to do at all?
     if all(p[0] == "skip" for p in audio_plan) and all(p[0] == "skip" for p in sub_plan):
-        log_warn("Nakonec není co měnit. Končím.")
+        log_warn("Nothing to change after all. Exiting.")
         return
 
     clear_screen()
-    log_info(f"Nastavím u {len(items_data)} položek:")
+    log_info(f"Will set on {len(items_data)} items:")
     print(f"    audio:   {plan_summary(audio_plan)}")
-    print(f"    titulky: {plan_summary(sub_plan)}")
+    print(f"    subtitles: {plan_summary(sub_plan)}")
     print()
 
     dry = args.dry_run
     if not dry and not args.yes:
-        if not ask_yes("Provést změnu?", default=True):
-            dry = ask_yes("Aspoň zobrazit plán (dry-run)?", default=True)
+        if not ask_yes("Apply the changes?", default=True):
+            dry = ask_yes("At least show the plan (dry-run)?", default=True)
             if not dry:
-                log_info("Zrušeno.")
+                log_info("Cancelled.")
                 return
 
     print()
     ok, fail, changed = apply_changes(client, items_data, audio_plan, sub_plan, dry)
     print()
     if dry:
-        log_info(f"Dry-run: naplánováno {changed} úprav (nic neuloženo).")
+        log_info(f"Dry-run: {changed} edits planned (nothing saved).")
     else:
         color = Fore.GREEN if fail == 0 else Fore.YELLOW
-        print(f"{color}Hotovo: {ok} úspěšně"
-              + (f", {fail} chyb" if fail else "")
-              + f" (dotčeno {changed} částí).{Style.RESET_ALL}")
-        log_info("V klientu se změna projeví po obnovení / novém přehrání.")
+        print(f"{color}Done: {ok} succeeded"
+              + (f", {fail} failed" if fail else "")
+              + f" ({changed} parts affected).{Style.RESET_ALL}")
+        log_info("The change shows in the client after a refresh / new playback.")
 
 
 if __name__ == "__main__":
@@ -1589,5 +1740,5 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         print()
-        log_warn("Přerušeno uživatelem.")
+        log_warn("Interrupted by user.")
         sys.exit(130)
