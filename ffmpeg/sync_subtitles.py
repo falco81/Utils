@@ -2245,13 +2245,20 @@ def ask_choice(prompt, options, allow_skip=True, allow_abort=True, header=None):
     if allow_abort:
         labels.append(f"{Fore.MAGENTA}— zrušit celý dávkový běh —{Style.RESET_ALL}")
         extra.append("abort")
+    _pend = _back_pending_take()
+    _dflt = 0
+    if _pend is not _BACK_NO_PENDING:
+        if isinstance(_pend, int) and 0 <= _pend < n:
+            _dflt = _pend
+        elif _pend in extra:
+            _dflt = n + extra.index(_pend)
     if _tui_supported():
-        idx = interactive_menu(prompt, labels, default=0, allow_cancel=True, header=header)
+        idx = interactive_menu(prompt, labels, default=_dflt, allow_cancel=True, header=header)
     else:
         for h in (header or []):
             if strip_ansi(h).strip():
                 print(h)
-        idx = _ask_pick_classic(prompt, labels, 0, allow_back=True)
+        idx = _ask_pick_classic(prompt, labels, _dflt, allow_back=True)
     if idx is None:
         raise _StepBack()
     result = idx if idx < n else extra[idx - n]
@@ -2325,21 +2332,30 @@ def resolve_preflight_problem(video_path, problem, sub_tracks, audio_tracks):
     """Interaktivně se zeptá, co dělat, když video nemá očekávané stopy.
     Vrací ('skip'|'abort'|'override', track_id_or_None, audio_track_id_or_None)."""
     log_warn(f"{os.path.basename(video_path)}: {problem}")
+    hdr = [f"{Fore.YELLOW}{os.path.basename(video_path)}: {problem}{Style.RESET_ALL}"]
     if sub_tracks:
-        print("  Dostupné titulkové stopy:")
+        hdr.append(f"{Fore.CYAN}Dostupné titulkové stopy:{Style.RESET_ALL}")
         for t in sub_tracks:
-            print(f"    ID={t['id']:>3}  jazyk={t['lang']:<5} kodek={t['codec']}")
+            hdr.append(f"   ID={t['id']:>3}  {t['lang']:<5} {t['codec']}")
     if audio_tracks:
-        print("  Dostupné zvukové stopy:")
+        hdr.append(f"{Fore.CYAN}Dostupné zvukové stopy:{Style.RESET_ALL}")
         for t in audio_tracks:
-            print(f"    ID={t['id']:>3}  jazyk={t['lang']:<5} kodek={t['codec']}")
-
-    choice = ask_choice("Co s tím?", ["Zadat konkrétní ID stopy/stop a zkusit to"])
-    if choice in ("skip", "abort"):
-        return choice, None, None
-
-    t_raw = input("  ID titulkové stopy k použití (Enter = nezadávat): ").strip()
-    a_raw = input("  ID zvukové stopy k použití (Enter = nezadávat): ").strip()
+            hdr.append(f"   ID={t['id']:>3}  {t['lang']:<5} {t['codec']}")
+    hdr.append("")
+    if sub_tracks:
+        labels = [f"pouzit titulkovou stopu ID={t['id']} ({t['lang']}, {t['codec']})" for t in sub_tracks]
+        labels.append("zadat ID stop ručně")
+        choice = ask_choice("Co s tím?", labels, header=hdr)
+        if choice in ("skip", "abort"):
+            return choice, None, None
+        if choice < len(sub_tracks):
+            return "override", sub_tracks[choice]["id"], None
+    else:
+        choice = ask_choice("Co s tím?", ["zadat ID stop ručně"], header=hdr)
+        if choice in ("skip", "abort"):
+            return choice, None, None
+    t_raw = ask_text("ID titulkové stopy k použití (Enter = nezadávat)", "").strip()
+    a_raw = ask_text("ID zvukové stopy k použití (Enter = nezadávat)", "").strip()
     t_id = int(t_raw) if t_raw.isdigit() else None
     a_id = int(a_raw) if a_raw.isdigit() else None
     return "override", t_id, a_id
@@ -2562,7 +2578,7 @@ def ask_readability_params(srt_files):
         return None
 
     if choice == len(preset_keys):
-        raw = input("  Zadej čtecí tempo ve znacích/s (např. 15): ").strip()
+        raw = ask_text("Zadej čtecí tempo ve znacích/s (např. 15)", "").strip()
         try:
             min_cps = float(raw)
         except ValueError:
@@ -2571,35 +2587,23 @@ def ask_readability_params(srt_files):
     else:
         min_cps, default_floor, _label = READING_SPEED_PRESETS[preset_keys[choice]]
 
-    print()
-    print(
-        "2) Minimální délka zobrazení (s) - i jedno krátké slovo se zobrazí "
-        f"alespoň takhle dlouho, bez ohledu na čtecí tempo výše. Enter = doporučená {default_floor}."
-    )
-    raw = input(f"  Minimální délka v sekundách [{default_floor}]: ").strip()
+    default_floor = 2.5   # výchozí nabízená minimální délka zobrazení
+    raw = ask_text(f"2) Minimální délka zobrazení (s) - i krátké slovo se zobrazí aspoň takhle "
+                   f"dlouho (bez ohledu na tempo výše). Sekundy", str(default_floor)).strip()
     try:
         min_floor = float(raw) if raw else default_floor
     except ValueError:
         min_floor = default_floor
 
-    print()
-    print(
-        "3) Bezpečnostní mezera (s) před dalším titulkem, kterou prodloužení "
-        f"nikdy nepřekročí (aby se titulky nezačaly překrývat). Enter = výchozí {DEFAULT_MIN_GAP}."
-    )
-    raw = input(f"  Mezera v sekundách [{DEFAULT_MIN_GAP}]: ").strip()
+    raw = ask_text(f"3) Bezpečnostní mezera (s) před dalším titulkem, kterou prodloužení nikdy "
+                   f"nepřekročí (aby se nepřekrývaly). Sekundy", str(DEFAULT_MIN_GAP)).strip()
     try:
         min_gap = float(raw) if raw else DEFAULT_MIN_GAP
     except ValueError:
         min_gap = DEFAULT_MIN_GAP
 
-    print()
-    print(
-        "4) Příplatek za řádek (s) - kolik sekund navíc dostane titulek za KAŽDÝ "
-        "řádek nad první (oči musí přeskočit na další řádek). Díky tomu dvouřádková "
-        f"věta dostane víc času než jednoslovný titulek se stejným počtem znaků. Enter = výchozí {DEFAULT_LINE_OVERHEAD}."
-    )
-    raw = input(f"  Příplatek za řádek v sekundách [{DEFAULT_LINE_OVERHEAD}]: ").strip()
+    raw = ask_text(f"4) Příplatek za řádek (s) navíc za KAŽDÝ řádek nad první (dvouřádková věta "
+                   f"dostane víc času než jednořádková). Sekundy", str(DEFAULT_LINE_OVERHEAD)).strip()
     try:
         line_overhead = float(raw) if raw else DEFAULT_LINE_OVERHEAD
     except ValueError:
@@ -2737,11 +2741,18 @@ def ask_yes_no(prompt, default_no=True):
         _preset_record("yesno", prompt, bool(v))
         return bool(v)
     suffix = "[a/N]" if default_no else "[A/n]"
+    _pend = _back_pending_take()
+    _prefill = ""
+    if _pend is not _BACK_NO_PENDING:
+        _prefill = "a" if _pend else "n"
     if _tui_supported():
-        raw = _read_line_tui(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} {suffix}: ", "").strip().lower()
+        raw = _read_line_tui(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} {suffix}: ", "", prefill=_prefill).strip().lower()
     else:
-        raw = input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} {suffix}: ").strip().lower()
-    val = (not default_no) if not raw else (raw in ("a", "y", "ano", "yes", "ja"))
+        raw = (input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} {suffix}: ").strip().lower() or _prefill)
+    if not raw and _pend is not _BACK_NO_PENDING:
+        val = bool(_pend)
+    else:
+        val = (not default_no) if not raw else (raw in ("a", "y", "ano", "yes", "ja"))
     _back_put(val)
     _preset_record("yesno", prompt, val)
     return val
@@ -2760,10 +2771,9 @@ def run_fix_readability(args):
     if args.mkv:
         target = str(args.mkv)
     elif interactive:
-        print("1) Co zpracovat - adresář k prohledání, nebo přímo konkrétní .srt soubor.")
-        raw = input("   Cesta [. = aktuální adresář]: ").strip()
+        raw = ask_text("Co zpracovat - adresář k prohledání, nebo konkrétní .srt soubor",
+                       ".").strip()
         target = raw if raw else "."
-        print()
     else:
         target = "."
 
@@ -3079,9 +3089,9 @@ def clean_subtitle_text(text, max_line=42):
     lines = [l.strip() for l in t.split("\n") if l.strip()]
     t = " ".join(lines)
     t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"\s+([,.!?;:…])", r"\1", t)
+    t = re.sub(r"\s+([,.!?;:...])", r"\1", t)
     t = re.sub(r"([¿¡])\s+", r"\1", t)
-    t = re.sub(r"\.{3,}", "…", t)
+    t = re.sub(r"\.{3,}", "...", t)
     if len(t) > max_line and " " in t:
         words = t.split(" ")
         target = len(t) / 2.0
@@ -3098,7 +3108,7 @@ def clean_subtitle_text(text, max_line=42):
     return t
 
 
-_SENT_ENDERS = ".!?…:"
+_SENT_ENDERS = ".!?...:"
 
 
 def _looks_continuation(cur, nxt, gap, max_gap=2.0):
@@ -3744,7 +3754,7 @@ def _mask(s):
     if not s:
         return "(nenastaveno)"
     s = str(s)
-    return (s[:4] + "…" + s[-2:]) if len(s) > 8 else "••••"
+    return (s[:4] + "..." + s[-2:]) if len(s) > 8 else "----"
 
 
 def run_config(args):
@@ -4264,10 +4274,7 @@ def run_extract_subs(args, minimal=False):
         if sample is None:
             die("Nepodařilo se přečíst titulkové stopy ze žádného videa (poškozené soubory, "
                 "nebo videa nemají titulky).")
-        log_info(f"Titulkové stopy ve vzorku ({sample.name}):")
-        for t in sub_tracks:
-            txt = "text" if is_text_codec(t["codec"]) else "OBRÁZKOVÉ (nelze do .srt)"
-            print(f"    #{t['id']}  {t['lang']:4}  {t['codec']:16} {t.get('title', '')}  [{txt}]")
+        log_info(f"Nalezeno {len(sub_tracks)} stop ve vzorku {sample.name}.")
         text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
         if not text_tracks:
             log_warn("Vzorové video má jen obrázkové titulky (PGS/VobSub). Můžeš přesto zkusit jiná "
@@ -4275,36 +4282,31 @@ def run_extract_subs(args, minimal=False):
 
     _hdr = [f"{Fore.MAGENTA}=== Extrahovat titulky z videí ==={Style.RESET_ALL}"]
     if videos:
-        _hdr.append(f"{Fore.CYAN}Nalezeno {len(videos)} videí. Titulkové stopy ve vzorku "
-                    f"({sample.name}):{Style.RESET_ALL}")
-        for t in sub_tracks:
-            _kind = "text" if is_text_codec(t["codec"]) else f"{Fore.YELLOW}OBRÁZKOVÉ (nelze do .srt){Style.RESET_ALL}"
-            _hdr.append(f"   #{t['id']}  {t['lang']:4} {t['codec']:16} {t.get('title', '')}  [{_kind}]")
+        _hdr.append(f"{Fore.CYAN}Nalezeno {len(videos)} videí. Vzorek: {sample.name}{Style.RESET_ALL}")
+        _img = [t for t in sub_tracks if not is_text_codec(t["codec"])]
+        if _img:
+            _hdr.append(f"{Fore.YELLOW}(Obrázkové stopy nelze do .srt: "
+                        + ", ".join(f"#{t['id']} {t['lang']}" for t in _img) + f"){Style.RESET_ALL}")
     _hdr.append("")
-    mode = ask_pick("Které titulkové stopy vytáhnout?",
-                    ["podle JAZYKA (zadám kódy - robustní pro celou složku)",
-                     "konkrétní STOPY podle čísla (číslo stopy ze vzorku)",
-                     "VŠECHNY textové titulkové stopy z každého videa"], default=0,
-                    header=_hdr,
-                    help=["podle jazyka: zadáš kódy (např. eng,cze,ger) a z KAŽDÉHO videa se "
-                          "vytáhnou stopy v těch jazycích - i když mají v různých videích jiná ID.",
-                          "konkrétní stopy: vybereš čísla stop podle vzorku výše; stejná čísla se "
-                          "použijí u všech videí (vhodné, když mají všechna stejné pořadí stop).",
-                          "všechny: z každého videa vytáhne všechny textové titulkové stopy."])
+
+    item_labels = [f"#{t['id']}  {t['lang']:4} {t['codec']:16} {t.get('title', '')}".rstrip()
+                   for t in text_tracks]
+    actions = ["Vytáhnout ZAŠKRTNUTÉ stopy (zaškrtni nahoře mezerníkem)",
+               "podle JAZYKA (napíšu kódy - robustní pro celou složku)",
+               "VŠECHNY textové titulkové stopy z každého videa"]
+    act, checked = ask_checklist("Které titulkové stopy vytáhnout?", item_labels, actions, header=_hdr)
 
     want_langs = None
     want_ids = None
-    if mode == 0:
+    if act == 0:                       # vytáhnout zaškrtnuté konkrétní stopy
+        if checked and text_tracks:
+            want_ids = [text_tracks[i]["id"] for i in checked if 0 <= i < len(text_tracks)]
+        if not want_ids:
+            log_info("Nic zaškrtnuto - beru VŠECHNY textové stopy.")
+    elif act == 1:                     # podle jazyka
         raw = ask_text("Kódy jazyků oddělené čárkou (např. eng,cze,ger; prázdné = všechny)", "")
         want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()] or None
-    elif mode == 1:
-        if text_tracks:
-            for k, t in enumerate(text_tracks, 1):
-                print(f"  {k}) #{t['id']}  {t['lang']}  {t['codec']}  {t.get('title', '')}")
-        raw = ask_text("Zadej čísla stop oddělená čárkou (např. 1,3)", "1")
-        if text_tracks:
-            picks = [int(x) for x in raw.replace(" ", "").split(",") if x.isdigit() and 1 <= int(x) <= len(text_tracks)]
-            want_ids = [text_tracks[k - 1]["id"] for k in picks] or [text_tracks[0]["id"]]
+    # act == 2 -> všechny textové (want_langs=None, want_ids=None)
 
     do_clean = False if minimal else ask_yes_no(
         "Pravidlově očistit text (mezery, interpunkce, rozlomení dlouhých řádků)?", default_no=True)
@@ -4507,7 +4509,60 @@ def _mkv_probe_full(mkvmerge_bin, video):
     return {"audio": audio, "subs": subs}
 
 
-def _collect_videos_subs(directory, recursive, sub_exts=(".srt", ".ass", ".ssa", ".sup", ".sub", ".vtt")):
+def _track_selectors(tracks):
+    """Pro seznam stop (jednoho druhu) v JEDNOM videu vrátí [(key, label, track)].
+    Rozlišuje i stejné jazyky - podle názvu stopy, forced, a když nejde jinak,
+    pořadím. key = (lang, name_lower, forced, ordinal) je stabilní napříč díly."""
+    seen = {}
+    prelim = []
+    for t in tracks:
+        lang = t.get("lang", "und") or "und"
+        name = (t.get("name") or "").strip()
+        forced = bool(t.get("forced"))
+        base = (lang, name.lower(), forced)
+        ordi = seen.get(base, 0)
+        seen[base] = ordi + 1
+        prelim.append((t, lang, name, forced, base, ordi))
+    base_total = {}
+    for _t, _l, _n, _f, base, _o in prelim:
+        base_total[base] = base_total.get(base, 0) + 1
+    out = []
+    for t, lang, name, forced, base, ordi in prelim:
+        key = (lang, name.lower(), forced, ordi)
+        extra = []
+        if name:
+            extra.append(name)
+        if forced:
+            extra.append("forced")
+        label = _lang3_name(lang) + (" - " + ", ".join(extra) if extra else "")
+        if base_total[base] > 1:
+            label += f"  #{ordi + 1}"
+        cod = t.get("codec", "")
+        if cod:
+            label += f"  [{cod}]"
+        out.append((key, label, t))
+    return out
+
+
+def _track_by_key(tracks, key):
+    for k, _label, t in _track_selectors(tracks):
+        if k == key:
+            return t
+    return None
+
+
+def _aggregate_track_keys(infos, kind):
+    """Napříč všemi videi seskupí stopy podle rozlišovacího klíče (ne jen jazyka).
+    Vrátí seřazený list (key, label, count)."""
+    order = []
+    meta = {}
+    for info in infos.values():
+        for key, label, _t in _track_selectors(info.get(kind, [])):
+            if key not in meta:
+                meta[key] = [label, 0]
+                order.append(key)
+            meta[key][1] += 1
+    return [(k, meta[k][0], meta[k][1]) for k in order]
     videos, subs = [], []
     walker = os.walk(directory) if recursive else [(directory, [], os.listdir(directory))]
     for root, _d, files in walker:
@@ -4673,51 +4728,33 @@ def run_remove_tracks(args):
     log_info(f"Nalezeno {len(mkvs)} MKV. Čtu stopy...")
     infos = {v: _mkv_probe_full(mm, v) for v in mkvs}
 
-    def aggregate(kind):
-        counts, order = {}, []
-        for info in infos.values():
-            for tr in info[kind]:
-                l = tr["lang"]
-                if l not in counts:
-                    counts[l] = 0
-                    order.append(l)
-                counts[l] += 1
-        return [(l, counts[l]) for l in order]
-
-    def ask_remove_langs(kind_label, langs):
-        if not langs:
+    def ask_remove_tracks(kind_label, entries):
+        # entries: [(key, label, count)]
+        if not entries:
             return set()
-        print(f"\n{Fore.CYAN}{kind_label}:{Style.RESET_ALL}")
-        for i, (l, n) in enumerate(langs, 1):
-            print(f"  {i}) {_lang3_name(l)}  ({n}×)")
-        print("  0) nic neodstraňovat")
-        raw = ask_text(f"Které {kind_label.lower()} ODSTRANIT (čísla/kódy, čárkou; 0=nic)", "0")
-        if raw.strip() in ("", "0"):
+        items = [f"{label}  ({n}×)" for _k, label, n in entries]
+        actions = [f"Odstranit zaškrtnuté {kind_label.lower()}", "nic neodstraňovat"]
+        act, checked = ask_checklist(f"Které {kind_label.lower()} ODSTRANIT? (zaškrtni mezerníkem)",
+                                     items, actions,
+                                     header=[f"{Fore.CYAN}{kind_label} (rozlišené i stejné jazyky):{Style.RESET_ALL}"])
+        if act != 0 or not checked:
             return set()
-        out = set()
-        for part in re.split(r"[,\s]+", raw.strip().lower()):
-            if not part:
-                continue
-            if part.isdigit() and 1 <= int(part) <= len(langs):
-                out.add(langs[int(part) - 1][0])
-            else:
-                cc = _canon3(part)
-                if cc in [l for l, _ in langs]:
-                    out.add(cc)
-        return out
+        return {entries[i][0] for i in checked if 0 <= i < len(entries)}
 
-    a_langs = aggregate("audio")
-    s_langs = aggregate("subs")
-    rem_audio = ask_remove_langs("Audio jazyky", a_langs)
-    rem_subs = ask_remove_langs("Titulkové jazyky", s_langs)
+    a_entries = _aggregate_track_keys(infos, "audio")
+    s_entries = _aggregate_track_keys(infos, "subs")
+    rem_audio = ask_remove_tracks("Audio stopy", a_entries)
+    rem_subs = ask_remove_tracks("Titulkové stopy", s_entries)
     if not rem_audio and not rem_subs:
         log_warn("Nic k odstranění.")
         return
     replace = ask_yes_no("Přepsat originály? (jinak uložím do podsložky 'trimmed')", default_no=True)
 
     print()
-    log_info("K odstranění -- audio: " + (",".join(_lang3_name(l) for l in rem_audio) or "nic")
-             + " | titulky: " + (",".join(_lang3_name(l) for l in rem_subs) or "nic"))
+    _al = {lbl for k, lbl, _n in a_entries if k in rem_audio}
+    _sl = {lbl for k, lbl, _n in s_entries if k in rem_subs}
+    log_info("K odstranění -- audio: " + (", ".join(sorted(_al)) or "nic")
+             + " | titulky: " + (", ".join(sorted(_sl)) or "nic"))
     if not ask_yes_no(f"Spustit pro {len(mkvs)} MKV?", default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
@@ -4732,10 +4769,12 @@ def run_remove_tracks(args):
     for v in mkvs:
         vp = Path(v)
         info = infos[v]
+        a_sel = _track_selectors(info["audio"])
+        s_sel = _track_selectors(info["subs"])
         a_all = [t["id"] for t in info["audio"]]
         s_all = [t["id"] for t in info["subs"]]
-        a_keep = [t["id"] for t in info["audio"] if t["lang"] not in rem_audio]
-        s_keep = [t["id"] for t in info["subs"] if t["lang"] not in rem_subs]
+        a_keep = [t["id"] for k, _l, t in a_sel if k not in rem_audio]
+        s_keep = [t["id"] for k, _l, t in s_sel if k not in rem_subs]
         if a_keep == a_all and s_keep == s_all:
             log_info(f"{vp.name}: nic k odstranění - přeskakuji.")
             skipped += 1
@@ -4800,62 +4839,45 @@ def run_set_default(args):
     log_info(f"Nalezeno {len(videos)} videí. Čtu stopy...")
     infos = {v: _mkv_probe_full(mm, v) for v in videos}
 
-    def aggregate(kind):
-        counts, order = {}, []
-        for info in infos.values():
-            for tr in info[kind]:
-                l = tr["lang"]
-                if l not in counts:
-                    counts[l] = 0
-                    order.append(l)
-                counts[l] += 1
-        return [(l, counts[l]) for l in order]
-
-    def ask_lang(kind_label, langs, allow_none):
-        if not langs:
+    def ask_track(kind_label, entries, allow_none):
+        # entries: [(key, label, count)]
+        if not entries:
             return "keep"
-        print(f"\n{Fore.CYAN}{kind_label}:{Style.RESET_ALL}")
-        for i, (l, n) in enumerate(langs, 1):
-            print(f"  {i}) {_lang3_name(l)}  ({n}×)")
-        extra = len(langs)
-        print(f"  {extra + 1}) neměnit")
+        labels = [f"{label}  ({n}×)" for _k, label, n in entries]
+        labels.append("neměnit (nechat jak je)")
         if allow_none:
-            print(f"  {extra + 2}) žádná (zrušit všechny default flagy)")
-        raw = ask_text(f"Výchozí {kind_label.lower()} - vyber číslo nebo kód", str(extra + 1)).strip().lower()
-        if raw == str(extra + 1) or raw in ("keep", ""):
+            labels.append("žádná (zrušit všechny default flagy)")
+        i = ask_pick(f"Výchozí {kind_label.lower()} - vyber stopu", labels, default=len(entries),
+                     header=[f"{Fore.CYAN}{kind_label} (rozlišené i stejné jazyky):{Style.RESET_ALL}"])
+        if i < len(entries):
+            return entries[i][0]      # key
+        if i == len(entries):
             return "keep"
-        if allow_none and (raw == str(extra + 2) or raw == "none"):
-            return "none"
-        if raw.isdigit() and 1 <= int(raw) <= len(langs):
-            return langs[int(raw) - 1][0]
-        return _canon3(raw)
+        return "none"
 
-    a_choice = ask_lang("Audio jazyk", aggregate("audio"), allow_none=False)
-    s_choice = ask_lang("Titulkový jazyk", aggregate("subs"), allow_none=True)
+    a_choice = ask_track("Audio stopa", _aggregate_track_keys(infos, "audio"), allow_none=False)
+    s_choice = ask_track("Titulková stopa", _aggregate_track_keys(infos, "subs"), allow_none=True)
     if a_choice == "keep" and s_choice == "keep":
         log_warn("Nic k nastavení.")
         return
 
     print()
-    log_info(f"Výchozí audio: {a_choice} | výchozí titulky: {s_choice}")
+
+    def _sum(c):
+        return "beze změny" if c == "keep" else ("žádná (zrušit default)" if c == "none" else "vybraná stopa")
+    log_info(f"Výchozí audio: {_sum(a_choice)} | výchozí titulky: {_sum(s_choice)}")
     if not ask_yes_no(f"Spustit pro {len(videos)} videí?", default_no=False):
         log_warn("Zrušeno uživatelem.")
         return
     preset_flush_if_save()
 
     def desired_default(tracks, choice):
-        """Vrátí {sel/rel -> bool} co má být default (první stopa daného jazyka)."""
-        res = {}
+        """Vrátí {track_id -> bool}; default nastaví přesně na vybranou stopu
+        (podle rozlišovacího klíče), ostatní vypne."""
         if choice == "keep":
             return None
-        picked = False
-        for tr in tracks:
-            want = False
-            if choice != "none" and not picked and tr["lang"] == choice:
-                want = True
-                picked = True
-            res[tr["id"]] = want
-        return res
+        target = None if choice == "none" else _track_by_key(tracks, choice)
+        return {tr["id"]: (target is not None and tr["id"] == target["id"]) for tr in tracks}
 
     done = failed = 0
     for v in videos:
@@ -5457,6 +5479,19 @@ _BACK_ACTIVE = False
 _BACK_REPLAY = []   # odpovědi k přehrání z minula (do "frontieru")
 _BACK_NEW = []      # nové odpovědi zadané v tomto průchodu
 _BACK_POS = 0
+_BACK_NO_PENDING = object()
+_BACK_PENDING = _BACK_NO_PENDING   # předchozí odpověď otázky, na kterou se vracíme
+
+
+def _back_pending_take():
+    """Předchozí odpověď PRVNÍ interaktivní otázky po přehrání (té, na kterou
+    jsme se vrátili Esc-em); jinak _BACK_NO_PENDING. Spotřebuje se jen jednou."""
+    global _BACK_PENDING
+    if _BACK_PENDING is _BACK_NO_PENDING:
+        return _BACK_NO_PENDING
+    v = _BACK_PENDING
+    _BACK_PENDING = _BACK_NO_PENDING
+    return v
 
 
 def _back_get():
@@ -5479,17 +5514,19 @@ def run_with_back(fn, args):
     Odpovědi se nahrávají; Esc v otázce vyhodí _StepBack a průvodce se přehraje
     znovu až k PŘEDCHOZÍ otázce. Esc na první otázce -> WizardBack (hlavní menu).
     Během přehrávání presetu (--load) je to jen průchod bez změn."""
-    global _BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW
+    global _BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW, _BACK_PENDING
     if preset_is_replaying():
         return fn(args)
-    saved = (_BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW)
+    saved = (_BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW, _BACK_PENDING)
     tape = []
+    pending = _BACK_NO_PENDING
     try:
         while True:
             _BACK_REPLAY = tape
             _BACK_NEW = []
             _BACK_POS = 0
             _BACK_ACTIVE = True
+            _BACK_PENDING = pending
             if _PRESET_MODE in ("save", "offer"):
                 _PRESET_REC.clear()   # čistý záznam presetu pro (finální) průchod
             try:
@@ -5498,17 +5535,21 @@ def run_with_back(fn, args):
                 full = list(_BACK_REPLAY[:_BACK_POS]) + _BACK_NEW
                 if not full:
                     raise WizardBack()
-                tape = full[:-1]      # zahoď poslední odpověď -> o otázku zpět
+                pending = full[-1]    # předchozí odpověď -> předvyplní se
+                tape = full[:-1]      # a k té otázce se vrátíme
     finally:
-        _BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW = saved
+        _BACK_ACTIVE, _BACK_POS, _BACK_REPLAY, _BACK_NEW, _BACK_PENDING = saved
 
 
-def _read_line_tui(prompt_str, default="", secret=False):
+def _read_line_tui(prompt_str, default="", secret=False, prefill=""):
     """Řádkový vstup v raw režimu s podporou Esc (= krok zpět). Vrací text nebo
-    default (Enter). Esc vyhodí _StepBack."""
+    default (Enter). Esc vyhodí _StepBack. 'prefill' = přednapsaný editovatelný
+    text (návrat Esc-em zachová předchozí odpověď)."""
     sys.stdout.write(prompt_str)
+    buf = list(prefill or "")
+    if buf:
+        sys.stdout.write(("*" * len(buf)) if secret else "".join(buf))
     sys.stdout.flush()
-    buf = []
     with _RawMode():
         while True:
             key = _read_key()
@@ -5532,7 +5573,7 @@ def _read_line_tui(prompt_str, default="", secret=False):
 
 
 def _read_key():
-    """Přečte jednu klávesu; vrátí akci ('up'/'down'/…/'enter'/'esc'/…) nebo
+    """Přečte jednu klávesu; vrátí akci ('up'/'down'/.../'enter'/'esc'/...) nebo
     ('char', znak)."""
     if _TUI_WINDOWS:
         ch = _msvcrt.getch()
@@ -5627,7 +5668,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, h
             return 80, 24
 
     def trunc(s, width):
-        return s[:max(1, width - 1)] + "…" if len(s) > width else s
+        return s[:max(1, width - 1)] + "..." if len(s) > width else s
 
     def render(order, sel_pos):
         nonlocal prev_lines, first
@@ -5662,7 +5703,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, h
             start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
             window = order[start:start + page_rows]
             if start > 0:
-                vis.append(f"  {Fore.CYAN}▲ ({start} výše){Style.RESET_ALL}")
+                vis.append(f"  {Fore.CYAN}^ ({start} výše){Style.RESET_ALL}")
             for pos, i in enumerate(window, start):
                 text = trunc(plain[i], maxw - 2)
                 if pos == sel_pos:
@@ -5672,7 +5713,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, h
                     vis.append(f"  {text}")
             rest = len(order) - (start + len(window))
             if rest > 0:
-                vis.append(f"  {Fore.CYAN}▼ ({rest} níže){Style.RESET_ALL}")
+                vis.append(f"  {Fore.CYAN}v ({rest} níže){Style.RESET_ALL}")
         pos_info = f" [{sel_pos + 1}/{len(order)}]" if order else ""
         if filt:
             vis.append(f"{Fore.MAGENTA}{trunc('Hledání: ' + filt + pos_info, maxw)}{Style.RESET_ALL}")
@@ -5710,7 +5751,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, h
             elif key == "end" and order:
                 sel_pos = len(order) - 1
             elif isinstance(key, tuple) and key[0] == "char" and key[1] == "?" and helplist and order:
-                status = f"{Fore.CYAN}ℹ {helplist[order[sel_pos]]}{Style.RESET_ALL}"
+                status = f"{Fore.CYAN}i: {helplist[order[sel_pos]]}{Style.RESET_ALL}"
             elif key in ("enter", "right"):
                 if order:
                     sys.stdout.write("\n")
@@ -5736,6 +5777,150 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, help=None, h
             page_rows = render(order, sel_pos)
 
 
+def interactive_checklist(prompt, item_labels, action_labels, header=None, checked=None):
+    """Zaškrtávací menu (multi-select): položky se přepínají mezerníkem, akce se
+    potvrzují Enterem. Vrací (action_index, [zaškrtnuté indexy]) nebo None (Esc).
+    ↑↓ pohyb, mezerník = zaškrtnout/odškrtnout, Enter = potvrdit akci, Esc = zpět."""
+    if not _tui_supported():
+        return None
+    nI = len(item_labels)
+    nA = len(action_labels)
+    rows = nI + nA
+    if rows == 0:
+        return None
+    checkset = set(checked or [])
+    sel = nI if nI < rows else 0   # start na první akci (typicky "Hotovo")
+    header = list(header or [])
+    prev_lines = 0
+    first = True
+
+    def render():
+        nonlocal prev_lines, first
+        try:
+            cols = os.get_terminal_size().columns
+        except Exception:
+            cols = 80
+        maxw = max(20, cols - 2)
+
+        def trunc(s):
+            return s if len(strip_ansi(s)) <= maxw else s[:maxw - 1] + "..."
+        buf = []
+        if first:
+            buf.append("\x1b[2J\x1b[H")
+            first = False
+        elif prev_lines > 0:
+            up = prev_lines - 1
+            buf.append((f"\x1b[{up}F" if up > 0 else "\r") + "\x1b[J")
+        vis = []
+        for h in header:
+            vis.append(trunc(h))
+        vis.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt))}{Style.RESET_ALL}")
+        vis.append(f"{Fore.CYAN}↑↓ pohyb · mezerník = zaškrtnout · Enter = potvrdit · Esc = zpět{Style.RESET_ALL}")
+        for i, lab in enumerate(item_labels):
+            box = f"{Fore.GREEN}[x]{Style.RESET_ALL}" if i in checkset else "[ ]"
+            line = f"{box} {lab}"
+            if sel == i:
+                vis.append(f"{Fore.GREEN}{Style.BRIGHT}›{Style.RESET_ALL} {box} "
+                           f"{Fore.GREEN}{Style.BRIGHT}{trunc(lab)}{Style.RESET_ALL}")
+            else:
+                vis.append(f"  {trunc(line)}")
+        if nI and nA:
+            vis.append(f"  {Fore.CYAN}{'-' * min(20, maxw)}{Style.RESET_ALL}")
+        for a, lab in enumerate(action_labels):
+            if sel == nI + a:
+                vis.append(f"{Fore.GREEN}{Style.BRIGHT}›{Style.RESET_ALL} "
+                           f"{Fore.GREEN}{Style.BRIGHT}{trunc(lab)}{Style.RESET_ALL}")
+            else:
+                vis.append(f"  {trunc(lab)}")
+        vis.append(f"{Fore.MAGENTA}Zaškrtnuto: {len(checkset)}{Style.RESET_ALL}")
+        buf.append("\n".join(vis))
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+        prev_lines = len(vis)
+
+    with _RawMode():
+        render()
+        while True:
+            key = _read_key()
+            if key == "up":
+                sel = (sel - 1) % rows
+            elif key == "down":
+                sel = (sel + 1) % rows
+            elif key == "home":
+                sel = 0
+            elif key == "end":
+                sel = rows - 1
+            elif isinstance(key, tuple) and key[0] == "char" and key[1] == " ":
+                if sel < nI:
+                    checkset.symmetric_difference_update({sel})
+            elif key == "enter":
+                if sel >= nI:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return (sel - nI, sorted(checkset))
+                else:
+                    checkset.symmetric_difference_update({sel})   # Enter na položce = přepnout
+            elif key == "esc":
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return None
+            render()
+
+
+def _ask_checklist_classic(prompt, item_labels, action_labels, checked=None):
+    checkset = set(checked or [])
+    while True:
+        print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
+        for i, lab in enumerate(item_labels, 1):
+            box = "[x]" if (i - 1) in checkset else "[ ]"
+            print(f"  {i}) {box} {lab}")
+        for a, lab in enumerate(action_labels):
+            print(f"  {chr(ord('a') + a)}) {lab}")
+        raw = input("Číslo = přepnout zaškrtnutí, písmeno = akce, Enter = první akce, z = zpět: ").strip().lower()
+        if raw in ("z", "q"):
+            return None
+        if raw == "":
+            return (0, sorted(checkset))
+        if raw.isdigit() and 1 <= int(raw) <= len(item_labels):
+            checkset.symmetric_difference_update({int(raw) - 1})
+            continue
+        if len(raw) == 1 and "a" <= raw < chr(ord("a") + len(action_labels)):
+            return (ord(raw) - ord("a"), sorted(checkset))
+        print(f"{Fore.RED}Neplatná volba.{Style.RESET_ALL}")
+
+
+def ask_checklist(prompt, item_labels, action_labels, header=None, checked=None):
+    """Multi-select se zaškrtáváním + akční řádky. Vrací (action_index,
+    [zaškrtnuté indexy]). Esc = krok zpět. Podporuje presety i návrat."""
+    r = _preset_replay()
+    if r is not _PRESET_MISS:
+        if isinstance(r, dict):
+            return (int(r.get("a", 0)), list(r.get("c", [])))
+        return (0, [])
+    got, v = _back_get()
+    if got and isinstance(v, dict):
+        _preset_record("checklist", prompt, v)
+        return (int(v.get("a", 0)), list(v.get("c", [])))
+    _pend = _back_pending_take()
+    init = checked
+    if _pend is not _BACK_NO_PENDING and isinstance(_pend, dict):
+        init = _pend.get("c", checked)
+    if _tui_supported():
+        res = interactive_checklist(prompt, item_labels, action_labels, header=header, checked=init)
+    else:
+        for h in (header or []):
+            if strip_ansi(h).strip():
+                print(h)
+        res = _ask_checklist_classic(prompt, item_labels, action_labels, checked=init)
+    if res is None:
+        raise _StepBack()
+    ai, checked_list = res
+    rec = {"a": ai, "c": checked_list}
+    _back_put(rec)
+    _preset_record("checklist", prompt, rec)
+    return (ai, checked_list)
+
+
 def _ask_pick_classic(prompt, labels, default=0, help=None, allow_back=False):
     hint = f"{Fore.CYAN} (? = více info){Style.RESET_ALL}" if help else ""
 
@@ -5752,7 +5937,7 @@ def _ask_pick_classic(prompt, labels, default=0, help=None, allow_back=False):
         if raw == "?" and help:
             if isinstance(help, (list, tuple)):
                 for h in help:
-                    print(f"  {Fore.CYAN}•{Style.RESET_ALL} {h}")
+                    print(f"  {Fore.CYAN}-{Style.RESET_ALL} {h}")
             else:
                 print(f"  {help}")
             _show()
@@ -5766,12 +5951,13 @@ def _ask_pick_classic(prompt, labels, default=0, help=None, allow_back=False):
         print(f"{Fore.RED}Neplatná volba, zkus to znovu.{Style.RESET_ALL}")
 
 
-def ask_pick(prompt, labels, default=0, help=None, allow_back=None, header=None):
+def ask_pick(prompt, labels, default=0, help=None, allow_back=None, header=None, cursor=None):
     """Výběr z nabídky. Na terminálu šipkové menu (↑↓, hledání psaním, ? =
     nápověda, Esc = zpět), jinak číslovaný fallback (z = zpět). Vrací index.
-    allow_back: None (výchozí) = Esc vyhodí WizardBack (probublá do hlavního
-    menu); True = Esc vrátí None (volající si zpět obslouží sám); False = Esc
-    nedělá nic (jen maže hledání). Zachovává ukládání/přehrávání presetů."""
+    'default' = položka posunutá na první místo. 'cursor' = na které položce
+    (původní index) má začít zvýraznění (např. při návratu do menu). allow_back:
+    None = Esc vyhodí WizardBack; True = Esc vrátí None; False = Esc nic.
+    Zachovává ukládání/přehrávání presetů."""
     r = _preset_replay()
     if r is not _PRESET_MISS:
         try:
@@ -5792,21 +5978,52 @@ def ask_pick(prompt, labels, default=0, help=None, allow_back=None, header=None)
         _preset_record("pick", prompt, v)
         return v
     can_esc = allow_back is not False
+    # návrat Esc-em v průvodci: předvyplnit dřívější volbu (kurzor na ní)
+    _pend = _back_pending_take()
+    eff_default = default
+    highlight = cursor
+    if _pend is not _BACK_NO_PENDING:
+        try:
+            _pi = int(_pend)
+            if 0 <= _pi < len(labels):
+                eff_default = _pi
+                highlight = _pi
+        except Exception:
+            pass
+    if highlight is None or not (0 <= highlight < len(labels)):
+        highlight = eff_default
+    # zobrazení: VÝCHOZÍ položka je vždy první, ostatní si drží pořadí.
+    # Vrácený/uložený index je ale PŮVODNÍ (aby presety zůstaly stabilní).
+    if 0 <= eff_default < len(labels) and eff_default != 0:
+        order = [eff_default] + [i for i in range(len(labels)) if i != eff_default]
+    else:
+        order = list(range(len(labels)))
+    try:
+        init_pos = order.index(highlight)
+    except ValueError:
+        init_pos = 0
+    disp_labels = [labels[i] for i in order]
+    if isinstance(help, (list, tuple)):
+        disp_help = [help[i] for i in order]
+    else:
+        disp_help = help
     if _tui_supported():
-        idx = interactive_menu(prompt, labels, default=default, help=help,
+        sel = interactive_menu(prompt, disp_labels, default=init_pos, help=disp_help,
                                allow_cancel=can_esc, header=header)
     else:
         for h in (header or []):
             if strip_ansi(h).strip():
                 print(h)
-        idx = _ask_pick_classic(prompt, labels, default, help, allow_back=can_esc)
-    if idx is None:
+        sel = _ask_pick_classic(prompt, disp_labels, init_pos, disp_help, allow_back=can_esc)
+    if sel is None:
         if allow_back is True:
             return None
         if allow_back is False:
             idx = default if 0 <= default < len(labels) else 0
         else:
             raise _StepBack()
+    else:
+        idx = order[sel]
     _back_put(idx)
     _preset_record("pick", prompt, idx)
     return idx
@@ -5821,10 +6038,14 @@ def ask_text(prompt, default=""):
         _preset_record("text", prompt, v)
         return v
     suffix = f" [{default}]" if default else ""
+    _pend = _back_pending_take()
+    _prefill = _pend if (_pend is not _BACK_NO_PENDING and isinstance(_pend, str)) else ""
     if _tui_supported():
-        val = _read_line_tui(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{suffix}: ", default)
+        val = _read_line_tui(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{suffix}: ", default, prefill=_prefill)
     else:
-        val = input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{suffix}: ").strip() or default
+        _dflt = _prefill or default
+        _sfx = f" [{_dflt}]" if _dflt else ""
+        val = input(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}{_sfx}: ").strip() or _dflt
     _back_put(val)
     _preset_record("text", prompt, val)
     return val
@@ -6301,7 +6522,7 @@ def run_presets_menu(args):
     preset. Esc nebo 'Zpět' vrací do hlavního menu."""
     while True:
         presets = list_named_presets()
-        labels = [f"▶ {lbl}  ({cmd})" for lbl, _k, cmd in presets]
+        labels = [f"> {lbl}  ({cmd})" for lbl, _k, cmd in presets]
         labels += ["+ Vytvořit nový preset", "Smazat preset", "Zpět do hlavního menu"]
         header = [
             f"{Fore.MAGENTA}=== Presety (uložená nastavení) ==={Style.RESET_ALL}",
@@ -6342,6 +6563,7 @@ def run_master_wizard(args):
     _mode_flags = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
                    "extract_subs", "import_subs", "remove_tracks", "set_default",
                    "rename_subs", "fix_readability")
+    _last_pos = 1   # kde byl kurzor naposledy (na startu = výchozí "dávka")
     while True:
         # čistý stav pro každou návštěvu hlavního menu
         args.mkv = _orig_mkv
@@ -6372,6 +6594,7 @@ def run_master_wizard(args):
              "Otestovat AI API (Anthropic/OpenAI) - ověřit klíč a model"],
             default=1,
             allow_back=True,
+            cursor=_last_pos,
             header=[f"{Fore.MAGENTA}=== sync_subtitles - interaktivní průvodce ==={Style.RESET_ALL}",
                     f"{Fore.CYAN}Tip:{Style.RESET_ALL} vyber akci šipkami (piš = hledat, ? = nápověda, Esc = konec). "
                     "Na konci si volby uložíš jako preset.",
@@ -6413,6 +6636,7 @@ def run_master_wizard(args):
         if mode is None:
             log_info("Konec.")
             return
+        _last_pos = mode   # zapamatuj pozici pro návrat do menu
         if mode == 10:
             try:
                 run_presets_menu(args)
