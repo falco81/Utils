@@ -332,7 +332,25 @@ def extract_subtitle_via_ffmpeg(ffmpeg_bin: str, video_path: Path, sub_position:
 # ----------------------------------------------------------------------
 
 FFMPEG = "ffmpeg"
-FFMPEG_DOWNLOAD_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# Odkud stáhnout Windows build ffmpegu (jen Windows). Zkouší se POSTUPNĚ:
+# první funkční se použije. Klidně uprav/přidej další. Za běhu jde přepsat
+# přes --ffmpeg-url (ta se pak zkusí jako první).
+FFMPEG_DOWNLOAD_URLS = [
+    "http://nas.falco81.net/ffmpeg-release-essentials.zip",              # výchozí (lokální NAS)
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",  # fallback
+]
+FFMPEG_DOWNLOAD_URL = FFMPEG_DOWNLOAD_URLS[0]   # zpětná kompatibilita
+_FFMPEG_URL_OVERRIDE = None
+
+
+def _ffmpeg_urls():
+    """Seznam URL k vyzkoušení (override z --ffmpeg-url jde první)."""
+    urls = list(FFMPEG_DOWNLOAD_URLS)
+    if _FFMPEG_URL_OVERRIDE:
+        urls = [_FFMPEG_URL_OVERRIDE] + [u for u in urls if u != _FFMPEG_URL_OVERRIDE]
+    return urls
+
+
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
@@ -460,25 +478,47 @@ def _download_to_file(url, dest_path, label):
         print()
 
 
-def _download_ffmpeg(url):
+def _download_ffmpeg(urls):
+    """Zkusí stáhnout+rozbalit ffmpeg z URL v pořadí; první úspěšná vyhraje.
+    Přijímá seznam nebo jednu URL (zpětná kompatibilita)."""
+    if isinstance(urls, str):
+        urls = [urls]
     cache = _cache_dir(".ffmpeg")
     os.makedirs(cache, exist_ok=True)
-    log_info(f"ffmpeg nenalezen; stahuji z {url}")
     tmp = os.path.join(cache, "ffmpeg_download.tmp")
-    _download_to_file(url, tmp, "ffmpeg")
-    log_info("Rozbaluji ffmpeg ...")
-    _extract_archive(tmp, cache, url)
-    try:
-        os.remove(tmp)
-    except OSError:
-        pass
+    last_err = None
+    for i, url in enumerate(urls, 1):
+        try:
+            log_info(f"ffmpeg nenalezen; stahuji z {url}" + (f" (zdroj {i}/{len(urls)})" if len(urls) > 1 else ""))
+            _download_to_file(url, tmp, "ffmpeg")
+            log_info("Rozbaluji ffmpeg ...")
+            _extract_archive(tmp, cache, url)
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return True
+        except Exception as e:
+            last_err = e
+            log_warn(f"Zdroj selhal ({url}): {e}")
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            if i < len(urls):
+                log_info("Zkouším další zdroj...")
+    if last_err:
+        raise last_err
+    return False
 
 
 def ensure_ffmpeg(target_dir, allow_download):
     """Najde ffmpeg: PATH -> --ffmpeg/FFMPEG override -> cache .ffmpeg (bez
     omezení hloubky) -> adresář videa/cwd (omezená hloubka, ať to neprochází
     celé obrovské stromy) -> (až jako poslední možnost, pokud povoleno)
-    stáhne a rozbalí z gyan.dev."""
+    stáhne a rozbalí z nakonfigurovaných URL (FFMPEG_DOWNLOAD_URLS / --ffmpeg-url,
+    postupně s fallbackem). Jen Windows."""
     cache_dirs = [_cache_dir(".ffmpeg"), os.path.join(target_dir, ".ffmpeg"),
                   os.path.join(os.getcwd(), ".ffmpeg")]
     broad_dirs = [target_dir, os.getcwd()]
@@ -489,11 +529,11 @@ def ensure_ffmpeg(target_dir, allow_download):
             ff = _find_cached("ffmpeg", broad_dirs, max_depth=3)
         if not _try_ff(ff):
             ff = None
-    if ff is None and allow_download and FFMPEG_DOWNLOAD_URL and os.name == "nt":
+    if ff is None and allow_download and _ffmpeg_urls() and os.name == "nt":
         try:
-            _download_ffmpeg(FFMPEG_DOWNLOAD_URL)
+            _download_ffmpeg(_ffmpeg_urls())
         except Exception as e:
-            log_warn(f"Stažení ffmpeg selhalo: {e}")
+            log_warn(f"Stažení ffmpeg selhalo (všechny zdroje): {e}")
         ff = _find_cached("ffmpeg", cache_dirs)
         if not _try_ff(ff):
             ff = None
@@ -2862,19 +2902,22 @@ def run_fix_readability(args):
 
     # 4) přepsat originál, nebo uložit jako nový soubor -----------------------
     overwrite = args.overwrite
+    make_bak = True
     if not args.overwrite and interactive:
         print()
         print("4) Jak uložit výsledek?")
         choice = ask_choice(
             "   Zvol režim uložení:",
             ["Nový soubor '<jméno>.readability.srt' vedle originálu (doporučeno - nic se nepřepíše)",
-             "Přepsat originál přímo (jednorázově se vytvoří '.bak' záloha)"],
+             "Přepsat originál přímo (jednorázově se vytvoří '.bak' záloha)",
+             "Přepsat originál BEZ zálohy (.bak se NEVYTVOŘÍ)"],
             allow_skip=False, allow_abort=True,
         )
         if choice == "abort":
             log_warn("Zrušeno uživatelem.")
             return
-        overwrite = (choice == 1)
+        overwrite = choice in (1, 2)
+        make_bak = (choice == 1)
         print()
 
     # 5) parametry čtecí rychlosti ---------------------------------------------
@@ -2894,7 +2937,7 @@ def run_fix_readability(args):
     log_info(
         f"Používám: čtecí tempo {min_cps:.1f} znaků/s, min. délka {min_floor:.2f}s, "
         f"mezera {min_gap:.3f}s, příplatek za řádek {line_overhead:.2f}s, "
-        f"výstup: {'přepsat originál (+.bak)' if overwrite else '*.readability.srt'}"
+        f"výstup: {('přepsat originál (+.bak)' if make_bak else 'přepsat originál (BEZ .bak)') if overwrite else '*.readability.srt'}"
     )
     print()
 
@@ -2922,9 +2965,10 @@ def run_fix_readability(args):
 
         srt_path = Path(srt_file)
         if overwrite:
-            bak = srt_path.with_suffix(srt_path.suffix + ".bak")
-            if not bak.exists():
-                shutil.copy(srt_path, bak)
+            if make_bak:
+                bak = srt_path.with_suffix(srt_path.suffix + ".bak")
+                if not bak.exists():
+                    shutil.copy(srt_path, bak)
             out_path = srt_path
         else:
             out_path = srt_path.with_name(srt_path.stem + ".readability" + srt_path.suffix)
@@ -7073,6 +7117,9 @@ RŮZNÉ JAZYKY (target vs reference):
     parser.add_argument("--no-mkvtoolnix-download", action="store_true",
                          help="Nezkoušet automaticky stáhnout MKVToolNix, pokud nebyl nikde nalezen")
     parser.add_argument("--ffmpeg", help="Cesta k ffmpeg.exe nebo ke složce s ním (jen pro --audio-mode replace/combine)")
+    parser.add_argument("--ffmpeg-url",
+                         help="URL k .zip s Windows buildem ffmpegu pro auto-stažení (zkusí se jako první, "
+                              "pak vestavěné fallbacky). Default viz FFMPEG_DOWNLOAD_URLS ve skriptu.")
     parser.add_argument("--no-ffmpeg-download", action="store_true",
                          help="Nezkoušet automaticky stáhnout ffmpeg, pokud nebyl nikde nalezen")
     parser.add_argument("--auto", action="store_true",
@@ -7134,8 +7181,10 @@ RŮZNÉ JAZYKY (target vs reference):
                               "přesnou odpověď nebo chybu (včetně těla od serveru) - pro ladění např. HTTP 400.")
     args = parser.parse_args()
 
-    global _STORE_PATH
+    global _STORE_PATH, _FFMPEG_URL_OVERRIDE
     _STORE_PATH = getattr(args, "config_file", None) or getattr(args, "preset_file", None) or None
+    if getattr(args, "ffmpeg_url", None):
+        _FFMPEG_URL_OVERRIDE = args.ffmpeg_url
     migrate_legacy_store()
 
     _cfg = {} if getattr(args, "no_config", False) else load_config()
