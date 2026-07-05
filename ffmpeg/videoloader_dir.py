@@ -659,8 +659,25 @@ def extract_patreon_post_id(input_str: str):
     return None
 
 
+def get_creator_name(campaign_id, session: requests.Session, verbose: bool = False):
+    """Best-effort Patreon creator/campaign display name via the /api/campaigns/{id} endpoint.
+    Isolated and defensive: any failure just returns None (never affects the download)."""
+    if not campaign_id:
+        return None
+    url = (f"https://www.patreon.com/api/campaigns/{campaign_id}"
+           f"?json-api-version=1.0&json-api-use-default-includes=false")
+    try:
+        r = session.get(url, headers={'Referer': PATREON_REFERER, 'Accept': 'application/json'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        d = r.json()
+        return _creator_from_attrs((d.get('data') or {}).get('attributes') or {})
+    except Exception:
+        return None
+
+
 def get_collection_info(collection_id: str, session: requests.Session, verbose: bool):
-    """Best-effort (title, campaign_id) for a Patreon collection. Both may be None."""
+    """Best-effort (title, campaign_id) for a Patreon collection. Both may be None. Also sets
+    the module-level creator name for display."""
     url = (f"https://www.patreon.com/api/collection/{collection_id}"
            f"?json-api-version=1.0&json-api-use-default-includes=false")
     title, campaign_id = None, None
@@ -675,8 +692,11 @@ def get_collection_info(collection_id: str, session: requests.Session, verbose: 
             campaign_id = m.group(1)
     except Exception:
         pass
+    global _patreon_creator
+    _patreon_creator = get_creator_name(campaign_id, session, verbose)
     if verbose:
-        print(f"[INFO] Patreon collection '{title}', campaign {campaign_id}")
+        print(f"[INFO] Patreon collection '{title}', campaign {campaign_id}, "
+              f"creator {_patreon_creator}")
     return title, campaign_id
 
 
@@ -1053,6 +1073,8 @@ def process_patreon_collection(collection_id: str, session: requests.Session, ch
         print("        changed its API. Provide cookies with --cookies or a *.json export nearby.")
         return
 
+    if _patreon_creator:
+        print(f"[INFO] Creator '{_patreon_creator}'")
     print(f"[INFO] Collection '{title or collection_id}': scanning {len(posts)} post(s) "
           f"for Drive / Dropbox links and native videos ...")
 
@@ -1081,6 +1103,10 @@ def fetch_patreon_post(post_id: str, session: requests.Session, verbose: bool):
     if not isinstance(post, dict):
         return None
     inc = d.get('included') or []
+    # Best-effort creator name from the post's campaign relationship (separate endpoint).
+    global _patreon_creator
+    camp = ((post.get('relationships') or {}).get('campaign') or {}).get('data') or {}
+    _patreon_creator = get_creator_name(camp.get('id'), session, verbose)
     if inc:
         post = dict(post)
         post['_included'] = inc   # searched by _walk_strings for extra Drive/Dropbox links
@@ -1103,6 +1129,8 @@ def process_patreon_post(post_id: str, session: requests.Session, chunk_size: in
         return
     a = post.get('attributes', {}) or {}
     title = (a.get('title') or post_id).strip()
+    if _patreon_creator:
+        print(f"[INFO] Creator '{_patreon_creator}'")
     print(f"[INFO] Post '{title}': scanning for Drive / Dropbox links and native videos ...")
     _download_from_posts([post], session, chunk_size, num_threads, folder_workers, recursive,
                          verbose, select, out_dir, max_connections, max_height, list_only)
@@ -3071,6 +3099,18 @@ _session_downloads_lock = threading.Lock()
 # When a Patreon collection is being processed, its (clean) title is stored here so the
 # post-download rename can name files "<Collection> <NN>" instead of the messy post titles.
 _active_collection_title = None
+# Patreon creator/campaign display name (e.g. "ES-DE Frontend (@es_de)") for the current source.
+_patreon_creator = None
+
+
+def _creator_from_attrs(a):
+    name = (a.get('name') or '').strip()
+    vanity = (a.get('vanity') or '').strip()
+    if name:
+        return f"{name} (@{vanity})" if vanity else name
+    if vanity:
+        return f"@{vanity}"
+    return None
 
 # Jobs that FAILED this run, captured with enough info to retry them later via resume.json.
 RESUME_FILE = "resume.json"
@@ -3421,8 +3461,9 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         _session_downloads.clear()
     with _failed_lock:
         _failed_jobs.clear()
-    global _active_collection_title
+    global _active_collection_title, _patreon_creator
     _active_collection_title = None
+    _patreon_creator = None
 
     try:
         if kind == 'patreon':
@@ -3836,6 +3877,36 @@ def _write_url_list_log(results, out_dir, started):
     return path
 
 
+def _comment_url_in_list(list_path, url):
+    """Prepend '# ' to the first uncommented line matching `url` in the list file, then flush
+    it straight to disk (so progress survives an interruption). Returns True if it edited."""
+    try:
+        with open(list_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+    except OSError:
+        return False
+    edited = False
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if s and not s.startswith('#') and s == url:
+            indent = line[:len(line) - len(line.lstrip())]
+            newline = '\n' if line.endswith('\n') else ''
+            lines[i] = f"{indent}# {s}{newline}"
+            edited = True
+            break
+    if not edited:
+        return False
+    try:
+        with open(list_path, 'w', encoding='utf-8') as f:
+            f.writelines(lines)
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError as e:
+        print(f"[WARN] Could not update {os.path.basename(list_path)}: {e}")
+        return False
+
+
 def run_url_list(list_path, base_kwargs, out_dir):
     """Read one URL per line from `list_path` and download each in turn (auto-rename mode),
     then write a report log. Blank lines and lines starting with '#' are ignored."""
@@ -3889,6 +3960,13 @@ def run_url_list(list_path, base_kwargs, out_dir):
         entry['seconds'] = time.time() - t0
         results.append(entry)
 
+        # If this URL downloaded correctly (no error, nothing still failing), mark it as done
+        # in the list file RIGHT NOW by prepending '#', flushing straight to disk — so an
+        # interrupted run resumes at the first not-yet-done URL.
+        if entry['ok'] and not entry['error'] and not entry.get('failed'):
+            if _comment_url_in_list(list_path, url):
+                print(f"[INFO] Marked as done in {os.path.basename(list_path)} (# prepended).")
+
     log_path = _write_url_list_log(results, out_dir, started)
     _notify_url_list_report(results, log_path)
     ok_n = sum(1 for r in results if r['ok'] and not r['error'])
@@ -3936,7 +4014,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.23.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.25.1")
 
     args = parser.parse_args()
 
