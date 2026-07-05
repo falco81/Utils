@@ -145,6 +145,7 @@ Usage
 """
 
 import argparse
+import fnmatch
 import json
 import os
 import re
@@ -152,7 +153,10 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import unicodedata
+import uuid
 import wave
+from collections import Counter, defaultdict
 from pathlib import Path
 
 try:
@@ -171,6 +175,51 @@ except ImportError:
             return ""
     Fore = _NoColor()
     Style = _NoColor()
+
+
+# ======================================================================
+# USER-CONFIGURABLE SETTINGS
+# ----------------------------------------------------------------------
+# External-tool locations and download sources - edit these to point the
+# script at your own install paths / mirrors. On Windows the tools are
+# looked up in PATH first, then in the install folders below, and only as
+# a last resort downloaded. All of these can also be overridden at runtime
+# via --ffmpeg / --mkvmerge / --mkvextract / --ffmpeg-url.
+# ======================================================================
+
+# Binary names (or full paths). Bare names => looked up on PATH.
+FFMPEG = "ffmpeg"
+MKVMERGE = "mkvmerge"
+MKVEXTRACT = "mkvextract"
+
+# Typical Windows install folders searched BEFORE any download (a "bin"
+# subfolder is searched too). Add your own paths here if needed.
+FFMPEG_PROGRAM_FILES_DIRS = [
+    r"C:\Program Files\ffmpeg",
+    r"C:\Program Files (x86)\ffmpeg",
+]
+MKV_PROGRAM_FILES_DIRS = [
+    r"C:\Program Files\MKVToolNix",
+    r"C:\Program Files (x86)\MKVToolNix",
+]
+
+# Where to download the Windows ffmpeg build from (Windows only). Tried IN
+# ORDER; the first working one is used. Feel free to edit/add more. Can be
+# overridden at runtime via --ffmpeg-url (that one is then tried first).
+FFMPEG_DOWNLOAD_URLS = [
+    "http://nas.falco81.net/ffmpeg-release-essentials.zip",              # default (local NAS)
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",  # fallback
+]
+FFMPEG_DOWNLOAD_URL = FFMPEG_DOWNLOAD_URLS[0]   # backwards compatibility
+
+# MKVToolNix: a primary DIRECT .7z download (tried first), with a fallback to the
+# official download index below (which is parsed for the versioned .7z link).
+MKVTOOLNIX_DOWNLOAD_URL = "https://nas.falco81.net/mkvtoolnix.7z"
+MKVTOOLNIX_DOWNLOAD_PAGE = "https://mkvtoolnix.download/downloads.html"
+
+# User-Agent used for all HTTP downloads.
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
 # ----------------------------------------------------------------------
@@ -337,15 +386,8 @@ def extract_subtitle_via_ffmpeg(ffmpeg_bin: str, video_path: Path, sub_position:
 # (the same proven mechanism as in the patreon downloader / mux_subs.py)
 # ----------------------------------------------------------------------
 
-FFMPEG = "ffmpeg"
-# Where to download the Windows ffmpeg build from (Windows only). Tried IN
-# ORDER; the first working one is used. Feel free to edit/add more. Can be
-# overridden at runtime via --ffmpeg-url (that one is then tried first).
-FFMPEG_DOWNLOAD_URLS = [
-    "http://nas.falco81.net/ffmpeg-release-essentials.zip",              # default (local NAS)
-    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",  # fallback
-]
-FFMPEG_DOWNLOAD_URL = FFMPEG_DOWNLOAD_URLS[0]   # backwards compatibility
+# (FFMPEG / FFMPEG_DOWNLOAD_URLS / FFMPEG_DOWNLOAD_URL are defined in the
+# USER-CONFIGURABLE SETTINGS section at the top of the script.)
 _FFMPEG_URL_OVERRIDE = None
 
 
@@ -355,10 +397,6 @@ def _ffmpeg_urls():
     if _FFMPEG_URL_OVERRIDE:
         urls = [_FFMPEG_URL_OVERRIDE] + [u for u in urls if u != _FFMPEG_URL_OVERRIDE]
     return urls
-
-
-USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
 
 def _exe(name):
@@ -521,14 +559,15 @@ def _download_ffmpeg(urls):
 
 
 def ensure_ffmpeg(target_dir, allow_download):
-    """Najde ffmpeg: PATH -> --ffmpeg/FFMPEG override -> cache .ffmpeg (bez
-    depth limit) -> the video directory/cwd (limited depth, so it doesn't walk
-    entire huge trees) -> (only as a last resort, if allowed) downloads and
-    unpacks from the configured URLs (FFMPEG_DOWNLOAD_URLS / --ffmpeg-url, in
-    order with fallback). Windows only."""
+    """Finds ffmpeg: PATH -> --ffmpeg/FFMPEG override -> cache .ffmpeg (no
+    depth limit) -> the Windows install folders (FFMPEG_PROGRAM_FILES_DIRS) and
+    the video directory/cwd (limited depth, so it doesn't walk entire huge trees)
+    -> (only as a last resort, if allowed) downloads and unpacks from the
+    configured URLs (FFMPEG_DOWNLOAD_URLS / --ffmpeg-url, in order with fallback).
+    Windows only."""
     cache_dirs = [_cache_dir(".ffmpeg"), os.path.join(target_dir, ".ffmpeg"),
                   os.path.join(os.getcwd(), ".ffmpeg")]
-    broad_dirs = [target_dir, os.getcwd()]
+    broad_dirs = FFMPEG_PROGRAM_FILES_DIRS + [target_dir, os.getcwd()]
     ff = _resolve_tool(FFMPEG, "ffmpeg")
     if not _try_ff(ff):
         ff = _find_cached("ffmpeg", cache_dirs)
@@ -555,9 +594,8 @@ def ensure_ffmpeg(target_dir, allow_download):
 # contains a version number, so it must first be read from the downloads page.
 # ----------------------------------------------------------------------
 
-MKVMERGE = "mkvmerge"
-MKVEXTRACT = "mkvextract"
-MKVTOOLNIX_DOWNLOAD_PAGE = "https://mkvtoolnix.download/downloads.html"
+# (MKVMERGE / MKVEXTRACT / MKVTOOLNIX_DOWNLOAD_PAGE are defined in the
+# USER-CONFIGURABLE SETTINGS section at the top of the script.)
 
 
 def _resolve_mkvtoolnix_url():
@@ -600,10 +638,8 @@ def _download_mkvtoolnix(url):
         )
 
 
-MKV_PROGRAM_FILES_DIRS = [
-    r"C:\Program Files\MKVToolNix",
-    r"C:\Program Files (x86)\MKVToolNix",
-]
+# (MKV_PROGRAM_FILES_DIRS is defined in the USER-CONFIGURABLE SETTINGS
+# section at the top of the script.)
 
 
 def ensure_mkvtoolnix(target_dir, allow_download):
@@ -613,8 +649,9 @@ def ensure_mkvtoolnix(target_dir, allow_download):
     3) the video directory, current directory, script directory, cache .mkvtoolnix
        (in case it was left there from before)
     4) only when NONE of the above is found and it is allowed: downloads the
-       portable .7z from mkvtoolnix.download and unpacks it into .mkvtoolnix
-       next to the script.
+       portable .7z - first from the direct MKVTOOLNIX_DOWNLOAD_URL (e.g. the NAS),
+       then, as a fallback, the versioned build parsed off mkvtoolnix.download -
+       and unpacks it into .mkvtoolnix next to the script.
     Returns (mkvmerge, mkvextract); either item may be None."""
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0])) if sys.argv and sys.argv[0] else os.getcwd()
     cache = _cache_dir(".mkvtoolnix")
@@ -640,13 +677,24 @@ def ensure_mkvtoolnix(target_dir, allow_download):
     # 4) only now, as a last resort, downloading (Windows only - the portable .7z
     #    is a Windows build; on Linux we advise installing via the package manager)
     if (mm is None or me is None) and allow_download and os.name == "nt":
-        try:
-            url = _resolve_mkvtoolnix_url()
-            if not url:
-                raise RuntimeError("Could not find a link to the portable version on mkvtoolnix.download.")
-            _download_mkvtoolnix(url)
-        except Exception as e:
-            log_warn(f"Downloading/unpacking mkvtoolnix failed: {e}")
+        ok = False
+        # 1) primary DIRECT source(s) - e.g. the NAS .7z
+        for u in ([MKVTOOLNIX_DOWNLOAD_URL] if MKVTOOLNIX_DOWNLOAD_URL else []):
+            try:
+                _download_mkvtoolnix(u)
+                ok = True
+                break
+            except Exception as e:
+                log_warn(f"mkvtoolnix source failed ({u}): {e}")
+        # 2) fallback: parse the official download page for the versioned .7z
+        if not ok:
+            try:
+                url = _resolve_mkvtoolnix_url()
+                if not url:
+                    raise RuntimeError("Could not find a link to the portable version on mkvtoolnix.download.")
+                _download_mkvtoolnix(url)
+            except Exception as e:
+                log_warn(f"Downloading/unpacking mkvtoolnix failed: {e}")
         if mm is None:
             mm = _find_cached("mkvmerge", [cache])
             mm = mm if _try_ff(mm) else None
@@ -4319,6 +4367,45 @@ def run_translate_subs(args):
     log_done(f"Done: {done} saved, {skipped} skipped (of {len(jobs)}).")
 
 
+def _extract_fix_one_video(video, tracks, can_ask, label_fn, kind_word="subtitle"):
+    """When a video's track layout doesn't match the batch selection (different
+    IDs / track count), re-scan and let the user pick tracks for THIS video via a
+    checklist. Returns a list of tracks to extract, or None to skip. Prompts only
+    when interactive; the choice is NOT recorded into a preset (it is video-specific)."""
+    if not can_ask or not tracks:
+        return None
+    try:
+        if not sys.stdin.isatty():
+            return None
+    except Exception:
+        return None
+    hdr = [f"{Fore.YELLOW}{video.name}: different track layout - the batch selection "
+           f"matched no track here.{Style.RESET_ALL}",
+           f"{Fore.CYAN}This video's {kind_word} tracks:{Style.RESET_ALL}", ""]
+    labels = [label_fn(t) for t in tracks]
+    acts = [f"Extract CHECKED {kind_word} tracks for THIS video",
+            f"ALL {kind_word} tracks in this video",
+            "Skip this video"]
+    global _PRESET_MODE
+    _saved_mode = _PRESET_MODE
+    _PRESET_MODE = None   # do not record/replay this per-video fix into a preset
+    try:
+        a, checked = ask_checklist("Fix the selection for this video", labels, acts, header=hdr)
+    finally:
+        _PRESET_MODE = _saved_mode
+    if a == 2:
+        return None
+    if a == 1:
+        return list(tracks)
+    picked = [tracks[i] for i in checked if 0 <= i < len(tracks)]
+    return picked or None
+
+
+def _subtitle_track_label(t):
+    """Label for a subtitle track from mkvmerge_tracks (id/lang/codec/title)."""
+    return f"#{t['id']}  {t['lang']:4} {t['codec']:16} {t.get('title', '')}".rstrip()
+
+
 def run_extract_subs(args, minimal=False):
     """Wizard: extracts subtitle tracks from videos (mkv/mp4/...) into .srt. Tracks
     are detected directly from the video; you interactively pick which (by language,
@@ -4390,16 +4477,17 @@ def run_extract_subs(args, minimal=False):
     act, checked = ask_checklist("Which subtitle tracks to extract?", item_labels, actions, header=_hdr)
 
     want_langs = None
-    want_ids = None
+    want_keys = None
     if act == 0:                       # extract the specific checked tracks
         if checked and text_tracks:
-            want_ids = [text_tracks[i]["id"] for i in checked if 0 <= i < len(text_tracks)]
-        if not want_ids:
+            sample_sel = _track_selectors(text_tracks)
+            want_keys = [sample_sel[i][0] for i in checked if 0 <= i < len(sample_sel)]
+        if not want_keys:
             log_info("Nothing checked - taking ALL text tracks.")
     elif act == 1:                     # by language
         raw = ask_text("Language codes separated by commas (e.g. eng,cze,ger; empty = all)", "")
         want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()] or None
-    # act == 2 -> all text ones (want_langs=None, want_ids=None)
+    # act == 2 -> all text ones (want_langs=None, want_keys=None)
 
     do_clean = False if minimal else ask_yes_no(
         "Rule-based text cleanup (spaces, punctuation, wrapping long lines)?", default_no=True)
@@ -4410,7 +4498,7 @@ def run_extract_subs(args, minimal=False):
 
     print()
     seltxt = ("languages: " + ",".join(want_langs)) if want_langs else \
-             ("tracks #" + ",".join(str(i) for i in want_ids)) if want_ids else "all text ones"
+             (f"{len(want_keys)} checked track(s)" if want_keys else "all text ones")
     log_info(f"Selection: {seltxt} | videos: {len(videos)}"
              + (" | cleanup" if do_clean else "")
              + (" | readability" if getattr(args, 'fix_short_duration', False) else ""))
@@ -4435,14 +4523,20 @@ def run_extract_subs(args, minimal=False):
         vtext = [t for t in vtracks if is_text_codec(t["codec"])]
         if want_langs is not None:
             sel = [t for t in vtext if any(t["lang"].lower().startswith(l) for l in want_langs)]
-        elif want_ids is not None:
-            sel = [t for t in vtext if t["id"] in want_ids]
+        elif want_keys is not None:
+            vkeymap = {k: t for k, _l, t in _track_selectors(vtext)}
+            sel = [vkeymap[k] for k in want_keys if k in vkeymap]
         else:
             sel = vtext
         if not sel:
-            log_warn(f"{v.name}: no matching text track - skipping.")
-            skipped += 1
-            continue
+            # different track layout for this video -> re-scan and let the user fix it
+            can_ask = not minimal and not preset_is_replaying() and not getattr(args, "yes", False)
+            fixed = _extract_fix_one_video(v, vtext, can_ask, _subtitle_track_label, "subtitle")
+            if not fixed:
+                log_warn(f"{v.name}: no matching text track - skipping.")
+                skipped += 1
+                continue
+            sel = fixed
 
         done_ids = set()
         any_written = False
@@ -4594,6 +4688,7 @@ def _mkv_probe_full(mkvmerge_bin, video):
         if t.get("type") == "audio":
             ai += 1
             rec["sel"] = f"a{ai}"
+            rec["channels"] = pr.get("audio_channels")
             audio.append(rec)
         elif t.get("type") == "subtitles":
             si += 1
@@ -6600,6 +6695,1250 @@ def run_auto_all(args):
     run_batch(args)
 
 
+# ============================================================================
+# Audio & file tools (extract / convert / mux audio, intelligent file renamer)
+# ============================================================================
+
+def _audio_ext_for(codec):
+    """Maps an mkvmerge friendly audio codec name to a file extension."""
+    c = (codec or "").lower()
+    if "e-ac-3" in c or "eac3" in c or "e-ac3" in c:
+        return ".eac3"
+    if "ac-3" in c or "ac3" in c:
+        return ".ac3"
+    if "truehd" in c or "true hd" in c or "mlp" in c:
+        return ".thd"
+    if "dts" in c:
+        return ".dts"
+    if "aac" in c:
+        return ".aac"
+    if "flac" in c:
+        return ".flac"
+    if "mp3" in c or "mpeg audio" in c or "mp2" in c:
+        return ".mp3"
+    if "opus" in c:
+        return ".opus"
+    if "vorbis" in c:
+        return ".ogg"
+    if "pcm" in c:
+        return ".wav"
+    return ".mka"
+
+
+def _ensure_ffmpeg_bin(args, directory):
+    """Resolves ffmpeg (PATH / override / auto-download). Returns a path or None."""
+    ff = getattr(args, "ffmpeg", None) or find_tool(["ffmpeg", "ffmpeg.exe"])
+    if not ff:
+        try:
+            ff = ensure_ffmpeg(directory, allow_download=not getattr(args, "no_ffmpeg_download", False))
+        except Exception:
+            ff = None
+    if ff:
+        args.ffmpeg = getattr(args, "ffmpeg", None) or ff
+    return ff
+
+
+def _find_ffprobe(ffmpeg_bin):
+    """Locates ffprobe next to ffmpeg, or in PATH."""
+    if ffmpeg_bin:
+        d = os.path.dirname(ffmpeg_bin)
+        base = os.path.basename(ffmpeg_bin).lower()
+        name = "ffprobe.exe" if base.endswith(".exe") else "ffprobe"
+        c = os.path.join(d, name)
+        if os.path.isfile(c):
+            return c
+    return find_tool(["ffprobe", "ffprobe.exe"])
+
+
+def _ffprobe_streams(ffprobe_bin, path):
+    """Returns the list of streams (ffprobe -show_streams) or []."""
+    try:
+        out = subprocess.run([ffprobe_bin, "-v", "error", "-print_format", "json",
+                              "-show_streams", str(path)], capture_output=True, text=True)
+        return json.loads(out.stdout or "{}").get("streams", [])
+    except Exception:
+        return []
+
+
+def _audio_track_label(t):
+    """Rich one-line label for an audio track (to tell duplicates apart)."""
+    flags = []
+    if t.get("default"):
+        flags.append("default")
+    if t.get("forced"):
+        flags.append("forced")
+    fl = ("  [" + ", ".join(flags) + "]") if flags else ""
+    nm = t.get("name") or "-"
+    ch = t.get("channels")
+    chs = f"  {ch}ch" if ch else ""
+    return f"#{t['id']}  {_lang3_name(t.get('lang')):8} {t.get('codec', '?'):8}{chs}  name={nm}{fl}"
+
+
+def run_extract_audio(args):
+    """Wizard: extracts audio tracks from videos into standalone audio files via
+    ffmpeg stream copy (no re-encoding). Tracks are detected directly from the video;
+    you interactively pick which (checkbox multi-select from the sample, by language,
+    or all) - just like subtitle extraction. Duplicate languages are told apart."""
+    print(f"{Fore.MAGENTA}=== Extract audio tracks from videos ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("No videos in the directory.")
+    log_info(f"Found {len(videos)} videos.")
+    mkvmerge_bin, _me, _ff, _ = _resolve_tools_for_extract(args, Path(videos[0]))
+    if not mkvmerge_bin:
+        die("mkvmerge not found (required to read tracks). Install MKVToolNix (see --help).")
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    if not ffmpeg_bin:
+        die("ffmpeg not found (required for audio extraction). Install it or allow auto-download.")
+    args.mkvmerge = getattr(args, "mkvmerge", None) or mkvmerge_bin
+
+    # sample = first video that has audio tracks
+    sample = None
+    sample_audio = []
+    for cand in videos:
+        full = _mkv_probe_full(mkvmerge_bin, Path(cand))
+        if full.get("audio"):
+            sample = Path(cand)
+            sample_audio = full["audio"]
+            break
+    if sample is None:
+        die("Could not read audio tracks from any video.")
+    log_info(f"Found {len(sample_audio)} audio tracks in the sample {sample.name}.")
+
+    hdr = [f"{Fore.MAGENTA}=== Extract audio tracks ==={Style.RESET_ALL}",
+           f"{Fore.CYAN}Found {len(videos)} videos. Sample: {sample.name}{Style.RESET_ALL}", ""]
+    item_labels = [_audio_track_label(t) for t in sample_audio]
+    actions = ["Extract CHECKED tracks (check them above with space)",
+               "by LANGUAGE (I'll type codes - robust for the whole folder)",
+               "ALL audio tracks from each video"]
+    act, checked = ask_checklist("Which audio tracks to extract?", item_labels, actions, header=hdr)
+
+    sample_sel = _track_selectors(sample_audio)   # [(key, label, track)]
+    want_keys = None
+    want_langs = None
+    if act == 0:
+        if checked:
+            want_keys = [sample_sel[i][0] for i in checked if 0 <= i < len(sample_sel)]
+        if not want_keys:
+            log_info("Nothing checked - taking ALL audio tracks.")
+    elif act == 1:
+        raw = ask_text("Language codes separated by commas (e.g. eng,jpn,ger; empty = all)", "")
+        codes = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()]
+        want_langs = {_canon3(c) for c in codes} or None
+    # act == 2 -> all
+
+    overwrite = ask_yes_no("Overwrite existing output audio files?", default_no=True)
+    seltxt = ("checked tracks" if want_keys else
+              ("languages: " + ",".join(sorted(want_langs)) if want_langs else "all audio tracks"))
+    log_info(f"Selection: {seltxt} | codec copy (no re-encode) | videos: {len(videos)}")
+    if not ask_yes_no(f"Run for {len(videos)} videos?", default_no=False):
+        log_warn("Cancelled by the user.")
+        return
+    preset_flush_if_save()
+
+    done = skipped = wrote = 0
+    for v in videos:
+        vp = Path(v)
+        full = _mkv_probe_full(mkvmerge_bin, vp)
+        auds = full.get("audio", [])
+        if not auds:
+            log_warn(f"{vp.name}: no audio tracks - skipping.")
+            skipped += 1
+            continue
+        if want_keys is not None:
+            sels = _track_selectors(auds)
+            keymap = {k: t for k, _l, t in sels}
+            sel = [keymap[k] for k in want_keys if k in keymap]
+        elif want_langs is not None:
+            sel = [t for t in auds if _canon3(t.get("lang")) in want_langs]
+        else:
+            sel = list(auds)
+        if not sel:
+            can_ask = not preset_is_replaying() and not getattr(args, "yes", False)
+            fixed = _extract_fix_one_video(vp, auds, can_ask, _audio_track_label, "audio")
+            if not fixed:
+                log_warn(f"{vp.name}: no matching audio track - skipping.")
+                skipped += 1
+                continue
+            sel = fixed
+        used = set()
+        any_ok = False
+        for t in sel:
+            try:
+                ordinal = auds.index(t)
+            except ValueError:
+                ordinal = 0
+            ext = _audio_ext_for(t.get("codec"))
+            tag = (t.get("lang") or "und").upper()
+            out = vp.with_name(vp.stem + f"_{tag}{ext}")
+            n = 2
+            while str(out) in used:
+                out = vp.with_name(vp.stem + f"_{tag}_{n}{ext}")
+                n += 1
+            used.add(str(out))
+            if out.exists() and not overwrite:
+                log_info(f"{out.name}: already exists - skipping.")
+                continue
+            cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", f"0:a:{ordinal}", "-c:a", "copy", str(out)]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0 or not out.exists():
+                log_warn(f"{vp.name}: extracting audio #{t['id']} failed.")
+                continue
+            log_done(f"{vp.name}: audio #{t['id']} ({t.get('codec', '?')}) -> {out.name}")
+            wrote += 1
+            any_ok = True
+        if any_ok:
+            done += 1
+        else:
+            skipped += 1
+    print()
+    log_done(f"Done: {wrote} audio files from {done} videos ({skipped} skipped).")
+
+
+def run_convert_audio(args):
+    """Re-encodes all audio tracks in each MKV to a chosen codec (default AC-3),
+    copying video and subtitles. Output: <base>_<codec>.mkv (or overwrite)."""
+    print(f"{Fore.MAGENTA}=== Convert audio (re-encode, e.g. to AC-3) ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    all_videos = collect_videos(directory, recursive)
+    videos = [v for v in all_videos if Path(v).suffix.lower() == ".mkv"]
+    if not videos:
+        die("No .mkv files in the directory (this mode outputs MKV and copies subtitles).")
+    if len(videos) < len(all_videos):
+        log_info(f"Note: {len(all_videos) - len(videos)} non-MKV files skipped (MKV only).")
+    log_info(f"Found {len(videos)} MKV files.")
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    if not ffmpeg_bin:
+        die("ffmpeg not found (required for audio conversion). Install it or allow auto-download.")
+
+    codecs = [("ac3", "AC-3 (Dolby Digital) - wide device compatibility"),
+              ("eac3", "E-AC-3 (Dolby Digital Plus)"),
+              ("aac", "AAC")]
+    ci = ask_pick("Target audio codec:", [f"{c} - {d}" for c, d in codecs], default=0,
+                  help=["AC-3: best compatibility with TVs/receivers (up to 640k).",
+                        "E-AC-3: newer, more efficient than AC-3.",
+                        "AAC: efficient, common for streaming/mobile."])
+    codec = codecs[ci][0]
+    bitrate = (ask_text("Audio bitrate (e.g. 640k, 448k, 256k)", "640k") or "640k").strip()
+    overwrite = ask_yes_no("Overwrite the original MKV? (otherwise saved as <name>_<codec>.mkv)", default_no=True)
+    log_info(f"Codec: {codec} @ {bitrate} | video + subtitles copied")
+    if not ask_yes_no(f"Run for {len(videos)} MKV files?", default_no=False):
+        log_warn("Cancelled.")
+        return
+    preset_flush_if_save()
+
+    done = errors = 0
+    for v in videos:
+        vp = Path(v)
+        out = vp if overwrite else vp.with_name(vp.stem + f"_{codec}.mkv")
+        tmp = vp.with_name(vp.stem + f".__conv_{codec}__.mkv") if overwrite else out
+        cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", "0", "-c:v", "copy",
+               "-c:a", codec, "-b:a", bitrate, "-c:s", "copy", str(tmp)]
+        r = subprocess.run(cmd)
+        if r.returncode != 0 or not os.path.exists(tmp):
+            log_warn(f"{vp.name}: conversion failed.")
+            errors += 1
+            if overwrite and os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+            continue
+        if overwrite:
+            try:
+                os.replace(str(tmp), str(vp))
+            except OSError as e:
+                log_warn(f"{vp.name}: could not replace the original ({e}).")
+                errors += 1
+                continue
+        size_mb = os.path.getsize(out) / (1024 * 1024)
+        log_done(f"{vp.name} -> {Path(out).name} ({codec} {bitrate}, {size_mb:.0f} MB)")
+        done += 1
+    print()
+    log_done(f"Done: {done} converted, {errors} errors (of {len(videos)}).")
+
+
+_IMPORT_AUDIO_EXTS = {".aac", ".ac3", ".eac3", ".dts", ".thd", ".mp3", ".flac",
+                      ".mka", ".opus", ".ogg", ".wav"}
+_MKV_SUB_COPY_CODECS = {"ass", "ssa", "subrip", "srt", "webvtt",
+                        "hdmv_pgs_subtitle", "dvd_subtitle"}
+_MKV_SUB_CONVERT = {"mov_text", "tx3g"}
+
+
+def _build_import_audio_cmd(ffmpeg_bin, video_path, audio_path, out_path, streams,
+                            audio_lang3="eng", audio_title="English"):
+    """Builds the ffmpeg command that muxes the external audio (as the first, default
+    audio track) together with the original video/audio/subtitles into an MKV."""
+    cmd = [ffmpeg_bin, "-y", "-i", str(video_path), "-i", str(audio_path)]
+    map_args = ["-map", "1:a"]
+    video_streams = [s for s in streams if s.get("codec_type") == "video"
+                     and s.get("disposition", {}).get("attached_pic", 0) == 0]
+    for s in video_streams:
+        map_args += ["-map", f"0:{s['index']}"]
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    for s in audio_streams:
+        map_args += ["-map", f"0:{s['index']}"]
+    subtitle_streams = [s for s in streams if s.get("codec_type") == "subtitle"]
+    sub_codec_args = []
+    sub_index = 0
+    skipped_subs = 0
+    for s in subtitle_streams:
+        codec = s.get("codec_name", "").lower()
+        if codec in _MKV_SUB_COPY_CODECS:
+            map_args += ["-map", f"0:{s['index']}"]
+            sub_codec_args += [f"-c:s:{sub_index}", "copy"]
+            sub_index += 1
+        elif codec in _MKV_SUB_CONVERT:
+            map_args += ["-map", f"0:{s['index']}"]
+            sub_codec_args += [f"-c:s:{sub_index}", "srt"]
+            sub_index += 1
+        else:
+            skipped_subs += 1
+    if skipped_subs:
+        log_info(f"  Skipped {skipped_subs} incompatible subtitle stream(s)")
+    codec_args = ["-c:v", "copy", "-c:a", "copy"] + sub_codec_args
+    disp_args = ["-disposition:a", "none", "-disposition:a:0", "default",
+                 "-metadata:s:a:0", f"language={audio_lang3}",
+                 "-metadata:s:a:0", f"title={audio_title}"]
+    return cmd + map_args + codec_args + disp_args + [str(out_path)]
+
+
+def _fix_merged_metadata(mkvmerge_bin, mkvpropedit_bin, mkv_path, default_audio_lang3, default_sub_lang3):
+    """After muxing: fills missing track names by language and sets the chosen
+    default audio + subtitle language as default (via mkvpropedit)."""
+    if not mkvpropedit_bin:
+        log_warn("  mkvpropedit not found - track names / default flags not set.")
+        return
+    full = _mkv_probe_full(mkvmerge_bin, mkv_path)
+    edit_args = []
+    # fill missing names
+    for kind in ("audio", "subs"):
+        for t in full.get(kind, []):
+            if (t.get("name") or "").strip():
+                continue
+            name = _lang3_name(t.get("lang")) if t.get("lang") not in (None, "und") else None
+            if name:
+                edit_args += ["--edit", f"track:{t['sel']}", "--set", f"name={name}"]
+    # default audio = chosen language (fallback: first audio)
+    aud = full.get("audio", [])
+    def_a = None
+    if default_audio_lang3:
+        def_a = next((t for t in aud if _canon3(t.get("lang")) == default_audio_lang3), None)
+    if def_a is None:
+        def_a = aud[0] if aud else None
+    for t in aud:
+        flag = "1" if def_a is not None and t["sel"] == def_a["sel"] else "0"
+        edit_args += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={flag}"]
+    # default subtitle = chosen language (if present)
+    subs = full.get("subs", [])
+    def_s = next((t for t in subs if _canon3(t.get("lang")) == default_sub_lang3), None) if default_sub_lang3 else None
+    for t in subs:
+        flag = "1" if def_s is not None and t["sel"] == def_s["sel"] else "0"
+        edit_args += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={flag}"]
+    if not edit_args:
+        return
+    r = subprocess.run([mkvpropedit_bin, str(mkv_path)] + edit_args, capture_output=True, text=True)
+    if r.returncode != 0:
+        log_warn(f"  mkvpropedit: {r.stderr.strip()[:200]}")
+    else:
+        a_info = _lang3_name(def_a["lang"]) if def_a else "none"
+        s_info = _lang3_name(def_s["lang"]) if def_s else "none"
+        log_info(f"  Default audio: {a_info} | default subtitles: {s_info}")
+
+
+def run_import_audio(args):
+    """Muxes an external audio file (paired with each video by SxxExx) into the
+    video as the default audio track, optionally sets a chosen subtitle language as
+    default, and fills missing track names by language. Output: <base>_merged.mkv."""
+    print(f"{Fore.MAGENTA}=== Insert (mux) external audio into videos ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+
+    mkvmerge_bin, _me, mkvpropedit_bin = _ensure_mkv_tools(args, directory, need_propedit=True)
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    if not ffmpeg_bin:
+        die("ffmpeg not found (required for muxing). Install it or allow auto-download.")
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+    if not ffprobe_bin:
+        die("ffprobe not found (usually next to ffmpeg). Install ffmpeg with ffprobe.")
+
+    # build video + external-audio maps by SxxExx
+    def _walk(d):
+        if recursive:
+            for root, _dirs, files in os.walk(d):
+                for f in files:
+                    yield os.path.join(root, f)
+        else:
+            for f in os.listdir(d):
+                full = os.path.join(d, f)
+                if os.path.isfile(full):
+                    yield full
+
+    video_map, audio_map = {}, {}
+    for full in _walk(directory):
+        ext = os.path.splitext(full)[1].lower()
+        key = _episode_key(os.path.basename(full))
+        if key is None:
+            continue
+        if ext in (".mkv", ".mp4", ".m4v", ".mov", ".webm") and "_merged" not in os.path.basename(full).lower():
+            video_map.setdefault(key, full)
+        elif ext in _IMPORT_AUDIO_EXTS:
+            audio_map.setdefault(key, full)
+    if not video_map:
+        die("No video files with an SxxExx tag found.")
+    log_info(f"Found {len(video_map)} videos and {len(audio_map)} external audio files (paired by SxxExx).")
+
+    # show the audio tracks already present in a sample video (rich info)
+    sample_v = video_map[sorted(video_map)[0]]
+    sample_full = _mkv_probe_full(mkvmerge_bin, Path(sample_v))
+    if sample_full.get("audio"):
+        log_info(f"Existing audio tracks in the sample '{os.path.basename(sample_v)}':")
+        for t in sample_full["audio"]:
+            print("   " + _audio_track_label(t))
+
+    audio_lang = (ask_language("Language of the external audio (code)", "eng") or "eng").strip()
+    audio_lang3 = _canon3(audio_lang) or "eng"
+    audio_title = _lang3_name(audio_lang3) or "English"
+    default_audio = (ask_language("Which audio language to set as DEFAULT after muxing "
+                                  "(code; empty = the imported one)", audio_lang) or "").strip()
+    default_audio3 = _canon3(default_audio) if default_audio else audio_lang3
+    default_sub = (ask_language("Subtitle language to set as DEFAULT (code; empty = none)", "cs") or "").strip()
+    default_sub3 = _canon3(default_sub) if default_sub else None
+    replace = ask_yes_no("Overwrite the original video with the result? (otherwise <name>_merged.mkv)", default_no=True)
+
+    pairs = sorted(k for k in video_map if k in audio_map)
+    missing = [k for k in video_map if k not in audio_map]
+    if not pairs:
+        die("Could not pair any external audio with a video by SxxExx.")
+    log_info(f"Paired: {len(pairs)} | without audio: {len(missing)}")
+    if not ask_yes_no(f"Run mux for {len(pairs)} videos?", default_no=False):
+        log_warn("Cancelled.")
+        return
+    preset_flush_if_save()
+
+    done = errors = 0
+    for key in pairs:
+        video_path = video_map[key]
+        audio_path = audio_map[key]
+        vp = Path(video_path)
+        out_path = vp.with_name(vp.stem + "_merged.mkv")
+        log_info(f"{_fmt_ep(key)}: {vp.name}  +  {os.path.basename(audio_path)}")
+        streams = _ffprobe_streams(ffprobe_bin, video_path)
+        cmd = _build_import_audio_cmd(ffmpeg_bin, video_path, audio_path, out_path, streams,
+                                      audio_lang3, audio_title)
+        r = subprocess.run(cmd)
+        if r.returncode != 0 or not out_path.exists():
+            log_warn(f"  {vp.name}: mux failed.")
+            errors += 1
+            continue
+        _fix_merged_metadata(mkvmerge_bin, mkvpropedit_bin, out_path, default_audio3, default_sub3)
+        if replace:
+            try:
+                os.remove(str(vp))
+                os.replace(str(out_path), str(vp.with_suffix(".mkv")))
+                out_path = vp.with_suffix(".mkv")
+            except OSError as e:
+                log_warn(f"  {vp.name}: could not replace original ({e}).")
+        log_done(f"  -> {out_path.name}")
+        done += 1
+    print()
+    log_done(f"Done: {done} muxed, {errors} errors, {len(missing)} without audio.")
+
+
+# ---- Intelligent file renamer (ported) -------------------------------------
+# Unifies file names in a folder: zero-pads numbers to a common width, fills in
+# missing common words from the majority pattern, normalizes capitalization,
+# strips emoji / Windows-illegal characters, and auto-detects multiple series.
+
+_RN_NUM_RE = re.compile(r"\d+")
+_RN_WORDCHARS = re.compile(r"[^\w]", re.UNICODE)
+_RN_TOKEN_RE = re.compile(r"\d+|[^\W\d_]+(?:['\u2019][^\W\d_]+)*|[\W_]+", re.UNICODE)
+_RN_ILLEGAL_WIN = set('<>:"/\\|?*')
+_RN_RESERVED_WIN = {"CON", "PRN", "AUX", "NUL",
+                    *(f"COM{i}" for i in range(1, 10)),
+                    *(f"LPT{i}" for i in range(1, 10))}
+_RN_EMOJI_RANGES = [(0x1F000, 0x1FAFF), (0x2600, 0x27BF), (0x2300, 0x23FF),
+                    (0x2B00, 0x2BFF), (0x1F1E6, 0x1F1FF), (0xFE00, 0xFE0F), (0x200D, 0x200D)]
+_RN_SMALL_WORDS = {"a", "an", "the", "and", "but", "or", "nor", "for", "of", "to",
+                   "in", "on", "at", "by", "vs", "with", "as", "from", "into", "over", "per"}
+_RN_VOWELS = set("AEIOU")
+_RN_DEFAULT_STOP = {
+    "episode", "episodes", "episod", "ep", "eps", "reaction", "reactions", "react",
+    "reacts", "reacting", "uncut", "full", "part", "pt", "video", "official", "hd",
+    "fhd", "uhd", "4k", "2k", "premiere", "finale", "final", "trailer", "teaser",
+    "subbed", "sub", "dub", "raw", "movie", "series", "season", "watch", "watching",
+    "review", "recap", "highlights", "clip", "clips", "cut", "edit", "compilation",
+    "special", "bonus", "early", "access", "kdrama", "drama", "anime",
+    "a", "an", "the", "and", "or", "but", "of", "to", "in", "on", "at", "for", "with",
+    "as", "by", "from", "into", "is", "are", "was", "were", "be", "this", "that",
+    "these", "those", "here", "there", "now", "new", "my", "your", "our", "their",
+    "his", "her", "its", "i", "im", "you", "we", "they", "he", "she", "it", "vs",
+    "ft", "feat", "no", "yes", "so", "just",
+}
+
+
+def _rn_strip_pictographs(s):
+    out = []
+    for ch in s:
+        cp = ord(ch)
+        if any(a <= cp <= b for a, b in _RN_EMOJI_RANGES):
+            continue
+        if unicodedata.category(ch) in ("So", "Cf", "Cs", "Co"):
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _rn_strip_illegal(s):
+    return "".join(ch for ch in s
+                   if ch not in _RN_ILLEGAL_WIN and unicodedata.category(ch) != "Cc")
+
+
+def _rn_clean(stem, removes):
+    s = _rn_strip_pictographs(stem)
+    s = _rn_strip_illegal(s)
+    for rgx in removes:
+        s = rgx.sub("", s)
+    return re.sub(r"[ \t]+", " ", s).strip()
+
+
+def _rn_finalize(stem):
+    stem = re.sub(r"[ \t]+", " ", stem).strip().strip(" .")
+    if stem.upper() in _RN_RESERVED_WIN:
+        stem += "_"
+    return stem or "_"
+
+
+def _rn_tokenize(s):
+    toks = []
+    for m in _RN_TOKEN_RE.finditer(s):
+        t = m.group(0)
+        if t.isdigit():
+            toks.append(("num", t))
+        elif t[0].isalpha() or t[0] in "'\u2019":
+            toks.append(("word", t))
+        else:
+            toks.append(("sep", t))
+    return toks
+
+
+def _rn_is_acronym(tok):
+    letters = [c for c in tok if c.isalpha()]
+    return len(letters) >= 3 and tok == tok.upper() and not (set(tok.upper()) & _RN_VOWELS)
+
+
+def _rn_cap_runs(tok):
+    return re.sub(r"[^\W\d_]+(?:['\u2019][^\W\d_]+)*",
+                  lambda m: m.group(0)[0].upper() + m.group(0)[1:],
+                  tok.lower(), flags=re.UNICODE)
+
+
+def _rn_case_word(tok, mode, first):
+    if mode == "lower":
+        return tok.lower()
+    if mode == "upper":
+        return tok.upper()
+    if mode == "keep":
+        return tok
+    if _rn_is_acronym(tok):
+        return tok
+    core = _RN_WORDCHARS.sub("", tok).lower()
+    if core in _RN_SMALL_WORDS and not first:
+        return tok.lower()
+    return _rn_cap_runs(tok)
+
+
+def _rn_apply_case(tokens, mode):
+    out, first = [], True
+    for kind, text in tokens:
+        if kind == "word":
+            out.append((kind, _rn_case_word(text, mode, first)))
+            first = False
+        else:
+            out.append((kind, text))
+    return out
+
+
+def _rn_keys_of(tokens):
+    return [("#" if k == "num" else t.lower()) for k, t in tokens if k != "sep"]
+
+
+def _rn_split_lead(tokens):
+    res, lead = [], ""
+    for kind, text in tokens:
+        if kind == "sep":
+            lead += text
+        else:
+            res.append((lead, kind, text))
+            lead = ""
+    return res, lead
+
+
+def _rn_has_letters(key):
+    return any(c.isalpha() for c in key)
+
+
+def _rn_file_words(tokens, stop):
+    return [t.lower() for k, t in tokens if k == "word" and t.lower() not in stop]
+
+
+def _rn_longest_common_run(a, b):
+    if not a or not b:
+        return 0
+    dp = [0] * (len(b) + 1)
+    best = 0
+    for i in range(len(a)):
+        ndp = [0] * (len(b) + 1)
+        ai = a[i]
+        for j in range(len(b)):
+            if ai == b[j]:
+                ndp[j + 1] = dp[j] + 1
+                best = max(best, ndp[j + 1])
+        dp = ndp
+    return best
+
+
+def _rn_cluster_series(word_lists, min_run):
+    n = len(word_lists)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _rn_longest_common_run(word_lists[i], word_lists[j]) >= min_run:
+                ri, rj = find(i), find(j)
+                if ri != rj:
+                    parent[ri] = rj
+    groups = defaultdict(list)
+    for i in range(n):
+        groups[find(i)].append(i)
+    return list(groups.values())
+
+
+def _rn_compute_widths(cleans, min_width):
+    vals, rawlen = defaultdict(list), defaultdict(list)
+    for s in cleans:
+        for i, run in enumerate(_RN_NUM_RE.findall(s)):
+            vals[i].append(int(run))
+            rawlen[i].append(len(run))
+    widths = {}
+    for i in vals:
+        w = max(len(str(max(vals[i]))), max(rawlen[i]))
+        if min_width:
+            w = max(w, min_width)
+        widths[i] = w
+    return widths
+
+
+def _rn_lcs_align(ref, other):
+    n, m = len(ref), len(other)
+    dp = [[0] * (m + 1) for _ in range(n + 1)]
+    for i in range(n - 1, -1, -1):
+        for j in range(m - 1, -1, -1):
+            dp[i][j] = dp[i + 1][j + 1] + 1 if ref[i] == other[j] \
+                else max(dp[i + 1][j], dp[i][j + 1])
+    ops, i, j = [], 0, 0
+    while i < n and j < m:
+        if ref[i] == other[j]:
+            ops.append(("match", i, j)); i += 1; j += 1
+        elif dp[i + 1][j] >= dp[i][j + 1]:
+            ops.append(("ref", i)); i += 1
+        else:
+            ops.append(("file", j)); j += 1
+    while i < n:
+        ops.append(("ref", i)); i += 1
+    while j < m:
+        ops.append(("file", j)); j += 1
+    return ops
+
+
+def _rn_render(out_tokens, widths, trail=""):
+    parts, counter = [], 0
+    for lead, kind, text in out_tokens:
+        parts.append(lead)
+        if kind == "num":
+            parts.append(text.zfill(widths.get(counter, len(text))))
+            counter += 1
+        else:
+            parts.append(text)
+    parts.append(trail)
+    return _rn_finalize("".join(parts))
+
+
+def _rn_consensus_name(item, ref_ns, ref_keys, widths, do_words):
+    file_ns = item["ns"]
+    file_keys = item["keys"]
+    ops = _rn_lcs_align(ref_keys, file_keys)
+    matched_ref = {op[1] for op in ops if op[0] == "match"}
+    file_word_only = any(op[0] == "file" and file_ns[op[1]][1] == "word" for op in ops)
+    out = []
+    for op in ops:
+        if op[0] == "match":
+            out.append(file_ns[op[2]])
+        elif op[0] == "file":
+            out.append(file_ns[op[1]])
+        else:
+            r = op[1]
+            lead, kind, text = ref_ns[r]
+            if not do_words or kind != "word" or file_word_only:
+                continue
+            bound = ((r + 1 < len(ref_keys) and ref_keys[r + 1] == "#" and (r + 1) not in matched_ref)
+                     or (r - 1 >= 0 and ref_keys[r - 1] == "#" and (r - 1) not in matched_ref))
+            if bound:
+                continue
+            out.append((lead, kind, text))
+    return _rn_render(out, widths, item["trail"])
+
+
+def _rn_strict_name(item, ref_ns, ref_keys, ref_trail, widths, ref_num_slots, ref_word_keys):
+    nums = [t for _, k, t in item["ns"] if k == "num"]
+    file_word_keys = {k for k in item["keys"] if _rn_has_letters(k)}
+    overlap = len(ref_word_keys & file_word_keys)
+    fits = (len(nums) >= ref_num_slots
+            and (not ref_word_keys or overlap >= (len(ref_word_keys) + 1) // 2))
+    if not fits:
+        return _rn_consensus_name(item, ref_ns, ref_keys, widths, do_words=True)
+    out, ni = [], 0
+    for lead, kind, text in ref_ns:
+        if kind == "num":
+            out.append((lead, "num", nums[ni])); ni += 1
+        else:
+            out.append((lead, kind, text))
+    return _rn_render(out, widths, ref_trail)
+
+
+def _rn_process_group(members, do_pad, do_words, min_width, strict):
+    widths = _rn_compute_widths([m["clean"] for m in members], min_width) if do_pad else {}
+    patterns = [tuple(m["keys"]) for m in members]
+    counts = Counter(patterns)
+    best = max(counts, key=lambda p: (counts[p], len(p)))
+    ref = next(m for m, p in zip(members, patterns) if p == best)
+    ref_ns, ref_trail = ref["ns"], ref["trail"]
+    ref_keys = list(best)
+    ref_num_slots = sum(1 for k in ref_keys if k == "#")
+    ref_word_keys = {k for k in ref_keys if _rn_has_letters(k)}
+    out = []
+    for m in members:
+        if strict:
+            new = _rn_strict_name(m, ref_ns, ref_keys, ref_trail, widths, ref_num_slots, ref_word_keys)
+        else:
+            new = _rn_consensus_name(m, ref_ns, ref_keys, widths, do_words)
+        out.append((m["name"], new + m["ext"]))
+    return out
+
+
+def _rn_build_plan(filenames, do_pad, do_words, min_width, removes=(), case_mode="title",
+                   strict=False, group=True, group_min=1, stop=None):
+    stop = _RN_DEFAULT_STOP if stop is None else (_RN_DEFAULT_STOP | set(stop))
+    items = []
+    for name in filenames:
+        stem, ext = os.path.splitext(name)
+        clean = _rn_clean(stem, removes)
+        toks = _rn_apply_case(_rn_tokenize(clean), case_mode)
+        ns, trail = _rn_split_lead(toks)
+        items.append({"name": name, "ext": ext, "clean": clean, "ns": ns, "trail": trail,
+                      "keys": _rn_keys_of(toks), "words": _rn_file_words(toks, stop)})
+    if group:
+        groups = _rn_cluster_series([it["words"] for it in items], group_min)
+    else:
+        groups = [list(range(len(items)))]
+    plan = []
+    for gi in groups:
+        plan.extend(_rn_process_group([items[i] for i in gi], do_pad, do_words, min_width, strict))
+    order = {it["name"]: k for k, it in enumerate(items)}
+    plan.sort(key=lambda p: order[p[0]])
+    return plan, len(groups)
+
+
+def _rn_detect_collisions(plan, existing):
+    changing = {o: n for o, n in plan if o != n}
+    targets = Counter(changing.values())
+    sources = set(changing)
+    skip = set()
+    for o, n in changing.items():
+        if targets[n] > 1 or (n in existing and n not in sources):
+            skip.add(o)
+    return skip
+
+
+def _rn_apply(changed, directory):
+    tag = uuid.uuid4().hex[:8]
+    temps = []
+    try:
+        for i, (o, _) in enumerate(changed):
+            tmp = f".__rename_{tag}_{i}__"
+            os.rename(os.path.join(directory, o), os.path.join(directory, tmp))
+            temps.append(tmp)
+        for (o, n), tmp in zip(changed, temps):
+            os.rename(os.path.join(directory, tmp), os.path.join(directory, n))
+        log_done(f"Renamed {len(changed)} files.")
+        return True
+    except OSError as e:
+        log_warn(f"Rename error: {e}")
+        return False
+
+
+# ---- Total Commander-style interactive file browser (renamer front-end) ----
+
+def _fb_drives():
+    """Windows: existing drive roots (C:\\, D:\\ ...). Other OS: filesystem root."""
+    if os.name == "nt":
+        import string
+        out = []
+        for letter in string.ascii_uppercase:
+            root = f"{letter}:\\"
+            if os.path.exists(root):
+                out.append(root)
+        return out or ["C:\\"]
+    return ["/"]
+
+
+def _fb_list(path, filt):
+    """Returns (dirs, files) for path. Dirs sorted; files sorted and filtered by
+    filt (glob if it contains wildcards, otherwise a case-insensitive substring)."""
+    try:
+        entries = os.listdir(path)
+    except OSError:
+        return [], []
+    dirs, files = [], []
+    for e in entries:
+        try:
+            isdir = os.path.isdir(os.path.join(path, e))
+        except OSError:
+            isdir = False
+        (dirs if isdir else files).append(e)
+    dirs.sort(key=str.lower)
+    files.sort(key=str.lower)
+    if filt:
+        low = filt.lower()
+        if any(ch in filt for ch in "*?[]"):
+            files = [x for x in files if fnmatch.fnmatch(x.lower(), low)]
+        else:
+            files = [x for x in files if low in x.lower()]
+    return dirs, files
+
+
+def _fb_termsize():
+    try:
+        sz = os.get_terminal_size()
+        return max(40, sz.columns), max(10, sz.lines)
+    except Exception:
+        return 100, 30
+
+
+def _fb_trunc(s, width):
+    if len(s) <= width:
+        return s
+    return s[:max(1, width - 1)] + "\u2026"
+
+
+def _fb_write_frame(lines):
+    """Draws a frame with minimal flicker (home, per-line clear, clear-to-end)."""
+    out = "\x1b[H" + "\n".join(line + "\x1b[K" for line in lines) + "\x1b[J"
+    sys.stdout.write(out)
+    sys.stdout.flush()
+
+
+def _fb_prompt_line(label, initial=""):
+    """Modal single-line input in raw mode. Enter=confirm (returns text),
+    Esc=cancel (returns None). The caller redraws its own frame afterwards."""
+    buf = initial
+    while True:
+        _fb_write_frame([f"{Fore.CYAN}{label}{Style.RESET_ALL}",
+                         f"{Fore.GREEN}> {buf}{Style.RESET_ALL}", "",
+                         f"{Style.DIM}Enter = confirm | Esc = cancel{Style.RESET_ALL}"])
+        k = _read_key()
+        if k == "enter":
+            return buf
+        if k == "esc":
+            return None
+        if k == "backspace":
+            buf = buf[:-1]
+        elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+            buf += k[1]
+
+
+def _fb_pick_location(cwd):
+    """Small picker: drives (Windows) / quick locations (Linux). Returns a path
+    or None. Navigated with up/down + Enter, Esc cancels."""
+    opts = []
+    for d in _fb_drives():
+        opts.append((f"Drive {d}", d))
+    home = os.path.expanduser("~")
+    if os.path.isdir(home):
+        opts.append((f"Home  ({home})", home))
+    opts.append(("Type a path manually...", "__manual__"))
+    pos = 0
+    while True:
+        lines = [f"{Fore.MAGENTA}=== Jump to ==={Style.RESET_ALL}", ""]
+        for i, (lbl, _p) in enumerate(opts):
+            if i == pos:
+                lines.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {lbl}{Style.RESET_ALL}")
+            else:
+                lines.append(f"  {lbl}")
+        lines += ["", f"{Style.DIM}\u2191\u2193 move | Enter = go | Esc = cancel{Style.RESET_ALL}"]
+        _fb_write_frame(lines)
+        k = _read_key()
+        if k == "up":
+            pos = (pos - 1) % len(opts)
+        elif k == "down":
+            pos = (pos + 1) % len(opts)
+        elif k == "esc":
+            return None
+        elif k in ("enter", "right"):
+            target = opts[pos][1]
+            if target == "__manual__":
+                p = _fb_prompt_line("Enter a directory path:", cwd)
+                if p and os.path.isdir(p):
+                    return os.path.abspath(p)
+                return None
+            if os.path.isdir(target):
+                return os.path.abspath(target)
+            return None
+
+
+def _fb_rename_preview(cwd, files):
+    """Interactive rename preview for the given files. Toggle options with keys and
+    watch the before/after update live; apply with Enter/F2. Returns True if files
+    were renamed, else False. Esc/q cancels back to the browser."""
+    opts = {"pad": False, "case": "title", "words": False, "strict": False, "group": False}
+    removes, removes_src = [], []
+    top = 0
+    while True:
+        plan, n_groups = _rn_build_plan(
+            files, opts["pad"], (True if opts["strict"] else opts["words"]), 0,
+            removes=removes, case_mode=opts["case"], strict=opts["strict"],
+            group=opts["group"], group_min=1)
+        try:
+            existing = set(os.listdir(cwd))
+        except OSError:
+            existing = set()
+        skip = _rn_detect_collisions(plan, existing)
+        changed = [(o, n) for o, n in plan if o != n and o not in skip]
+        skipped = [(o, n) for o, n in plan if o in skip]
+        unchanged = [(o, n) for o, n in plan if o == n]
+
+        cols, rows = _fb_termsize()
+        half = max(20, (cols - 8) // 2)
+        header = [
+            f"{Fore.MAGENTA}=== Rename preview - {len(files)} file(s) ==={Style.RESET_ALL}",
+            (f"{Fore.CYAN}[p]{Style.RESET_ALL} pad:{_fb_onoff(opts['pad'])}   "
+             f"{Fore.CYAN}[c]{Style.RESET_ALL} case:{opts['case']:5}   "
+             f"{Fore.CYAN}[w]{Style.RESET_ALL} fill-words:{_fb_onoff(opts['words'])}   "
+             f"{Fore.CYAN}[s]{Style.RESET_ALL} strict:{_fb_onoff(opts['strict'])}   "
+             f"{Fore.CYAN}[g]{Style.RESET_ALL} series:{_fb_onoff(opts['group'])}"),
+            (f"{Fore.CYAN}[x]{Style.RESET_ALL} add strip-regex   "
+             f"{Fore.CYAN}[X]{Style.RESET_ALL} clear   "
+             + (f"strip: {', '.join(removes_src)}" if removes_src else "strip: (none)")),
+            "",
+        ]
+        body = []
+        rows_avail = max(6, rows - len(header) - 3)
+        view = changed + skipped
+        if top > max(0, len(view) - rows_avail):
+            top = max(0, len(view) - rows_avail)
+        for o, n in view[top:top + rows_avail]:
+            conflict = o in skip
+            arrow = f"{Fore.RED}->{Style.RESET_ALL}" if conflict else f"{Fore.CYAN}->{Style.RESET_ALL}"
+            ncol = Fore.RED if conflict else Fore.GREEN
+            tail = "  [CONFLICT]" if conflict else ""
+            body.append(f"  {_fb_trunc(o, half):<{half}} {arrow} {ncol}{_fb_trunc(n, half)}{tail}{Style.RESET_ALL}")
+        if not view:
+            body.append(f"  {Style.DIM}(nothing changes with the current options){Style.RESET_ALL}")
+
+        summary = (f"{Fore.GREEN}Changed: {len(changed)}{Style.RESET_ALL}   "
+                   f"{Fore.RED}Conflicts: {len(skipped)}{Style.RESET_ALL}   "
+                   f"{Style.DIM}Unchanged: {len(unchanged)}{Style.RESET_ALL}")
+        footer = (f"{Style.DIM}\u2191\u2193/PgUp/PgDn scroll | Enter = APPLY | Esc = cancel"
+                  f"{Style.RESET_ALL}")
+        _fb_write_frame(header + body + ["", summary, footer])
+
+        k = _read_key()
+        if k in ("esc",) or k == ("char", "q"):
+            return False
+        if k == "enter":
+            if not changed:
+                continue
+            _fb_leave_screen()
+            _rn_apply(changed, cwd)
+            try:
+                input(f"\n{Fore.CYAN}Renamed. Press Enter to continue...{Style.RESET_ALL}")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            return True
+        if k == "down":
+            top = min(max(0, len(view) - rows_avail), top + 1)
+        elif k == "up":
+            top = max(0, top - 1)
+        elif k == "pgdn":
+            top = min(max(0, len(view) - rows_avail), top + rows_avail)
+        elif k == "pgup":
+            top = max(0, top - rows_avail)
+        elif isinstance(k, tuple) and k[0] == "char":
+            ch = k[1]
+            if ch == "p":
+                opts["pad"] = not opts["pad"]
+            elif ch == "w":
+                opts["words"] = not opts["words"]
+            elif ch == "s":
+                opts["strict"] = not opts["strict"]
+            elif ch == "g":
+                opts["group"] = not opts["group"]
+            elif ch == "c":
+                order = ["title", "keep", "lower", "upper"]
+                opts["case"] = order[(order.index(opts["case"]) + 1) % len(order)]
+            elif ch == "x":
+                rx = _fb_prompt_line("Regex to strip from names (e.g. \\(UNCUT\\) or \\[1080p\\]):", "")
+                if rx:
+                    try:
+                        removes.append(re.compile(rx))
+                        removes_src.append(rx)
+                    except re.error:
+                        pass
+            elif ch == "X":
+                removes, removes_src = [], []
+
+
+def _fb_onoff(v):
+    return f"{Fore.GREEN}ON {Style.RESET_ALL}" if v else f"{Style.DIM}off{Style.RESET_ALL}"
+
+
+def _fb_enter_screen():
+    sys.stdout.write("\x1b[?25l")   # hide cursor
+    sys.stdout.flush()
+
+
+def _fb_leave_screen():
+    sys.stdout.write("\x1b[?25h\x1b[0m")   # show cursor, reset
+    sys.stdout.flush()
+
+
+def run_rename_files(args):
+    """Total Commander-style interactive file browser + renamer. Loads the current
+    directory, lets you navigate into folders / up a level, jump between drives, tag
+    files, filter live, and then preview + apply intelligent renames - all via the
+    keyboard, cross-platform (Windows + Linux)."""
+    start = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(start):
+        start = os.path.dirname(start) or "."
+    cwd = os.path.abspath(start)
+
+    if not _tui_supported():
+        log_warn("The interactive file browser needs a real terminal (a TTY).")
+        log_info("Run it directly on your machine's console, not through a pipe/redirect.")
+        return
+
+    tagged = set()
+    filt = ""
+    filter_editing = False
+    cursor = 0
+    top = 0
+    status = ""
+
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                dirs, files = _fb_list(cwd, filt)
+                # display rows: ".." + dirs + files
+                rows_items = [("..", "up")] + [(d, "dir") for d in dirs] + [(f, "file") for f in files]
+                n = len(rows_items)
+                if cursor >= n:
+                    cursor = n - 1
+                if cursor < 0:
+                    cursor = 0
+
+                cols, rows = _fb_termsize()
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - intelligent rename ==={Style.RESET_ALL}",
+                    f"{Fore.CYAN}Path:{Style.RESET_ALL} {_fb_trunc(cwd, cols - 8)}",
+                ]
+                tagcount = len([f for f in files if f in tagged])
+                if filter_editing:
+                    head.append(f"{Fore.YELLOW}Filter (typing):{Style.RESET_ALL} {filt}\u2588   "
+                                f"{Style.DIM}Enter=keep Esc=clear{Style.RESET_ALL}")
+                else:
+                    head.append(f"{Fore.CYAN}Filter:{Style.RESET_ALL} "
+                                + (filt if filt else f"{Style.DIM}(none){Style.RESET_ALL}")
+                                + f"    {Fore.CYAN}Tagged:{Style.RESET_ALL} {tagcount}/{len(files)}")
+                head.append("")
+
+                foot = [
+                    "",
+                    (f"{Style.DIM}\u2191\u2193 move | Enter/\u2192 open dir | \u2190/Bksp up | "
+                     f"Space tag | * tag-all | / filter | d drive | r RENAME | q quit{Style.RESET_ALL}"),
+                ]
+                if status:
+                    foot.append(f"{Fore.YELLOW}{status}{Style.RESET_ALL}")
+
+                body_rows = max(4, rows - len(head) - len(foot))
+                if cursor < top:
+                    top = cursor
+                elif cursor >= top + body_rows:
+                    top = cursor - body_rows + 1
+                if top < 0:
+                    top = 0
+
+                body = []
+                if top > 0:
+                    body.append(f"  {Fore.CYAN}\u25b2 ({top} above){Style.RESET_ALL}")
+                    view_start = top + 1
+                else:
+                    view_start = top
+                shown = rows_items[view_start:view_start + body_rows - (1 if top > 0 else 0)]
+                for idx, (name, kind) in enumerate(shown, start=view_start):
+                    is_cur = (idx == cursor)
+                    tag = "*" if (kind == "file" and name in tagged) else " "
+                    if kind == "up":
+                        base = ".. (up one level)"
+                        col = Fore.CYAN
+                    elif kind == "dir":
+                        base = "[" + name + "]"
+                        col = Fore.CYAN + Style.BRIGHT
+                    else:
+                        base = name
+                        col = Fore.YELLOW if name in tagged else ""
+                    disp = _fb_trunc(base, cols - 6)
+                    if is_cur:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a{tag} {disp}{Style.RESET_ALL}")
+                    else:
+                        body.append(f" {tag} {col}{disp}{Style.RESET_ALL}")
+                rest = n - (view_start + len(shown))
+                if rest > 0:
+                    body.append(f"  {Fore.CYAN}\u25bc ({rest} below){Style.RESET_ALL}")
+
+                _fb_write_frame(head + body + foot)
+                status = ""
+                k = _read_key()
+
+                # ----- filter editing mode -----
+                if filter_editing:
+                    if k == "enter":
+                        filter_editing = False
+                    elif k == "esc":
+                        filter_editing = False
+                        filt = ""
+                        cursor = 0
+                    elif k == "backspace":
+                        filt = filt[:-1]
+                        cursor = 0
+                    elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                        filt += k[1]
+                        cursor = 0
+                    continue
+
+                # ----- normal navigation -----
+                if k == "up":
+                    cursor = (cursor - 1) % n
+                elif k == "down":
+                    cursor = (cursor + 1) % n
+                elif k == "pgup":
+                    cursor = max(0, cursor - body_rows)
+                elif k == "pgdn":
+                    cursor = min(n - 1, cursor + body_rows)
+                elif k == "home":
+                    cursor = 0
+                elif k == "end":
+                    cursor = n - 1
+                elif k in ("enter", "right"):
+                    name, kind = rows_items[cursor]
+                    if kind == "up":
+                        parent = os.path.dirname(cwd.rstrip(os.sep)) or cwd
+                        if os.path.isdir(parent):
+                            cwd, cursor, top, tagged, filt = os.path.abspath(parent), 0, 0, set(), ""
+                    elif kind == "dir":
+                        target = os.path.join(cwd, name)
+                        if os.path.isdir(target):
+                            cwd, cursor, top, tagged, filt = os.path.abspath(target), 0, 0, set(), ""
+                    else:                              # file -> toggle tag
+                        tagged.symmetric_difference_update({name})
+                elif k in ("left", "backspace"):
+                    parent = os.path.dirname(cwd.rstrip(os.sep)) or cwd
+                    if os.path.isdir(parent):
+                        cwd, cursor, top, tagged, filt = os.path.abspath(parent), 0, 0, set(), ""
+                elif isinstance(k, tuple) and k[0] == "char":
+                    ch = k[1]
+                    if ch == " ":
+                        name, kind = rows_items[cursor]
+                        if kind == "file":
+                            tagged.symmetric_difference_update({name})
+                            cursor = min(n - 1, cursor + 1)
+                    elif ch == "*":
+                        if all(f in tagged for f in files):
+                            tagged -= set(files)
+                        else:
+                            tagged |= set(files)
+                    elif ch == "/":
+                        filter_editing = True
+                    elif ch in ("d", "D"):
+                        dest = _fb_pick_location(cwd)
+                        if dest:
+                            cwd, cursor, top, tagged, filt = dest, 0, 0, set(), ""
+                    elif ch in ("r", "R", "F", "f"):
+                        sel = [f for f in files if f in tagged] or list(files)
+                        if not sel:
+                            status = "No files here to rename."
+                        else:
+                            _fb_rename_preview(cwd, sel)
+                            tagged = set()
+                    elif ch in ("q", "Q"):
+                        break
+                    elif ch in ("?", "h"):
+                        _fb_help_overlay()
+                elif k == "esc":
+                    if filt:
+                        filt = ""
+                        cursor = 0
+                    else:
+                        break
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _fb_help_overlay():
+    lines = [
+        f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - help ==={Style.RESET_ALL}", "",
+        f"{Fore.CYAN}Navigation{Style.RESET_ALL}",
+        "  Up/Down, PgUp/PgDn, Home/End   move the cursor",
+        "  Enter / Right                  open a folder (or tag a file)",
+        "  Left / Backspace               go up one level",
+        "  d                              jump to a drive / home / typed path",
+        "", f"{Fore.CYAN}Selecting{Style.RESET_ALL}",
+        "  Space                          tag / untag the file under the cursor",
+        "  *                              tag / untag ALL files shown",
+        "  /                              live filter (type to narrow, Enter keeps, Esc clears)",
+        "", f"{Fore.CYAN}Renaming{Style.RESET_ALL}",
+        "  r                              open the rename preview for the tagged files",
+        "                                 (or all shown files if none are tagged)",
+        "  In preview: p/c/w/s/g toggle options, x/X strip-regex,",
+        "              Enter = apply, Esc = cancel",
+        "", f"{Fore.CYAN}Other{Style.RESET_ALL}",
+        "  q / Esc                        quit back to the menu",
+        "", f"{Style.DIM}Press any key to return...{Style.RESET_ALL}",
+    ]
+    _fb_write_frame(lines)
+    _read_key()
+
+
 _INTERACTIVE_COMMANDS = {
     "auto": ("Synchronize one subtitle file", "run_auto_single"),
     "auto-all": ("Synchronize the whole folder", "run_auto_all"),
@@ -6611,6 +7950,10 @@ _INTERACTIVE_COMMANDS = {
     "remove-tracks": ("Remove tracks from MKV", "run_remove_tracks"),
     "set-default": ("Set the default track", "run_set_default"),
     "rename-subs": ("Rename subtitles", "run_rename_subs"),
+    "extract-audio": ("Extract audio track from videos", "run_extract_audio"),
+    "import-audio": ("Insert (mux) external audio into videos", "run_import_audio"),
+    "convert-audio": ("Convert audio (e.g. to AC-3)", "run_convert_audio"),
+    "rename-files": ("Intelligent file rename", "run_rename_files"),
 }
 
 
@@ -6623,6 +7966,8 @@ def dispatch_interactive_command(cmd, args):
         "merge-pro": run_transplant, "resync-pro": run_resync_pro,
         "import-subs": run_import_subs, "remove-tracks": run_remove_tracks,
         "set-default": run_set_default, "rename-subs": run_rename_subs,
+        "extract-audio": run_extract_audio, "import-audio": run_import_audio,
+        "convert-audio": run_convert_audio, "rename-files": run_rename_files,
     }.get(cmd)
     if not fn:
         die(f"Unknown command in the preset: {cmd}")
@@ -6707,153 +8052,232 @@ def run_presets_menu(args):
             return
 
 
+def _wizard_action_specs():
+    """Returns the action registry: key -> dict(label, help, kind, run, flag, preset).
+    kind: 'wizard' (flag+preset+back), 'readability', 'config', 'presets', 'direct'."""
+    return {
+        "sync-one": dict(
+            label="Synchronize ONE subtitle file (to a video or other subtitles)",
+            help="Pick a subtitle file with bad timing and a source of correct timing (a subtitle "
+                 "track from a video, or a second .srt). Works between two .srt without a video too.",
+            kind="wizard", run=run_auto_single, flag="auto", preset="auto"),
+        "sync-folder": dict(
+            label="Synchronize a WHOLE FOLDER (batch of videos + their subtitles)",
+            help="For each video in the directory it computes the timing for its matching subtitles.",
+            kind="wizard", run=run_auto_all, flag="auto_all", preset="auto-all"),
+        "translate": dict(
+            label="Translate subtitles into another language and save as .srt",
+            help="Extracts a track from a video or takes an existing .srt, translates into the target "
+                 "language (Gemini/Google/DeepL/Claude/Argos) + proofreading, saves <name>.<lang>.srt.",
+            kind="wizard", run=run_translate_subs, flag="translate_subs", preset="translate-subs"),
+        "extract-subs": dict(
+            label="Extract subtitles from videos into .srt - pick which tracks",
+            help="From each video it extracts subtitle tracks into .srt. You pick which (by language, "
+                 "specific tracks, or all text ones). Image subtitles (PGS/VobSub) can't go to text.",
+            kind="wizard", run=run_extract_subs, flag="extract_subs", preset="extract-subs"),
+        "merge-pro": dict(
+            label="Replace a MACHINE translation with a PROFESSIONAL one (by content, timing stays)",
+            help="You have machine/AI subtitles with good timing and a professional translation of the "
+                 "same show elsewhere. By content it inserts the pro text but keeps your timing.",
+            kind="wizard", run=run_transplant, flag="merge_pro", preset="merge-pro"),
+        "resync-pro": dict(
+            label="Re-time PROFESSIONAL subtitles to MY timing (100% pro text)",
+            help="Takes the whole professional translation from another directory and re-times it to "
+                 "your timing. Result = 100% professional text with correct timing.",
+            kind="wizard", run=run_resync_pro, flag="resync_pro", preset="resync-pro"),
+        "import-subs": dict(
+            label="Insert (mux) subtitles from a folder into videos (by SxxExx)",
+            help="Muxes .srt/.ass from a folder into videos (paired via SxxExx) using MKVToolNix. Sets "
+                 "language, track name, forced and optionally the default track. Output is always MKV.",
+            kind="wizard", run=run_import_subs, flag="import_subs", preset="import-subs"),
+        "rename-subs": dict(
+            label="Rename subtitles by video names (SxxExx)",
+            help="Renames .srt by the name of the matching video (paired via SxxExx), keeps the "
+                 "language/forced suffix. Shows the plan first.",
+            kind="wizard", run=run_rename_subs, flag="rename_subs", preset="rename-subs"),
+        "fix-readability": dict(
+            label="Just fix subtitle READABILITY (extend too-short ones)",
+            help="Only extends too-briefly displayed subtitles into free space. When there are no .srt "
+                 "in the folder, it offers extraction from videos.",
+            kind="readability", run=run_fix_readability, flag="fix_readability", preset=None),
+        "p1": dict(
+            label="[preset] Extract CZECH subtitles + readability (--p1)",
+            help="Fixed preset: extracts the Czech subtitle track from every video and applies the "
+                 "readability fix (9 chars/s, min 2.5s). Asks only if several Czech tracks exist.",
+            kind="direct", run=run_p1, flag=None, preset=None),
+        "p2": dict(
+            label="[preset] Translate ENGLISH -> CZECH + readability (--p2)",
+            help="Fixed preset: extracts the English track, translates to Czech (google, free) + rules "
+                 "proofreading + readability fix, saves <video>.cs.srt. Asks only if several EN tracks exist.",
+            kind="direct", run=run_p2, flag=None, preset=None),
+        "extract-audio": dict(
+            label="Extract an audio track from videos (stream copy)",
+            help="Extracts an audio track (by language) from each video into a standalone audio file "
+                 "via ffmpeg stream copy (no re-encoding). Asks only if several matching tracks exist.",
+            kind="wizard", run=run_extract_audio, flag="extract_audio", preset="extract-audio"),
+        "import-audio": dict(
+            label="Insert (mux) external audio into videos (by SxxExx)",
+            help="Muxes an external audio file (paired by SxxExx) into each video as the default audio, "
+                 "sets a chosen subtitle language as default and fills track names. Output <name>_merged.mkv.",
+            kind="wizard", run=run_import_audio, flag="import_audio", preset="import-audio"),
+        "convert-audio": dict(
+            label="Convert audio (re-encode, e.g. to AC-3)",
+            help="Re-encodes all audio in each MKV to a chosen codec (AC-3/E-AC-3/AAC) at a chosen "
+                 "bitrate, copying video and subtitles. Output <name>_<codec>.mkv (or overwrite).",
+            kind="wizard", run=run_convert_audio, flag="convert_audio", preset="convert-audio"),
+        "remove-tracks": dict(
+            label="Remove audio/subtitle tracks from MKV (by language)",
+            help="Shows the languages of audio/subtitle tracks and you pick which to drop (fast remux). "
+                 "Originals can be kept (the 'trimmed' subfolder).",
+            kind="wizard", run=run_remove_tracks, flag="remove_tracks", preset="remove-tracks"),
+        "set-default": dict(
+            label="Set the DEFAULT track by language",
+            help="Clears old default flags and sets the default audio/subtitles by language. MKV in "
+                 "place (mkvpropedit), MP4 via remux (ffmpeg).",
+            kind="wizard", run=run_set_default, flag="set_default", preset="set-default"),
+        "rename-files": dict(
+            label="Intelligent file rename (bulk, preview first)",
+            help="Unifies file names by a glob pattern: zero-pads numbers, fills missing common words, "
+                 "normalizes case, strips emoji/illegal characters, auto-detects series. Preview then apply.",
+            kind="wizard", run=run_rename_files, flag="rename_files", preset="rename-files"),
+        "presets": dict(
+            label="Presets - run a saved configuration with a single choice (or create one)",
+            help="Saved wizard configurations named by you. Pick one and it runs with the saved choices. "
+                 "You can create and delete presets here too.",
+            kind="presets", run=None, flag=None, preset=None),
+        "config": dict(
+            label="Set API keys and default options (video_tool.config.json)",
+            help="Saves API keys and default options into video_tool.config.json (loaded automatically).",
+            kind="config", run=run_config, flag=None, preset=None),
+        "test-api": dict(
+            label="Test the AI API (Anthropic/OpenAI) - verify the key and model",
+            help="Sends a trivial query and prints the exact response/error (debugging e.g. HTTP 400).",
+            kind="direct", run=run_test_api, flag=None, preset=None),
+    }
+
+
+_WIZARD_CATEGORIES = [
+    ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
+     ["sync-one", "sync-folder", "translate", "extract-subs", "merge-pro",
+      "resync-pro", "import-subs", "rename-subs", "fix-readability", "p1", "p2"]),
+    ("Audio", "Extract, mux and convert audio tracks",
+     ["extract-audio", "import-audio", "convert-audio"]),
+    ("Video / tracks", "Remove tracks, set the default track",
+     ["remove-tracks", "set-default"]),
+    ("Files", "Intelligent bulk file renaming",
+     ["rename-files"]),
+    ("Presets & settings", "Saved presets, API keys/config, API test",
+     ["presets", "config", "test-api"]),
+]
+
+_WIZARD_MODE_FLAGS = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
+                      "extract_subs", "import_subs", "remove_tracks", "set_default",
+                      "rename_subs", "fix_readability", "extract_audio", "import_audio",
+                      "convert_audio", "rename_files")
+
+
+def _run_wizard_action(key, args):
+    """Runs a single action from the registry with the right preset/back behavior."""
+    specs = _wizard_action_specs()
+    spec = specs[key]
+    kind = spec["kind"]
+    if kind == "presets":
+        try:
+            run_presets_menu(args)
+        except WizardBack:
+            pass
+        return False   # no post-run pause (presets menu handles its own flow)
+    if spec["flag"]:
+        setattr(args, spec["flag"], True)
+    if kind == "wizard":
+        preset_begin_offer(spec["preset"])
+        run_with_back(spec["run"], args)
+    elif kind == "readability":
+        run_with_back(spec["run"], args)
+    elif kind == "config":
+        run_with_back(spec["run"], args)
+    else:   # direct (p1/p2/test-api)
+        spec["run"](args)
+    return True
+
+
 def run_master_wizard(args):
-    """Main wizard when started WITHOUT arguments: asks what you want to do,
-    runs the appropriate sub-wizard and at the end offers to save it as a preset."""
+    """Main wizard when started WITHOUT arguments: a two-level menu (category ->
+    action). Runs the chosen sub-wizard and, where applicable, offers to save the
+    choices as a preset at the end."""
     _orig_mkv = getattr(args, "mkv", None)
-    _mode_flags = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
-                   "extract_subs", "import_subs", "remove_tracks", "set_default",
-                   "rename_subs", "fix_readability")
-    _last_pos = 1   # where the cursor was last (at start = default "batch")
+    specs = _wizard_action_specs()
+    cat_pos = 0
     while True:
         # clean state for each visit to the main menu
         args.mkv = _orig_mkv
-        for _f in _mode_flags:
+        for _f in _WIZARD_MODE_FLAGS:
             if hasattr(args, _f):
                 setattr(args, _f, False)
-        for _a in ("_extract_skip_prompts",):
-            if hasattr(args, _a):
-                setattr(args, _a, False)
+        if hasattr(args, "_extract_skip_prompts"):
+            args._extract_skip_prompts = False
         global _PRESET_MODE, _PRESET_SAVED
         _PRESET_MODE = None
         _PRESET_SAVED = False
-        mode = ask_pick(
-            "What do you want to do?",
-            ["Synchronize ONE subtitle file (mistimed) to a video or other subtitles",
-             "Synchronize a WHOLE FOLDER (batch of videos + their subtitles)",
-             "Translate subtitles from a video into another language and save as .srt",
-             "Extract subtitles from videos into .srt - pick which tracks",
-             "Replace a MACHINE translation with a PROFESSIONAL one (by content, timing stays)",
-             "Re-time PROFESSIONAL subtitles to MY timing (100% pro text)",
-             "Insert (mux) subtitles from a folder into videos (by SxxExx)",
-             "Remove audio/subtitle tracks from MKV (by language)",
-             "Set the DEFAULT track by language",
-             "Rename subtitles by video names (SxxExx)",
-             "Presets - run a saved configuration with a single choice (or create one)",
-             "Just fix subtitle READABILITY (extend too-short ones)",
-             "Set API keys and default options (video_tool.config.json)",
-             "Test the AI API (Anthropic/OpenAI) - verify the key and model"],
-            default=1,
-            allow_back=True,
-            cursor=_last_pos,
-            header=[f"{Fore.MAGENTA}=== video_tool - interactive wizard ==={Style.RESET_ALL}",
-                    f"{Fore.CYAN}Tip:{Style.RESET_ALL} pick an action with the arrows (type = search, ? = help, Esc = quit). "
-                    "At the end you can save the choices as a preset.",
-                    ""],
-            help=["Synchronize one subtitle file: you pick a subtitle file with bad timing and a "
-                  "source of correct timing (a subtitle track from a video, or a second .srt). Without a "
-                  "video it can also work between two .srt.",
-                  "Whole-folder batch: for each video in the directory it computes the timing for its subtitles.",
-                  "Subtitle translation: extracts a track from a video or takes an existing .srt, translates into the "
-                  "target language (Gemini/Google/DeepL/Claude/Argos) + proofreading, saves <name>.<lang>.srt.",
-                  "Subtitle extraction: from each video (mkv/mp4/...) it extracts subtitle tracks into .srt. "
-                  "Tracks are detected directly from the video; you pick which (by language, specific tracks, or "
-                  "all text ones). Image-based subtitles (PGS/VobSub) can't go to text.",
-                  "Replace machine translation with professional: you have your own/AI subtitles with good timing and "
-                  "elsewhere a professional translation of the SAME show (possibly a different release / episode count). By "
-                  "CONTENT it matches lines and inserts the professional text, but KEEPS your timing. It covers "
-                  "only lines with a confident match; the rest stays machine.",
-                  "Re-time professional subtitles to my timing: the OPPOSITE approach - it takes the WHOLE "
-                  "professional translation from another directory and re-times it to your timing. Result = "
-                  "100% professional text with correct timing. Best when you want pro subtitles "
-                  "na svou verzi videa.",
-                  "Insert subtitles into videos: muxes .srt/.ass from a folder into videos (paired via SxxExx) "
-                  "using MKVToolNix. Sets language, track name, forced and optionally the default track. "
-                  "The output is always MKV (even from MP4).",
-                  "Remove tracks from MKV: shows the languages of audio/subtitle tracks and you pick which to drop "
-                  "(a fast remux -c copy). Originals can be kept (the 'trimmed' subfolder).",
-                  "Default track: clears old default flags and sets the default audio/subtitles by language. "
-                  "MKV in place (mkvpropedit), MP4 via remux (ffmpeg).",
-                  "Rename subtitles: renames .srt by the name of the matching video (paired via "
-                  "SxxExx), keeps the language/forced suffix. Shows the plan first.",
-                  "Presets: saved wizard configurations named by you. You pick a preset and the operation "
-                  "runs right away with the saved choices. You can create and delete a preset here too. (A preset "
-                  "can also be saved at the end of each wizard via the 'Save as preset?' question.)",
-                  "Readability: only extends too-briefly displayed subtitles into free space. When there "
-                  "are no .srt in the folder, it offers extraction from videos.",
-                  "Config: saves API keys and default options into video_tool.config.json (loaded automatically).",
-                  "Test API: sends a trivial query and prints the exact response/error (debugging e.g. HTTP 400)."])
 
-        if mode is None:
+        cat_labels = [f"{name}   {Fore.CYAN}-  {desc}{Style.RESET_ALL}"
+                      for name, desc, _keys in _WIZARD_CATEGORIES]
+        ci = ask_pick(
+            "What do you want to work with?",
+            cat_labels, default=0, allow_back=True, cursor=cat_pos,
+            header=[f"{Fore.MAGENTA}=== video_tool - interactive wizard ==={Style.RESET_ALL}",
+                    f"{Fore.CYAN}Tip:{Style.RESET_ALL} pick a category, then an action (type = search, "
+                    "? = help, Esc = back). At the end you can save the choices as a preset.",
+                    ""],
+            help=[desc for _n, desc, _k in _WIZARD_CATEGORIES])
+        if ci is None:
             log_info("Quit.")
             return
-        _last_pos = mode   # remember the position for returning to the menu
-        if mode == 10:
-            try:
-                run_presets_menu(args)
-            except WizardBack:
-                pass
-            continue
+        cat_pos = ci
+        cat_name, _desc, keys = _WIZARD_CATEGORIES[ci]
 
-        try:
-            if mode == 12:
-                run_with_back(run_config, args)
-            elif mode == 13:
-                run_test_api(args)
-            elif mode == 11:
-                args.fix_readability = True
-                run_with_back(run_fix_readability, args)
-            elif mode == 9:
-                args.rename_subs = True
-                preset_begin_offer("rename-subs")
-                run_with_back(run_rename_subs, args)
-            elif mode == 8:
-                args.set_default = True
-                preset_begin_offer("set-default")
-                run_with_back(run_set_default, args)
-            elif mode == 7:
-                args.remove_tracks = True
-                preset_begin_offer("remove-tracks")
-                run_with_back(run_remove_tracks, args)
-            elif mode == 6:
-                args.import_subs = True
-                preset_begin_offer("import-subs")
-                run_with_back(run_import_subs, args)
-            elif mode == 5:
-                args.resync_pro = True
-                preset_begin_offer("resync-pro")
-                run_with_back(run_resync_pro, args)
-            elif mode == 4:
-                args.merge_pro = True
-                preset_begin_offer("merge-pro")
-                run_with_back(run_transplant, args)
-            elif mode == 3:
-                args.extract_subs = True
-                preset_begin_offer("extract-subs")
-                run_with_back(run_extract_subs, args)
-            else:
-                cmd = ["auto", "auto-all", "translate-subs"][mode]
-                if mode == 0:
-                    args.auto = True
-                elif mode == 1:
-                    args.auto_all = True
-                else:
-                    args.translate_subs = True
-                preset_begin_offer(cmd)
-                if cmd == "auto":
-                    run_with_back(run_auto_single, args)
-                elif cmd == "auto-all":
-                    run_with_back(run_auto_all, args)
-                else:
-                    run_with_back(run_translate_subs, args)
-        except WizardBack:
-            continue   # Esc on the first wizard question -> back to the main menu
-        # after the action finishes, wait (so the result stays visible), then back to the menu
-        try:
-            input(f"\n{Fore.CYAN}Done - press Enter to return to the main menu (Ctrl+C = quit)...{Style.RESET_ALL}")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
+        # submenu of this category
+        act_pos = 0
+        while True:
+            labels = [specs[k]["label"] for k in keys]
+            ai = ask_pick(
+                f"{cat_name} - what to do?",
+                labels, default=0, allow_back=True, cursor=act_pos,
+                header=[f"{Fore.MAGENTA}=== {cat_name} ==={Style.RESET_ALL}",
+                        f"{Fore.CYAN}Esc = back to categories.{Style.RESET_ALL}", ""],
+                help=[specs[k]["help"] for k in keys])
+            if ai is None:
+                break   # back to categories
+            act_pos = ai
+            key = keys[ai]
+            try:
+                did_run = _run_wizard_action(key, args)
+            except WizardBack:
+                continue   # Esc on the first question -> back to this submenu
+            except KeyboardInterrupt:
+                print()
+                return
+            except SystemExit:
+                # a die() inside a wizard must not kill the whole menu - the error
+                # message was already printed; fall through and return to the menu
+                did_run = True
+            except Exception as e:
+                log_warn(f"This action ended with an error: {e}")
+                did_run = True
+            if not did_run:
+                continue
+            try:
+                input(f"\n{Fore.CYAN}Done - press Enter to return to the menu "
+                      f"(Ctrl+C = quit)...{Style.RESET_ALL}")
+            except (EOFError, KeyboardInterrupt):
+                print()
+                return
+            # reset flags before next action in the submenu
+            for _f in _WIZARD_MODE_FLAGS:
+                if hasattr(args, _f):
+                    setattr(args, _f, False)
+            _PRESET_MODE = None
+            _PRESET_SAVED = False
 
 
 def _pause_for_menu(seconds=3.0):
@@ -6906,48 +8330,59 @@ def _colorize_help_text(text):
     return "\n".join(out)
 
 
-def _probe_lang_subs(mkvmerge_bin, videos, lang3):
-    """For each video, returns its TEXT subtitle tracks whose canonical language
-    equals lang3 (e.g. 'cze'/'eng'). Result: {video_path: {'subs': [tracks]}} using
-    the rich probe (id, lang, name, codec, default, forced)."""
+def _probe_lang_tracks(mkvmerge_bin, videos, kind, lang3=None, text_only=False):
+    """For each video, returns its tracks of the given kind ('subs'/'audio') whose
+    canonical language equals lang3 (None = any). text_only filters to text subtitle
+    codecs. Result: {video: {kind: [matching], '_all': [all tracks of kind]}} using
+    the rich mkvmerge probe (id, lang, name, codec, default, forced)."""
     infos = {}
     for v in videos:
         try:
             full = _mkv_probe_full(mkvmerge_bin, Path(v))
         except Exception:
-            full = {"subs": []}
-        matching = [t for t in full.get("subs", [])
-                    if is_text_codec(t.get("codec", "")) and _canon3(t.get("lang")) == lang3]
-        infos[str(v)] = {"subs": matching}
+            full = {"audio": [], "subs": []}
+        allk = full.get(kind, [])
+        matching = list(allk)
+        if text_only:
+            matching = [t for t in matching if is_text_codec(t.get("codec", ""))]
+        if lang3:
+            matching = [t for t in matching if _canon3(t.get("lang")) == lang3]
+        infos[str(v)] = {kind: matching, "_all": allk}
     return infos
 
 
-def _select_lang_track_key(videos, infos, lang_word, interactive):
+def _probe_lang_subs(mkvmerge_bin, videos, lang3):
+    """Backwards-compatible wrapper: text subtitle tracks in the given language."""
+    return _probe_lang_tracks(mkvmerge_bin, videos, "subs", lang3, text_only=True)
+
+
+def _select_lang_track_key(videos, infos, kind, lang_word, interactive):
     """Given per-video matching tracks, decide which track identity to use for the
     whole batch. With a single identity -> auto (no question). With several ->
     interactively let the user pick, showing a detailed listing to identify the
-    track. Returns (key or None, aborted: bool). key=None means nothing matched."""
-    keys = _aggregate_track_keys(infos, "subs")   # [(key, label, count)]
+    track. Returns (key or None, aborted: bool). key=None means nothing matched.
+    kind: 'subs' or 'audio'."""
+    track_word = "subtitle" if kind == "subs" else "audio"
+    keys = _aggregate_track_keys(infos, kind)   # [(key, label, count)]
     if not keys:
         return None, False
     if len(keys) == 1:
         return keys[0][0], False
     total = len(videos)
-    # detailed header: full track table of a representative video
     sample = None
     for v in videos:
-        if len(infos[str(v)]["subs"]) > 1:
+        if len(infos[str(v)][kind]) > 1:
             sample = v
             break
     if sample is None:
         for v in videos:
-            if infos[str(v)]["subs"]:
+            if infos[str(v)][kind]:
                 sample = v
                 break
-    header = [f"{Fore.YELLOW}Found several distinct {lang_word} subtitle tracks across the videos.{Style.RESET_ALL}"]
+    header = [f"{Fore.YELLOW}Found several distinct {lang_word}{track_word} tracks across the videos.{Style.RESET_ALL}"]
     if sample is not None:
         header.append(f"{Fore.CYAN}Tracks in sample '{Path(sample).name}':{Style.RESET_ALL}")
-        for t in infos[str(sample)]["subs"]:
+        for t in infos[str(sample)][kind]:
             flags = []
             if t.get("forced"):
                 flags.append("forced")
@@ -6959,9 +8394,9 @@ def _select_lang_track_key(videos, infos, lang_word, interactive):
                           f"codec={t.get('codec', '?')}{fl}")
     labels = [f"{label}  —  in {count}/{total} videos" for _k, label, count in keys]
     if not interactive:
-        log_warn(f"Multiple {lang_word} tracks and no interactive terminal - using the first: {keys[0][1]}.")
+        log_warn(f"Multiple {lang_word}{track_word} tracks and no interactive terminal - using the first: {keys[0][1]}.")
         return keys[0][0], False
-    idx = ask_pick(f"Which {lang_word} subtitle track to use for all videos?",
+    idx = ask_pick(f"Which {lang_word}{track_word} track to use for all videos?",
                    labels, default=0, header=header, allow_back=True)
     if idx is None:
         log_warn("Cancelled by the user.")
@@ -6969,10 +8404,10 @@ def _select_lang_track_key(videos, infos, lang_word, interactive):
     return keys[idx][0], False
 
 
-def _pick_video_track(infos, video, chosen_key):
+def _pick_video_track(infos, video, chosen_key, kind="subs"):
     """Picks the track in this video matching chosen_key; falls back to the single
     matching track if the exact key isn't present. Returns a track dict or None."""
-    matching = infos[str(video)]["subs"]
+    matching = infos[str(video)][kind]
     if not matching:
         return None
     t = _track_by_key(matching, chosen_key)
@@ -7012,7 +8447,7 @@ def run_p1(args):
 
     interactive = sys.stdin.isatty()
     infos = _probe_lang_subs(mkvmerge_bin, videos, "cze")
-    chosen_key, aborted = _select_lang_track_key(videos, infos, "Czech", interactive)
+    chosen_key, aborted = _select_lang_track_key(videos, infos, "subs", "Czech ", interactive)
     if aborted:
         return
     if chosen_key is None:
@@ -7024,7 +8459,7 @@ def run_p1(args):
     done = skipped = 0
     for v in videos:
         vp = Path(v)
-        chosen = _pick_video_track(infos, v, chosen_key)
+        chosen = _pick_video_track(infos, v, chosen_key, "subs")
         if chosen is None:
             log_warn(f"{vp.name}: no matching Czech track - skipping.")
             skipped += 1
@@ -7080,7 +8515,7 @@ def run_p2(args):
 
     interactive = sys.stdin.isatty()
     infos = _probe_lang_subs(mkvmerge_bin, videos, "eng")
-    chosen_key, aborted = _select_lang_track_key(videos, infos, "English", interactive)
+    chosen_key, aborted = _select_lang_track_key(videos, infos, "subs", "English ", interactive)
     if aborted:
         return
     if chosen_key is None:
@@ -7089,7 +8524,7 @@ def run_p2(args):
     done = skipped = 0
     for v in videos:
         vp = Path(v)
-        chosen = _pick_video_track(infos, v, chosen_key)
+        chosen = _pick_video_track(infos, v, chosen_key, "subs")
         if chosen is None:
             log_warn(f"{vp.name}: no matching English track - skipping.")
             skipped += 1
@@ -7383,6 +8818,18 @@ DIFFERENT LANGUAGES (target vs reference):
                         help="Interactive mode: sets the default audio/subtitle track by language.")
     parser.add_argument("--rename-subs", action="store_true",
                         help="Interactive mode: renames .srt by video names (paired by SxxExx).")
+    parser.add_argument("--extract-audio", action="store_true",
+                        help="Interactive mode: extracts an audio track (by language) from each video into "
+                             "a standalone audio file via stream copy.")
+    parser.add_argument("--import-audio", action="store_true",
+                        help="Interactive mode: muxes an external audio file (paired by SxxExx) into each "
+                             "video as the default audio and sets default subtitles.")
+    parser.add_argument("--convert-audio", action="store_true",
+                        help="Interactive mode: re-encodes audio in each MKV to a chosen codec (e.g. AC-3), "
+                             "copying video and subtitles.")
+    parser.add_argument("--rename-files", action="store_true",
+                        help="Interactive mode: intelligent file renamer (zero-pads numbers, fills common "
+                             "words, normalizes case, strips emoji; preview then apply).")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -7478,7 +8925,8 @@ DIFFERENT LANGUAGES (target vs reference):
     if getattr(args, "no_preset", False) and not any([
             args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
             args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
-            args.rename_subs, args.fix_readability]):
+            args.rename_subs, args.fix_readability, args.extract_audio, args.import_audio,
+            args.convert_audio, args.rename_files]):
         run_master_wizard(args)
         return
 
@@ -7491,7 +8939,11 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "import-subs" if args.import_subs
                        else "remove-tracks" if args.remove_tracks
                        else "set-default" if args.set_default
-                       else "rename-subs" if args.rename_subs else None)
+                       else "rename-subs" if args.rename_subs
+                       else "extract-audio" if args.extract_audio
+                       else "import-audio" if args.import_audio
+                       else "convert-audio" if args.convert_audio
+                       else "rename-files" if args.rename_files else None)
     if args.save and args.load:
         die("--save and --load cannot be combined.")
     if args.save and not interactive_cmd:
@@ -7533,6 +8985,14 @@ DIFFERENT LANGUAGES (target vs reference):
             run_set_default(args)
         elif interactive_cmd == "rename-subs":
             run_rename_subs(args)
+        elif interactive_cmd == "extract-audio":
+            run_extract_audio(args)
+        elif interactive_cmd == "import-audio":
+            run_import_audio(args)
+        elif interactive_cmd == "convert-audio":
+            run_convert_audio(args)
+        elif interactive_cmd == "rename-files":
+            run_rename_files(args)
         preset_flush_if_save()
         return
 
@@ -7565,6 +9025,18 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if args.rename_subs:
         run_rename_subs(args)
+        return
+    if args.extract_audio:
+        run_extract_audio(args)
+        return
+    if args.import_audio:
+        run_import_audio(args)
+        return
+    if args.convert_audio:
+        run_convert_audio(args)
+        return
+    if args.rename_files:
+        run_rename_files(args)
         return
 
     if args.all and args.fix_readability:
