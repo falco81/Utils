@@ -8312,100 +8312,316 @@ def _vid_remove_tracks(args, info):
     return None
 
 
-def _vid_edit_track(args, info):
-    picks = _vid_pick_tracks(info, ["audio", "subs"], "Which track to EDIT (name / language / flags)?")
-    if not picks:
-        return None
-    p = info["path"]
-    # gather edits per track interactively
-    plan = []  # (kind, rec, {field: value})
-    for k, t in picks:
-        tag = ("A" if k == "audio" else "S") + str(t["ord"] + 1)
-        log_info(f"Editing {tag} ({_lang3_name(t['lang'])} {t['codec']})")
-        changes = {}
-        nm = ask_text(f"  Track name (Enter = keep '{t.get('name') or '-'}')", "")
-        if nm:
-            changes["name"] = nm
-        lg = ask_language(f"  Language code (Enter = keep '{t['lang']}')", "")
-        if lg:
-            changes["lang"] = _canon3(lg)
-        df = ask_pick("  Default flag", ["keep", "set default = YES", "set default = NO"], default=0)
-        if df == 1:
-            changes["default"] = True
-        elif df == 2:
-            changes["default"] = False
-        fo = ask_pick("  Forced flag", ["keep", "set forced = YES", "set forced = NO"], default=0)
-        if fo == 1:
-            changes["forced"] = True
-        elif fo == 2:
-            changes["forced"] = False
-        if changes:
-            plan.append((k, t, changes))
-    if not plan:
-        log_info("Nothing to change.")
-        return None
+def _vid_pick_language(current):
+    """Searchable full-screen language picker (name + code). Type to filter, arrows
+    to move, Enter selects (returns a 3-letter code), Esc cancels (returns None).
+    A '(type a custom code)' entry lets you enter any code manually."""
+    base = {}
+    for c2, name in LANGUAGE_NAMES.items():
+        base[_canon3(c2)] = name
+    items = [("(undetermined)", "und")] + sorted(((n, c) for c, n in base.items()), key=lambda x: x[0])
+    items.append(("(type a custom code...)", "__custom__"))
+    filt = ""
+    pos = 0
+    top = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                f = filt.lower().strip()
+                if f:
+                    view = [(n, c) for n, c in items
+                            if c not in ("__custom__",) and (f in n.lower() or f in c.lower())]
+                    view.append(("(type a custom code...)", "__custom__"))
+                else:
+                    view = items
+                if not view:
+                    view = [("(no match - Esc to cancel)", "")]
+                pos = max(0, min(pos, len(view) - 1))
+                cols, rows = _fb_termsize()
+                head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Select language ==={Style.RESET_ALL}",
+                        f"{Fore.CYAN}Current:{Style.RESET_ALL} {current or 'und'}    "
+                        f"{Fore.YELLOW}Search:{Style.RESET_ALL} {filt}_", ""]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | type to search | Enter = select | Esc = cancel{Style.RESET_ALL}"]
+                avail = max(3, rows - len(head) - len(foot))
+                if pos < top:
+                    top = pos
+                elif pos >= top + avail:
+                    top = pos - avail + 1
+                top = max(0, top)
+                body = []
+                for i, (n, c) in enumerate(view[top:top + avail], start=top):
+                    label = f"{n}  ({c})" if c and not c.startswith("__") else n
+                    if i == pos:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {label}{Style.RESET_ALL}")
+                    else:
+                        body.append(f"  {Fore.CYAN}{label}{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+                if k == "esc":
+                    return None
+                elif k in ("enter", "right"):
+                    n, c = view[pos]
+                    if c == "__custom__":
+                        code = _fb_prompt_line("Type a language code (e.g. eng, cze, jpn):", current or "")
+                        return _canon3(code) if code else None
+                    return c or None
+                elif k == "up":
+                    pos = (pos - 1) % len(view)
+                elif k == "down":
+                    pos = (pos + 1) % len(view)
+                elif k == "pgup":
+                    pos = max(0, pos - avail)
+                elif k == "pgdn":
+                    pos = min(len(view) - 1, pos + avail)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(view) - 1
+                elif k == "backspace":
+                    filt = filt[:-1]
+                    pos = top = 0
+                elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                    filt += k[1]
+                    pos = top = 0
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
 
-    if info["is_mkv"] and info["mkvpropedit"]:
+
+def _vid_track_list_screen(info, tracks, start=0):
+    """Arrow-key list of the video's audio+subtitle tracks. Enter on a track returns
+    its index (to open the editor form); Esc/q returns None (done)."""
+    pos = max(0, min(start, len(tracks) - 1))
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                lines = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Edit tracks - {_fb_trunc(info['path'].name, 60)} ==={Style.RESET_ALL}",
+                         f"{Fore.CYAN}Enter on a track to edit its name / language / flags.{Style.RESET_ALL}", ""]
+                for i, (kind, t) in enumerate(tracks):
+                    tag = ("A" if kind == "audio" else "S") + str(t["ord"] + 1)
+                    flags = [x for x in ("default" if t["default"] else "", "forced" if t["forced"] else "") if x]
+                    fl = f"  [{', '.join(flags)}]" if flags else ""
+                    nm = f'  "{t["name"]}"' if t.get("name") else ""
+                    ch = f"  {t['channels']}ch" if t.get("channels") else ""
+                    row = f"{tag}  {_lang3_name(t['lang']):8} {t['codec']}{ch}{fl}{nm}"
+                    if i == pos:
+                        lines.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {row}{Style.RESET_ALL}")
+                    else:
+                        colr = Fore.YELLOW if kind == "audio" else Fore.CYAN
+                        lines.append(f"  {colr}{row}{Style.RESET_ALL}")
+                lines += ["", f"{Style.DIM}\u2191\u2193 move | Enter = edit this track | Esc = done{Style.RESET_ALL}"]
+                _fb_write_frame(lines)
+                k = _read_key()
+                if k == "up":
+                    pos = (pos - 1) % len(tracks)
+                elif k == "down":
+                    pos = (pos + 1) % len(tracks)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(tracks) - 1
+                elif k in ("enter", "right"):
+                    return pos
+                elif k == "esc" or k == ("char", "q"):
+                    return None
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _vid_track_form(kind, t):
+    """Second screen: a field editor for ONE track. Navigate rows with Up/Down;
+    type to edit text (Name / Language), Left/Right/Space toggles Default/Forced;
+    Enter on [Confirm] applies, [Cancel]/Esc discards. Returns a changes dict
+    (only fields that differ from the current value) or None on cancel."""
+    tag = ("A" if kind == "audio" else "S") + str(t["ord"] + 1)
+    fields = [
+        {"key": "name", "label": "Name", "type": "text", "val": t.get("name") or ""},
+        {"key": "lang", "label": "Language", "type": "text", "val": (t["lang"] if t["lang"] and t["lang"] != "und" else "")},
+        {"key": "default", "label": "Default", "type": "bool", "val": bool(t["default"])},
+        {"key": "forced", "label": "Forced", "type": "bool", "val": bool(t["forced"])},
+    ]
+    orig = {f["key"]: f["val"] for f in fields}
+    rows = fields + [{"action": "confirm", "label": "[ Confirm changes ]"},
+                     {"action": "cancel", "label": "[ Cancel ]"}]
+    pos = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                lines = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Edit track {tag}  ({_lang3_name(t['lang'])} {t['codec']}) ==={Style.RESET_ALL}", ""]
+                for i, r in enumerate(rows):
+                    cur = (i == pos)
+                    mark = f"{Fore.GREEN}{Style.BRIGHT}\u203a{Style.RESET_ALL}" if cur else " "
+                    if "action" in r:
+                        col = Fore.GREEN if r["action"] == "confirm" else Fore.RED
+                        style = Style.BRIGHT if cur else ""
+                        lines.append(f"{mark} {col}{style}{r['label']}{Style.RESET_ALL}")
+                    elif r["type"] == "text":
+                        shown = r["val"] + ("_" if cur else "")
+                        if not r["val"] and not cur:
+                            shown = f"{Style.DIM}(empty){Style.RESET_ALL}"
+                        hl = f"{Fore.YELLOW}" if cur else ""
+                        hint = f"  {Style.DIM}(Enter = pick from list){Style.RESET_ALL}" if (cur and r["key"] == "lang") else ""
+                        lines.append(f"{mark} {hl}{r['label']:9}:{Style.RESET_ALL} {shown}{hint}")
+                    else:
+                        val = f"{Fore.GREEN}yes{Style.RESET_ALL}" if r["val"] else f"{Style.DIM}no{Style.RESET_ALL}"
+                        hl = f"{Fore.YELLOW}" if cur else ""
+                        arrows = f"  {Style.DIM}<- ->{Style.RESET_ALL}" if cur else ""
+                        lines.append(f"{mark} {hl}{r['label']:9}:{Style.RESET_ALL} {val}{arrows}")
+                    if i == len(fields) - 1:
+                        lines.append(f"  {Style.DIM}{'-' * 24}{Style.RESET_ALL}")
+                lines += ["", f"{Style.DIM}\u2191\u2193 move | type to edit text | <-/->/Space toggle | "
+                          f"Enter = confirm/apply | Esc = cancel{Style.RESET_ALL}"]
+                _fb_write_frame(lines)
+                k = _read_key()
+                r = rows[pos]
+                if k == "up":
+                    pos = (pos - 1) % len(rows)
+                elif k == "down":
+                    pos = (pos + 1) % len(rows)
+                elif k == "esc":
+                    return None
+                elif "action" in r:
+                    if k in ("enter", "right"):
+                        if r["action"] == "cancel":
+                            return None
+                        changes = {}
+                        for f in fields:
+                            if f["val"] != orig[f["key"]]:
+                                changes[f["key"]] = f["val"]
+                        return changes
+                elif r["type"] == "bool":
+                    if k in ("left", "right") or k == ("char", " "):
+                        r["val"] = not r["val"]
+                    elif k == "enter":
+                        pos = (pos + 1) % len(rows)
+                elif r["type"] == "text":
+                    if k == "backspace":
+                        r["val"] = r["val"][:-1]
+                    elif k == "enter":
+                        if r["key"] == "lang":
+                            code = _vid_pick_language(r["val"])
+                            if code is not None:
+                                r["val"] = "" if code == "und" else code
+                            _fb_enter_screen()   # re-hide cursor after the nested picker
+                        else:
+                            pos = (pos + 1) % len(rows)
+                    elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                        r["val"] += k[1]
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _vid_apply_track_changes(args, info, kind, t, changes):
+    """Applies one track's changes (name/lang/default/forced). MKV -> mkvpropedit in
+    place; MP4/other -> ffmpeg remux. Returns True on success."""
+    if not changes:
+        return False
+    p = info["path"]
+    if "lang" in changes:
+        changes = dict(changes)
+        changes["lang"] = _canon3(changes["lang"]) or "und"
+    if info["is_mkv"] and info["mkvpropedit"] and t.get("sel"):
         edits = []
-        for _k, t, ch in plan:
-            sel = t.get("sel")
-            if not sel:
-                continue
-            if "name" in ch:
-                edits += ["--edit", f"track:{sel}", "--set", f"name={ch['name']}"]
-            if "lang" in ch:
-                edits += ["--edit", f"track:{sel}", "--set", f"language={ch['lang']}"]
-            if "default" in ch:
-                edits += ["--edit", f"track:{sel}", "--set", f"flag-default={1 if ch['default'] else 0}"]
-            if "forced" in ch:
-                edits += ["--edit", f"track:{sel}", "--set", f"flag-forced={1 if ch['forced'] else 0}"]
+        if "name" in changes:
+            edits += ["--edit", f"track:{t['sel']}", "--set", f"name={changes['name']}"] if changes["name"] \
+                else ["--edit", f"track:{t['sel']}", "--delete", "name"]
+        if "lang" in changes:
+            edits += ["--edit", f"track:{t['sel']}", "--set", f"language={changes['lang']}"]
+        if "default" in changes:
+            edits += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={1 if changes['default'] else 0}"]
+            if changes["default"]:
+                # exactly one default per type: clear default on the other tracks of this kind
+                siblings = info["audio"] if kind == "audio" else info["subs"]
+                for o in siblings:
+                    if o.get("sel") and o["sel"] != t["sel"] and o.get("default"):
+                        edits += ["--edit", f"track:{o['sel']}", "--set", "flag-default=0"]
+        if "forced" in changes:
+            edits += ["--edit", f"track:{t['sel']}", "--set", f"flag-forced={1 if changes['forced'] else 0}"]
         r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True)
         if r.returncode >= 2:
             log_warn(f"mkvpropedit error: {r.stderr.strip()[:200]}")
-            return None
-        log_done(f"Updated metadata of {len(plan)} track(s) in place.")
-        return info["path"]
-    else:
-        # MP4 / other -> remux with ffmpeg applying metadata + disposition
-        ff = info["ffmpeg"]
-        tmp = p.with_name(p.stem + ".edittmp" + p.suffix)
-        meta = []
-        for k, t, ch in plan:
-            spec = f"a:{t['ord']}" if k == "audio" else f"s:{t['ord']}"
-            if "name" in ch:
-                meta += [f"-metadata:s:{spec}", f"title={ch['name']}"]
-            if "lang" in ch:
-                meta += [f"-metadata:s:{spec}", f"language={ch['lang']}"]
-        # disposition must be given for all streams of a kind that we touch
-        disp = []
-        touched = {("audio", t["ord"]) for k, t, ch in plan if "default" in ch or "forced" in ch for _ in [0] if k == "audio"}
-        for kind, letter, tracks in (("audio", "a", info["audio"]), ("subs", "s", info["subs"])):
-            if not any((pk == kind and ("default" in c or "forced" in c)) for pk, _pt, c in plan):
-                continue
-            wanted = {t["ord"]: dict(default=t["default"], forced=t["forced"]) for t in tracks}
-            for pk, pt, c in plan:
-                if pk == kind:
-                    if "default" in c:
-                        wanted[pt["ord"]]["default"] = c["default"]
-                    if "forced" in c:
-                        wanted[pt["ord"]]["forced"] = c["forced"]
-            for t in tracks:
-                fl = []
-                if wanted[t["ord"]]["default"]:
-                    fl.append("default")
-                if wanted[t["ord"]]["forced"]:
+            return False
+        log_done(f"{('A' if kind == 'audio' else 'S')}{t['ord'] + 1}: updated {', '.join(changes)}.")
+        return True
+    # MP4 / other -> ffmpeg remux
+    ff = info["ffmpeg"]
+    tmp = p.with_name(p.stem + ".edittmp" + p.suffix)
+    spec = f"a:{t['ord']}" if kind == "audio" else f"s:{t['ord']}"
+    letter = "a" if kind == "audio" else "s"
+    meta = []
+    if "name" in changes:
+        meta += [f"-metadata:s:{spec}", f"title={changes['name']}"]
+    if "lang" in changes:
+        meta += [f"-metadata:s:{spec}", f"language={changes['lang']}"]
+    disp = []
+    if changes.get("default") is True:
+        # one default per type: set this track default, clear it on the others (keep forced)
+        for o in (info["audio"] if kind == "audio" else info["subs"]):
+            fl = []
+            if o["ord"] == t["ord"]:
+                fl.append("default")
+                if changes.get("forced", o["forced"]):
                     fl.append("forced")
-                disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
-        cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + meta + disp + [str(tmp)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0 or not tmp.exists():
-            log_warn("ffmpeg remux failed.")
-            tmp.exists() and os.remove(str(tmp))
-            return None
-        if _vid_replace(tmp, p):
-            log_done(f"Updated metadata of {len(plan)} track(s) (remux).")
-            return info["path"]
-    return None
+            elif o["forced"]:
+                fl.append("forced")
+            disp += [f"-disposition:{letter}:{o['ord']}", "+".join(fl) if fl else "0"]
+    elif "default" in changes or "forced" in changes:
+        fl = []
+        if changes.get("default", t["default"]):
+            fl.append("default")
+        if changes.get("forced", t["forced"]):
+            fl.append("forced")
+        disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
+    cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + meta + disp + [str(tmp)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.exists():
+        log_warn("ffmpeg remux failed.")
+        tmp.exists() and os.remove(str(tmp))
+        return False
+    if _vid_replace(tmp, p):
+        log_done(f"{('A' if kind == 'audio' else 'S')}{t['ord'] + 1}: updated {', '.join(changes)} (remux).")
+        return True
+    return False
+
+
+def _vid_edit_track(args, info):
+    """Track editor: a list of tracks; Enter opens a per-track form (Name / Language
+    / Default / Forced) navigated with the arrows, with Confirm/Cancel. Changes are
+    applied immediately per track; the list refreshes so you can edit several."""
+    path = str(info["path"])
+    if not (info["audio"] or info["subs"]):
+        log_warn("This video has no audio/subtitle tracks to edit.")
+        return None
+    if not _tui_supported():
+        log_warn("The track editor needs a real terminal.")
+        return None
+    changed_any = False
+    sel = 0
+    while True:
+        info = _vid_probe(args, path)
+        tracks = [("audio", t) for t in info["audio"]] + [("subs", t) for t in info["subs"]]
+        if not tracks:
+            break
+        idx = _vid_track_list_screen(info, tracks, sel)
+        if idx is None:
+            break
+        sel = idx
+        kind, t = tracks[idx]
+        changes = _vid_track_form(kind, t)
+        if changes:
+            if _vid_apply_track_changes(args, info, kind, t, changes):
+                changed_any = True
+        # loop back to the (refreshed) track list
+    # leave immediately (the refreshed report will reflect any changes) - no extra pause
+    raise WizardBack()
 
 
 def _vid_set_default(args, info):
@@ -8678,10 +8894,158 @@ def _vid_extract_stream_only(args, info):
     return None
 
 
+def _vid_scroll_view(title, lines):
+    """Full-screen scrollable text viewer (Up/Down/PgUp/PgDn/Home/End, Esc/q close).
+    Falls back to a plain print when there is no TTY."""
+    if not _tui_supported():
+        for ln in lines:
+            print(ln)
+        return
+    top = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                cols, rows = _fb_termsize()
+                head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== {_fb_trunc(title, cols - 8)} ==={Style.RESET_ALL}", ""]
+                foot = ["", f"{Style.DIM}\u2191\u2193 / PgUp / PgDn / Home / End scroll | Esc = close{Style.RESET_ALL}"]
+                avail = max(3, rows - len(head) - len(foot))
+                top = max(0, min(top, max(0, len(lines) - avail)))
+                body = []
+                for ln in lines[top:top + avail]:
+                    # truncate plain lines to width; leave short (colored header) lines as-is
+                    body.append(ln if ("\x1b[" in ln or len(ln) <= cols) else _fb_trunc(ln, cols - 1))
+                while len(body) < avail:
+                    body.append("")
+                pos = f"[{min(top + avail, len(lines))}/{len(lines)}]"
+                head[0] = head[0] + f"  {Style.DIM}{pos}{Style.RESET_ALL}"
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+                if k == "esc" or k == ("char", "q"):
+                    return
+                elif k == "down":
+                    top += 1
+                elif k == "up":
+                    top = max(0, top - 1)
+                elif k == "pgdn":
+                    top += avail
+                elif k == "pgup":
+                    top = max(0, top - avail)
+                elif k == "home":
+                    top = 0
+                elif k == "end":
+                    top = len(lines)
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _vid_advanced_lines(info, data):
+    """Builds a VLC-style, per-stream technical breakdown from full ffprobe output."""
+    L = []
+    fmt = data.get("format", {}) or {}
+    L.append(f"{Fore.CYAN}File:{Style.RESET_ALL} {info['path'].name}")
+    L.append(f"{Fore.CYAN}Container:{Style.RESET_ALL} {fmt.get('format_long_name') or info['container']}")
+    L.append(f"Size: {_vid_human_size(fmt.get('size'))}   "
+             f"Duration: {_vid_human_dur(fmt.get('duration'))}   "
+             f"Overall bitrate: {_vid_bitrate(fmt.get('bit_rate')) or '?'}")
+    if fmt.get("nb_streams"):
+        L.append(f"Streams: {fmt.get('nb_streams')}   Chapters: {info.get('chapters', 0)}   "
+                 f"Attachments: {len(info.get('attachments', []))}")
+    L.append("")
+
+    def add(label, val):
+        if val not in (None, "", "N/A", "0/0"):
+            L.append(f"    {label}: {val}")
+
+    for s in data.get("streams", []):
+        t = s.get("codec_type", "?")
+        tags = s.get("tags", {}) or {}
+        disp = s.get("disposition", {}) or {}
+        typ = {"video": "Video", "audio": "Audio", "subtitle": "Subtitle",
+               "data": "Data", "attachment": "Attachment"}.get(t, t.title())
+        extra = []
+        if tags.get("language"):
+            extra.append(_lang3_name(_canon3(tags.get("language"))))
+        if tags.get("title"):
+            extra.append(f'"{tags["title"]}"')
+        hdr = f"Stream {s.get('index')} - {typ}" + (("  (" + ", ".join(extra) + ")") if extra else "")
+        L.append(f"{Fore.GREEN}{Style.BRIGHT}{hdr}{Style.RESET_ALL}")
+
+        codec = s.get("codec_long_name") or s.get("codec_name", "?")
+        if s.get("codec_name") and s.get("codec_name") not in codec.lower():
+            codec += f" ({s['codec_name']})"
+        tag = s.get("codec_tag_string")
+        if tag and tag not in ("[0][0][0][0]", ""):
+            codec += f"  [tag: {tag}]"
+        add("Codec", codec)
+        if s.get("profile"):
+            add("Profile", str(s["profile"]) + (f" @ L{s['level']}" if s.get("level") not in (None, -99) else ""))
+        if s.get("bit_rate"):
+            add("Bitrate", f"{int(s['bit_rate']) // 1000} kb/s")
+
+        if t == "video":
+            add("Resolution", f"{s.get('width')}x{s.get('height')}")
+            if s.get("coded_width") and (s.get("coded_width") != s.get("width")
+                                         or s.get("coded_height") != s.get("height")):
+                add("Coded size", f"{s.get('coded_width')}x{s.get('coded_height')}")
+            add("Display aspect ratio", s.get("display_aspect_ratio"))
+            add("Sample aspect ratio", s.get("sample_aspect_ratio"))
+            fps = _vid_fps(s.get("avg_frame_rate") or s.get("r_frame_rate") or "0")
+            if fps:
+                add("Frame rate", f"{fps:.3f} fps")
+            add("Pixel format", s.get("pix_fmt"))
+            add("Bit depth", s.get("bits_per_raw_sample"))
+            color = []
+            for key, lab in (("color_primaries", "primaries"), ("color_transfer", "transfer"),
+                             ("color_space", "space"), ("color_range", "range")):
+                if s.get(key):
+                    color.append(f"{lab} {s[key]}")
+            if color:
+                add("Color", " | ".join(color))
+            add("Field order", s.get("field_order"))
+            add("Frames", s.get("nb_frames"))
+        elif t == "audio":
+            if s.get("sample_rate"):
+                add("Sample rate", f"{s['sample_rate']} Hz")
+            if s.get("channels"):
+                add("Channels", f"{s['channels']}" + (f" ({s['channel_layout']})" if s.get("channel_layout") else ""))
+            add("Sample format", s.get("sample_fmt"))
+            add("Bits per sample", s.get("bits_per_sample") or s.get("bits_per_raw_sample") or None)
+
+        flags = [k for k in ("default", "forced", "hearing_impaired", "visual_impaired",
+                             "comment", "attached_pic") if disp.get(k)]
+        if flags:
+            add("Flags", ", ".join(flags))
+        if tags.get("handler_name"):
+            add("Handler", tags.get("handler_name"))
+        L.append("")
+    return L
+
+
+def _vid_advanced_info(args, info):
+    """Shows a detailed, VLC-style technical breakdown of every stream (ffprobe)."""
+    ffprobe = info.get("ffprobe") or _find_ffprobe(info.get("ffmpeg"))
+    if not ffprobe:
+        log_warn("ffprobe not found (needed for advanced info). Install ffmpeg (includes ffprobe).")
+        return None
+    try:
+        out = subprocess.run([ffprobe, "-v", "error", "-show_streams", "-show_format",
+                              "-print_format", "json", str(info["path"])], capture_output=True, text=True)
+        data = json.loads(out.stdout or "{}")
+    except Exception as e:
+        log_warn(f"ffprobe failed: {e}")
+        return None
+    _vid_scroll_view(f"Advanced info - {info['path'].name}", _vid_advanced_lines(info, data))
+    raise WizardBack()   # pure viewer -> straight back to the menu, no extra pause
+
+
 def _video_detail_menu(args, path):
     """Inspector for a single video: shows a full report and offers every operation.
     Loops until the user goes Back. Returns when done (path may have changed)."""
     path = str(path)
+    sel = 0
     while True:
         try:
             info = _vid_probe(args, path)
@@ -8694,6 +9058,7 @@ def _video_detail_menu(args, path):
             return
         # build the action list (only what makes sense for this container)
         actions = []  # (label, help, fn)
+        actions.append(("Advanced info (ffprobe / VLC-style)", "Full technical per-stream breakdown, like VLC's Codec tab (scrollable).", _vid_advanced_info))
         actions.append(("Extract audio track(s) -> file", "Stream-copy chosen audio tracks to standalone files.", _vid_extract_audio))
         actions.append(("Extract subtitle track(s) -> .srt", "Extract chosen text subtitle tracks to .srt.", _vid_extract_subs))
         actions.append(("Edit track metadata (name / language / default / forced)", "Rename/retag tracks and set flags.", _vid_edit_track))
@@ -8713,9 +9078,11 @@ def _video_detail_menu(args, path):
         header = _vid_report_lines(info)
         header.append(f"{Fore.CYAN}Pick an operation (Esc = back to the browser):{Style.RESET_ALL}")
         idx = ask_pick("Action for this video:", [a[0] for a in actions],
-                       default=0, allow_back=True, header=header, help=[a[1] for a in actions])
+                       default=0, allow_back=True, header=header, help=[a[1] for a in actions],
+                       cursor=sel)
         if idx is None:
             return
+        sel = idx    # remember where we were, so we come back to the same item
         fn = actions[idx][2]
         try:
             newp = fn(args, info)
@@ -8781,7 +9148,7 @@ def _video_browser_loop(state, args):
                     elif kind == "dir":
                         disp, col = "[" + name + "]", Fore.CYAN + Style.BRIGHT
                     elif kind == "video":
-                        disp, col = name, Fore.GREEN + Style.BRIGHT
+                        disp, col = name, Fore.WHITE + Style.BRIGHT
                     else:
                         disp, col = "  " + name, Style.DIM
                     disp = _fb_trunc(disp, cols - 4)
