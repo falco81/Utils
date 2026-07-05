@@ -7546,7 +7546,7 @@ def _fb_termsize():
 def _fb_trunc(s, width):
     if len(s) <= width:
         return s
-    return s[:max(1, width - 1)] + "\u2026"
+    return s[:max(1, width - 1)] + "..."
 
 
 def _fb_write_frame(lines):
@@ -7772,7 +7772,7 @@ def run_rename_files(args):
                 ]
                 tagcount = len([f for f in files if f in tagged])
                 if filter_editing:
-                    head.append(f"{Fore.YELLOW}Filter (typing):{Style.RESET_ALL} {filt}\u2588   "
+                    head.append(f"{Fore.YELLOW}Filter (typing):{Style.RESET_ALL} {filt}_   "
                                 f"{Style.DIM}Enter=keep Esc=clear{Style.RESET_ALL}")
                 else:
                     head.append(f"{Fore.CYAN}Filter:{Style.RESET_ALL} "
@@ -7798,7 +7798,7 @@ def run_rename_files(args):
 
                 body = []
                 if top > 0:
-                    body.append(f"  {Fore.CYAN}\u25b2 ({top} above){Style.RESET_ALL}")
+                    body.append(f"  {Fore.CYAN}^ ({top} above){Style.RESET_ALL}")
                     view_start = top + 1
                 else:
                     view_start = top
@@ -7822,7 +7822,7 @@ def run_rename_files(args):
                         body.append(f" {tag} {col}{disp}{Style.RESET_ALL}")
                 rest = n - (view_start + len(shown))
                 if rest > 0:
-                    body.append(f"  {Fore.CYAN}\u25bc ({rest} below){Style.RESET_ALL}")
+                    body.append(f"  {Fore.CYAN}v ({rest} below){Style.RESET_ALL}")
 
                 _fb_write_frame(head + body + foot)
                 status = ""
@@ -7939,6 +7939,951 @@ def _fb_help_overlay():
     _read_key()
 
 
+# ============================================================================
+# Video browser + inspector (Total Commander style) - full per-video toolbox
+# ============================================================================
+
+_AUDIO_FILE_EXTS = {".aac", ".ac3", ".eac3", ".dts", ".thd", ".mp3", ".flac",
+                    ".mka", ".opus", ".ogg", ".wav", ".m4a"}
+_SUB_FILE_EXTS = {".srt", ".ass", ".ssa", ".sup", ".vtt"}
+
+
+def _vid_human_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.2f} {unit}"
+        n /= 1024
+
+
+def _vid_human_dur(sec):
+    try:
+        sec = float(sec)
+    except (TypeError, ValueError):
+        return "?"
+    h = int(sec // 3600)
+    m = int((sec % 3600) // 60)
+    s = int(sec % 60)
+    return f"{h:d}:{m:02d}:{s:02d}"
+
+
+def _vid_fps(rate):
+    try:
+        a, b = rate.split("/")
+        a, b = float(a), float(b)
+        return (a / b) if b else 0.0
+    except Exception:
+        try:
+            return float(rate)
+        except Exception:
+            return 0.0
+
+
+def _vid_bitrate(bps):
+    try:
+        v = float(bps)
+    except (TypeError, ValueError):
+        return None
+    if v >= 1_000_000:
+        return f"{v / 1_000_000:.1f} Mbps"
+    if v >= 1000:
+        return f"{v / 1000:.0f} kbps"
+    return f"{v:.0f} bps"
+
+
+def _vid_probe(args, path):
+    """Rich probe of a single video: ffprobe for stream/format details, mkvmerge
+    (for MKV) to obtain track IDs/selectors + attachments + chapters. Returns a
+    unified info dict used both for the report and for the operations."""
+    p = Path(path)
+    ext = p.suffix.lower()
+    is_mkv = ext in (".mkv", ".webm", ".mka")
+    ffmpeg = _ensure_ffmpeg_bin(args, str(p.parent))
+    ffprobe = _find_ffprobe(ffmpeg)
+    mkvmerge = getattr(args, "mkvmerge", None) or find_tool(["mkvmerge", "mkvmerge.exe"])
+    mkvextract = getattr(args, "mkvextract", None) or find_tool(["mkvextract", "mkvextract.exe"])
+    mkvpropedit = _find_mkvpropedit(mkvmerge)
+
+    streams = _ffprobe_streams(ffprobe, p) if ffprobe else []
+    fmt = {}
+    chapters = 0
+    if ffprobe:
+        try:
+            out = subprocess.run([ffprobe, "-v", "error", "-show_format", "-show_chapters",
+                                  "-print_format", "json", str(p)], capture_output=True, text=True)
+            data = json.loads(out.stdout or "{}")
+            fmt = data.get("format", {})
+            chapters = len(data.get("chapters", []))
+        except Exception:
+            pass
+
+    mk = {"tracks": [], "attachments": []}
+    if mkvmerge and is_mkv:
+        try:
+            mk = json.loads(subprocess.run([mkvmerge, "-J", str(p)], capture_output=True, text=True).stdout or "{}")
+        except Exception:
+            mk = {"tracks": [], "attachments": []}
+    mk_audio = [t for t in mk.get("tracks", []) if t.get("type") == "audio"]
+    mk_subs = [t for t in mk.get("tracks", []) if t.get("type") == "subtitles"]
+
+    video, audio, subs = [], [], []
+    ai = si = 0
+    for s in streams:
+        t = s.get("codec_type")
+        disp = s.get("disposition", {}) or {}
+        tags = s.get("tags", {}) or {}
+        if t == "video" and not disp.get("attached_pic"):
+            video.append({
+                "codec": s.get("codec_name", "?"), "w": s.get("width"), "h": s.get("height"),
+                "fps": _vid_fps(s.get("avg_frame_rate") or s.get("r_frame_rate") or "0"),
+                "bitrate": _vid_bitrate(s.get("bit_rate") or fmt.get("bit_rate")),
+                "pix": s.get("pix_fmt", ""),
+            })
+        elif t == "audio":
+            rec = {
+                "ord": ai, "index": s.get("index"), "codec": s.get("codec_name", "?"),
+                "channels": s.get("channels"), "sr": s.get("sample_rate"),
+                "bitrate": _vid_bitrate(s.get("bit_rate")),
+                "lang": _canon3(tags.get("language")), "name": tags.get("title", ""),
+                "default": bool(disp.get("default")), "forced": bool(disp.get("forced")),
+            }
+            if ai < len(mk_audio):
+                rec["mkv_id"] = mk_audio[ai]["id"]
+                rec["sel"] = f"a{ai + 1}"
+                if not rec["name"]:
+                    rec["name"] = (mk_audio[ai].get("properties", {}) or {}).get("track_name", "") or ""
+            audio.append(rec)
+            ai += 1
+        elif t == "subtitle":
+            codec = s.get("codec_name", "?")
+            rec = {
+                "ord": si, "index": s.get("index"), "codec": codec,
+                "lang": _canon3(tags.get("language")), "name": tags.get("title", ""),
+                "default": bool(disp.get("default")), "forced": bool(disp.get("forced")),
+                "text": codec.lower() in ("subrip", "srt", "ass", "ssa", "webvtt", "mov_text", "text"),
+            }
+            if si < len(mk_subs):
+                rec["mkv_id"] = mk_subs[si]["id"]
+                rec["sel"] = f"s{si + 1}"
+                if not rec["name"]:
+                    rec["name"] = (mk_subs[si].get("properties", {}) or {}).get("track_name", "") or ""
+            subs.append(rec)
+            si += 1
+
+    atts = []
+    for a in mk.get("attachments", []):
+        atts.append({"id": a.get("id"), "name": a.get("file_name", "?"),
+                     "mime": a.get("content_type", ""), "size": a.get("size")})
+
+    return {
+        "path": p, "ext": ext, "is_mkv": is_mkv,
+        "container": ext.lstrip(".").upper(),
+        "size": fmt.get("size"), "duration": fmt.get("duration"),
+        "bitrate": _vid_bitrate(fmt.get("bit_rate")),
+        "video": video, "audio": audio, "subs": subs,
+        "chapters": chapters, "attachments": atts,
+        "ffmpeg": ffmpeg, "ffprobe": ffprobe, "mkvmerge": mkvmerge,
+        "mkvextract": mkvextract, "mkvpropedit": mkvpropedit,
+    }
+
+
+def _vid_report_lines(info):
+    """Colorized, detailed breakdown of the video for the inspector header."""
+    p = info["path"]
+    L = []
+    L.append(f"{Fore.MAGENTA}{Style.BRIGHT}=== {_fb_trunc(p.name, 70)} ==={Style.RESET_ALL}")
+    meta = f"{info['container']}  |  {_vid_human_size(info['size'])}  |  {_vid_human_dur(info['duration'])}"
+    if info["bitrate"]:
+        meta += f"  |  {info['bitrate']}"
+    L.append(f"{Fore.CYAN}{meta}{Style.RESET_ALL}")
+    for v in info["video"]:
+        res = f"{v['w']}x{v['h']}" if v.get("w") else "?"
+        fps = f"{v['fps']:.3f}".rstrip("0").rstrip(".") + "fps" if v.get("fps") else ""
+        extra = "  ".join(x for x in [v["codec"], res, fps, v.get("bitrate") or "", v.get("pix", "")] if x)
+        L.append(f"  {Fore.GREEN}Video{Style.RESET_ALL}  {extra}")
+    if info["audio"]:
+        L.append(f"  {Fore.GREEN}Audio ({len(info['audio'])}){Style.RESET_ALL}")
+        for a in info["audio"]:
+            flags = []
+            if a["default"]:
+                flags.append("default")
+            if a["forced"]:
+                flags.append("forced")
+            fl = f"  [{', '.join(flags)}]" if flags else ""
+            ch = f"{a['channels']}ch" if a.get("channels") else ""
+            nm = f'  "{a["name"]}"' if a.get("name") else ""
+            idtag = f"#{a.get('mkv_id', a['ord'])}"
+            L.append(f"    A{a['ord'] + 1} {idtag}  {_lang3_name(a['lang']):8} {a['codec']:6} {ch:4} "
+                     f"{a.get('bitrate') or '':9}{fl}{nm}")
+    if info["subs"]:
+        L.append(f"  {Fore.GREEN}Subtitles ({len(info['subs'])}){Style.RESET_ALL}")
+        for s in info["subs"]:
+            flags = []
+            if s["default"]:
+                flags.append("default")
+            if s["forced"]:
+                flags.append("forced")
+            fl = f"  [{', '.join(flags)}]" if flags else ""
+            kind = "text" if s.get("text") else "image"
+            nm = f'  "{s["name"]}"' if s.get("name") else ""
+            idtag = f"#{s.get('mkv_id', s['ord'])}"
+            L.append(f"    S{s['ord'] + 1} {idtag}  {_lang3_name(s['lang']):8} {s['codec']:8} ({kind}){fl}{nm}")
+    tail = []
+    if info["chapters"]:
+        tail.append(f"Chapters: {info['chapters']}")
+    if info["attachments"]:
+        tail.append(f"Attachments: {len(info['attachments'])}")
+    if tail:
+        L.append(f"  {Fore.CYAN}{'  |  '.join(tail)}{Style.RESET_ALL}")
+    L.append("")
+    return L
+
+
+# ---- helpers shared by the operations -------------------------------------
+
+def _vid_ask_out_mode(default_new=True):
+    """Overwrite in place, or write a new file next to it?"""
+    return not ask_yes_no("Overwrite the original file in place? (otherwise a new file is written next to it)",
+                          default_no=default_new)
+
+
+def _vid_replace(tmp, target):
+    try:
+        os.replace(str(tmp), str(target))
+        return True
+    except OSError as e:
+        log_warn(f"Could not replace the file ({e}).")
+        try:
+            os.path.exists(tmp) and os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def _vid_pick_tracks(info, kinds, prompt):
+    """Checklist over audio+/subs tracks. kinds subset of {'audio','subs'}.
+    Returns list of ('audio'|'subs', rec) or None if cancelled/none."""
+    rows = []
+    labels = []
+    for k in kinds:
+        for t in info[k]:
+            rows.append((k, t))
+            tag = "A" if k == "audio" else "S"
+            flags = [x for x in ("default" if t["default"] else "", "forced" if t["forced"] else "") if x]
+            fl = f"  [{', '.join(flags)}]" if flags else ""
+            nm = f'  "{t["name"]}"' if t.get("name") else ""
+            ch = f"  {t['channels']}ch" if t.get("channels") else ""
+            labels.append(f"{tag}{t['ord'] + 1}  {_lang3_name(t['lang']):8} {t['codec']}{ch}{fl}{nm}")
+    if not rows:
+        log_warn("No matching tracks.")
+        return None
+    act, checked = ask_checklist(prompt, labels, ["Confirm CHECKED", "cancel"],
+                                 header=[f"{Fore.CYAN}Check with space, confirm with Enter.{Style.RESET_ALL}"])
+    if act != 0 or not checked:
+        raise WizardBack()   # user cancelled -> straight back to the video's menu
+    return [rows[i] for i in checked if 0 <= i < len(rows)]
+
+
+def _vid_dir_files(info, exts):
+    d = info["path"].parent
+    out = []
+    try:
+        for f in sorted(os.listdir(d)):
+            if Path(f).suffix.lower() in exts and (d / f).is_file():
+                out.append(str(d / f))
+    except OSError:
+        pass
+    return out
+
+
+# ---- operations -----------------------------------------------------------
+
+def _vid_extract_audio(args, info):
+    if not info["audio"]:
+        log_warn("This video has no audio tracks.")
+        return None
+    picks = _vid_pick_tracks(info, ["audio"], "Which audio tracks to EXTRACT?")
+    if not picks:
+        return None
+    ff = info["ffmpeg"]
+    p = info["path"]
+    used = set()
+    for _k, t in picks:
+        ext = _audio_ext_for(t["codec"])
+        tag = (t["lang"] or "und").upper()
+        out = p.with_name(p.stem + f"_{tag}{ext}")
+        n = 2
+        while str(out) in used or out.exists():
+            out = p.with_name(p.stem + f"_{tag}_{n}{ext}")
+            n += 1
+        used.add(str(out))
+        cmd = [ff, "-y", "-i", str(p), "-map", f"0:a:{t['ord']}", "-c:a", "copy", str(out)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode == 0 and out.exists():
+            log_done(f"Audio A{t['ord'] + 1} ({t['codec']}) -> {out.name}")
+        else:
+            log_warn(f"A{t['ord'] + 1}: extraction failed.")
+    return None
+
+
+def _vid_extract_subs(args, info):
+    if not info["subs"]:
+        log_warn("This video has no subtitle tracks.")
+        return None
+    picks = _vid_pick_tracks(info, ["subs"], "Which subtitle tracks to EXTRACT (to .srt)?")
+    if not picks:
+        return None
+    p = info["path"]
+    for _k, t in picks:
+        if not t.get("text"):
+            log_warn(f"S{t['ord'] + 1} ({t['codec']}) is image-based (PGS/VobSub) - cannot go to .srt, skipping.")
+            continue
+        out = p.with_name(p.stem + f".{t['lang'] if t['lang'] != 'und' else 'sub' + str(t['ord'] + 1)}.srt")
+        n = 2
+        while out.exists():
+            out = p.with_name(p.stem + f".{t['lang']}.{n}.srt")
+            n += 1
+        try:
+            if info["is_mkv"] and info["mkvextract"] and t.get("mkv_id") is not None:
+                extract_subtitle_to_srt(info["mkvextract"], p, t["mkv_id"], out)
+            else:
+                extract_subtitle_via_ffmpeg(info["ffmpeg"], p, t["ord"], out)
+            log_done(f"Subtitles S{t['ord'] + 1} ({t['lang']}) -> {out.name}")
+        except SystemExit:
+            log_warn(f"S{t['ord'] + 1}: extraction failed.")
+        except Exception as e:
+            log_warn(f"S{t['ord'] + 1}: {e}")
+    return None
+
+
+def _vid_remove_tracks(args, info):
+    picks = _vid_pick_tracks(info, ["audio", "subs"], "Which tracks to REMOVE (delete)?")
+    if not picks:
+        return None
+    rem_a = {t["ord"] for k, t in picks if k == "audio"}
+    rem_s = {t["ord"] for k, t in picks if k == "subs"}
+    if len(rem_a) >= len(info["audio"]) and info["audio"]:
+        log_warn("Refusing to remove ALL audio tracks.")
+        return None
+    p = info["path"]
+    in_place = not _vid_ask_out_mode()
+    if info["is_mkv"] and info["mkvmerge"]:
+        keep_a = [t["mkv_id"] for t in info["audio"] if t["ord"] not in rem_a and t.get("mkv_id") is not None]
+        keep_s = [t["mkv_id"] for t in info["subs"] if t["ord"] not in rem_s and t.get("mkv_id") is not None]
+        tmp = p.with_name(p.stem + ".rmtmp.mkv")
+        cmd = [info["mkvmerge"], "-o", str(tmp)]
+        if info["audio"] and not keep_a:
+            cmd += ["--no-audio"]
+        elif keep_a and len(keep_a) < len(info["audio"]):
+            cmd += ["--audio-tracks", ",".join(map(str, keep_a))]
+        if info["subs"] and not keep_s:
+            cmd += ["--no-subtitles"]
+        elif keep_s and len(keep_s) < len(info["subs"]):
+            cmd += ["--subtitle-tracks", ",".join(map(str, keep_s))]
+        cmd += [str(p)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode >= 2 or not tmp.exists():
+            log_warn("mkvmerge failed.")
+            tmp.exists() and os.remove(str(tmp))
+            return None
+    else:
+        ff = info["ffmpeg"]
+        tmp = p.with_name(p.stem + ".rmtmp" + p.suffix)
+        maps = ["-map", "0:v"]
+        for t in info["audio"]:
+            if t["ord"] not in rem_a:
+                maps += ["-map", f"0:a:{t['ord']}"]
+        for t in info["subs"]:
+            if t["ord"] not in rem_s:
+                maps += ["-map", f"0:s:{t['ord']}"]
+        cmd = [ff, "-y", "-i", str(p)] + maps + ["-c", "copy", str(tmp)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists():
+            log_warn("ffmpeg failed.")
+            tmp.exists() and os.remove(str(tmp))
+            return None
+    target = p if in_place else p.with_name(p.stem + ".trimmed" + p.suffix)
+    if _vid_replace(tmp, target):
+        log_done(f"Removed {len(rem_a)} audio + {len(rem_s)} subtitle track(s) -> {target.name}")
+        return target if in_place else info["path"]
+    return None
+
+
+def _vid_edit_track(args, info):
+    picks = _vid_pick_tracks(info, ["audio", "subs"], "Which track to EDIT (name / language / flags)?")
+    if not picks:
+        return None
+    p = info["path"]
+    # gather edits per track interactively
+    plan = []  # (kind, rec, {field: value})
+    for k, t in picks:
+        tag = ("A" if k == "audio" else "S") + str(t["ord"] + 1)
+        log_info(f"Editing {tag} ({_lang3_name(t['lang'])} {t['codec']})")
+        changes = {}
+        nm = ask_text(f"  Track name (Enter = keep '{t.get('name') or '-'}')", "")
+        if nm:
+            changes["name"] = nm
+        lg = ask_language(f"  Language code (Enter = keep '{t['lang']}')", "")
+        if lg:
+            changes["lang"] = _canon3(lg)
+        df = ask_pick("  Default flag", ["keep", "set default = YES", "set default = NO"], default=0)
+        if df == 1:
+            changes["default"] = True
+        elif df == 2:
+            changes["default"] = False
+        fo = ask_pick("  Forced flag", ["keep", "set forced = YES", "set forced = NO"], default=0)
+        if fo == 1:
+            changes["forced"] = True
+        elif fo == 2:
+            changes["forced"] = False
+        if changes:
+            plan.append((k, t, changes))
+    if not plan:
+        log_info("Nothing to change.")
+        return None
+
+    if info["is_mkv"] and info["mkvpropedit"]:
+        edits = []
+        for _k, t, ch in plan:
+            sel = t.get("sel")
+            if not sel:
+                continue
+            if "name" in ch:
+                edits += ["--edit", f"track:{sel}", "--set", f"name={ch['name']}"]
+            if "lang" in ch:
+                edits += ["--edit", f"track:{sel}", "--set", f"language={ch['lang']}"]
+            if "default" in ch:
+                edits += ["--edit", f"track:{sel}", "--set", f"flag-default={1 if ch['default'] else 0}"]
+            if "forced" in ch:
+                edits += ["--edit", f"track:{sel}", "--set", f"flag-forced={1 if ch['forced'] else 0}"]
+        r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True)
+        if r.returncode >= 2:
+            log_warn(f"mkvpropedit error: {r.stderr.strip()[:200]}")
+            return None
+        log_done(f"Updated metadata of {len(plan)} track(s) in place.")
+        return info["path"]
+    else:
+        # MP4 / other -> remux with ffmpeg applying metadata + disposition
+        ff = info["ffmpeg"]
+        tmp = p.with_name(p.stem + ".edittmp" + p.suffix)
+        meta = []
+        for k, t, ch in plan:
+            spec = f"a:{t['ord']}" if k == "audio" else f"s:{t['ord']}"
+            if "name" in ch:
+                meta += [f"-metadata:s:{spec}", f"title={ch['name']}"]
+            if "lang" in ch:
+                meta += [f"-metadata:s:{spec}", f"language={ch['lang']}"]
+        # disposition must be given for all streams of a kind that we touch
+        disp = []
+        touched = {("audio", t["ord"]) for k, t, ch in plan if "default" in ch or "forced" in ch for _ in [0] if k == "audio"}
+        for kind, letter, tracks in (("audio", "a", info["audio"]), ("subs", "s", info["subs"])):
+            if not any((pk == kind and ("default" in c or "forced" in c)) for pk, _pt, c in plan):
+                continue
+            wanted = {t["ord"]: dict(default=t["default"], forced=t["forced"]) for t in tracks}
+            for pk, pt, c in plan:
+                if pk == kind:
+                    if "default" in c:
+                        wanted[pt["ord"]]["default"] = c["default"]
+                    if "forced" in c:
+                        wanted[pt["ord"]]["forced"] = c["forced"]
+            for t in tracks:
+                fl = []
+                if wanted[t["ord"]]["default"]:
+                    fl.append("default")
+                if wanted[t["ord"]]["forced"]:
+                    fl.append("forced")
+                disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
+        cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + meta + disp + [str(tmp)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists():
+            log_warn("ffmpeg remux failed.")
+            tmp.exists() and os.remove(str(tmp))
+            return None
+        if _vid_replace(tmp, p):
+            log_done(f"Updated metadata of {len(plan)} track(s) (remux).")
+            return info["path"]
+    return None
+
+
+def _vid_set_default(args, info):
+    """Quick set of the default audio + subtitle track by picking one of each."""
+    def _pick(kind, label):
+        tracks = info[kind]
+        if not tracks:
+            return "keep"
+        labels = [f"{_lang3_name(t['lang'])} {t['codec']}" + (f'  "{t["name"]}"' if t.get("name") else "")
+                  for t in tracks]
+        labels += ["keep as is", "none (clear default)"]
+        i = ask_pick(f"Default {label}", labels, default=len(tracks))
+        if i < len(tracks):
+            return tracks[i]["ord"]
+        return "keep" if i == len(tracks) else "none"
+    a = _pick("audio", "audio track")
+    s = _pick("subs", "subtitle track")
+    if a == "keep" and s == "keep":
+        return None
+    p = info["path"]
+    if info["is_mkv"] and info["mkvpropedit"]:
+        edits = []
+        if a != "keep":
+            for t in info["audio"]:
+                val = 1 if (a != "none" and t["ord"] == a) else 0
+                edits += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={val}"]
+        if s != "keep":
+            for t in info["subs"]:
+                val = 1 if (s != "none" and t["ord"] == s) else 0
+                edits += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={val}"]
+        r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True)
+        if r.returncode >= 2:
+            log_warn("mkvpropedit error.")
+            return None
+        log_done("Default track(s) set in place.")
+        return info["path"]
+    else:
+        ff = info["ffmpeg"]
+        tmp = p.with_name(p.stem + ".deftmp" + p.suffix)
+        disp = []
+        for choice, letter, tracks in ((a, "a", info["audio"]), (s, "s", info["subs"])):
+            if choice == "keep":
+                continue
+            for t in tracks:
+                fl = []
+                if choice != "none" and t["ord"] == choice:
+                    fl.append("default")
+                if t["forced"]:
+                    fl.append("forced")
+                disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
+        cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + disp + [str(tmp)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0 or not tmp.exists():
+            log_warn("ffmpeg failed.")
+            tmp.exists() and os.remove(str(tmp))
+            return None
+        if _vid_replace(tmp, p):
+            log_done("Default track(s) set (remux).")
+            return info["path"]
+    return None
+
+
+def _vid_add_audio(args, info):
+    cands = _vid_dir_files(info, _AUDIO_FILE_EXTS)
+    if not cands:
+        log_warn("No external audio files (.ac3/.aac/.dts/...) in this folder.")
+        return None
+    i = ask_pick("Pick the external audio file to add:", [os.path.basename(c) for c in cands],
+                 default=0, allow_back=True)
+    if i is None:
+        raise WizardBack()
+    apath = cands[i]
+    lang = _canon3(ask_language("Language of the added audio (code)", "eng") or "eng")
+    make_default = ask_yes_no("Make the added audio the DEFAULT track?", default_no=False)
+    p = info["path"]
+    out = p.with_name(p.stem + ".mkv") if not info["is_mkv"] else p
+    tmp = p.with_name(p.stem + ".addtmp.mkv")
+    ff = info["ffmpeg"]
+    cmd = [ff, "-y", "-i", str(p), "-i", str(apath), "-map", "0", "-map", "1:a",
+           "-c", "copy", f"-metadata:s:a:{len(info['audio'])}", f"language={lang}"]
+    if make_default:
+        cmd += ["-disposition:a", "0", f"-disposition:a:{len(info['audio'])}", "default"]
+    # convert text subs when muxing into mkv from mp4 to be safe
+    cmd += ["-c:s", "copy" if info["is_mkv"] else "srt", str(tmp)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not tmp.exists():
+        log_warn("ffmpeg mux failed.")
+        tmp.exists() and os.remove(str(tmp))
+        return None
+    if not info["is_mkv"]:
+        os.remove(str(p))
+    if _vid_replace(tmp, out):
+        log_done(f"Added audio '{os.path.basename(apath)}' -> {out.name}")
+        return out
+    return None
+
+
+def _vid_add_subs(args, info):
+    cands = _vid_dir_files(info, _SUB_FILE_EXTS)
+    if not cands:
+        log_warn("No subtitle files (.srt/.ass/...) in this folder.")
+        return None
+    i = ask_pick("Pick the subtitle file to add:", [os.path.basename(c) for c in cands],
+                 default=0, allow_back=True)
+    if i is None:
+        raise WizardBack()
+    spath = cands[i]
+    lang = _canon3(ask_language("Subtitle language (code)", "eng") or "eng")
+    name = ask_text("Track name (Enter = language name)", "") or _lang3_name(lang)
+    forced = ask_yes_no("Mark as forced?", default_no=True)
+    default = ask_yes_no("Mark as default subtitle?", default_no=True)
+    p = info["path"]
+    mm = info["mkvmerge"]
+    if not mm:
+        log_warn("mkvmerge (MKVToolNix) is required to mux subtitles.")
+        return None
+    out = p.with_name(p.stem + ".mkv")
+    tmp = p.with_name(p.stem + ".subtmp.mkv")
+    cmd = [mm, "-o", str(tmp), str(p),
+           "--language", f"0:{lang}", "--track-name", f"0:{name}",
+           "--forced-track", "0:yes" if forced else "0:no",
+           "--default-track", "0:yes" if default else "0:no", str(spath)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode >= 2 or not tmp.exists():
+        log_warn("mkvmerge mux failed.")
+        tmp.exists() and os.remove(str(tmp))
+        return None
+    if info["ext"] != ".mkv":
+        os.remove(str(p))
+    if _vid_replace(tmp, out):
+        log_done(f"Added subtitles '{os.path.basename(spath)}' -> {out.name}")
+        return out
+    return None
+
+
+def _vid_convert_audio(args, info):
+    if not info["audio"]:
+        log_warn("No audio to convert.")
+        return None
+    codecs = [("ac3", "AC-3 (Dolby Digital) - wide compatibility"),
+              ("eac3", "E-AC-3"), ("aac", "AAC")]
+    ci = ask_pick("Convert ALL audio to which codec?", [f"{c} - {d}" for c, d in codecs], default=0)
+    codec = codecs[ci][0]
+    br = (ask_text("Bitrate", "640k") or "640k").strip()
+    p = info["path"]
+    in_place = not _vid_ask_out_mode()
+    out = p if in_place else p.with_name(p.stem + f"_{codec}" + p.suffix)
+    tmp = p.with_name(p.stem + f".convtmp{p.suffix}")
+    ff = info["ffmpeg"]
+    subflag = ["-c:s", "copy"] if info["is_mkv"] else ["-c:s", "mov_text"]
+    cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c:v", "copy",
+           "-c:a", codec, "-b:a", br] + subflag + [str(tmp)]
+    r = subprocess.run(cmd)
+    if r.returncode != 0 or not tmp.exists():
+        log_warn("Conversion failed.")
+        tmp.exists() and os.remove(str(tmp))
+        return None
+    if _vid_replace(tmp, out):
+        log_done(f"Audio converted to {codec} @ {br} -> {out.name}")
+        return out if in_place else info["path"]
+    return None
+
+
+def _vid_convert_container(args, info):
+    p = info["path"]
+    ff = info["ffmpeg"]
+    to_mkv = not info["is_mkv"]
+    target_ext = ".mkv" if to_mkv else ".mp4"
+    out = p.with_suffix(target_ext)
+    if out.exists() and out != p:
+        if not ask_yes_no(f"{out.name} already exists - overwrite?", default_no=True):
+            return None
+    tmp = p.with_name(p.stem + ".convtmp" + target_ext)
+    if to_mkv:
+        # everything copies cleanly into MKV
+        cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy", str(tmp)]
+    else:
+        # MKV -> MP4: text subs must become mov_text; image subs (PGS/VobSub) dropped
+        has_img = any(not s.get("text") for s in info["subs"])
+        cmd = [ff, "-y", "-i", str(p), "-map", "0:v", "-map", "0:a?"]
+        if info["subs"]:
+            if has_img:
+                log_info("MP4 can't hold image subtitles (PGS/VobSub) - those will be dropped.")
+                for s in info["subs"]:
+                    if s.get("text"):
+                        cmd += ["-map", f"0:s:{s['ord']}"]
+            else:
+                cmd += ["-map", "0:s?"]
+        cmd += ["-c:v", "copy", "-c:a", "copy", "-c:s", "mov_text", str(tmp)]
+    log_info(f"Remuxing {info['container']} -> {target_ext.lstrip('.').upper()} (no re-encode)...")
+    r = subprocess.run(cmd)
+    if r.returncode != 0 or not tmp.exists():
+        log_warn("Container conversion failed.")
+        tmp.exists() and os.remove(str(tmp))
+        return None
+    keep_src = (out != p) and ask_yes_no(f"Keep the original {info['container']} file too?", default_no=True)
+    if not _vid_replace(tmp, out):
+        return None
+    if p.exists() and p != out and not keep_src:
+        try:
+            os.remove(str(p))
+        except OSError:
+            pass
+    log_done(f"Converted -> {out.name}")
+    return out
+
+
+def _vid_extract_chapters(args, info):
+    if not info["is_mkv"] or not info["mkvextract"]:
+        log_warn("Chapter extraction is available for MKV (mkvextract).")
+        return None
+    if not info["chapters"]:
+        log_warn("This file has no chapters.")
+        return None
+    p = info["path"]
+    out = p.with_name(p.stem + ".chapters.xml")
+    r = subprocess.run([info["mkvextract"], str(p), "chapters", str(out)], capture_output=True, text=True)
+    if r.returncode >= 2 or not out.exists():
+        log_warn("Chapter extraction failed.")
+        return None
+    log_done(f"Chapters -> {out.name}")
+    return None
+
+
+def _vid_extract_attachments(args, info):
+    if not info["is_mkv"] or not info["mkvextract"] or not info["attachments"]:
+        log_warn("No attachments to extract (MKV only).")
+        return None
+    p = info["path"]
+    outdir = p.with_name(p.stem + "_attachments")
+    os.makedirs(outdir, exist_ok=True)
+    spec = [f"{a['id']}:{outdir / a['name']}" for a in info["attachments"] if a.get("id") is not None]
+    r = subprocess.run([info["mkvextract"], str(p), "attachments"] + spec, capture_output=True, text=True)
+    if r.returncode >= 2:
+        log_warn("Attachment extraction failed.")
+        return None
+    log_done(f"Extracted {len(spec)} attachment(s) -> {outdir.name}/")
+    return None
+
+
+def _vid_thumbnail(args, info):
+    p = info["path"]
+    ts = ask_text("Timestamp for the thumbnail (HH:MM:SS or seconds)", "00:00:30").strip() or "00:00:30"
+    out = p.with_name(p.stem + ".thumb.jpg")
+    r = subprocess.run([info["ffmpeg"], "-y", "-ss", ts, "-i", str(p), "-frames:v", "1",
+                        "-q:v", "2", str(out)], capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        log_warn("Thumbnail extraction failed (timestamp beyond the end?).")
+        return None
+    log_done(f"Thumbnail at {ts} -> {out.name}")
+    return None
+
+
+def _vid_extract_stream_only(args, info):
+    which = ask_pick("Extract a clean stream into its own file:",
+                     ["video only (no audio/subs)", "all audio (video+audio, no subs)"], default=0)
+    p = info["path"]
+    ff = info["ffmpeg"]
+    if which == 0:
+        out = p.with_name(p.stem + ".video" + p.suffix)
+        cmd = [ff, "-y", "-i", str(p), "-map", "0:v", "-c", "copy", "-an", "-sn", str(out)]
+    else:
+        out = p.with_name(p.stem + ".noSubs" + p.suffix)
+        cmd = [ff, "-y", "-i", str(p), "-map", "0:v", "-map", "0:a?", "-c", "copy", "-sn", str(out)]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not out.exists():
+        log_warn("Extraction failed.")
+        return None
+    log_done(f"-> {out.name}")
+    return None
+
+
+def _video_detail_menu(args, path):
+    """Inspector for a single video: shows a full report and offers every operation.
+    Loops until the user goes Back. Returns when done (path may have changed)."""
+    path = str(path)
+    while True:
+        try:
+            info = _vid_probe(args, path)
+        except Exception as e:
+            log_warn(f"Could not read the video: {e}")
+            try:
+                input("Enter to go back...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            return
+        # build the action list (only what makes sense for this container)
+        actions = []  # (label, help, fn)
+        actions.append(("Extract audio track(s) -> file", "Stream-copy chosen audio tracks to standalone files.", _vid_extract_audio))
+        actions.append(("Extract subtitle track(s) -> .srt", "Extract chosen text subtitle tracks to .srt.", _vid_extract_subs))
+        actions.append(("Edit track metadata (name / language / default / forced)", "Rename/retag tracks and set flags.", _vid_edit_track))
+        actions.append(("Set DEFAULT audio / subtitle track", "Pick which audio and subtitle become default.", _vid_set_default))
+        actions.append(("Remove (delete) track(s)", "Drop chosen audio/subtitle tracks (fast remux).", _vid_remove_tracks))
+        actions.append(("Add external AUDIO into the video", "Mux an audio file from this folder as a new track.", _vid_add_audio))
+        actions.append(("Add external SUBTITLES into the video", "Mux a .srt/.ass from this folder (MKV output).", _vid_add_subs))
+        actions.append(("Convert audio codec (AC-3 / E-AC-3 / AAC)", "Re-encode all audio, copy video+subs.", _vid_convert_audio))
+        actions.append((f"Convert container -> {'MKV' if not info['is_mkv'] else 'MP4'}", "Remux to the other container (no re-encode).", _vid_convert_container))
+        if info["is_mkv"] and info["chapters"]:
+            actions.append(("Extract chapters -> .xml", "Save chapters as an XML file (mkvextract).", _vid_extract_chapters))
+        if info["is_mkv"] and info["attachments"]:
+            actions.append(("Extract attachments (fonts/images)", "Save attached files into a subfolder.", _vid_extract_attachments))
+        actions.append(("Save a thumbnail (JPG)", "Grab a single frame at a chosen timestamp.", _vid_thumbnail))
+        actions.append(("Extract clean stream (video-only / no-subs)", "Write a copy with only some stream kinds.", _vid_extract_stream_only))
+
+        header = _vid_report_lines(info)
+        header.append(f"{Fore.CYAN}Pick an operation (Esc = back to the browser):{Style.RESET_ALL}")
+        idx = ask_pick("Action for this video:", [a[0] for a in actions],
+                       default=0, allow_back=True, header=header, help=[a[1] for a in actions])
+        if idx is None:
+            return
+        fn = actions[idx][2]
+        try:
+            newp = fn(args, info)
+        except (WizardBack, KeyboardInterrupt):
+            continue    # cancelled (Esc / cancel choice) -> straight back, no warning/pause
+        except SystemExit:
+            newp = None    # die() inside the op: its message was already printed
+        except Exception as e:
+            log_warn(f"Operation failed: {e}")
+            newp = None
+        if newp:
+            path = str(newp)
+        try:
+            input(f"\n{Fore.CYAN}Enter to return to the video's menu...{Style.RESET_ALL}")
+        except (EOFError, KeyboardInterrupt):
+            return
+
+
+def _video_browser_loop(state, args):
+    """Total Commander style browser limited to a view where Enter on a VIDEO opens
+    the inspector. Navigates dirs/drives, live filter. Returns ('inspect', path),
+    ('quit', None). Updates state (cwd/cursor/top/filt) in place."""
+    filter_editing = False
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                dirs, files = _fb_list(state["cwd"], state["filt"])
+                vids = [f for f in files if Path(f).suffix.lower() in VIDEO_EXTS_BATCH]
+                others = [f for f in files if Path(f).suffix.lower() not in VIDEO_EXTS_BATCH]
+                rows_items = [("..", "up")] + [(d, "dir") for d in dirs] \
+                    + [(f, "video") for f in vids] + [(f, "file") for f in others]
+                n = len(rows_items)
+                state["cursor"] = max(0, min(state["cursor"], n - 1))
+                cols, rows = _fb_termsize()
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Video browser / inspector ==={Style.RESET_ALL}",
+                    f"{Fore.CYAN}Path:{Style.RESET_ALL} {_fb_trunc(state['cwd'], cols - 8)}",
+                ]
+                if filter_editing:
+                    head.append(f"{Fore.YELLOW}Filter (typing):{Style.RESET_ALL} {state['filt']}_   "
+                                f"{Style.DIM}Enter=keep Esc=clear{Style.RESET_ALL}")
+                else:
+                    head.append(f"{Fore.CYAN}Filter:{Style.RESET_ALL} "
+                                + (state["filt"] if state["filt"] else f"{Style.DIM}(none){Style.RESET_ALL}")
+                                + f"    {Fore.CYAN}Videos here:{Style.RESET_ALL} {len(vids)}")
+                head.append("")
+                foot = ["",
+                        (f"{Style.DIM}\u2191\u2193 move | Enter/\u2192 open (dir or INSPECT video) | \u2190/Bksp up | "
+                         f"/ filter | d drive | q quit{Style.RESET_ALL}")]
+                body_rows = max(4, rows - len(head) - len(foot))
+                if state["cursor"] < state["top"]:
+                    state["top"] = state["cursor"]
+                elif state["cursor"] >= state["top"] + body_rows:
+                    state["top"] = state["cursor"] - body_rows + 1
+                state["top"] = max(0, state["top"])
+                body = []
+                view = rows_items[state["top"]:state["top"] + body_rows]
+                for idx, (name, kind) in enumerate(view, start=state["top"]):
+                    cur = (idx == state["cursor"])
+                    if kind == "up":
+                        disp, col = ".. (up one level)", Fore.CYAN
+                    elif kind == "dir":
+                        disp, col = "[" + name + "]", Fore.CYAN + Style.BRIGHT
+                    elif kind == "video":
+                        disp, col = name, Fore.GREEN + Style.BRIGHT
+                    else:
+                        disp, col = "  " + name, Style.DIM
+                    disp = _fb_trunc(disp, cols - 4)
+                    if cur:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {disp}{Style.RESET_ALL}")
+                    else:
+                        body.append(f"  {col}{disp}{Style.RESET_ALL}")
+                rest = n - (state["top"] + len(view))
+                if rest > 0:
+                    body.append(f"  {Fore.CYAN}v ({rest} more){Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+
+                if filter_editing:
+                    if k == "enter":
+                        filter_editing = False
+                    elif k == "esc":
+                        filter_editing = False
+                        state["filt"] = ""
+                        state["cursor"] = 0
+                    elif k == "backspace":
+                        state["filt"] = state["filt"][:-1]
+                        state["cursor"] = 0
+                    elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                        state["filt"] += k[1]
+                        state["cursor"] = 0
+                    continue
+
+                if k == "up":
+                    state["cursor"] = (state["cursor"] - 1) % n
+                elif k == "down":
+                    state["cursor"] = (state["cursor"] + 1) % n
+                elif k == "pgup":
+                    state["cursor"] = max(0, state["cursor"] - body_rows)
+                elif k == "pgdn":
+                    state["cursor"] = min(n - 1, state["cursor"] + body_rows)
+                elif k == "home":
+                    state["cursor"] = 0
+                elif k == "end":
+                    state["cursor"] = n - 1
+                elif k in ("enter", "right"):
+                    name, kind = rows_items[state["cursor"]]
+                    if kind == "up":
+                        parent = os.path.dirname(state["cwd"].rstrip(os.sep)) or state["cwd"]
+                        if os.path.isdir(parent):
+                            state.update(cwd=os.path.abspath(parent), cursor=0, top=0, filt="")
+                    elif kind == "dir":
+                        target = os.path.join(state["cwd"], name)
+                        if os.path.isdir(target):
+                            state.update(cwd=os.path.abspath(target), cursor=0, top=0, filt="")
+                    elif kind == "video":
+                        return ("inspect", os.path.join(state["cwd"], name))
+                    # plain files: ignore
+                elif k in ("left", "backspace"):
+                    parent = os.path.dirname(state["cwd"].rstrip(os.sep)) or state["cwd"]
+                    if os.path.isdir(parent):
+                        state.update(cwd=os.path.abspath(parent), cursor=0, top=0, filt="")
+                elif isinstance(k, tuple) and k[0] == "char":
+                    ch = k[1]
+                    if ch == "/":
+                        filter_editing = True
+                    elif ch in ("d", "D"):
+                        dest = _fb_pick_location(state["cwd"])
+                        if dest:
+                            state.update(cwd=dest, cursor=0, top=0, filt="")
+                    elif ch in ("q", "Q"):
+                        return ("quit", None)
+                    elif ch in ("?", "h"):
+                        _fb_help_overlay()
+                elif k == "esc":
+                    if state["filt"]:
+                        state["filt"] = ""
+                        state["cursor"] = 0
+                    else:
+                        return ("quit", None)
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def run_video_browser(args):
+    """Total Commander style video browser: navigate folders/drives, and press Enter
+    on a video to open a full inspector with every operation the tool can do on it
+    (extract/import/rename/remove tracks, set defaults, convert audio, MP4<->MKV,
+    chapters, attachments, thumbnails...). Cross-platform (Windows + Linux)."""
+    start = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(start):
+        start = os.path.dirname(start) or "."
+    if not _tui_supported():
+        log_warn("The interactive video browser needs a real terminal (a TTY).")
+        log_info("Run it directly on your machine's console, not through a pipe/redirect.")
+        return
+    state = {"cwd": os.path.abspath(start), "cursor": 0, "top": 0, "filt": ""}
+    while True:
+        result, payload = _video_browser_loop(state, args)
+        if result == "quit":
+            return
+        if result == "inspect":
+            _video_detail_menu(args, payload)
+
+
 _INTERACTIVE_COMMANDS = {
     "auto": ("Synchronize one subtitle file", "run_auto_single"),
     "auto-all": ("Synchronize the whole folder", "run_auto_all"),
@@ -7954,6 +8899,7 @@ _INTERACTIVE_COMMANDS = {
     "import-audio": ("Insert (mux) external audio into videos", "run_import_audio"),
     "convert-audio": ("Convert audio (e.g. to AC-3)", "run_convert_audio"),
     "rename-files": ("Intelligent file rename", "run_rename_files"),
+    "video-browser": ("Video browser / inspector", "run_video_browser"),
 }
 
 
@@ -7968,6 +8914,7 @@ def dispatch_interactive_command(cmd, args):
         "set-default": run_set_default, "rename-subs": run_rename_subs,
         "extract-audio": run_extract_audio, "import-audio": run_import_audio,
         "convert-audio": run_convert_audio, "rename-files": run_rename_files,
+        "video-browser": run_video_browser,
     }.get(cmd)
     if not fn:
         die(f"Unknown command in the preset: {cmd}")
@@ -8140,6 +9087,12 @@ def _wizard_action_specs():
             help="Unifies file names by a glob pattern: zero-pads numbers, fills missing common words, "
                  "normalizes case, strips emoji/illegal characters, auto-detects series. Preview then apply.",
             kind="wizard", run=run_rename_files, flag="rename_files", preset="rename-files"),
+        "video-browser": dict(
+            label="Video browser / inspector (Total Commander style)",
+            help="Browse folders/drives; press Enter on a video for a full report and every operation: "
+                 "extract/add/rename/remove tracks, set defaults, convert audio, MP4<->MKV, chapters, "
+                 "attachments, thumbnails.",
+            kind="browser", run=run_video_browser, flag=None, preset=None),
         "presets": dict(
             label="Presets - run a saved configuration with a single choice (or create one)",
             help="Saved wizard configurations named by you. Pick one and it runs with the saved choices. "
@@ -8163,7 +9116,7 @@ _WIZARD_CATEGORIES = [
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
-     ["remove-tracks", "set-default"]),
+     ["remove-tracks", "set-default", "video-browser"]),
     ("Files", "Intelligent bulk file renaming",
      ["rename-files"]),
     ("Presets & settings", "Saved presets, API keys/config, API test",
@@ -8187,6 +9140,9 @@ def _run_wizard_action(key, args):
         except WizardBack:
             pass
         return False   # no post-run pause (presets menu handles its own flow)
+    if kind == "browser":
+        spec["run"](args)   # self-contained TUI; no preset, no post pause
+        return False
     if spec["flag"]:
         setattr(args, spec["flag"], True)
     if kind == "wizard":
@@ -8830,6 +9786,9 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--rename-files", action="store_true",
                         help="Interactive mode: intelligent file renamer (zero-pads numbers, fills common "
                              "words, normalizes case, strips emoji; preview then apply).")
+    parser.add_argument("--video-browser", action="store_true",
+                        help="Interactive mode: Total Commander style video browser; Enter on a video opens a "
+                             "full inspector with every track/convert operation.")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -8926,7 +9885,7 @@ DIFFERENT LANGUAGES (target vs reference):
             args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
             args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
             args.rename_subs, args.fix_readability, args.extract_audio, args.import_audio,
-            args.convert_audio, args.rename_files]):
+            args.convert_audio, args.rename_files, args.video_browser]):
         run_master_wizard(args)
         return
 
@@ -8943,7 +9902,8 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "extract-audio" if args.extract_audio
                        else "import-audio" if args.import_audio
                        else "convert-audio" if args.convert_audio
-                       else "rename-files" if args.rename_files else None)
+                       else "rename-files" if args.rename_files
+                       else "video-browser" if args.video_browser else None)
     if args.save and args.load:
         die("--save and --load cannot be combined.")
     if args.save and not interactive_cmd:
@@ -8993,6 +9953,8 @@ DIFFERENT LANGUAGES (target vs reference):
             run_convert_audio(args)
         elif interactive_cmd == "rename-files":
             run_rename_files(args)
+        elif interactive_cmd == "video-browser":
+            run_video_browser(args)
         preset_flush_if_save()
         return
 
@@ -9037,6 +9999,9 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if args.rename_files:
         run_rename_files(args)
+        return
+    if args.video_browser:
+        run_video_browser(args)
         return
 
     if args.all and args.fix_readability:
