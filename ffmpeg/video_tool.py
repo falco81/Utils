@@ -221,6 +221,15 @@ MKVTOOLNIX_DOWNLOAD_PAGE = "https://mkvtoolnix.download/downloads.html"
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
+# Where to load/save the settings file (config + saved presets). EMPTY = next to
+# the script (the current default behaviour). May be a FOLDER or a full .json path.
+# Supported everywhere: '~' and environment variables (%APPDATA%, $HOME, ...).
+# Windows: drive paths (Z:\Configs), UNC network paths (\\server\share\dir), and
+# mapped network drives all work. Linux: normal paths incl. an SMB/CIFS mount
+# (e.g. /mnt/nas/video_tool). Priority: --config-file (one-off) > this constant >
+# the 'video_tool.configpath' pointer file (set via --config) > default.
+CONFIG_STORE_PATH = r""
+
 
 # ----------------------------------------------------------------------
 # Helper functions / colored output (Windows CLI friendly via colorama)
@@ -2124,24 +2133,99 @@ _SECRET_HINTS = ("key", "password", "token", "secret")
 
 # ---- Unified store: video_tool.config.json (config + presets) -----------
 _STORE_PATH = None
+_STORE_FILENAME = "video_tool.config.json"
+_STORE_POINTER_NAME = "video_tool.configpath"
+
+
+def _script_dir():
+    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
+    return os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
+
+
+def _is_unc(p):
+    return p.startswith("\\\\") or p.startswith("//")
+
+
+def _normalize_store_path(raw):
+    """Turns a user-supplied path into a full path to the settings .json.
+    Accepts a folder OR a full .json file path; expands '~' and environment
+    variables; keeps UNC (\\\\server\\share) and absolute paths; resolves a
+    relative path against the script directory. Returns None for an empty value
+    (meaning: use the default)."""
+    if raw is None:
+        return None
+    p = str(raw).strip().strip('"').strip("'")
+    if not p:
+        return None
+    p = os.path.expanduser(os.path.expandvars(p))
+    # treat as a folder when it is an existing dir, ends with a separator, or has
+    # no ".json" extension -> then append the standard filename
+    if os.path.isdir(p) or p.endswith(("\\", "/")) or os.path.splitext(p)[1].lower() != ".json":
+        p = os.path.join(p, _STORE_FILENAME)
+    if not (os.path.isabs(p) or _is_unc(p)):
+        p = os.path.join(_script_dir(), p)
+    return p
+
+
+def _read_store_pointer():
+    try:
+        with open(os.path.join(_script_dir(), _STORE_POINTER_NAME), "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _write_store_pointer(path):
+    """Saves (or clears when empty) the pointer file next to the script."""
+    ptr = os.path.join(_script_dir(), _STORE_POINTER_NAME)
+    try:
+        if path and str(path).strip():
+            with open(ptr, "w", encoding="utf-8") as f:
+                f.write(str(path).strip())
+        elif os.path.exists(ptr):
+            os.remove(ptr)
+        return True
+    except Exception as e:
+        log_warn(f"Could not update {_STORE_POINTER_NAME}: {e}")
+        return False
 
 
 def default_store_path():
-    argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
-    base = os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
-    return os.path.join(base, "video_tool.config.json")
+    return os.path.join(_script_dir(), _STORE_FILENAME)
 
 
 def current_store_path():
-    return _STORE_PATH or default_store_path()
+    # 1) explicit one-off override from --config-file (already normalized)
+    if _STORE_PATH:
+        return _STORE_PATH
+    # 2) the CONFIG_STORE_PATH constant edited in the script
+    n = _normalize_store_path(CONFIG_STORE_PATH)
+    if n:
+        return n
+    # 3) the pointer file set interactively via --config
+    n = _normalize_store_path(_read_store_pointer())
+    if n:
+        return n
+    # 4) default: next to the script
+    return default_store_path()
+
+
+_STORE_WARNED = set()
 
 
 def load_store():
     """Loads the unified file {config, presets, default_preset}."""
+    p = current_store_path()
     try:
-        with open(current_store_path(), "r", encoding="utf-8") as f:
+        with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        data = {}
+    except Exception as e:
+        if p not in _STORE_WARNED:
+            _STORE_WARNED.add(p)
+            log_warn(f"Could not read the settings file: {p}")
+            log_warn(f"  reason: {e}")
         data = {}
     if not isinstance(data, dict):
         data = {}
@@ -2154,6 +2238,9 @@ def load_store():
 def save_store(store):
     p = current_store_path()
     try:
+        d = os.path.dirname(p)
+        if d and not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)   # create target folder (also for a new network dir)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(store, f, ensure_ascii=False, indent=2)
         try:
@@ -3860,6 +3947,10 @@ CONFIG_FIELDS = [
     ("llm_api", "llm_api", None, False),
     ("llm_model", "llm_model", None, False),
     ("out_lang", "out_lang", None, False),
+    ("tmdb_key", "tmdb_key", "TMDB_API_KEY", True),
+    ("tmdb_bearer", "tmdb_bearer", "TMDB_BEARER", True),
+    ("omdb_key", "omdb_key", "OMDB_API_KEY", True),
+    ("meta_lang", "meta_lang", None, False),
 ]
 
 
@@ -3875,15 +3966,20 @@ def save_config(cfg):
     save_store(store)
 
 
-def apply_config_to_args(args, cfg):
+def apply_config_to_args(args, cfg, force=False):
     """Fills args with values that were not given on the command line.
-    Priority: CLI (already set) > environment variable > saved config."""
+    Priority: CLI (already set) > environment variable > saved config.
+    force=True overrides args to match the saved config exactly - used right after
+    the config wizard so that edits take effect in the SAME running session
+    (otherwise a change would only apply after a restart)."""
     for ckey, attr, env, _secret in CONFIG_FIELDS:
-        if getattr(args, attr, None):
+        if not force and getattr(args, attr, None):
             continue  # given on the CLI
         val = (os.environ.get(env) if env else None) or cfg.get(ckey)
         if val:
             setattr(args, attr, val)
+        elif force:
+            setattr(args, attr, None)   # reflect deletions in-session
     # Gemini akceptuje i GOOGLE_API_KEY
     if not getattr(args, "gemini_key", None):
         g = os.environ.get("GOOGLE_API_KEY")
@@ -3898,10 +3994,50 @@ def _mask(s):
     return (s[:4] + "..." + s[-2:]) if len(s) > 8 else "----"
 
 
+def _config_location_wizard(args):
+    """Lets the user choose WHERE the settings file is stored (folder or full .json
+    path; UNC / mapped drive / ~ / env vars / Linux paths supported). Empty resets
+    to the default (next to the script). Existing settings are copied to the new
+    location. No effect when CONFIG_STORE_PATH is hard-coded in the script."""
+    global _STORE_PATH
+    if str(CONFIG_STORE_PATH).strip():
+        log_info(f"Config location is fixed by CONFIG_STORE_PATH in the script: {current_store_path()}")
+        return
+    if _STORE_PATH:
+        return   # a one-off --config-file was given; don't touch the pointer
+    loc = current_store_path()
+    if not ask_yes_no(f"Change WHERE settings are stored?  (now: {loc})", default_no=True):
+        return
+    log_info("Enter a FOLDER or a full .json path. Supported:")
+    log_info("  Windows: Z:\\Configs, \\\\server\\share\\dir (UNC), mapped drives, %APPDATA%\\...")
+    log_info("  Linux:   /mnt/nas/video_tool (e.g. an SMB/CIFS mount), ~/...")
+    log_info("  EMPTY = reset to the default (next to the script).")
+    newraw = ask_text("Config path", _read_store_pointer() or "")
+    old_full = load_store()   # read from the current location before switching
+    _write_store_pointer(newraw.strip() if newraw and newraw.strip() else "")
+    dest = current_store_path()
+    if os.path.abspath(dest) == os.path.abspath(loc):
+        log_info(f"Config location unchanged: {dest}")
+        return
+    if os.path.exists(dest):
+        log_info(f"Using existing settings already present at: {dest}")
+    else:
+        try:
+            d = os.path.dirname(dest)
+            if d and not os.path.isdir(d):
+                os.makedirs(d, exist_ok=True)
+            save_store(old_full)   # writes to the NEW location (config + presets)
+            log_done(f"Settings moved to: {dest}")
+        except Exception as e:
+            log_warn(f"Could not write to the new location ({e}). Reverting to the previous one.")
+            _write_store_pointer("")
+
+
 def run_config(args):
     """Interactive wizard for configuring config.json. It asks only about what
     you want to enable; leaves unfilled ones alone. Keys are stored in the file
     in readable form - keep it safe."""
+    _config_location_wizard(args)
     store_name = os.path.basename(current_store_path())
     cfg = load_config()
     print(f"{Fore.MAGENTA}=== Settings ({store_name}) ==={Style.RESET_ALL}")
@@ -3971,6 +4107,20 @@ def run_config(args):
         if _v:
             cfg["out_lang"] = _v
 
+    # TMDB (online recognition + Plex naming for the renamer)
+    if ask_yes_no("Set up TMDB (online show/movie recognition + Plex naming in the renamer)?",
+                  default_no=not (cfg.get("tmdb_key") or cfg.get("tmdb_bearer"))):
+        log_info("Free key at themoviedb.org -> Settings -> API (Developer plan). Either works:")
+        log_info("  - v3 API key (a short string), or")
+        log_info("  - v4 Read Access Token (a long token; paste it as the Bearer below).")
+        ask_secret("TMDB API key (v3)", "tmdb_key")
+        ask_secret("TMDB Read Access Token (v4, optional)", "tmdb_bearer")
+        _ml = ask_language("Metadata language (code, e.g. cs, en)", cfg.get("meta_lang") or "cs")
+        if _ml:
+            cfg["meta_lang"] = _ml
+        if ask_yes_no("Also add OMDb (IMDb IDs, optional)?", default_no=not cfg.get("omdb_key")):
+            ask_secret("OMDb API key", "omdb_key")
+
     if ask_yes_no("Delete some saved value?", default_no=True):
         keys = list(cfg.keys())
         if keys:
@@ -3981,6 +4131,7 @@ def run_config(args):
                 cfg.pop(keys[idx], None)
 
     save_config(cfg)
+    apply_config_to_args(args, cfg, force=True)   # apply the edits to THIS session right away
     print()
     log_done(f"Saved to {current_store_path()}")
     enabled = []
@@ -3994,6 +4145,8 @@ def run_config(args):
         enabled.append("Claude")
     if cfg.get("llm_key"):
         enabled.append("OpenAI")
+    if cfg.get("tmdb_key") or cfg.get("tmdb_bearer"):
+        enabled.append("TMDB" + ("+OMDb" if cfg.get("omdb_key") else ""))
     log_info("Active: " + (", ".join(enabled) if enabled else "(no online features)"))
 
 
@@ -4002,6 +4155,20 @@ def run_test_api(args):
     (including the server body). Helps reveal the cause of errors like HTTP 400."""
     import urllib.request
     import urllib.error
+    # diagnostics: where are settings read from, and what got loaded?
+    _p = current_store_path()
+    print(f"{Fore.MAGENTA}=== API test ==={Style.RESET_ALL}")
+    log_info(f"Settings file: {_p}")
+    if os.path.exists(_p):
+        _cfg = load_config()
+        if _cfg:
+            log_info(f"Loaded {len(_cfg)} setting(s): {', '.join(sorted(_cfg))}")
+        else:
+            log_warn("The settings file exists but contains no config values.")
+    else:
+        log_warn("The settings file was NOT found at this path (using defaults/none).")
+        log_info("Tip: set the location via --config (Change WHERE settings are stored) "
+                 "or the CONFIG_STORE_PATH constant.")
     tested = 0
 
     akey = getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
@@ -7636,7 +7803,6 @@ def _fb_rename_preview(cwd, files):
         unchanged = [(o, n) for o, n in plan if o == n]
 
         cols, rows = _fb_termsize()
-        half = max(20, (cols - 8) // 2)
         header = [
             f"{Fore.MAGENTA}=== Rename preview - {len(files)} file(s) ==={Style.RESET_ALL}",
             (f"{Fore.CYAN}[p]{Style.RESET_ALL} pad:{_fb_onoff(opts['pad'])}   "
@@ -7654,12 +7820,16 @@ def _fb_rename_preview(cwd, files):
         view = changed + skipped
         if top > max(0, len(view) - rows_avail):
             top = max(0, len(view) - rows_avail)
+        # dynamic column: align arrows to the longest old name, no wider than needed
+        max_old = max((len(o) for o, _n in view), default=10)
+        oldw = min(max_old, max(10, cols - 6 - 24))
+        destw = max(16, cols - 6 - oldw)
         for o, n in view[top:top + rows_avail]:
             conflict = o in skip
             arrow = f"{Fore.RED}->{Style.RESET_ALL}" if conflict else f"{Fore.CYAN}->{Style.RESET_ALL}"
             ncol = Fore.RED if conflict else Fore.GREEN
             tail = "  [CONFLICT]" if conflict else ""
-            body.append(f"  {_fb_trunc(o, half):<{half}} {arrow} {ncol}{_fb_trunc(n, half)}{tail}{Style.RESET_ALL}")
+            body.append(f"  {_fb_trunc(o, oldw):<{oldw}} {arrow} {ncol}{_fb_trunc(n, destw)}{tail}{Style.RESET_ALL}")
         if not view:
             body.append(f"  {Style.DIM}(nothing changes with the current options){Style.RESET_ALL}")
 
@@ -7733,8 +7903,8 @@ def _fb_leave_screen():
 def run_rename_files(args):
     """Total Commander-style interactive file browser + renamer. Loads the current
     directory, lets you navigate into folders / up a level, jump between drives, tag
-    files, filter live, and then preview + apply intelligent renames - all via the
-    keyboard, cross-platform (Windows + Linux)."""
+    files, filter live, then either preview + apply intelligent renames or run an
+    ONLINE rename via TMDB (Plex naming) - all via the keyboard, cross-platform."""
     start = str(args.mkv) if getattr(args, "mkv", None) else "."
     if not os.path.isdir(start):
         start = os.path.dirname(start) or "."
@@ -7747,171 +7917,178 @@ def run_rename_files(args):
 
     tagged = set()
     filt = ""
-    filter_editing = False
     cursor = 0
     top = 0
     status = ""
 
-    with _RawMode():
-        _fb_enter_screen()
-        try:
-            while True:
-                dirs, files = _fb_list(cwd, filt)
-                # display rows: ".." + dirs + files
-                rows_items = [("..", "up")] + [(d, "dir") for d in dirs] + [(f, "file") for f in files]
-                n = len(rows_items)
-                if cursor >= n:
-                    cursor = n - 1
-                if cursor < 0:
-                    cursor = 0
+    while True:   # outer loop: lets the online action leave raw mode and come back
+        filter_editing = False
+        online_files = None
+        action = "quit"
+        with _RawMode():
+            _fb_enter_screen()
+            try:
+                while True:
+                    dirs, files = _fb_list(cwd, filt)
+                    rows_items = [("..", "up")] + [(d, "dir") for d in dirs] + [(f, "file") for f in files]
+                    n = len(rows_items)
+                    cursor = max(0, min(cursor, n - 1))
 
-                cols, rows = _fb_termsize()
-                head = [
-                    f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - intelligent rename ==={Style.RESET_ALL}",
-                    f"{Fore.CYAN}Path:{Style.RESET_ALL} {_fb_trunc(cwd, cols - 8)}",
-                ]
-                tagcount = len([f for f in files if f in tagged])
-                if filter_editing:
-                    head.append(f"{Fore.YELLOW}Filter (typing):{Style.RESET_ALL} {filt}_   "
-                                f"{Style.DIM}Enter=keep Esc=clear{Style.RESET_ALL}")
-                else:
-                    head.append(f"{Fore.CYAN}Filter:{Style.RESET_ALL} "
-                                + (filt if filt else f"{Style.DIM}(none){Style.RESET_ALL}")
-                                + f"    {Fore.CYAN}Tagged:{Style.RESET_ALL} {tagcount}/{len(files)}")
-                head.append("")
-
-                foot = [
-                    "",
-                    (f"{Style.DIM}\u2191\u2193 move | Enter/\u2192 open dir | \u2190/Bksp up | "
-                     f"Space tag | * tag-all | / filter | d drive | r RENAME | q quit{Style.RESET_ALL}"),
-                ]
-                if status:
-                    foot.append(f"{Fore.YELLOW}{status}{Style.RESET_ALL}")
-
-                body_rows = max(4, rows - len(head) - len(foot))
-                if cursor < top:
-                    top = cursor
-                elif cursor >= top + body_rows:
-                    top = cursor - body_rows + 1
-                if top < 0:
-                    top = 0
-
-                body = []
-                if top > 0:
-                    body.append(f"  {Fore.CYAN}^ ({top} above){Style.RESET_ALL}")
-                    view_start = top + 1
-                else:
-                    view_start = top
-                shown = rows_items[view_start:view_start + body_rows - (1 if top > 0 else 0)]
-                for idx, (name, kind) in enumerate(shown, start=view_start):
-                    is_cur = (idx == cursor)
-                    tag = "*" if (kind == "file" and name in tagged) else " "
-                    if kind == "up":
-                        base = ".. (up one level)"
-                        col = Fore.CYAN
-                    elif kind == "dir":
-                        base = "[" + name + "]"
-                        col = Fore.CYAN + Style.BRIGHT
+                    cols, rows = _fb_termsize()
+                    head = [
+                        f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - rename (local + online) ==={Style.RESET_ALL}",
+                        f"{Fore.CYAN}Path:{Style.RESET_ALL} {_fb_trunc(cwd, cols - 8)}",
+                    ]
+                    tagcount = len([f for f in files if f in tagged])
+                    if filter_editing:
+                        head.append(f"{Fore.YELLOW}Filter (typing):{Style.RESET_ALL} {filt}_   "
+                                    f"{Style.DIM}Enter=keep Esc=clear{Style.RESET_ALL}")
                     else:
-                        base = name
-                        col = Fore.YELLOW if name in tagged else ""
-                    disp = _fb_trunc(base, cols - 6)
-                    if is_cur:
-                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a{tag} {disp}{Style.RESET_ALL}")
-                    else:
-                        body.append(f" {tag} {col}{disp}{Style.RESET_ALL}")
-                rest = n - (view_start + len(shown))
-                if rest > 0:
-                    body.append(f"  {Fore.CYAN}v ({rest} below){Style.RESET_ALL}")
+                        head.append(f"{Fore.CYAN}Filter:{Style.RESET_ALL} "
+                                    + (filt if filt else f"{Style.DIM}(none){Style.RESET_ALL}")
+                                    + f"    {Fore.CYAN}Tagged:{Style.RESET_ALL} {tagcount}/{len(files)}")
+                    head.append("")
 
-                _fb_write_frame(head + body + foot)
-                status = ""
-                k = _read_key()
+                    foot = [
+                        "",
+                        (f"{Style.DIM}\u2191\u2193 move | Enter/\u2192 open | \u2190/Bksp up | Space tag | "
+                         f"* all | / filter | d drive | r RENAME | o ONLINE(TMDB) | q quit{Style.RESET_ALL}"),
+                    ]
+                    if status:
+                        foot.append(f"{Fore.YELLOW}{status}{Style.RESET_ALL}")
 
-                # ----- filter editing mode -----
-                if filter_editing:
-                    if k == "enter":
-                        filter_editing = False
-                    elif k == "esc":
-                        filter_editing = False
-                        filt = ""
-                        cursor = 0
-                    elif k == "backspace":
-                        filt = filt[:-1]
-                        cursor = 0
-                    elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
-                        filt += k[1]
-                        cursor = 0
-                    continue
+                    body_rows = max(4, rows - len(head) - len(foot))
+                    if cursor < top:
+                        top = cursor
+                    elif cursor >= top + body_rows:
+                        top = cursor - body_rows + 1
+                    top = max(0, top)
 
-                # ----- normal navigation -----
-                if k == "up":
-                    cursor = (cursor - 1) % n
-                elif k == "down":
-                    cursor = (cursor + 1) % n
-                elif k == "pgup":
-                    cursor = max(0, cursor - body_rows)
-                elif k == "pgdn":
-                    cursor = min(n - 1, cursor + body_rows)
-                elif k == "home":
-                    cursor = 0
-                elif k == "end":
-                    cursor = n - 1
-                elif k in ("enter", "right"):
-                    name, kind = rows_items[cursor]
-                    if kind == "up":
+                    body = []
+                    view = rows_items[top:top + body_rows]
+                    for idx, (name, kind) in enumerate(view, start=top):
+                        cur = (idx == cursor)
+                        tag = "*" if (kind == "file" and name in tagged) else " "
+                        if kind == "up":
+                            base, col = ".. (up one level)", Fore.CYAN
+                        elif kind == "dir":
+                            base, col = "[" + name + "]", Fore.CYAN + Style.BRIGHT
+                        else:
+                            base = name
+                            col = Fore.YELLOW if name in tagged else Fore.WHITE
+                        disp = _fb_trunc(base, cols - 6)
+                        if cur:
+                            body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a{tag} {disp}{Style.RESET_ALL}")
+                        else:
+                            body.append(f" {tag} {col}{disp}{Style.RESET_ALL}")
+                    rest = n - (top + len(view))
+                    if rest > 0:
+                        body.append(f"  {Fore.CYAN}v ({rest} more){Style.RESET_ALL}")
+
+                    _fb_write_frame(head + body + foot)
+                    status = ""
+                    k = _read_key()
+
+                    if filter_editing:
+                        if k == "enter":
+                            filter_editing = False
+                        elif k == "esc":
+                            filter_editing = False
+                            filt = ""
+                            cursor = 0
+                        elif k == "backspace":
+                            filt = filt[:-1]
+                            cursor = 0
+                        elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                            filt += k[1]
+                            cursor = 0
+                        continue
+
+                    if k == "up":
+                        cursor = (cursor - 1) % n
+                    elif k == "down":
+                        cursor = (cursor + 1) % n
+                    elif k == "pgup":
+                        cursor = max(0, cursor - body_rows)
+                    elif k == "pgdn":
+                        cursor = min(n - 1, cursor + body_rows)
+                    elif k == "home":
+                        cursor = 0
+                    elif k == "end":
+                        cursor = n - 1
+                    elif k in ("enter", "right"):
+                        name, kind = rows_items[cursor]
+                        if kind == "up":
+                            parent = os.path.dirname(cwd.rstrip(os.sep)) or cwd
+                            if os.path.isdir(parent):
+                                cwd, cursor, top, tagged, filt = os.path.abspath(parent), 0, 0, set(), ""
+                        elif kind == "dir":
+                            target = os.path.join(cwd, name)
+                            if os.path.isdir(target):
+                                cwd, cursor, top, tagged, filt = os.path.abspath(target), 0, 0, set(), ""
+                        else:
+                            tagged.symmetric_difference_update({name})
+                    elif k in ("left", "backspace"):
                         parent = os.path.dirname(cwd.rstrip(os.sep)) or cwd
                         if os.path.isdir(parent):
                             cwd, cursor, top, tagged, filt = os.path.abspath(parent), 0, 0, set(), ""
-                    elif kind == "dir":
-                        target = os.path.join(cwd, name)
-                        if os.path.isdir(target):
-                            cwd, cursor, top, tagged, filt = os.path.abspath(target), 0, 0, set(), ""
-                    else:                              # file -> toggle tag
-                        tagged.symmetric_difference_update({name})
-                elif k in ("left", "backspace"):
-                    parent = os.path.dirname(cwd.rstrip(os.sep)) or cwd
-                    if os.path.isdir(parent):
-                        cwd, cursor, top, tagged, filt = os.path.abspath(parent), 0, 0, set(), ""
-                elif isinstance(k, tuple) and k[0] == "char":
-                    ch = k[1]
-                    if ch == " ":
-                        name, kind = rows_items[cursor]
-                        if kind == "file":
-                            tagged.symmetric_difference_update({name})
-                            cursor = min(n - 1, cursor + 1)
-                    elif ch == "*":
-                        if all(f in tagged for f in files):
-                            tagged -= set(files)
+                    elif isinstance(k, tuple) and k[0] == "char":
+                        ch = k[1]
+                        if ch == " ":
+                            name, kind = rows_items[cursor]
+                            if kind == "file":
+                                tagged.symmetric_difference_update({name})
+                                cursor = min(n - 1, cursor + 1)
+                        elif ch == "*":
+                            if all(f in tagged for f in files):
+                                tagged -= set(files)
+                            else:
+                                tagged |= set(files)
+                        elif ch == "/":
+                            filter_editing = True
+                        elif ch in ("d", "D"):
+                            dest = _fb_pick_location(cwd)
+                            if dest:
+                                cwd, cursor, top, tagged, filt = dest, 0, 0, set(), ""
+                        elif ch in ("r", "R", "F"):
+                            sel = [f for f in files if f in tagged] or list(files)
+                            if not sel:
+                                status = "No files here to rename."
+                            else:
+                                _fb_rename_preview(cwd, sel)
+                                tagged = set()
+                        elif ch in ("o", "O"):
+                            vids = [os.path.join(cwd, f) for f in (list(tagged) if tagged else files)
+                                    if os.path.splitext(f)[1].lower() in VIDEO_EXTS_BATCH]
+                            if not vids:
+                                status = "No videos here for online rename (tag some, or open a folder with videos)."
+                            else:
+                                online_files = vids
+                                action = "online"
+                                break
+                        elif ch in ("q", "Q"):
+                            action = "quit"
+                            break
+                        elif ch in ("?", "h"):
+                            _fb_help_overlay()
+                    elif k == "esc":
+                        if filt:
+                            filt = ""
+                            cursor = 0
                         else:
-                            tagged |= set(files)
-                    elif ch == "/":
-                        filter_editing = True
-                    elif ch in ("d", "D"):
-                        dest = _fb_pick_location(cwd)
-                        if dest:
-                            cwd, cursor, top, tagged, filt = dest, 0, 0, set(), ""
-                    elif ch in ("r", "R", "F", "f"):
-                        sel = [f for f in files if f in tagged] or list(files)
-                        if not sel:
-                            status = "No files here to rename."
-                        else:
-                            _fb_rename_preview(cwd, sel)
-                            tagged = set()
-                    elif ch in ("q", "Q"):
-                        break
-                    elif ch in ("?", "h"):
-                        _fb_help_overlay()
-                elif k == "esc":
-                    if filt:
-                        filt = ""
-                        cursor = 0
-                    else:
-                        break
-        finally:
-            _fb_leave_screen()
-            sys.stdout.write("\x1b[2J\x1b[H")
-            sys.stdout.flush()
+                            action = "quit"
+                            break
+            finally:
+                _fb_leave_screen()
+                sys.stdout.write("\x1b[2J\x1b[H")
+                sys.stdout.flush()
+
+        if action == "online":
+            # normal terminal mode here (raw mode released) -> the online preview runs
+            _online_rename_core(args, online_files)
+            tagged = set()
+            continue
+        return
 
 
 def _fb_help_overlay():
@@ -7931,6 +8108,8 @@ def _fb_help_overlay():
         "                                 (or all shown files if none are tagged)",
         "  In preview: p/c/w/s/g toggle options, x/X strip-regex,",
         "              Enter = apply, Esc = cancel",
+        "  o                              ONLINE rename via TMDB (recognizes the show/movie,",
+        "                                 fetches episode titles, applies Plex naming)",
         "", f"{Fore.CYAN}Other{Style.RESET_ALL}",
         "  q / Esc                        quit back to the menu",
         "", f"{Style.DIM}Press any key to return...{Style.RESET_ALL}",
@@ -9251,6 +9430,743 @@ def run_video_browser(args):
             _video_detail_menu(args, payload)
 
 
+# ============================================================================
+# Online rename via TMDB (recognize shows/movies) + Plex-style naming
+# ----------------------------------------------------------------------------
+# Uses The Movie Database (TMDB). Data provided by TMDB - this product uses the
+# TMDB API but is not endorsed or certified by TMDB. A free API key is needed
+# (themoviedb.org -> Settings -> API); store it via --config. Works with either
+# a v3 API key or a v4 Read Access Token (Bearer).
+# ============================================================================
+
+_TMDB_BASE = "https://api.themoviedb.org/3"
+_TMDB_CACHE = {}
+
+_TMDB_LANG_MAP = {
+    "cs": "cs-CZ", "sk": "sk-SK", "en": "en-US", "de": "de-DE", "pl": "pl-PL",
+    "es": "es-ES", "fr": "fr-FR", "it": "it-IT", "ru": "ru-RU", "hu": "hu-HU",
+    "pt": "pt-PT", "nl": "nl-NL", "ja": "ja-JP", "ko": "ko-KR", "zh": "zh-CN",
+}
+
+# SxxExx (+ optional -Exx range), and the 1x02 style
+_MN_SE = re.compile(r"[Ss](\d{1,2})[ ._-]?[Ee](\d{1,3})(?:[ ._-]?[Ee](\d{1,3}))?")
+_MN_SE_X = re.compile(r"\b(\d{1,2})x(\d{1,3})\b")
+_MN_YEAR = re.compile(r"[\(\.\[\s_](19\d{2}|20\d{2})[\)\.\]\s_]")
+_MN_YEAR_END = re.compile(r"(19\d{2}|20\d{2})\s*$")
+
+
+def _tmdb_auth(args):
+    key = getattr(args, "tmdb_key", None) or os.environ.get("TMDB_API_KEY")
+    bearer = getattr(args, "tmdb_bearer", None) or os.environ.get("TMDB_BEARER")
+    return key, bearer
+
+
+def _iso3_to_iso2(code3):
+    code3 = (code3 or "").lower()
+    for c2 in LANGUAGE_NAMES:
+        if _canon3(c2) == code3:
+            return c2
+    return None
+
+
+def _tmdb_lang(args):
+    ml = (getattr(args, "meta_lang", None) or "cs").replace("_", "-").strip()
+    if "-" in ml:
+        return ml
+    low = ml.lower()
+    if low in _TMDB_LANG_MAP:
+        return _TMDB_LANG_MAP[low]
+    two = _iso3_to_iso2(low)          # accept 3-letter codes (e.g. from the language picker)
+    if two:
+        return _TMDB_LANG_MAP.get(two, two)
+    return ml
+
+
+def _tmdb_request(args, path, params=None):
+    """Low-level TMDB GET. Raises on network/HTTP errors (caller handles)."""
+    import urllib.request
+    import urllib.parse
+    key, bearer = _tmdb_auth(args)
+    q = dict(params or {})
+    headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+    if bearer:
+        headers["Authorization"] = f"Bearer {bearer}"
+    elif key:
+        q["api_key"] = key
+    else:
+        raise RuntimeError("No TMDB key/token configured (run --config).")
+    url = _TMDB_BASE + path + "?" + urllib.parse.urlencode(q)
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=25) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def _tmdb_cached(args, path, params=None):
+    import urllib.parse
+    keyid = path + "?" + urllib.parse.urlencode(sorted((params or {}).items()))
+    if keyid in _TMDB_CACHE:
+        return _TMDB_CACHE[keyid]
+    data = _tmdb_request(args, path, params)
+    _TMDB_CACHE[keyid] = data
+    return data
+
+
+def _tmdb_error_hint(e):
+    import urllib.error
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 401:
+            return "TMDB rejected the key (HTTP 401) - check the API key/token in --config."
+        if e.code == 429:
+            return "TMDB rate limit (HTTP 429) - wait a moment and try again."
+        return f"TMDB HTTP {e.code}."
+    return f"TMDB network error: {e}"
+
+
+def _tmdb_search_tv(args, query, year=None):
+    p = {"query": query, "language": _tmdb_lang(args), "include_adult": "false"}
+    if year:
+        p["first_air_date_year"] = year
+    data = _tmdb_cached(args, "/search/tv", p)
+    out = []
+    for r in data.get("results", [])[:12]:
+        out.append({"id": r["id"], "kind": "tv",
+                    "title": r.get("name") or r.get("original_name") or "",
+                    "orig": r.get("original_name") or "",
+                    "year": (r.get("first_air_date") or "")[:4],
+                    "overview": r.get("overview") or ""})
+    return out
+
+
+def _tmdb_search_movie(args, query, year=None):
+    p = {"query": query, "language": _tmdb_lang(args), "include_adult": "false"}
+    if year:
+        p["year"] = year
+    data = _tmdb_cached(args, "/search/movie", p)
+    out = []
+    for r in data.get("results", [])[:12]:
+        out.append({"id": r["id"], "kind": "movie",
+                    "title": r.get("title") or r.get("original_title") or "",
+                    "orig": r.get("original_title") or "",
+                    "year": (r.get("release_date") or "")[:4],
+                    "overview": r.get("overview") or ""})
+    return out
+
+
+def _tmdb_season_titles(args, tv_id, season):
+    """Returns {episode_number: title}. Falls back to English titles when the
+    localized ones are missing."""
+    try:
+        data = _tmdb_cached(args, f"/tv/{tv_id}/season/{season}", {"language": _tmdb_lang(args)})
+    except Exception:
+        return {}
+    eps = {}
+    missing = False
+    for e in data.get("episodes", []):
+        num = e.get("episode_number")
+        name = (e.get("name") or "").strip()
+        if num is not None:
+            eps[int(num)] = name
+            if not name:
+                missing = True
+    if missing and not _tmdb_lang(args).startswith("en"):
+        try:
+            en = _tmdb_cached(args, f"/tv/{tv_id}/season/{season}", {"language": "en-US"})
+            for e in en.get("episodes", []):
+                num = e.get("episode_number")
+                if num is not None and not eps.get(int(num)):
+                    eps[int(num)] = (e.get("name") or "").strip()
+        except Exception:
+            pass
+    return eps
+
+
+def _tmdb_external_ids(args, kind, tid):
+    try:
+        d = _tmdb_cached(args, f"/{kind}/{tid}/external_ids", {})
+        return d.get("imdb_id") or None
+    except Exception:
+        return None
+
+
+def _parse_media_name(name):
+    """Guesses title / year / season / episode(s) from a file name. is_tv is True
+    when an SxxExx / NxNN pattern is found."""
+    stem = os.path.splitext(name)[0]
+    s = e = e2 = None
+    m = _MN_SE.search(stem)
+    if m:
+        s, e = int(m.group(1)), int(m.group(2))
+        e2 = int(m.group(3)) if m.group(3) else None
+        title_part = stem[:m.start()]
+    else:
+        m2 = _MN_SE_X.search(stem)
+        if m2:
+            s, e = int(m2.group(1)), int(m2.group(2))
+            title_part = stem[:m2.start()]
+        else:
+            title_part = stem
+    year = None
+    ym = _MN_YEAR.search(title_part)
+    if ym:
+        year = ym.group(1)
+        title_part = title_part[:ym.start()]
+    else:
+        ym2 = _MN_YEAR_END.search(title_part.strip())
+        if ym2:
+            year = ym2.group(1)
+            title_part = title_part[:ym2.start()]
+    title = re.sub(r"[._]+", " ", title_part)
+    title = re.sub(r"\s+", " ", title).strip(" -_.[]()")
+    return {"title": title, "year": year, "season": s, "episode": e,
+            "episode_end": e2, "is_tv": s is not None, "raw": stem}
+
+
+def _online_sanitize(t):
+    t = _rn_strip_illegal(_rn_strip_pictographs(t or ""))
+    t = re.sub(r"\s+", " ", t).strip().rstrip(". ")
+    return t
+
+
+def _online_ids_suffix(ids):
+    if not ids:
+        return ""
+    parts = [f"{{{k}-{v}}}" for k, v in ids.items() if v]
+    return (" " + " ".join(parts)) if parts else ""
+
+
+def _plex_tv_name(show, year, s, e, e2, eptitle, ext, ids=None):
+    base = _online_sanitize(show)
+    if year:
+        base += f" ({year})"
+    epc = f"S{s:02d}E{e:02d}" + (f"-E{e2:02d}" if e2 else "")
+    name = f"{base} - {epc}"
+    et = _online_sanitize(eptitle)
+    if et:
+        name += f" - {et}"
+    return name + _online_ids_suffix(ids) + ext
+
+
+def _plex_movie_name(title, year, ext, ids=None):
+    base = _online_sanitize(title)
+    if year:
+        base += f" ({year})"
+    return base + _online_ids_suffix(ids) + ext
+
+
+def _online_pick_show(args, candidates, guess_title, kind):
+    """Returns ('ok', candidate) | ('research', None) | ('skip', None). Shows a
+    Latin-friendly title (English fallback) so non-Latin names don't render as boxes."""
+    labels = []
+    for c in candidates:
+        disp = _online_best_title(args, c)
+        extra = f"   [{c['orig']}]" if (c.get('orig') and c['orig'] != disp and not _online_needs_latin(c['orig'])) else ""
+        labels.append(f"{disp} ({c['year'] or '----'}){extra}")
+    helps = [((c['overview'] or "(no overview)")[:400]) for c in candidates]
+    labels.append("-> Type a different search query")
+    labels.append("-> Skip this group")
+    helps += ["Enter a different title to search TMDB again.", "Leave these files unchanged."]
+    idx = ask_pick(f"Which {kind} is \"{guess_title}\"?", labels, default=0,
+                   allow_back=True, help=helps)
+    if idx is None or idx == len(candidates) + 1:
+        return ("skip", None)
+    if idx == len(candidates):
+        return ("research", None)
+    return ("ok", candidates[idx])
+
+
+def _online_needs_latin(s):
+    return any(ord(c) >= 0x370 for c in (s or ""))
+
+
+def _online_best_title(args, cand):
+    """Prefer a Latin-script title for file names (so names stay readable on Windows
+    consoles and match Plex conventions). Uses the localized title when it is Latin,
+    otherwise the English title, then the original."""
+    t = (cand.get("title") or "").strip()
+    if t and not _online_needs_latin(t):
+        return t
+    try:
+        d = _tmdb_cached(args, f"/{cand['kind']}/{cand['id']}", {"language": "en-US"})
+        en = (d.get("name") or d.get("title") or "").strip()
+    except Exception:
+        en = ""
+    if en and not _online_needs_latin(en):
+        return en
+    orig = (cand.get("orig") or "").strip()
+    if orig and not _online_needs_latin(orig):
+        return orig
+    return t or en or orig or "Unknown"
+
+
+def _online_ensure_key(args):
+    """Ensures a TMDB key/token is available; offers to enter and save one. Returns
+    True when a key is available."""
+    key, bearer = _tmdb_auth(args)
+    if key or bearer:
+        return True
+    log_warn("No TMDB API key configured.")
+    log_info("Get a FREE key at themoviedb.org -> Settings -> API (Developer plan).")
+    if ask_yes_no("Enter a TMDB key/token now and save it?", default_no=False):
+        k = (ask_text("TMDB v3 API key or v4 token", "") or "").strip()
+        if k:
+            cfg = load_config()
+            if k.count(".") >= 2 and len(k) > 60:   # looks like a v4 JWT bearer
+                cfg["tmdb_bearer"] = k
+            else:
+                cfg["tmdb_key"] = k
+            save_config(cfg)
+            apply_config_to_args(args, cfg, force=True)
+            log_done("Saved.")
+    key, bearer = _tmdb_auth(args)
+    if not (key or bearer):
+        log_warn("Cannot continue without a TMDB key.")
+        return False
+    return True
+
+
+def _online_build_groups(videos):
+    """Groups the videos by detected title (+ tv/movie; movies also by year)."""
+    groups = {}
+    for v in videos:
+        info = _parse_media_name(Path(v).name)
+        if not info["title"]:
+            log_warn(f"{Path(v).name}: could not detect a title - skipping.")
+            continue
+        gkey = (info["title"].lower(), info["is_tv"], "" if info["is_tv"] else (info["year"] or ""))
+        groups.setdefault(gkey, {"guess": info["title"], "year": info["year"], "is_tv": info["is_tv"],
+                                 "query": info["title"], "files": [], "cands": [], "chosen": None, "caches": {}})
+        groups[gkey]["files"].append((v, info))
+    return list(groups.values())
+
+
+def _online_search_group(args, g):
+    try:
+        g["cands"] = (_tmdb_search_tv(args, g["query"], g["year"]) if g["is_tv"]
+                      else _tmdb_search_movie(args, g["query"], g["year"]))
+        if not g["cands"] and g["year"]:
+            g["cands"] = (_tmdb_search_tv(args, g["query"]) if g["is_tv"]
+                          else _tmdb_search_movie(args, g["query"]))
+    except Exception as e:
+        log_warn("  " + _tmdb_error_hint(e))
+        g["cands"] = []
+    g["chosen"] = 0 if g["cands"] else None
+    g["caches"] = {}
+
+
+def _online_plan_entries(args, groups, embed_ids, folder_mode, use_eptitle=True):
+    """Builds [dir, old, new, sub, changed, group] for every file, using cached
+    per-group title / imdb / season data so toggles are instant. folder_mode is
+    'off' | 'season' (Season NN) | 's' (SNN). use_eptitle appends the TMDB episode
+    title (in the current language) when True."""
+    entries = []
+    for g in groups:
+        chosen = g["cands"][g["chosen"]] if (g["cands"] and g["chosen"] is not None) else None
+        if not chosen:
+            for v, fi in g["files"]:
+                p = Path(v)
+                entries.append([str(p.parent), p.name, p.name, None, False, g])
+            continue
+        c = g["caches"]
+        if "title" not in c:
+            c["title"] = _online_best_title(args, chosen)
+        title = c["title"]
+        ids = None
+        if embed_ids:
+            if "imdb" not in c:
+                c["imdb"] = _tmdb_external_ids(args, chosen["kind"], chosen["id"])
+            ids = {"tmdb": chosen["id"]}
+            if c["imdb"]:
+                ids["imdb"] = c["imdb"]
+        show_year = chosen["year"] or g["year"]
+        show_folder = f"{_online_sanitize(title)}" + (f" ({show_year})" if show_year else "")
+        seasons = c.setdefault("seasons", {})
+        for v, fi in g["files"]:
+            p = Path(v)
+            if g["is_tv"]:
+                s, e, e2 = fi["season"], fi["episode"], fi["episode_end"]
+                if s not in seasons:
+                    seasons[s] = _tmdb_season_titles(args, chosen["id"], s)
+                ep = seasons[s].get(e, "") if use_eptitle else ""
+                new = _plex_tv_name(title, show_year, s, e, e2, ep, p.suffix, ids)
+                if folder_mode == "season":
+                    sub = show_folder + os.sep + f"Season {s:02d}"
+                elif folder_mode == "s":
+                    sub = show_folder + os.sep + f"S{s:02d}"
+                else:
+                    sub = None
+            else:
+                new = _plex_movie_name(title, show_year, p.suffix, ids)
+                sub = show_folder if folder_mode != "off" else None
+            changed = (new != p.name) or bool(sub)
+            entries.append([str(p.parent), p.name, new, sub, changed, g])
+    return entries
+
+
+def _online_change_match(args, groups):
+    """Interactively re-pick the TMDB match (which group, then which show)."""
+    if len(groups) == 1:
+        gi = 0
+    else:
+        labels = []
+        for g in groups:
+            ch = g["cands"][g["chosen"]] if (g["cands"] and g["chosen"] is not None) else None
+            labels.append(f"{g['guess']} -> " + (f"{ch['title']} ({ch['year'] or '----'})" if ch else "(no match)"))
+        labels.append("cancel")
+        gi = ask_pick("Change which match?", labels, default=0, allow_back=True)
+        if gi is None or gi >= len(groups):
+            return
+    g = groups[gi]
+    kind = "series" if g["is_tv"] else "movie"
+    if not g["cands"]:
+        q = _fb_prompt_line("Search query:", g["query"])
+        if q:
+            g["query"] = q
+            _online_search_group(args, g)
+        return
+    action, cand = _online_pick_show(args, g["cands"], g["guess"], kind)
+    if action == "research":
+        q = _fb_prompt_line("New search query:", g["query"])
+        if q:
+            g["query"] = q
+            _online_search_group(args, g)
+    elif action == "ok":
+        g["chosen"] = g["cands"].index(cand)
+        g["caches"] = {}
+
+
+def _online_apply(changed):
+    done = skipped = 0
+    for d, old, new, sub, _ch, _g in changed:
+        src = os.path.join(d, old)
+        dstdir = os.path.join(d, sub) if sub else d
+        dst = os.path.join(dstdir, new)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        if os.path.exists(dst) and os.path.abspath(dst) != os.path.abspath(src):
+            log_warn(f"{old}: target exists - skipping.")
+            skipped += 1
+            continue
+        try:
+            if sub:
+                os.makedirs(dstdir, exist_ok=True)
+            os.replace(src, dst)
+            done += 1
+        except OSError as ex:
+            log_warn(f"{old}: {ex}")
+            skipped += 1
+    log_done(f"Done: {done} renamed/moved, {skipped} skipped.")
+
+
+def _online_rename_preview(args, videos):
+    """Interactive online-rename preview in the same style as the local renamer:
+    toggle options with keys, re-pick the match, scroll the before/after list, and
+    apply with Enter. Esc cancels."""
+    groups = _online_build_groups(videos)
+    if not groups:
+        log_warn("Could not detect any titles from the file names.")
+        return
+    print(f"{Fore.CYAN}Searching TMDB...{Style.RESET_ALL}")
+    orig_lang = getattr(args, "meta_lang", None)
+    lang_code = orig_lang or "cs"
+    args.meta_lang = lang_code       # session-only override; the config is NOT changed
+    for g in groups:
+        _online_search_group(args, g)
+
+    embed_ids = True
+    folder_mode = "off"   # off | season (Season NN) | s (SNN)
+    use_eptitle = True
+    top = 0
+    to_apply = []
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                entries = _online_plan_entries(args, groups, embed_ids, folder_mode, use_eptitle)
+                seen = {}
+                conflicts = set()
+                for d, old, new, sub, ch, g in entries:
+                    if not ch:
+                        continue
+                    tgt = os.path.join(d, sub or "", new)
+                    if tgt in seen or (os.path.exists(tgt) and os.path.basename(tgt) != old):
+                        conflicts.add(tgt)
+                    seen[tgt] = True
+
+                def _is_conf(e):
+                    return os.path.join(e[0], e[3] or "", e[2]) in conflicts
+                changed = [e for e in entries if e[4] and not _is_conf(e)]
+                conf = [e for e in entries if e[4] and _is_conf(e)]
+                unchanged = [e for e in entries if not e[4]]
+
+                cols, rows = _fb_termsize()
+                header = [
+                    f"{Fore.MAGENTA}=== Online rename preview - {len(videos)} file(s) ==={Style.RESET_ALL}",
+                    (f"{Fore.CYAN}[i]{Style.RESET_ALL} embed-ids:{_fb_onoff(embed_ids)}   "
+                     f"{Fore.CYAN}[f]{Style.RESET_ALL} folders:"
+                     + ({"off": f"{Style.DIM}off{Style.RESET_ALL}",
+                         "season": f"{Fore.GREEN}Season NN{Style.RESET_ALL}",
+                         "s": f"{Fore.GREEN}SNN{Style.RESET_ALL}"}[folder_mode])
+                     + f"   {Fore.CYAN}[t]{Style.RESET_ALL} ep-title:{_fb_onoff(use_eptitle)}   "
+                     f"{Fore.CYAN}[l]{Style.RESET_ALL} lang:{lang_code}   "
+                     f"{Fore.CYAN}[m]{Style.RESET_ALL} change match"),
+                ]
+                for g in groups:
+                    ch = g["cands"][g["chosen"]] if (g["cands"] and g["chosen"] is not None) else None
+                    if ch:
+                        t = g["caches"].get("title") or ch["title"]
+                        header.append(f"  {Fore.CYAN}Match:{Style.RESET_ALL} {_fb_trunc(t, 40)} "
+                                      f"({ch['year'] or '----'})  {Style.DIM}[tmdb-{ch['id']}]{Style.RESET_ALL}")
+                    else:
+                        header.append(f"  {Fore.RED}Match: (none for \"{_fb_trunc(g['guess'], 30)}\") "
+                                      f"- press m{Style.RESET_ALL}")
+                header.append("")
+
+                view = [(e[1], (e[3] + os.sep if e[3] else "") + e[2], _is_conf(e)) for e in entries if e[4]]
+                rows_avail = max(6, rows - len(header) - 3)
+                if top > max(0, len(view) - rows_avail):
+                    top = max(0, len(view) - rows_avail)
+                # dynamic column: align the arrows to the longest old name, no wider than needed
+                max_old = max((len(o) for o, _d, _c in view), default=10)
+                oldw = min(max_old, max(10, cols - 6 - 24))
+                destw = max(16, cols - 6 - oldw)
+                body = []
+                for old, dest, cf in view[top:top + rows_avail]:
+                    arrow = f"{Fore.RED}->{Style.RESET_ALL}" if cf else f"{Fore.CYAN}->{Style.RESET_ALL}"
+                    ncol = Fore.RED if cf else Fore.GREEN
+                    tail = "  [CONFLICT]" if cf else ""
+                    body.append(f"  {_fb_trunc(old, oldw):<{oldw}} {arrow} {ncol}{_fb_trunc(dest, destw)}{tail}{Style.RESET_ALL}")
+                if not view:
+                    body.append(f"  {Style.DIM}(nothing to change - press m to pick a match){Style.RESET_ALL}")
+
+                summary = (f"{Fore.GREEN}Changed: {len(changed)}{Style.RESET_ALL}   "
+                           f"{Fore.RED}Conflicts: {len(conf)}{Style.RESET_ALL}   "
+                           f"{Style.DIM}Unchanged: {len(unchanged)}{Style.RESET_ALL}")
+                footer = (f"{Style.DIM}\u2191\u2193/PgUp/PgDn scroll | i/f/t toggle | l language | "
+                          f"m change match | Enter = APPLY | Esc = cancel{Style.RESET_ALL}")
+                _fb_write_frame(header + body + ["", summary, footer])
+
+                k = _read_key()
+                if k == "esc" or k == ("char", "q"):
+                    return
+                if k == "enter":
+                    if not changed:
+                        continue
+                    to_apply = list(changed)
+                    break
+                if k == "down":
+                    top = min(max(0, len(view) - rows_avail), top + 1)
+                elif k == "up":
+                    top = max(0, top - 1)
+                elif k == "pgdn":
+                    top = min(max(0, len(view) - rows_avail), top + rows_avail)
+                elif k == "pgup":
+                    top = max(0, top - rows_avail)
+                elif isinstance(k, tuple) and k[0] == "char":
+                    ch = k[1]
+                    if ch in ("i", "I"):
+                        embed_ids = not embed_ids
+                    elif ch in ("f", "F"):
+                        folder_mode = {"off": "season", "season": "s", "s": "off"}[folder_mode]
+                    elif ch in ("t", "T"):
+                        use_eptitle = not use_eptitle
+                    elif ch in ("l", "L"):
+                        code = _vid_pick_language(lang_code)
+                        if code and code != "und":
+                            lang_code = code
+                            args.meta_lang = code           # session-only; config untouched
+                            for g in groups:
+                                g["caches"] = {}            # refetch titles/episodes in the new language
+                        _fb_enter_screen()   # re-hide cursor after the nested picker
+                    elif ch in ("m", "M"):
+                        _online_change_match(args, groups)
+                        _fb_enter_screen()   # re-hide cursor after the nested picker
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+            args.meta_lang = orig_lang   # restore the config default (config file was never touched)
+    # normal terminal mode here -> apply is visible
+    _online_apply(to_apply)
+    try:
+        input(f"\n{Fore.CYAN}Press Enter to continue...{Style.RESET_ALL}")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def _online_rename_core(args, videos):
+    """Recognizes shows/movies via TMDB and renames the given video files to the
+    Plex scheme. Uses the interactive preview on a real terminal; otherwise a
+    simple prompt-based flow. Shared by the wizard and the file browser."""
+    if not videos:
+        log_warn("No videos to process.")
+        return
+    log_info("Data by TMDB. This product uses the TMDB API but is not endorsed or certified by TMDB.")
+    if not _online_ensure_key(args):
+        return
+    if _tui_supported():
+        _online_rename_preview(args, videos)
+    else:
+        _online_rename_classic(args, videos)
+
+
+def _online_rename_classic(args, videos):
+    """Non-TTY fallback for the online rename (simple prompts + printed preview)."""
+    if not videos:
+        log_warn("No videos to process.")
+        return
+    embed_ids = ask_yes_no("Embed IDs for perfect Plex matching (e.g. {tmdb-123} {imdb-tt...})?", default_no=True)
+    make_folders = ask_yes_no("Also move files into Plex folders (Show (Year)/Season NN/)?", default_no=True)
+
+    # group by detected title (+ tv/movie); movies group by title+year
+    groups = {}
+    for v in videos:
+        info = _parse_media_name(Path(v).name)
+        if not info["title"]:
+            log_warn(f"{Path(v).name}: could not detect a title - skipping.")
+            continue
+        gkey = (info["title"].lower(), info["is_tv"], "" if info["is_tv"] else (info["year"] or ""))
+        groups.setdefault(gkey, {"info": info, "files": []})
+        groups[gkey]["files"].append((v, info))
+    if not groups:
+        log_warn("Could not detect any titles from the file names.")
+        return
+
+    interactive = sys.stdin.isatty()
+    plan = []   # (dir, old_name, new_name, subfolder_or_None)
+    for gkey, g in sorted(groups.items()):
+        info = g["info"]
+        guess, year = info["title"], info["year"]
+        is_tv = info["is_tv"]
+        kind = "series" if is_tv else "movie"
+        log_info(f"Detected {kind}: \"{guess}\"" + (f" ({year})" if year else "")
+                 + f"  - {len(g['files'])} file(s)")
+        query = guess
+        chosen = None
+        while True:
+            try:
+                cands = _tmdb_search_tv(args, query, year) if is_tv else _tmdb_search_movie(args, query, year)
+                if not cands and year:
+                    cands = _tmdb_search_tv(args, query) if is_tv else _tmdb_search_movie(args, query)
+            except Exception as e:
+                log_warn("  " + _tmdb_error_hint(e))
+                cands = []
+            if not cands:
+                if interactive and ask_yes_no(f"  No match for \"{query}\". Type a different query?", default_no=False):
+                    query = (ask_text("  Search query", guess) or guess).strip()
+                    continue
+                log_warn("  No match - skipping this group.")
+                break
+            if not interactive or len(cands) == 1:
+                chosen = cands[0]
+                if not interactive:
+                    log_info(f"  Using: {chosen['title']} ({chosen['year'] or '----'})")
+                break
+            action, cand = _online_pick_show(args, cands, guess, kind)
+            if action == "skip":
+                break
+            if action == "research":
+                query = (ask_text("  New search query", query) or query).strip()
+                continue
+            chosen = cand
+            break
+        if not chosen:
+            continue
+
+        title = _online_best_title(args, chosen)   # Latin-friendly name for files/folders
+        ids = None
+        if embed_ids:
+            ids = {"tmdb": chosen["id"]}
+            imdb = _tmdb_external_ids(args, chosen["kind"], chosen["id"])
+            if imdb:
+                ids["imdb"] = imdb
+        show_year = chosen["year"] or year
+        season_cache = {}
+        for v, finfo in g["files"]:
+            p = Path(v)
+            if is_tv:
+                s, e, e2 = finfo["season"], finfo["episode"], finfo["episode_end"]
+                if s not in season_cache:
+                    season_cache[s] = _tmdb_season_titles(args, chosen["id"], s)
+                eptitle = season_cache[s].get(e, "")
+                newname = _plex_tv_name(title, show_year, s, e, e2, eptitle, p.suffix, ids)
+                sub = (f"{_online_sanitize(title)}" + (f" ({show_year})" if show_year else "")
+                       + os.sep + f"Season {s:02d}") if make_folders else None
+            else:
+                newname = _plex_movie_name(title, show_year, p.suffix, ids)
+                sub = (f"{_online_sanitize(title)}" + (f" ({show_year})" if show_year else "")) if make_folders else None
+            if newname != p.name or sub:
+                plan.append((str(p.parent), p.name, newname, sub))
+
+    if not plan:
+        log_warn("Nothing to rename.")
+        return
+
+    print()
+    log_info(f"Preview ({len(plan)} file(s)):")
+    seen_targets = {}
+    conflicts = set()
+    for d, old, new, sub in plan:
+        tgt = os.path.join(d, sub or "", new)
+        if tgt in seen_targets or (os.path.exists(tgt) and os.path.basename(tgt) != old):
+            conflicts.add(tgt)
+        seen_targets[tgt] = True
+    for d, old, new, sub in sorted(plan, key=lambda x: (x[3] or "", x[2])):
+        tgt = os.path.join(d, sub or "", new)
+        dest = (sub + os.sep if sub else "") + new
+        color = Fore.RED if tgt in conflicts else Fore.GREEN
+        flag = "   [CONFLICT]" if tgt in conflicts else ""
+        print(f"  {old}\n    {color}-> {dest}{flag}{Style.RESET_ALL}")
+    print()
+    log_info(f"Ready: {len([1 for d, o, n, s in plan if os.path.join(d, s or '', n) not in conflicts])}   "
+             f"Conflicts: {len(conflicts)}")
+
+    if not ask_yes_no(f"Apply and rename/move {len(plan)} file(s)?", default_no=True):
+        log_info("Preview only - nothing changed.")
+        return
+
+    done = skipped = 0
+    for d, old, new, sub in plan:
+        src = os.path.join(d, old)
+        dstdir = os.path.join(d, sub) if sub else d
+        dst = os.path.join(dstdir, new)
+        if os.path.abspath(src) == os.path.abspath(dst):
+            continue
+        if os.path.join(d, sub or "", new) in conflicts or (os.path.exists(dst) and os.path.abspath(dst) != os.path.abspath(src)):
+            log_warn(f"{old}: target exists - skipping.")
+            skipped += 1
+            continue
+        try:
+            if sub:
+                os.makedirs(dstdir, exist_ok=True)
+            os.replace(src, dst)
+            done += 1
+        except OSError as ex:
+            log_warn(f"{old}: {ex}")
+            skipped += 1
+    print()
+    log_done(f"Done: {done} renamed/moved, {skipped} skipped.")
+
+
+def run_online_rename(args):
+    """Recognizes shows/movies online via TMDB and renames files to the Plex
+    naming scheme (e.g. 'Show (2020) - S01E02 - Episode Title.mkv'). Groups
+    episodes by detected title, asks you to confirm the match, fetches official
+    episode titles, shows a full before/after preview, then optionally applies."""
+    print(f"{Fore.MAGENTA}=== Online rename (TMDB -> Plex naming) ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    if not _online_ensure_key(args):
+        return
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("No videos in the directory.")
+    log_info(f"Found {len(videos)} videos.")
+    _online_rename_core(args, videos)
+
+
 _INTERACTIVE_COMMANDS = {
     "auto": ("Synchronize one subtitle file", "run_auto_single"),
     "auto-all": ("Synchronize the whole folder", "run_auto_all"),
@@ -9267,6 +10183,7 @@ _INTERACTIVE_COMMANDS = {
     "convert-audio": ("Convert audio (e.g. to AC-3)", "run_convert_audio"),
     "rename-files": ("Intelligent file rename", "run_rename_files"),
     "video-browser": ("Video browser / inspector", "run_video_browser"),
+    "online-rename": ("Online rename (TMDB -> Plex)", "run_online_rename"),
 }
 
 
@@ -9282,6 +10199,7 @@ def dispatch_interactive_command(cmd, args):
         "extract-audio": run_extract_audio, "import-audio": run_import_audio,
         "convert-audio": run_convert_audio, "rename-files": run_rename_files,
         "video-browser": run_video_browser,
+        "online-rename": run_online_rename,
     }.get(cmd)
     if not fn:
         die(f"Unknown command in the preset: {cmd}")
@@ -9453,7 +10371,13 @@ def _wizard_action_specs():
             label="Intelligent file rename (bulk, preview first)",
             help="Unifies file names by a glob pattern: zero-pads numbers, fills missing common words, "
                  "normalizes case, strips emoji/illegal characters, auto-detects series. Preview then apply.",
-            kind="wizard", run=run_rename_files, flag="rename_files", preset="rename-files"),
+            kind="browser", run=run_rename_files, flag="rename_files", preset="rename-files"),
+        "online-rename": dict(
+            label="Online rename via TMDB (recognize show/movie, Plex naming)",
+            help="Recognizes shows/movies online (TMDB), fetches official episode titles and renames files "
+                 "to the Plex scheme 'Show (Year) - S01E02 - Title.ext'. Needs a free TMDB key (--config). "
+                 "Confirms each match and previews before applying.",
+            kind="wizard", run=run_online_rename, flag="online_rename", preset="online-rename"),
         "video-browser": dict(
             label="Video browser / inspector (Total Commander style)",
             help="Browse folders/drives; press Enter on a video for a full report and every operation: "
@@ -9485,7 +10409,7 @@ _WIZARD_CATEGORIES = [
     ("Video / tracks", "Remove tracks, set the default track",
      ["remove-tracks", "set-default", "video-browser"]),
     ("Files", "Intelligent bulk file renaming",
-     ["rename-files"]),
+     ["rename-files", "online-rename"]),
     ("Presets & settings", "Saved presets, API keys/config, API test",
      ["presets", "config", "test-api"]),
 ]
@@ -9493,7 +10417,7 @@ _WIZARD_CATEGORIES = [
 _WIZARD_MODE_FLAGS = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
                       "extract_subs", "import_subs", "remove_tracks", "set_default",
                       "rename_subs", "fix_readability", "extract_audio", "import_audio",
-                      "convert_audio", "rename_files")
+                      "convert_audio", "rename_files", "online_rename")
 
 
 def _run_wizard_action(key, args):
@@ -10156,6 +11080,9 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--video-browser", action="store_true",
                         help="Interactive mode: Total Commander style video browser; Enter on a video opens a "
                              "full inspector with every track/convert operation.")
+    parser.add_argument("--online-rename", action="store_true",
+                        help="Interactive mode: recognize shows/movies via TMDB and rename files to the Plex "
+                             "naming scheme (needs a free TMDB key in --config).")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -10177,7 +11104,9 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--llm-key", default=None, help="API key for AI proofreading (or OPENAI_API_KEY).")
     parser.add_argument("--config", action="store_true",
                          help="Interactive setup of API keys and default options into video_tool.config.json (asks only about what you want to enable). Loaded automatically at startup.")
-    parser.add_argument("--config-file", default=None, help="Path to the unified video_tool.config.json file (config + presets; default next to the script).")
+    parser.add_argument("--config-file", default=None, help="One-off path to the settings file (folder or full .json; "
+                        "supports UNC \\\\server\\share, mapped drives, ~ and env vars, Linux/SMB paths). "
+                        "To set it permanently use --config or the CONFIG_STORE_PATH constant. Default: next to the script.")
     parser.add_argument("--no-config", action="store_true", help="Do not load the saved configuration (config) at startup.")
     parser.add_argument("--anthropic-key", default=None, help="Anthropic (Claude) API key (or ANTHROPIC_API_KEY).")
     parser.add_argument("--anthropic-model", default=None, help="Model Claude (default claude-sonnet-4-6).")
@@ -10201,7 +11130,7 @@ DIFFERENT LANGUAGES (target vs reference):
     args = parser.parse_args()
 
     global _STORE_PATH, _FFMPEG_URL_OVERRIDE
-    _STORE_PATH = getattr(args, "config_file", None) or getattr(args, "preset_file", None) or None
+    _STORE_PATH = _normalize_store_path(getattr(args, "config_file", None) or getattr(args, "preset_file", None))
     if getattr(args, "ffmpeg_url", None):
         _FFMPEG_URL_OVERRIDE = args.ffmpeg_url
     migrate_legacy_store()
@@ -10252,7 +11181,7 @@ DIFFERENT LANGUAGES (target vs reference):
             args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
             args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
             args.rename_subs, args.fix_readability, args.extract_audio, args.import_audio,
-            args.convert_audio, args.rename_files, args.video_browser]):
+            args.convert_audio, args.rename_files, args.video_browser, args.online_rename]):
         run_master_wizard(args)
         return
 
@@ -10270,7 +11199,8 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "import-audio" if args.import_audio
                        else "convert-audio" if args.convert_audio
                        else "rename-files" if args.rename_files
-                       else "video-browser" if args.video_browser else None)
+                       else "video-browser" if args.video_browser
+                       else "online-rename" if args.online_rename else None)
     if args.save and args.load:
         die("--save and --load cannot be combined.")
     if args.save and not interactive_cmd:
@@ -10322,6 +11252,8 @@ DIFFERENT LANGUAGES (target vs reference):
             run_rename_files(args)
         elif interactive_cmd == "video-browser":
             run_video_browser(args)
+        elif interactive_cmd == "online-rename":
+            run_online_rename(args)
         preset_flush_if_save()
         return
 
@@ -10369,6 +11301,9 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if args.video_browser:
         run_video_browser(args)
+        return
+    if args.online_rename:
+        run_online_rename(args)
         return
 
     if args.all and args.fix_readability:
