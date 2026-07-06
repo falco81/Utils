@@ -3850,10 +3850,14 @@ class OpenSubtitles:
             return None
         url = d.get("link")
         if not url:
+            log_warn("OpenSubtitles: no download link returned (download limit reached, or login required).")
             return None
         try:
             import urllib.request
-            with urllib.request.urlopen(url, timeout=60) as r:
+            # OpenSubtitles rejects requests without a proper User-Agent (HTTP 403),
+            # so the link fetch must carry one too - not just the API calls.
+            req = urllib.request.Request(url, headers={"User-Agent": self.ua})
+            with urllib.request.urlopen(req, timeout=60) as r:
                 return _decode_subtitle_bytes(r.read())
         except Exception as e:
             log_warn(f"OpenSubtitles file download failed: {e}")
@@ -3951,6 +3955,7 @@ CONFIG_FIELDS = [
     ("tmdb_bearer", "tmdb_bearer", "TMDB_BEARER", True),
     ("omdb_key", "omdb_key", "OMDB_API_KEY", True),
     ("meta_lang", "meta_lang", None, False),
+    ("subs_langs", "subs_langs", None, False),
 ]
 
 
@@ -4073,6 +4078,17 @@ def run_config(args):
                       default_no=not cfg.get("opensubtitles_user")):
             ask_plain("OpenSubtitles username", "opensubtitles_user")
             ask_secret("OpenSubtitles heslo", "opensubtitles_password")
+        cur_langs = [x.strip().lower() for x in (cfg.get("subs_langs") or "cs").split(",") if x.strip()]
+        if _tui_supported():
+            log_info("Choose default subtitle languages for the downloader (Space = toggle, Enter = confirm).")
+            picked = _pick_languages_multi(cur_langs)
+            if picked:
+                cfg["subs_langs"] = ",".join(picked)
+        else:
+            _sl = ask_text("Default subtitle languages (codes, comma-separated, e.g. cs,en)",
+                           ",".join(cur_langs))
+            if _sl:
+                cfg["subs_langs"] = ",".join(x.strip().lower() for x in _sl.split(",") if x.strip())
 
     # AI proofreading / translation
     if ask_yes_no("Set up Google Gemini (FREE AI TRANSLATION, recommended for Czech)?",
@@ -4115,7 +4131,7 @@ def run_config(args):
         log_info("  - v4 Read Access Token (a long token; paste it as the Bearer below).")
         ask_secret("TMDB API key (v3)", "tmdb_key")
         ask_secret("TMDB Read Access Token (v4, optional)", "tmdb_bearer")
-        _ml = ask_language("Metadata language (code, e.g. cs, en)", cfg.get("meta_lang") or "cs")
+        _ml = ask_language("Metadata language for the ONLINE RENAMER (code, e.g. cs, en)", cfg.get("meta_lang") or "cs")
         if _ml:
             cfg["meta_lang"] = _ml
         if ask_yes_no("Also add OMDb (IMDb IDs, optional)?", default_no=not cfg.get("omdb_key")):
@@ -7900,11 +7916,11 @@ def _fb_leave_screen():
     sys.stdout.flush()
 
 
-def run_rename_files(args):
-    """Total Commander-style interactive file browser + renamer. Loads the current
-    directory, lets you navigate into folders / up a level, jump between drives, tag
-    files, filter live, then either preview + apply intelligent renames or run an
-    ONLINE rename via TMDB (Plex naming) - all via the keyboard, cross-platform."""
+def run_rename_files(args, mode="rename"):
+    """Total Commander-style interactive file browser. Navigate folders / up / drives,
+    tag files, filter live. mode='rename' offers local + online rename; mode='subs'
+    downloads subtitles from OpenSubtitles for the tagged/shown videos."""
+    is_subs = (mode == "subs")
     start = str(args.mkv) if getattr(args, "mkv", None) else "."
     if not os.path.isdir(start):
         start = os.path.dirname(start) or "."
@@ -7936,7 +7952,9 @@ def run_rename_files(args):
 
                     cols, rows = _fb_termsize()
                     head = [
-                        f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - rename (local + online) ==={Style.RESET_ALL}",
+                        f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - "
+                        + ("download subtitles" if is_subs else "rename (local + online)")
+                        + f" ==={Style.RESET_ALL}",
                         f"{Fore.CYAN}Path:{Style.RESET_ALL} {_fb_trunc(cwd, cols - 8)}",
                     ]
                     tagcount = len([f for f in files if f in tagged])
@@ -7952,7 +7970,9 @@ def run_rename_files(args):
                     foot = [
                         "",
                         (f"{Style.DIM}\u2191\u2193 move | Enter/\u2192 open | \u2190/Bksp up | Space tag | "
-                         f"* all | / filter | d drive | r RENAME | o ONLINE(TMDB) | q quit{Style.RESET_ALL}"),
+                         f"* all | / filter | d drive | "
+                         + ("s DOWNLOAD subs" if is_subs else "r RENAME | o ONLINE(TMDB)")
+                         + f" | q quit{Style.RESET_ALL}"),
                     ]
                     if status:
                         foot.append(f"{Fore.YELLOW}{status}{Style.RESET_ALL}")
@@ -8050,14 +8070,14 @@ def run_rename_files(args):
                             dest = _fb_pick_location(cwd)
                             if dest:
                                 cwd, cursor, top, tagged, filt = dest, 0, 0, set(), ""
-                        elif ch in ("r", "R", "F"):
+                        elif ch in ("r", "R", "F") and not is_subs:
                             sel = [f for f in files if f in tagged] or list(files)
                             if not sel:
                                 status = "No files here to rename."
                             else:
                                 _fb_rename_preview(cwd, sel)
                                 tagged = set()
-                        elif ch in ("o", "O"):
+                        elif ch in ("o", "O") and not is_subs:
                             vids = [os.path.join(cwd, f) for f in (list(tagged) if tagged else files)
                                     if os.path.splitext(f)[1].lower() in VIDEO_EXTS_BATCH]
                             if not vids:
@@ -8066,11 +8086,20 @@ def run_rename_files(args):
                                 online_files = vids
                                 action = "online"
                                 break
+                        elif ch in ("s", "S") and is_subs:
+                            vids = [os.path.join(cwd, f) for f in (list(tagged) if tagged else files)
+                                    if os.path.splitext(f)[1].lower() in VIDEO_EXTS_BATCH]
+                            if not vids:
+                                status = "No videos here for subtitle download (tag some, or open a folder with videos)."
+                            else:
+                                online_files = vids
+                                action = "subs"
+                                break
                         elif ch in ("q", "Q"):
                             action = "quit"
                             break
                         elif ch in ("?", "h"):
-                            _fb_help_overlay()
+                            _fb_help_overlay(is_subs)
                     elif k == "esc":
                         if filt:
                             filt = ""
@@ -8088,10 +8117,19 @@ def run_rename_files(args):
             _online_rename_core(args, online_files)
             tagged = set()
             continue
+        if action == "subs":
+            fails = _subs_download_core(args, online_files) or 0
+            if fails:
+                try:
+                    input(f"\n{Fore.CYAN}Some downloads failed - press Enter to return...{Style.RESET_ALL}")
+                except (EOFError, KeyboardInterrupt):
+                    return
+            tagged = set()
+            continue
         return
 
 
-def _fb_help_overlay():
+def _fb_help_overlay(is_subs=False):
     lines = [
         f"{Fore.MAGENTA}{Style.BRIGHT}=== File browser - help ==={Style.RESET_ALL}", "",
         f"{Fore.CYAN}Navigation{Style.RESET_ALL}",
@@ -8103,13 +8141,28 @@ def _fb_help_overlay():
         "  Space                          tag / untag the file under the cursor",
         "  *                              tag / untag ALL files shown",
         "  /                              live filter (type to narrow, Enter keeps, Esc clears)",
-        "", f"{Fore.CYAN}Renaming{Style.RESET_ALL}",
-        "  r                              open the rename preview for the tagged files",
-        "                                 (or all shown files if none are tagged)",
-        "  In preview: p/c/w/s/g toggle options, x/X strip-regex,",
-        "              Enter = apply, Esc = cancel",
-        "  o                              ONLINE rename via TMDB (recognizes the show/movie,",
-        "                                 fetches episode titles, applies Plex naming)",
+        "",
+    ]
+    if is_subs:
+        lines += [
+            f"{Fore.CYAN}Subtitles{Style.RESET_ALL}",
+            "  s                              download SUBTITLES for the tagged files",
+            "                                 (or all shown files if none are tagged)",
+            "  In preview: arrows move, Enter = pick a version for this file,",
+            "              Tab = info, a = download all (best), l languages (multi),",
+            "              h hearing-impaired, o overwrite, m change match, Esc = cancel",
+        ]
+    else:
+        lines += [
+            f"{Fore.CYAN}Renaming{Style.RESET_ALL}",
+            "  r                              open the rename preview for the tagged files",
+            "                                 (or all shown files if none are tagged)",
+            "  In preview: p/c/w/s/g toggle options, x/X strip-regex,",
+            "              Enter = apply, Esc = cancel",
+            "  o                              ONLINE rename via TMDB (recognizes the show/movie,",
+            "                                 fetches episode titles, applies Plex naming)",
+        ]
+    lines += [
         "", f"{Fore.CYAN}Other{Style.RESET_ALL}",
         "  q / Esc                        quit back to the menu",
         "", f"{Style.DIM}Press any key to return...{Style.RESET_ALL}",
@@ -9802,36 +9855,161 @@ def _online_plan_entries(args, groups, embed_ids, folder_mode, use_eptitle=True)
     return entries
 
 
-def _online_change_match(args, groups):
-    """Interactively re-pick the TMDB match (which group, then which show)."""
-    if len(groups) == 1:
-        gi = 0
-    else:
-        labels = []
-        for g in groups:
-            ch = g["cands"][g["chosen"]] if (g["cands"] and g["chosen"] is not None) else None
-            labels.append(f"{g['guess']} -> " + (f"{ch['title']} ({ch['year'] or '----'})" if ch else "(no match)"))
-        labels.append("cancel")
-        gi = ask_pick("Change which match?", labels, default=0, allow_back=True)
-        if gi is None or gi >= len(groups):
-            return
-    g = groups[gi]
+def _online_disp_light(c):
+    """Latin-friendly title for a candidate WITHOUT extra network calls."""
+    t = (c.get("title") or "").strip()
+    if t and not _online_needs_latin(t):
+        return t
+    o = (c.get("orig") or "").strip()
+    if o and not _online_needs_latin(o):
+        return o
+    return t or o or "?"
+
+
+def _online_live_match(args, g, info_fn=None):
+    """Live, search-as-you-type match picker. The search box starts pre-filled with
+    the detected title; editing it re-queries TMDB immediately and the result list
+    updates. Enter selects the highlighted show; Tab shows detailed info; Esc keeps
+    the current match. info_fn(candidate), if given, renders context-specific info
+    (e.g. available online subtitles); otherwise TMDB details are shown."""
     kind = "series" if g["is_tv"] else "movie"
-    if not g["cands"]:
-        q = _fb_prompt_line("Search query:", g["query"])
-        if q:
-            g["query"] = q
-            _online_search_group(args, g)
+
+    def _search(q):
+        orig = getattr(args, "meta_lang", None)
+        args.meta_lang = "en"     # English titles -> readable (Latin) results
+        try:
+            return (_tmdb_search_tv(args, q) if g["is_tv"] else _tmdb_search_movie(args, q))
+        except Exception:
+            return []
+        finally:
+            args.meta_lang = orig
+
+    def _show_info(c):
+        (info_fn(c) if info_fn else _online_tmdb_info(args, c))
+
+    query = (g.get("query") or g["guess"] or "").strip()
+    results = []
+    last = None
+    sel = 0
+    top = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                if query != last:
+                    last = query
+                    results = _search(query.strip()) if len(query.strip()) >= 2 else []
+                    sel = 0
+                    top = 0
+                sel = max(0, min(sel, max(0, len(results) - 1)))
+                cols, rows = _fb_termsize()
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Change match ({kind}) ==={Style.RESET_ALL}",
+                    f"{Fore.YELLOW}Search:{Style.RESET_ALL} {query}_",
+                    f"{Style.DIM}{len(results)} result(s){Style.RESET_ALL}", "",
+                ]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | type / backspace to edit | "
+                        f"Tab = more info | Enter = select | Esc = cancel{Style.RESET_ALL}"]
+                avail = max(3, rows - len(head) - len(foot))
+                if sel < top:
+                    top = sel
+                elif sel >= top + avail:
+                    top = sel - avail + 1
+                top = max(0, top)
+                body = []
+                for i, c in enumerate(results[top:top + avail], start=top):
+                    label = f"{_online_disp_light(c)} ({c['year'] or '----'})   [tmdb-{c['id']}]"
+                    if i == sel:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {_fb_trunc(label, cols - 4)}{Style.RESET_ALL}")
+                    else:
+                        body.append(f"  {Fore.CYAN}{_fb_trunc(label, cols - 4)}{Style.RESET_ALL}")
+                if not results:
+                    body.append(f"  {Style.DIM}" + ("(type at least 2 characters to search)"
+                                if len(query.strip()) < 2 else "(no matches)") + f"{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+                if k == "esc":
+                    return
+                elif k in ("enter", "right"):
+                    if results:
+                        g["cands"] = results
+                        g["chosen"] = sel
+                        g["query"] = query
+                        g["caches"] = {}
+                    return
+                elif k == ("char", "\t"):
+                    if results:
+                        _show_info(results[sel])
+                        _fb_enter_screen()
+                elif k == "up":
+                    sel = (sel - 1) % len(results) if results else 0
+                elif k == "down":
+                    sel = (sel + 1) % len(results) if results else 0
+                elif k == "pgup":
+                    sel = max(0, sel - avail)
+                elif k == "pgdn":
+                    sel = min(len(results) - 1, sel + avail) if results else 0
+                elif k == "backspace":
+                    query = query[:-1]
+                elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                    query += k[1]
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _online_tmdb_info(args, cand):
+    """Scrollable TMDB details for a candidate (overview, seasons/episodes, genres...)."""
+    kind = cand.get("kind", "tv")
+    try:
+        d = _tmdb_cached(args, f"/{kind}/{cand['id']}", {"language": _tmdb_lang(args)})
+    except Exception as e:
+        log_warn("TMDB details: " + _tmdb_error_hint(e))
         return
-    action, cand = _online_pick_show(args, g["cands"], g["guess"], kind)
-    if action == "research":
-        q = _fb_prompt_line("New search query:", g["query"])
-        if q:
-            g["query"] = q
-            _online_search_group(args, g)
-    elif action == "ok":
-        g["chosen"] = g["cands"].index(cand)
-        g["caches"] = {}
+    L = [f"{Fore.CYAN}Title:{Style.RESET_ALL} {cand.get('title')}",
+         f"{Fore.CYAN}Original:{Style.RESET_ALL} {d.get('original_name') or d.get('original_title') or '-'}",
+         f"{Fore.CYAN}Year:{Style.RESET_ALL} {cand.get('year') or '-'}    "
+         f"{Fore.CYAN}Rating:{Style.RESET_ALL} {d.get('vote_average', '-')}/10 ({d.get('vote_count', 0)} votes)",
+         f"{Fore.CYAN}Genres:{Style.RESET_ALL} {', '.join(g.get('name', '') for g in d.get('genres', [])) or '-'}",
+         f"{Fore.CYAN}TMDB:{Style.RESET_ALL} tmdb-{cand['id']}", ""]
+    if kind == "tv":
+        L.append(f"{Fore.CYAN}Seasons:{Style.RESET_ALL} {d.get('number_of_seasons', '?')}   "
+                 f"{Fore.CYAN}Episodes:{Style.RESET_ALL} {d.get('number_of_episodes', '?')}   "
+                 f"{Fore.CYAN}Status:{Style.RESET_ALL} {d.get('status', '-')}")
+        L.append(f"{Fore.CYAN}Networks:{Style.RESET_ALL} "
+                 f"{', '.join(n.get('name', '') for n in d.get('networks', [])) or '-'}")
+        for s in d.get("seasons", []):
+            L.append(f"  Season {s.get('season_number')}: {s.get('episode_count', '?')} episodes"
+                     + (f"  ({s.get('air_date')})" if s.get("air_date") else ""))
+    else:
+        L.append(f"{Fore.CYAN}Runtime:{Style.RESET_ALL} {d.get('runtime', '?')} min   "
+                 f"{Fore.CYAN}Released:{Style.RESET_ALL} {d.get('release_date', '-')}")
+    ov = (d.get("overview") or "").strip()
+    if ov:
+        L += ["", f"{Fore.CYAN}Overview:{Style.RESET_ALL}"]
+        # wrap overview to ~90 chars
+        import textwrap
+        L += ["  " + ln for ln in textwrap.wrap(ov, 90)]
+    _vid_scroll_view(f"TMDB info - {cand.get('title')}", L)
+
+
+def _online_change_match(args, groups, info_fn=None):
+    """Re-pick the TMDB match. With multiple detected titles, first choose which one,
+    then use the live search picker. info_fn is forwarded to the picker for the
+    Tab = more info panel."""
+    if len(groups) == 1:
+        _online_live_match(args, groups[0], info_fn=info_fn)
+        return
+    labels = []
+    for g in groups:
+        ch = g["cands"][g["chosen"]] if (g["cands"] and g["chosen"] is not None) else None
+        labels.append(f"{g['guess']} -> " + (f"{_online_disp_light(ch)} ({ch['year'] or '----'})" if ch else "(no match)"))
+    labels.append("cancel")
+    gi = ask_pick("Change which match?", labels, default=0, allow_back=True)
+    if gi is None or gi >= len(groups):
+        return
+    _online_live_match(args, groups[gi], info_fn=info_fn)
 
 
 def _online_apply(changed):
@@ -9872,7 +10050,7 @@ def _online_rename_preview(args, videos):
     for g in groups:
         _online_search_group(args, g)
 
-    embed_ids = True
+    embed_ids = False
     folder_mode = "off"   # off | season (Season NN) | s (SNN)
     use_eptitle = True
     top = 0
@@ -10147,24 +10325,554 @@ def _online_rename_classic(args, videos):
     log_done(f"Done: {done} renamed/moved, {skipped} skipped.")
 
 
-def run_online_rename(args):
-    """Recognizes shows/movies online via TMDB and renames files to the Plex
-    naming scheme (e.g. 'Show (2020) - S01E02 - Episode Title.mkv'). Groups
-    episodes by detected title, asks you to confirm the match, fetches official
-    episode titles, shows a full before/after preview, then optionally applies."""
-    print(f"{Fore.MAGENTA}=== Online rename (TMDB -> Plex naming) ==={Style.RESET_ALL}")
-    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
-    if not os.path.isdir(directory):
-        directory = os.path.dirname(directory) or "."
-    log_info(f"Working directory: {os.path.abspath(directory)}")
-    if not _online_ensure_key(args):
+# ============================================================================
+# Online subtitle download (OpenSubtitles) - same UI as the online renamer,
+# with MULTI-language selection. Reachable from the file browser via 's'.
+# ============================================================================
+
+def _pick_languages_multi(selected):
+    """Searchable multi-select language picker (name + 2-letter code). Space toggles,
+    type to filter, Enter confirms (returns a list of codes), Esc cancels (None)."""
+    items = sorted(((name, c2) for c2, name in LANGUAGE_NAMES.items()), key=lambda x: x[0])
+    sel = set(c.lower() for c in (selected or []))
+    filt = ""
+    pos = 0
+    top = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                f = filt.lower().strip()
+                view = [(n, c) for n, c in items if (not f or f in n.lower() or f in c.lower())]
+                if not view:
+                    view = [("(no match)", "")]
+                pos = max(0, min(pos, len(view) - 1))
+                cols, rows = _fb_termsize()
+                chosen = ", ".join(sorted(sel)) if sel else "(none)"
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Select languages ==={Style.RESET_ALL}",
+                    f"{Fore.CYAN}Selected:{Style.RESET_ALL} {_fb_trunc(chosen, cols - 12)}",
+                    f"{Fore.YELLOW}Search:{Style.RESET_ALL} {filt}_", "",
+                ]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | type = search | "
+                        f"Enter = confirm | Esc = cancel{Style.RESET_ALL}"]
+                avail = max(3, rows - len(head) - len(foot))
+                if pos < top:
+                    top = pos
+                elif pos >= top + avail:
+                    top = pos - avail + 1
+                top = max(0, top)
+                body = []
+                for i, (n, c) in enumerate(view[top:top + avail], start=top):
+                    box = "[x]" if c in sel else "[ ]"
+                    label = f"{box} {n}  ({c})" if c else n
+                    if i == pos:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {label}{Style.RESET_ALL}")
+                    else:
+                        col = Fore.YELLOW if c in sel else Fore.CYAN
+                        body.append(f"  {col}{label}{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+                if k == "esc":
+                    return None
+                elif k == "enter":
+                    return sorted(sel)
+                elif k == ("char", " "):
+                    c = view[pos][1]
+                    if c:
+                        sel.discard(c) if c in sel else sel.add(c)
+                elif k == "up":
+                    pos = (pos - 1) % len(view)
+                elif k == "down":
+                    pos = (pos + 1) % len(view)
+                elif k == "pgup":
+                    pos = max(0, pos - avail)
+                elif k == "pgdn":
+                    pos = min(len(view) - 1, pos + avail)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(view) - 1
+                elif k == "backspace":
+                    filt = filt[:-1]
+                    pos = top = 0
+                elif isinstance(k, tuple) and k[0] == "char" and k[1] >= " ":
+                    filt += k[1]
+                    pos = top = 0
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _subs_ensure_key(args):
+    key = getattr(args, "opensubtitles_key", None) or os.environ.get("OPENSUBTITLES_API_KEY")
+    if not key:
+        log_warn("No OpenSubtitles API key configured.")
+        log_info("Get a free API key at opensubtitles.com (consumer API). Downloading also needs an account.")
+        if ask_yes_no("Enter an OpenSubtitles API key now and save it?", default_no=False):
+            k = (ask_text("OpenSubtitles API key", "") or "").strip()
+            if k:
+                cfg = load_config()
+                cfg["opensubtitles_key"] = k
+                save_config(cfg)
+                apply_config_to_args(args, cfg, force=True)
+                log_done("Saved.")
+        key = getattr(args, "opensubtitles_key", None)
+    if not key:
+        log_warn("Cannot continue without an OpenSubtitles API key.")
+        return None
+    return key
+
+
+def _subs_client(args):
+    key = getattr(args, "opensubtitles_key", None) or os.environ.get("OPENSUBTITLES_API_KEY")
+    user = getattr(args, "opensubtitles_user", None) or os.environ.get("OPENSUBTITLES_USER")
+    pw = getattr(args, "opensubtitles_password", None) or os.environ.get("OPENSUBTITLES_PASSWORD")
+    return OpenSubtitles(key, username=user, password=pw)
+
+
+def _subs_search(client, langs, query=None, season=None, episode=None, tmdb_id=None, hearing_impaired=None):
+    from urllib.parse import urlencode
+    params = {"languages": ",".join(langs)}
+    if query:
+        params["query"] = query
+    if season is not None:
+        params["season_number"] = season
+    if episode is not None:
+        params["episode_number"] = episode
+    if tmdb_id:
+        params["tmdb_id"] = tmdb_id
+    if hearing_impaired is not None:
+        params["hearing_impaired"] = "only" if hearing_impaired else "exclude"
+    try:
+        d = client._req("GET", "/subtitles?" + urlencode(params))
+        return d.get("data", []) or []
+    except Exception as e:
+        log_warn("OpenSubtitles search: " + str(e))
+        return []
+
+
+def _subs_dl(r):
+    a = r.get("attributes", {}) or {}
+    return int(a.get("download_count", 0) or 0)
+
+
+def _subs_best_by_lang(results, langs):
+    """Returns {lang: best_result} choosing the most-downloaded per language."""
+    best = {}
+    for r in results:
+        a = r.get("attributes", {}) or {}
+        lg = (a.get("language") or "").lower()
+        if lg not in langs:
+            continue
+        if lg not in best or _subs_dl(r) > _subs_dl(best[lg]):
+            best[lg] = r
+    return best
+
+
+def _subs_file_id(r):
+    files = (r.get("attributes", {}) or {}).get("files") or []
+    return files[0].get("file_id") if files else None
+
+
+def _subs_info_view(args, client, langs, cand):
+    """Scrollable panel: which episodes/files have online subtitles for this show,
+    with release, downloads, fps, hearing-impaired and uploader details."""
+    tid = cand["id"]
+    L = [f"{Fore.CYAN}Show:{Style.RESET_ALL} {_online_disp_light(cand)} ({cand.get('year') or '----'})  "
+         f"{Style.DIM}[tmdb-{tid}]{Style.RESET_ALL}",
+         f"{Fore.CYAN}Languages:{Style.RESET_ALL} {', '.join(langs) or '-'}", ""]
+    # optional TMDB overview
+    try:
+        d = _tmdb_cached(args, f"/{cand.get('kind', 'tv')}/{tid}", {"language": _tmdb_lang(args)})
+        ov = (d.get("overview") or "").strip()
+        if ov:
+            import textwrap
+            L += [f"{Fore.CYAN}Overview:{Style.RESET_ALL}"] + ["  " + ln for ln in textwrap.wrap(ov, 90)] + [""]
+    except Exception:
+        pass
+    L.append(f"{Fore.GREEN}Available online subtitles (OpenSubtitles):{Style.RESET_ALL}")
+    try:
+        res = _subs_search(client, langs, tmdb_id=tid)
+    except Exception as e:
+        res = []
+        L.append(f"  {Style.DIM}(search failed: {e}){Style.RESET_ALL}")
+    if not res:
+        L.append(f"  {Style.DIM}(none found for these languages){Style.RESET_ALL}")
+    else:
+        by_ep = {}
+        for r in res:
+            a = r.get("attributes", {}) or {}
+            fd = a.get("feature_details", {}) or {}
+            by_ep.setdefault((fd.get("season_number"), fd.get("episode_number")), []).append(r)
+        L.append(f"  {Style.DIM}{len(res)} subtitle file(s) across {len(by_ep)} item(s){Style.RESET_ALL}")
+        for key in sorted(by_ep, key=lambda x: ((x[0] or 0), (x[1] or 0))):
+            s, e = key
+            fd0 = (by_ep[key][0].get("attributes", {}) or {}).get("feature_details", {}) or {}
+            eptitle = fd0.get("title") or fd0.get("movie_name") or ""
+            hdr = (f"S{s:02d}E{e:02d}" if (s and e) else (fd0.get("parent_title") or "item"))
+            L.append("")
+            L.append(f"{Fore.YELLOW}{hdr}{Style.RESET_ALL}" + (f"  {eptitle}" if eptitle else ""))
+            for r in sorted(by_ep[key], key=_subs_dl, reverse=True)[:10]:
+                a = r.get("attributes", {}) or {}
+                L.append(f"   {(a.get('language') or '?'):5} dl {(_subs_dl(r)):>6}  "
+                         f"fps {str(a.get('fps') or '?'):>5}  hi {'Y' if a.get('hearing_impaired') else 'N'}  "
+                         f"{(a.get('release') or '')[:48]}")
+    _vid_scroll_view(f"Online subtitles - {_online_disp_light(cand)}", L)
+
+
+def _subs_result_line(r):
+    a = r.get("attributes", {}) or {}
+    fd = a.get("feature_details", {}) or {}
+    ep = f"S{fd.get('season_number'):02d}E{fd.get('episode_number'):02d} " if (fd.get('season_number') and fd.get('episode_number')) else ""
+    return (f"{(a.get('language') or '?'):5} dl {_subs_dl(r):>6}  fps {str(a.get('fps') or '?'):>5}  "
+            f"hi {'Y' if a.get('hearing_impaired') else 'N'}  {ep}{(a.get('release') or a.get('files',[{}])[0].get('file_name','') or '')[:56]}")
+
+
+def _subs_file_results(client, langs, video, tmdb_id):
+    info = _parse_media_name(Path(video).name)
+    try:
+        return _subs_search(client, langs,
+                            query=(None if tmdb_id else (info["title"] or Path(video).stem)),
+                            season=info["season"], episode=info["episode"], tmdb_id=tmdb_id)
+    except Exception:
+        return []
+
+
+def _subs_file_info(args, client, langs, video, tmdb_id):
+    """Read-only scrollable list of the subtitles available online for one file."""
+    res = _subs_file_results(client, langs, video, tmdb_id)
+    L = [f"{Fore.CYAN}File:{Style.RESET_ALL} {Path(video).name}",
+         f"{Fore.CYAN}Languages:{Style.RESET_ALL} {', '.join(langs) or '-'}",
+         f"{Fore.CYAN}Available:{Style.RESET_ALL} {len(res)} subtitle file(s)", ""]
+
+    def _lg(r):
+        return (r.get("attributes", {}) or {}).get("language", "")
+    if not res:
+        L.append(f"  {Style.DIM}(none found for these languages){Style.RESET_ALL}")
+    else:
+        for r in sorted(res, key=lambda r: ((langs.index(_lg(r)) if _lg(r) in langs else 99), -_subs_dl(r))):
+            L.append("  " + _subs_result_line(r))
+    _vid_scroll_view(f"Subtitles - {Path(video).name}", L)
+
+
+def _subs_pick_for_file(args, client, langs, video, tmdb_id, overwrite):
+    """Interactive per-file picker: lists every available subtitle version for this
+    episode and downloads the one you choose (Enter). Esc goes back."""
+    res = _subs_file_results(client, langs, video, tmdb_id)
+
+    def _lg(r):
+        return (r.get("attributes", {}) or {}).get("language", "")
+    if not res:
+        _fb_write_frame([f"{Fore.MAGENTA}{Style.BRIGHT}=== {_fb_trunc(Path(video).name, 60)} ==={Style.RESET_ALL}",
+                         "", f"  {Style.DIM}No subtitles found for the selected languages.{Style.RESET_ALL}",
+                         "", f"  {Style.DIM}Tip: add languages with [l] in the preview.{Style.RESET_ALL}",
+                         "", f"{Style.DIM}Press any key to go back...{Style.RESET_ALL}"])
+        _read_key()
         return
-    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
-    videos = collect_videos(directory, recursive)
+    items = sorted(res, key=lambda r: ((langs.index(_lg(r)) if _lg(r) in langs else 99), -_subs_dl(r)))
+    sel = 0
+    top = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                cols, rows = _fb_termsize()
+                head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Subtitles: {_fb_trunc(Path(video).name, 55)} ==={Style.RESET_ALL}",
+                        f"{Style.DIM}{len(items)} version(s) - pick one to download{Style.RESET_ALL}", ""]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | Enter = download this version | Esc = back{Style.RESET_ALL}"]
+                avail = max(3, rows - len(head) - len(foot))
+                sel = max(0, min(sel, len(items) - 1))
+                if sel < top:
+                    top = sel
+                elif sel >= top + avail:
+                    top = sel - avail + 1
+                top = max(0, top)
+                body = []
+                for i, r in enumerate(items[top:top + avail], start=top):
+                    line = _subs_result_line(r)
+                    if i == sel:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {_fb_trunc(line, cols - 4)}{Style.RESET_ALL}")
+                    else:
+                        body.append(f"  {Fore.CYAN}{_fb_trunc(line, cols - 4)}{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+                if k == "esc" or k == ("char", "q"):
+                    return
+                elif k in ("enter", "right"):
+                    r = items[sel]
+                    lg = _lg(r) or "und"
+                    fid = _subs_file_id(r)
+                    out = f"{str(Path(video).with_suffix(''))}.{lg}.srt"
+                    _fb_leave_screen()
+                    if os.path.exists(out) and not overwrite:
+                        log_warn(f"{Path(out).name}: already exists (enable [o] overwrite to replace).")
+                    else:
+                        client.login()
+                        content = client.download_srt(fid) if fid else None
+                        if content:
+                            try:
+                                with open(out, "w", encoding="utf-8") as f:
+                                    f.write(content)
+                                log_done(f"Saved {Path(out).name}")
+                            except OSError as ex:
+                                log_warn(f"{Path(out).name}: {ex}")
+                        else:
+                            log_warn(f"{Path(out).name}: download failed.")
+                    try:
+                        input(f"\n{Fore.CYAN}Press Enter to continue...{Style.RESET_ALL}")
+                    except (EOFError, KeyboardInterrupt):
+                        return
+                    _fb_enter_screen()
+                elif k == "up":
+                    sel = (sel - 1) % len(items)
+                elif k == "down":
+                    sel = (sel + 1) % len(items)
+                elif k == "pgup":
+                    sel = max(0, sel - avail)
+                elif k == "pgdn":
+                    sel = min(len(items) - 1, sel + avail)
+                elif k == "home":
+                    sel = 0
+                elif k == "end":
+                    sel = len(items) - 1
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _subs_preview(args, videos):
+    """Interactive OpenSubtitles download preview. Move the cursor with the arrows,
+    press Enter on a file to pick a specific version, Tab to see all available
+    subtitles for it, 'a' to batch-download the best per language. [l] languages
+    (multi), [h] hearing-impaired, [o] overwrite, [m] refine the show match."""
+    client = _subs_client(args)
+    groups = _online_build_groups(videos)
+    v2g = {}
+    for g in groups:
+        for v, _fi in g["files"]:
+            v2g[v] = g
+    _sl = getattr(args, "subs_langs", None) or getattr(args, "out_lang", None) or "cs"
+    langs = [x.strip().lower() for x in str(_sl).split(",") if x.strip()] or ["cs"]
+    hi = False
+    overwrite = False
+    cache = {}
+    cursor = 0
+    top = 0
+    to_download = []
+
+    def _tid(g):
+        if g and g.get("cands") and g.get("chosen") is not None:
+            return g["cands"][g["chosen"]]["id"]
+        return None
+
+    def plan_for(v):
+        g = v2g.get(v)
+        tid = _tid(g)
+        key = (v, tuple(sorted(langs)), hi, tid)
+        if key not in cache:
+            info = _parse_media_name(Path(v).name)
+            cache[key] = _subs_best_by_lang(_subs_search(
+                client, langs,
+                query=(None if tid else (info["title"] or Path(v).stem)),
+                season=info["season"], episode=info["episode"],
+                tmdb_id=tid, hearing_impaired=hi if hi else None), langs)
+        return cache[key]
+
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                entries = [(v, plan_for(v)) for v in videos]
+                found_pairs = sum(len(b) for _v, b in entries)
+                missing_pairs = len(videos) * len(langs) - found_pairs
+
+                cols, rows = _fb_termsize()
+                header = [
+                    f"{Fore.MAGENTA}=== Subtitle download (OpenSubtitles) - {len(videos)} file(s) ==={Style.RESET_ALL}",
+                    (f"{Fore.CYAN}[l]{Style.RESET_ALL} languages:{Fore.GREEN}{','.join(langs) or '-'}{Style.RESET_ALL}   "
+                     f"{Fore.CYAN}[h]{Style.RESET_ALL} hearing-impaired:{_fb_onoff(hi)}   "
+                     f"{Fore.CYAN}[o]{Style.RESET_ALL} overwrite:{_fb_onoff(overwrite)}   "
+                     f"{Fore.CYAN}[m]{Style.RESET_ALL} change match"),
+                ]
+                for g in groups:
+                    tid = _tid(g)
+                    if tid:
+                        ch = g["cands"][g["chosen"]]
+                        header.append(f"  {Fore.CYAN}Match:{Style.RESET_ALL} {_fb_trunc(_online_disp_light(ch), 40)} "
+                                      f"({ch['year'] or '----'})  {Style.DIM}[tmdb-{tid}]{Style.RESET_ALL}")
+                header.append("")
+
+                plain = []
+                for v, best in entries:
+                    cells = [(lg, (f"{lg}:OK[{_subs_dl(best[lg])}]" if best.get(lg) else f"{lg}:--"), bool(best.get(lg)))
+                             for lg in langs]
+                    plain.append((Path(v).name, cells))
+                cellw = {lg: max((len(c[1]) for _n, cs in plain for c in cs if c[0] == lg), default=6) for lg in langs}
+                namew = min(max((len(n) for n, _c in plain), default=10),
+                            max(10, cols - sum(cellw.values()) - 2 * len(langs) - 8))
+
+                rows_avail = max(4, rows - len(header) - 3)
+                cursor = max(0, min(cursor, len(plain) - 1)) if plain else 0
+                if cursor < top:
+                    top = cursor
+                elif cursor >= top + rows_avail:
+                    top = cursor - rows_avail + 1
+                top = max(0, top)
+                body = []
+                for idx, (name, cells) in enumerate(plain[top:top + rows_avail], start=top):
+                    seg = "  ".join(
+                        f"{(Fore.GREEN if found else Style.DIM)}{txt:<{cellw[lg]}}{Style.RESET_ALL}"
+                        for lg, txt, found in cells)
+                    if idx == cursor:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {_fb_trunc(name, namew):<{namew}}{Style.RESET_ALL}  {seg}")
+                    else:
+                        body.append(f"  {_fb_trunc(name, namew):<{namew}}  {seg}")
+                if not plain:
+                    body.append(f"  {Style.DIM}(no videos){Style.RESET_ALL}")
+
+                summary = (f"{Fore.GREEN}Found: {found_pairs}{Style.RESET_ALL}   "
+                           f"{Style.DIM}Missing: {missing_pairs}{Style.RESET_ALL}   "
+                           f"(saved as name.<lang>.srt)")
+                footer = (f"{Style.DIM}\u2191\u2193 move | Enter = versions/download | Tab = info | "
+                          f"a = download all | l/h/o/m | Esc = cancel{Style.RESET_ALL}")
+                _fb_write_frame(header + body + ["", summary, footer])
+
+                k = _read_key()
+                if k == "esc" or k == ("char", "q"):
+                    return 0
+                if k == "enter":
+                    if plain:
+                        v = videos[cursor]
+                        _subs_pick_for_file(args, client, langs, v, _tid(v2g.get(v)), overwrite)
+                        cache.clear()
+                        _fb_enter_screen()
+                    continue
+                if k == ("char", "\t"):
+                    if plain:
+                        v = videos[cursor]
+                        _subs_file_info(args, client, langs, v, _tid(v2g.get(v)))
+                        _fb_enter_screen()
+                    continue
+                if k == "down":
+                    cursor = (cursor + 1) % len(plain) if plain else 0
+                elif k == "up":
+                    cursor = (cursor - 1) % len(plain) if plain else 0
+                elif k == "pgdn":
+                    cursor = min(len(plain) - 1, cursor + rows_avail) if plain else 0
+                elif k == "pgup":
+                    cursor = max(0, cursor - rows_avail)
+                elif k == "home":
+                    cursor = 0
+                elif k == "end":
+                    cursor = len(plain) - 1 if plain else 0
+                elif isinstance(k, tuple) and k[0] == "char":
+                    ch = k[1]
+                    if ch in ("a", "A"):
+                        if found_pairs == 0:
+                            continue
+                        to_download = entries
+                        break
+                    elif ch in ("l", "L"):
+                        newl = _pick_languages_multi(langs)
+                        if newl is not None:
+                            langs = newl or langs
+                        _fb_enter_screen()
+                    elif ch in ("h", "H"):
+                        hi = not hi
+                    elif ch in ("o", "O"):
+                        overwrite = not overwrite
+                    elif ch in ("m", "M"):
+                        _online_change_match(args, groups,
+                                             info_fn=lambda c: _subs_info_view(args, client, langs, c))
+                        cache.clear()
+                        _fb_enter_screen()
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+    # batch download (from 'a') - visible in normal mode
+    if not to_download:
+        return 0
+    logged = client.login()
+    if not logged and not (client.user and client.password):
+        log_warn("No OpenSubtitles account set - downloading requires a username/password (--config).")
+    done = skipped = fail = 0
+    for v, best in to_download:
+        stem = str(Path(v).with_suffix(""))
+        for lg, r in best.items():
+            out = f"{stem}.{lg}.srt"
+            if os.path.exists(out) and not overwrite:
+                skipped += 1
+                continue
+            fid = _subs_file_id(r)
+            content = client.download_srt(fid) if fid else None
+            if content:
+                try:
+                    with open(out, "w", encoding="utf-8") as f:
+                        f.write(content)
+                    log_done(f"{Path(out).name}")
+                    done += 1
+                except OSError as ex:
+                    log_warn(f"{Path(out).name}: {ex}")
+                    fail += 1
+            else:
+                fail += 1
+    print()
+    log_done(f"Downloaded: {done}   skipped(existing): {skipped}   failed: {fail}")
+    return fail
+
+
+def _subs_classic(args, videos):
+    """Non-TTY fallback: downloads the default-language subtitle for each video."""
+    client = _subs_client(args)
+    _sl = getattr(args, "subs_langs", None) or getattr(args, "out_lang", None) or "en"
+    langs = [x.strip().lower() for x in str(_sl).split(",") if x.strip()] or ["en"]
+    client.login()
+    done = fail = 0
+    for v in videos:
+        info = _parse_media_name(Path(v).name)
+        res = _subs_search(client, langs, query=info["title"] or Path(v).stem,
+                           season=info["season"], episode=info["episode"])
+        best = _subs_best_by_lang(res, langs)
+        for lg, r in best.items():
+            fid = _subs_file_id(r)
+            content = client.download_srt(fid) if fid else None
+            out = f"{str(Path(v).with_suffix(''))}.{lg}.srt"
+            if content:
+                with open(out, "w", encoding="utf-8") as f:
+                    f.write(content)
+                log_done(Path(out).name)
+                done += 1
+            else:
+                fail += 1
+    log_done(f"Downloaded: {done}   failed: {fail}")
+    return fail
+
+
+def _subs_download_core(args, videos):
+    """Downloads subtitles from OpenSubtitles for the given videos. Interactive
+    preview on a real terminal; a simple flow otherwise. Returns the number of
+    failed downloads (0 = all fine / nothing to do)."""
     if not videos:
-        die("No videos in the directory.")
-    log_info(f"Found {len(videos)} videos.")
-    _online_rename_core(args, videos)
+        log_warn("No videos to process.")
+        return 0
+    log_info("Subtitles by OpenSubtitles.com.")
+    if not _subs_ensure_key(args):
+        return 0
+    if _tui_supported():
+        return _subs_preview(args, videos) or 0
+    return _subs_classic(args, videos) or 0
+
+
+def run_subs_download(args):
+    """Standalone subtitle downloader: opens the same Total Commander-style browser
+    as the renamer (navigate folders / drives / back, tag files), then downloads
+    subtitles from OpenSubtitles (multi-language) via the 's' key."""
+    run_rename_files(args, mode="subs")
 
 
 _INTERACTIVE_COMMANDS = {
@@ -10178,12 +10886,12 @@ _INTERACTIVE_COMMANDS = {
     "remove-tracks": ("Remove tracks from MKV", "run_remove_tracks"),
     "set-default": ("Set the default track", "run_set_default"),
     "rename-subs": ("Rename subtitles", "run_rename_subs"),
+    "subs-download": ("Download subtitles (OpenSubtitles)", "run_subs_download"),
     "extract-audio": ("Extract audio track from videos", "run_extract_audio"),
     "import-audio": ("Insert (mux) external audio into videos", "run_import_audio"),
     "convert-audio": ("Convert audio (e.g. to AC-3)", "run_convert_audio"),
     "rename-files": ("Intelligent file rename", "run_rename_files"),
     "video-browser": ("Video browser / inspector", "run_video_browser"),
-    "online-rename": ("Online rename (TMDB -> Plex)", "run_online_rename"),
 }
 
 
@@ -10195,11 +10903,10 @@ def dispatch_interactive_command(cmd, args):
         "translate-subs": run_translate_subs, "extract-subs": run_extract_subs,
         "merge-pro": run_transplant, "resync-pro": run_resync_pro,
         "import-subs": run_import_subs, "remove-tracks": run_remove_tracks,
-        "set-default": run_set_default, "rename-subs": run_rename_subs,
+        "set-default": run_set_default, "rename-subs": run_rename_subs, "subs-download": run_subs_download,
         "extract-audio": run_extract_audio, "import-audio": run_import_audio,
         "convert-audio": run_convert_audio, "rename-files": run_rename_files,
         "video-browser": run_video_browser,
-        "online-rename": run_online_rename,
     }.get(cmd)
     if not fn:
         die(f"Unknown command in the preset: {cmd}")
@@ -10327,6 +11034,12 @@ def _wizard_action_specs():
             help="Renames .srt by the name of the matching video (paired via SxxExx), keeps the "
                  "language/forced suffix. Shows the plan first.",
             kind="wizard", run=run_rename_subs, flag="rename_subs", preset="rename-subs"),
+        "subs-download": dict(
+            label="Download subtitles from OpenSubtitles (multi-language)",
+            help="Recognizes the show/episode from file names and downloads subtitles for one or MORE "
+                 "languages from OpenSubtitles, saved next to each video as name.<lang>.srt. Needs a free "
+                 "OpenSubtitles API key (and an account for downloading) - set via --config.",
+            kind="browser", run=run_subs_download, flag="subs_download", preset="subs-download"),
         "fix-readability": dict(
             label="Just fix subtitle READABILITY (extend too-short ones)",
             help="Only extends too-briefly displayed subtitles into free space. When there are no .srt "
@@ -10372,12 +11085,6 @@ def _wizard_action_specs():
             help="Unifies file names by a glob pattern: zero-pads numbers, fills missing common words, "
                  "normalizes case, strips emoji/illegal characters, auto-detects series. Preview then apply.",
             kind="browser", run=run_rename_files, flag="rename_files", preset="rename-files"),
-        "online-rename": dict(
-            label="Online rename via TMDB (recognize show/movie, Plex naming)",
-            help="Recognizes shows/movies online (TMDB), fetches official episode titles and renames files "
-                 "to the Plex scheme 'Show (Year) - S01E02 - Title.ext'. Needs a free TMDB key (--config). "
-                 "Confirms each match and previews before applying.",
-            kind="wizard", run=run_online_rename, flag="online_rename", preset="online-rename"),
         "video-browser": dict(
             label="Video browser / inspector (Total Commander style)",
             help="Browse folders/drives; press Enter on a video for a full report and every operation: "
@@ -10403,13 +11110,13 @@ def _wizard_action_specs():
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
      ["sync-one", "sync-folder", "translate", "extract-subs", "merge-pro",
-      "resync-pro", "import-subs", "rename-subs", "fix-readability", "p1", "p2"]),
+      "resync-pro", "import-subs", "rename-subs", "subs-download", "fix-readability", "p1", "p2"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
      ["remove-tracks", "set-default", "video-browser"]),
     ("Files", "Intelligent bulk file renaming",
-     ["rename-files", "online-rename"]),
+     ["rename-files"]),
     ("Presets & settings", "Saved presets, API keys/config, API test",
      ["presets", "config", "test-api"]),
 ]
@@ -10417,7 +11124,7 @@ _WIZARD_CATEGORIES = [
 _WIZARD_MODE_FLAGS = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
                       "extract_subs", "import_subs", "remove_tracks", "set_default",
                       "rename_subs", "fix_readability", "extract_audio", "import_audio",
-                      "convert_audio", "rename_files", "online_rename")
+                      "convert_audio", "rename_files", "subs_download")
 
 
 def _run_wizard_action(key, args):
@@ -11080,9 +11787,9 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--video-browser", action="store_true",
                         help="Interactive mode: Total Commander style video browser; Enter on a video opens a "
                              "full inspector with every track/convert operation.")
-    parser.add_argument("--online-rename", action="store_true",
-                        help="Interactive mode: recognize shows/movies via TMDB and rename files to the Plex "
-                             "naming scheme (needs a free TMDB key in --config).")
+    parser.add_argument("--subs-download", dest="subs_download", action="store_true",
+                        help="Interactive mode: download subtitles from OpenSubtitles for a folder of videos "
+                             "(multi-language). Needs a free OpenSubtitles key/account (--config).")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -11181,7 +11888,7 @@ DIFFERENT LANGUAGES (target vs reference):
             args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
             args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
             args.rename_subs, args.fix_readability, args.extract_audio, args.import_audio,
-            args.convert_audio, args.rename_files, args.video_browser, args.online_rename]):
+            args.convert_audio, args.rename_files, args.video_browser, args.subs_download]):
         run_master_wizard(args)
         return
 
@@ -11200,7 +11907,7 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "convert-audio" if args.convert_audio
                        else "rename-files" if args.rename_files
                        else "video-browser" if args.video_browser
-                       else "online-rename" if args.online_rename else None)
+                       else "subs-download" if args.subs_download else None)
     if args.save and args.load:
         die("--save and --load cannot be combined.")
     if args.save and not interactive_cmd:
@@ -11252,8 +11959,8 @@ DIFFERENT LANGUAGES (target vs reference):
             run_rename_files(args)
         elif interactive_cmd == "video-browser":
             run_video_browser(args)
-        elif interactive_cmd == "online-rename":
-            run_online_rename(args)
+        elif interactive_cmd == "subs-download":
+            run_subs_download(args)
         preset_flush_if_save()
         return
 
@@ -11302,8 +12009,8 @@ DIFFERENT LANGUAGES (target vs reference):
     if args.video_browser:
         run_video_browser(args)
         return
-    if args.online_rename:
-        run_online_rename(args)
+    if args.subs_download:
+        run_subs_download(args)
         return
 
     if args.all and args.fix_readability:
