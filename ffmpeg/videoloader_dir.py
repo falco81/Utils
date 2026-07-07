@@ -1,4 +1,5 @@
-from urllib.parse import unquote, unquote_plus, urlencode, urljoin, urlparse
+from urllib.parse import (unquote, unquote_plus, urlencode, urljoin, urlparse,
+                          parse_qsl, quote, urlunparse)
 import requests
 import argparse
 import sys
@@ -9,9 +10,11 @@ import threading
 import math
 import shutil
 import json
+import base64
 import subprocess
 import time
 import atexit
+import random
 from datetime import datetime
 import unicodedata
 import uuid
@@ -2354,10 +2357,1378 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     return master, title, duration
 
 
+# ---- YouTube + Twitch (pure requests; both resolve to a standard HLS master) ---------- #
+YT_IOS_VERSION = "19.45.4"
+YT_IOS_UA = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
+YT_IOS_KEY = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
+YT_WEB_VERSION = "2.20240814.00.00"
+YT_WEB_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+YOUTUBE_HEADERS = {'User-Agent': YT_IOS_UA, 'Origin': 'https://www.youtube.com'}
+TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
+TWITCH_HEADERS = {'User-Agent': USER_AGENT, 'Referer': 'https://www.twitch.tv/'}
+
+
+def _yt_video_id(url):
+    """Extract a YouTube video id from any watch / youtu.be / shorts / embed URL (or a bare id)."""
+    if re.fullmatch(r'[0-9A-Za-z_-]{11}', url or ''):
+        return url
+    for pat in (r'[?&]v=([0-9A-Za-z_-]{11})',
+                r'youtu\.be/([0-9A-Za-z_-]{11})',
+                r'/shorts/([0-9A-Za-z_-]{11})',
+                r'/embed/([0-9A-Za-z_-]{11})',
+                r'/live/([0-9A-Za-z_-]{11})'):
+        m = re.search(pat, url or '')
+        if m:
+            return m.group(1)
+    return None
+
+
+def _yt_playlist_id(url):
+    m = re.search(r'[?&]list=([0-9A-Za-z_-]+)', url or '')
+    if m and not m.group(1).startswith(('RD', 'UL')):   # skip radio/mix auto-playlists
+        return m.group(1)
+    return None
+
+
+def _innertube_player(video_id, session, verbose):
+    """Call the InnerTube iOS 'player' endpoint (returns direct HLS manifest, no JS ciphers)."""
+    body = {
+        "videoId": video_id,
+        "context": {"client": {
+            "clientName": "IOS", "clientVersion": YT_IOS_VERSION,
+            "deviceModel": "iPhone16,2", "hl": "en", "gl": "US", "userAgent": YT_IOS_UA,
+        }},
+        "playbackContext": {"contentPlaybackContext": {"html5Preference": "HTML5_PREF_WANTS"}},
+        "contentCheckOk": True, "racyCheckOk": True,
+    }
+    url = f"https://www.youtube.com/youtubei/v1/player?key={YT_IOS_KEY}&prettyPrint=false"
+    headers = {"User-Agent": YT_IOS_UA, "Content-Type": "application/json",
+               "X-YouTube-Client-Name": "5", "X-YouTube-Client-Version": YT_IOS_VERSION,
+               "Origin": "https://www.youtube.com"}
+    try:
+        r = session.post(url, json=body, headers=headers,
+                         timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        if verbose:
+            print(f"[WARN] YouTube player fetch failed for {video_id}: {e}")
+        return None
+
+
+# InnerTube clients that return direct format URLs (or signatureCipher we can solve), unlike
+# the WEB client which is now SABR-only (no direct URLs). Tried in order until one has usable
+# formats. Versions drift over time; update here if a client stops working.
+_YT_CLIENTS = [
+    ('tv', {'clientName': 'TVHTML5', 'clientVersion': '7.20250312.16.00'}, 7, None),
+    ('ios', {'clientName': 'IOS', 'clientVersion': YT_IOS_VERSION,
+             'deviceModel': 'iPhone16,2', 'userAgent': YT_IOS_UA}, 5, YT_IOS_KEY),
+    ('android', {'clientName': 'ANDROID', 'clientVersion': '19.44.38',
+                 'androidSdkVersion': 34,
+                 'userAgent': 'com.google.android.youtube/19.44.38 (Linux; U; Android 14) gzip'},
+     3, None),
+    ('mweb', {'clientName': 'MWEB', 'clientVersion': '2.20250101.00.00'}, 2, None),
+]
+
+
+def _innertube_call(video_id, session, name, client, cnum, key, verbose):
+    ctx = {'clientName': client['clientName'], 'clientVersion': client['clientVersion'],
+           'hl': 'en', 'gl': 'US'}
+    ctx.update({k: v for k, v in client.items() if k not in ('clientName', 'clientVersion')})
+    body = {'videoId': video_id, 'context': {'client': ctx},
+            'playbackContext': {'contentPlaybackContext': {'html5Preference': 'HTML5_PREF_WANTS'}},
+            'contentCheckOk': True, 'racyCheckOk': True}
+    url = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
+    if key:
+        url += f'&key={key}'
+    headers = {'Content-Type': 'application/json', 'User-Agent': client.get('userAgent', USER_AGENT),
+               'X-YouTube-Client-Name': str(cnum), 'X-YouTube-Client-Version': client['clientVersion'],
+               'Origin': 'https://www.youtube.com'}
+    try:
+        r = session.post(url, json=body, headers=headers,
+                         timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        return r.json()
+    except (requests.RequestException, ValueError) as e:
+        if verbose:
+            print(f"[WARN] YouTube {name} player failed: {e}")
+        return None
+
+
+def _yt_streaming_data(video_id, session, verbose):
+    """Return (player_dict_with_usable_formats, client_name) or (None, None)."""
+    for name, client, cnum, key in _YT_CLIENTS:
+        d = _innertube_call(video_id, session, name, client, cnum, key, verbose)
+        if not d:
+            continue
+        sd = d.get('streamingData') or {}
+        fmts = (sd.get('adaptiveFormats') or []) + (sd.get('formats') or [])
+        usable = any(f.get('url') or f.get('signatureCipher') for f in fmts)
+        if verbose:
+            st = (d.get('playabilityStatus') or {}).get('status')
+            print(f"[DBG] client {name}: status={st}, formats={len(fmts)}, "
+                  f"{'direct URLs' if usable else 'no url/cipher (SABR) - trying next'}")
+        if usable:
+            return d, name
+    return None, None
+
+
+def resolve_youtube(video_id, session, verbose):
+    """Return (hls_master_url, title, duration_seconds) or (None, None, 0). Only used for the
+    rare videos/live streams that expose an HLS manifest; regular VODs go via the DASH path."""
+    d = _innertube_player(video_id, session, verbose)
+    if not d:
+        return None, None, 0
+    status = (d.get('playabilityStatus') or {})
+    if status.get('status') and status.get('status') != 'OK' and verbose:
+        print(f"[WARN] YouTube {video_id}: {status.get('status')} - {status.get('reason')}")
+    sd = d.get('streamingData') or {}
+    master = sd.get('hlsManifestUrl')
+    vd = d.get('videoDetails') or {}
+    title = vd.get('title')
+    try:
+        dur = int(vd.get('lengthSeconds') or 0)
+    except (TypeError, ValueError):
+        dur = 0
+    return master, title, dur
+
+
+# ---- YouTube DASH via node signature/n solver (yt_solver_bundle.js) --------------------- #
+
+def _yt_pywebview_import_error():
+    """Return None if pywebview imports, else a short error string explaining why."""
+    try:
+        import webview  # noqa: F401
+        return None
+    except Exception as e:
+        return f"{type(e).__name__}: {e}"
+
+
+def _yt_pywebview_available():
+    return _yt_pywebview_import_error() is None
+
+
+def _yt_can_solve():
+    return _yt_pywebview_available()
+
+
+# YouTube signature/n solver (yt-dlp public-domain AST solver + meriyah/astring parsers),
+# gzip+base64-embedded so there is NO external .js file. Run inside a system webview
+# (pywebview) as a real JavaScript engine.
+_YT_BUNDLE_B64 = (
+    "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"
+)
+
+
+def _yt_bundle_js():
+    import gzip as _gz
+    return _gz.decompress(base64.b64decode(_YT_BUNDLE_B64)).decode('utf-8')
+
+
+def _yt_solver_html(data):
+    """Self-contained HTML: embeds the challenge input + solver bundle, runs jsc() on load,
+    stores the JSON result in window.__RESULT__."""
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'></head><body>"
+        "<script>window.__INPUT__=" + json.dumps(data) + ";</script>"
+        "<script>" + _yt_bundle_js() + "</script>"
+        "<script>try{window.__RESULT__=JSON.stringify(jsc(window.__INPUT__));}"
+        "catch(e){window.__RESULT__=JSON.stringify({type:'error',error:String(e&&e.message||e)});}"
+        "</script></body></html>"
+    )
+
+
+def _yt_webview_worker(html, conn):
+    """Separate process: open a hidden webview, wait for window.__RESULT__, send it back.
+    A separate process avoids pywebview single-start / main-thread limits."""
+    try:
+        import webview
+    except Exception as e:
+        try:
+            conn.send({'error': 'pywebview not installed: {}'.format(e)})
+            conn.close()
+        except Exception:
+            pass
+        return
+    holder = {}
+
+    def _on_start(window):
+        import time as _t
+        for _ in range(1800):
+            try:
+                r = window.evaluate_js("window.__RESULT__ || null")
+            except Exception:
+                r = None
+            if r:
+                holder['r'] = r
+                break
+            _t.sleep(0.1)
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    try:
+        w = webview.create_window('yt', html=html, hidden=True)
+        webview.start(_on_start, (w,))
+    except Exception as e:
+        try:
+            conn.send({'error': str(e)})
+            conn.close()
+        except Exception:
+            pass
+        return
+    try:
+        conn.send({'result': holder.get('r')})
+        conn.close()
+    except Exception:
+        pass
+
+
+def _yt_solve(base_js, sig_list, n_list, verbose):
+    """Solve signature + n challenges via a system webview (pywebview). Returns (sig_map, n_map)."""
+    reqs = []
+    if sig_list:
+        reqs.append({'type': 'sig', 'challenges': list(sig_list)})
+    if n_list:
+        reqs.append({'type': 'n', 'challenges': list(n_list)})
+    if not reqs:
+        return {}, {}
+    if not _yt_pywebview_available():
+        if verbose:
+            print("[WARN] pywebview is not installed; cannot solve YouTube signatures.")
+        return {}, {}
+    data = {'type': 'player', 'player': base_js, 'output_preprocessed': False, 'requests': reqs}
+    html = _yt_solver_html(data)
+    import multiprocessing as _mp
+    got = None
+    try:
+        ctx = _mp.get_context('spawn')
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(target=_yt_webview_worker, args=(html, child), daemon=True)
+        if verbose:
+            print("[DBG] launching webview solver process...")
+        proc.start()
+        got = parent.recv() if parent.poll(200) else None
+        proc.join(5)
+        if proc.is_alive():
+            proc.terminate()
+    except Exception as e:
+        if verbose:
+            print(f"[WARN] YouTube webview process failed: {e}")
+        return {}, {}
+    if verbose:
+        if got is None:
+            print("[WARN] webview solver: no response within 200s (window didn't return a result).")
+        elif got.get('error'):
+            print(f"[WARN] webview solver error: {got['error']}")
+        elif not got.get('result'):
+            print("[WARN] webview solver: empty result (evaluate_js returned nothing — WebView2 "
+                  "backend issue or the page didn't run).")
+        else:
+            print(f"[DBG] webview solver returned {len(got['result'])} chars")
+    if not got or got.get('error') or not got.get('result'):
+        return {}, {}
+    try:
+        out = json.loads(got['result'])
+    except (ValueError, TypeError):
+        return {}, {}
+    if out.get('type') != 'result':
+        if verbose:
+            print(f"[WARN] YouTube solver: {out.get('error')}")
+        return {}, {}
+    sig_map, n_map = {}, {}
+    for req, resp in zip(reqs, out.get('responses', [])):
+        if resp.get('type') == 'result':
+            (sig_map if req['type'] == 'sig' else n_map).update(resp.get('data') or {})
+    return sig_map, n_map
+
+
+def _yt_watch_player(video_id, session, verbose):
+    """Fetch the watch page and return (player_response_dict, base_js_text). The page's player
+    response and its base.js always match, so signatures decode correctly."""
+    url = (f"https://www.youtube.com/watch?v={video_id}"
+           "&bpctr=9999999999&has_verified=1&hl=en")
+    headers = {'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9'}
+    try:
+        r = session.get(url, headers=headers, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        html = r.text
+    except requests.RequestException as e:
+        if verbose:
+            print(f"[WARN] YouTube watch page fetch failed: {e}")
+        return None, None
+    if verbose:
+        print(f"[DBG] watch page: HTTP {r.status_code}, {len(html)} bytes, "
+              f"final url {urlparse(r.url).netloc}{urlparse(r.url).path}")
+    player = _extract_json_after(html, 'ytInitialPlayerResponse')
+    if player is None:
+        player = _extract_json_after(html, '"playerResponse":')
+    m = re.search(r'"jsUrl":"([^"]+base\.js)"', html) or re.search(r'(/s/player/[^"]+base\.js)', html)
+    base_js = None
+    if m:
+        js_url = m.group(1)
+        if js_url.startswith('/'):
+            js_url = 'https://www.youtube.com' + js_url
+        try:
+            base_js = session.get(js_url, headers={'User-Agent': USER_AGENT},
+                                  timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)).text
+        except requests.RequestException as e:
+            if verbose:
+                print(f"[WARN] base.js fetch failed: {e}")
+    if verbose:
+        sd = (player or {}).get('streamingData') or {}
+        print(f"[DBG] playerResponse: {'found' if player else 'MISSING'} | "
+              f"base.js: {'found' if base_js else 'MISSING'} | "
+              f"formats: {len(sd.get('formats') or [])} progressive, "
+              f"{len(sd.get('adaptiveFormats') or [])} adaptive | "
+              f"status: {(player or {}).get('playabilityStatus', {}).get('status')}")
+    return player, base_js
+
+
+def _extract_json_after(text, marker):
+    """Extract the first balanced {...} object appearing after `marker` in text."""
+    i = text.find(marker)
+    if i < 0:
+        return None
+    i = text.find('{', i)
+    if i < 0:
+        return None
+    depth, in_str, esc, start = 0, False, False, i
+    for j in range(i, len(text)):
+        c = text[j]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == '\\':
+                esc = True
+            elif c == '"':
+                in_str = False
+        else:
+            if c == '"':
+                in_str = True
+            elif c == '{':
+                depth += 1
+            elif c == '}':
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:j + 1])
+                    except ValueError:
+                        return None
+    return None
+
+
+def _yt_cipher_parts(fmt):
+    """Return (needs_sig, s_value, sp_name, base_url) for a format's URL or signatureCipher."""
+    if fmt.get('url'):
+        return False, None, None, fmt['url']
+    cipher = fmt.get('signatureCipher') or fmt.get('cipher') or ''
+    q = dict(parse_qsl(cipher))
+    return True, q.get('s'), (q.get('sp') or 'signature'), q.get('url')
+
+
+def _yt_apply(base_url, sig_needed, s_val, sp_name, sig_map, n_map):
+    """Build the final videoplayback URL: append the deciphered signature (if any) and swap the
+    throttling 'n' parameter for its solved value."""
+    if not base_url:
+        return None
+    url = base_url
+    if sig_needed and s_val is not None:
+        sig = sig_map.get(s_val)
+        if not sig:
+            return None
+        url += ('&' if '?' in url else '?') + f"{sp_name}={quote(sig, safe='')}"
+    parts = urlparse(url)
+    q = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if q.get('n') and n_map.get(q['n']):
+        q['n'] = n_map[q['n']]
+        url = urlunparse(parts._replace(query=urlencode(q)))
+    return url
+
+
+def _yt_pick_streams(video_id, session, max_height, verbose):
+    """Resolve a video to a download descriptor using the DASH formats + webview solver.
+    Returns {'title', 'mode':'progressive'|'adaptive', ...urls} or None."""
+    # Formats: from an InnerTube client that returns direct URLs (WEB is SABR-only now).
+    player, client = _yt_streaming_data(video_id, session, verbose)
+    # base.js (to solve the 'n' throttling param, and signatures for the TV client) comes from
+    # the watch page.
+    wp_player, base_js = _yt_watch_player(video_id, session, verbose)
+    if not player:
+        player = wp_player
+    if not player:
+        return None
+    status = (player.get('playabilityStatus') or {})
+    if status.get('status') and status.get('status') != 'OK':
+        if verbose:
+            print(f"[WARN] YouTube {video_id}: {status.get('status')} - {status.get('reason')}")
+        if status.get('status') in ('LOGIN_REQUIRED', 'UNPLAYABLE', 'ERROR'):
+            return None
+    sd = player.get('streamingData') or {}
+    title = ((player.get('videoDetails') or {}).get('title') or video_id).strip()
+    adaptive = sd.get('adaptiveFormats') or []
+    progressive = sd.get('formats') or []
+    cap = max_height or 10000
+
+    vids = [f for f in adaptive if (f.get('mimeType', '').startswith('video/mp4')) and f.get('height')]
+    auds = [f for f in adaptive if f.get('mimeType', '').startswith('audio/mp4')]
+    chosen, mode = [], None
+    if vids and auds:
+        vids.sort(key=lambda f: f.get('height', 0))
+        pick = [f for f in vids if f.get('height', 0) <= cap] or vids
+        v = pick[-1]
+        a = max(auds, key=lambda f: f.get('bitrate', 0))
+        chosen, mode = [('video', v), ('audio', a)], 'adaptive'
+    elif progressive:
+        pr = [f for f in progressive if f.get('height')]
+        pr.sort(key=lambda f: f.get('height', 0))
+        pick = [f for f in pr if f.get('height', 0) <= cap] or pr
+        chosen, mode = [('muxed', pick[-1] if pick else progressive[-1])], 'progressive'
+    else:
+        if verbose:
+            print(f"[WARN] {video_id}: no usable mp4 formats "
+                  f"(adaptive={len(adaptive)}, progressive={len(progressive)}). "
+                  f"YouTube likely wants a PO-token / sign-in for this request.")
+        return None
+    if verbose:
+        print(f"[DBG] {video_id}: mode={mode}, "
+              + (f"video {chosen[0][1].get('height')}p itag {chosen[0][1].get('itag')}"
+                 if mode == 'adaptive' else f"progressive itag {chosen[0][1].get('itag')}"))
+
+    # Gather + solve challenges for the chosen formats only.
+    sig_needed, n_needed = set(), set()
+    parsed = []
+    for role, fmt in chosen:
+        needs, s_val, sp, base_url = _yt_cipher_parts(fmt)
+        if needs and s_val:
+            sig_needed.add(s_val)
+        if base_url:
+            nq = dict(parse_qsl(urlparse(base_url).query)).get('n')
+            if nq:
+                n_needed.add(nq)
+        parsed.append((role, needs, s_val, sp, base_url))
+    if verbose:
+        print(f"[DBG] {video_id}: challenges -> {len(sig_needed)} sig, {len(n_needed)} n")
+    if (sig_needed or n_needed):
+        if not _yt_can_solve():
+            return {'__no_solver__': True, 'title': title}
+        if base_js is None:
+            if verbose:
+                print(f"[WARN] {video_id}: base.js missing, cannot decode signatures.")
+            return None
+        sig_map, n_map = _yt_solve(base_js, sig_needed, n_needed, verbose)
+        if verbose:
+            print(f"[DBG] {video_id}: solved {len(sig_map)}/{len(sig_needed)} sig, "
+                  f"{len(n_map)}/{len(n_needed)} n")
+    else:
+        sig_map, n_map = {}, {}
+
+    out = {'title': title, 'mode': mode}
+    for role, needs, s_val, sp, base_url in parsed:
+        final = _yt_apply(base_url, needs, s_val, sp, sig_map, n_map)
+        if not final:
+            if verbose:
+                print(f"[WARN] {video_id}: could not build final URL for {role} "
+                      f"(sig/n unsolved?).")
+            return None
+        out[role + '_url' if role != 'muxed' else 'url'] = final
+    return out
+
+
+def download_youtube(items, session, chunk_size, max_connections, max_height, verbose):
+    """Resolve each YouTube item (parallel) to DASH streams, download video+audio via the
+    shared pool, and mux with ffmpeg — same workers/threads/connections/rename as everything
+    else. `items` are descriptors with a 'youtube_id'."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    if not _yt_can_solve():
+        err = _yt_pywebview_import_error()
+        print("[ERROR] YouTube needs pywebview (a system webview / JS engine) to decode stream")
+        print("        signatures, but 'import webview' failed in the Python running this script.")
+        if err:
+            print(f"        Reason : {err}")
+        print(f"        Python : {sys.executable}")
+        print("        Fix    : install pywebview into THIS Python, e.g.:")
+        print(f'                 "{sys.executable}" -m pip install pywebview')
+        print("        (If you have several Pythons, pip may have installed it into a different")
+        print("         one than the file association uses.)")
+        return
+
+    print(f"[INFO] Resolving {len(items)} YouTube video(s) (solving signatures via webview)...")
+    resolve_bar = make_bar(total=len(items), desc='Resolving', unit='video', leave=False)
+    lock = threading.Lock()
+
+    def _res(it):
+        try:
+            return it, _yt_pick_streams(it['youtube_id'], session, max_height, verbose)
+        except Exception as exc:
+            if verbose:
+                tqdm.write(f"[WARN] Could not resolve {it.get('title')}: {exc}")
+            return it, None
+        finally:
+            with lock:
+                resolve_bar.update(1)
+
+    resolved = []
+    with ThreadPoolExecutor(max_workers=min(max_connections, 8)) as ex:
+        for it, desc in ex.map(_res, items):
+            resolved.append((it, desc))
+    resolve_bar.close()
+
+    raw_jobs, mux_plan = [], []   # raw_jobs: direct-url entries; mux_plan: (final, video_tmp, audio_tmp|None)
+    for it, desc in resolved:
+        if not desc:
+            print(f"[WARN] Skipped (no downloadable stream): {it.get('title')}")
+            continue
+        if desc.get('__no_solver__'):
+            print("[ERROR] Node/solver unavailable — cannot decode YouTube signatures.")
+            return
+        base = safe_filename(prefer_mp4_ext(desc['title']), it['youtube_id'])
+        stem = os.path.splitext(base)[0]
+        if desc['mode'] == 'progressive':
+            raw_jobs.append({'direct_url': desc['url'], 'id': it['youtube_id'],
+                             'title': stem, 'name': stem + '.mp4'})
+            mux_plan.append((stem + '.mp4', stem + '.mp4', None))
+        else:
+            vtmp = _temp_artifact(os.path.join(os.getcwd(), stem + '.mp4'), '.ytv.mp4')
+            atmp = _temp_artifact(os.path.join(os.getcwd(), stem + '.mp4'), '.yta.m4a')
+            raw_jobs.append({'direct_url': desc['video_url'], 'id': it['youtube_id'] + ':v',
+                             'title': os.path.basename(vtmp), 'name': os.path.basename(vtmp)})
+            raw_jobs.append({'direct_url': desc['audio_url'], 'id': it['youtube_id'] + ':a',
+                             'title': os.path.basename(atmp), 'name': os.path.basename(atmp)})
+            mux_plan.append((stem + '.mp4', vtmp, atmp))
+
+    if not raw_jobs:
+        print("[INFO] Nothing to download (YouTube).")
+        return
+
+    # Download all raw streams via the shared pool (do not offer these temp files for rename).
+    download_folder_pooled(raw_jobs, session, chunk_size, verbose, label="YouTube")
+
+    if not ensure_ffmpeg(verbose):
+        print("[ERROR] ffmpeg is required to finalize YouTube videos.")
+        return
+    for final, vfile, afile in mux_plan:
+        vpath = vfile if os.path.isabs(vfile) else os.path.join(os.getcwd(), vfile)
+        if afile is None:
+            if os.path.exists(vpath):
+                _record_download(os.path.abspath(final))
+            continue
+        if not (os.path.exists(vpath) and os.path.exists(afile)):
+            print(f"[WARN] Missing stream for mux: {final}")
+            continue
+        ok, err = _ffmpeg_mux(vpath, afile, os.path.join(os.getcwd(), final), verbose)
+        if ok:
+            for t in (vpath, afile):
+                try:
+                    os.remove(t)
+                except OSError:
+                    pass
+            _record_download(os.path.abspath(final))
+            tqdm.write(f"[OK] {final}")
+        else:
+            print(f"[WARN] Mux failed for {final}: {err}")
+
+
+def _yt_iter_dicts(obj):
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _yt_iter_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _yt_iter_dicts(v)
+
+
+def _yt_browse(continuation_or_id, session, is_continuation):
+    url = f"https://www.youtube.com/youtubei/v1/browse?key={YT_WEB_KEY}&prettyPrint=false"
+    ctx = {"client": {"clientName": "WEB", "clientVersion": YT_WEB_VERSION, "hl": "en", "gl": "US"}}
+    body = {"context": ctx}
+    if is_continuation:
+        body["continuation"] = continuation_or_id
+    else:
+        body["browseId"] = "VL" + continuation_or_id
+    headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT,
+               "X-YouTube-Client-Name": "1", "X-YouTube-Client-Version": YT_WEB_VERSION,
+               "Origin": "https://www.youtube.com"}
+    r = session.post(url, json=body, headers=headers,
+                     timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+    return r.json()
+
+
+def youtube_playlist_videos(playlist_id, session, verbose):
+    """Enumerate a playlist's videos as native descriptors, following continuations."""
+    videos, seen = [], set()
+    token, is_cont = playlist_id, False
+    for _page in range(200):                       # safety cap (~200 * 100 videos)
+        try:
+            j = _yt_browse(token, session, is_cont)
+        except (requests.RequestException, ValueError) as e:
+            if verbose:
+                print(f"[WARN] YouTube playlist page failed: {e}")
+            break
+        next_token = None
+        added = 0
+        for d in _yt_iter_dicts(j):
+            pvr = d.get('playlistVideoRenderer')
+            if isinstance(pvr, dict):
+                vid = pvr.get('videoId')
+                t = pvr.get('title') or {}
+                title = ''
+                if isinstance(t.get('runs'), list) and t['runs']:
+                    title = t['runs'][0].get('text', '')
+                elif t.get('simpleText'):
+                    title = t['simpleText']
+                if vid and vid not in seen:
+                    seen.add(vid)
+                    videos.append({'source': 'youtube', 'youtube_id': vid,
+                                   'title': title or vid})
+                    added += 1
+            cc = d.get('continuationCommand')
+            if isinstance(cc, dict) and cc.get('token'):
+                next_token = cc['token']
+        if not next_token or added == 0:
+            break
+        token, is_cont = next_token, True
+    return videos
+
+
+def youtube_playlist_title(playlist_id, session, verbose):
+    try:
+        j = _yt_browse(playlist_id, session, False)
+    except (requests.RequestException, ValueError):
+        return None
+    for d in _yt_iter_dicts(j):
+        md = d.get('playlistMetadataRenderer') or d.get('microformatDataRenderer')
+        if isinstance(md, dict) and md.get('title'):
+            return md['title']
+    return None
+
+
+def _twitch_vod_id(url):
+    m = re.search(r'twitch\.tv/videos/(\d+)', url or '') or \
+        re.search(r'twitch\.tv/\w+/v(?:ideo)?/(\d+)', url or '')
+    return m.group(1) if m else None
+
+
+def _twitch_gql(body, session):
+    r = session.post("https://gql.twitch.tv/gql", json=body,
+                     headers={"Client-ID": TWITCH_CLIENT_ID, "User-Agent": USER_AGENT},
+                     timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+    return r.json()
+
+
+def _twitch_vod_title(vod_id, session):
+    try:
+        d = _twitch_gql({"query": "query{video(id:\"%s\"){title owner{displayName}}}" % vod_id},
+                        session)
+        v = (d.get('data') or {}).get('video') or {}
+        owner = (v.get('owner') or {}).get('displayName')
+        title = v.get('title')
+        if title and owner:
+            return f"{owner} - {title}"
+        return title or None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def resolve_twitch(vod_id, session, verbose):
+    """Return (hls_master_url, title) for a Twitch VOD, or (None, None)."""
+    query = ("query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, "
+             "$vodID: ID!, $isVod: Boolean!, $playerType: String!, $platform: String!) { "
+             "streamPlaybackAccessToken(channelName: $login, params: {platform: $platform, "
+             "playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) "
+             "{ value signature authorization { isForbidden forbiddenReasonCode } __typename } "
+             "videoPlaybackAccessToken(id: $vodID, params: {platform: $platform, "
+             "playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) "
+             "{ value signature __typename } }")
+    body = {"operationName": "PlaybackAccessToken_Template", "query": query,
+            "variables": {"isLive": False, "login": "", "isVod": True,
+                          "vodID": vod_id, "playerType": "site", "platform": "web"}}
+    try:
+        d = _twitch_gql(body, session)
+        tok = (d.get('data') or {}).get('videoPlaybackAccessToken') or {}
+        value, sig = tok.get('value'), tok.get('signature')
+        if not (value and sig):
+            if verbose:
+                print(f"[WARN] Twitch: no access token for VOD {vod_id} (sub-only? needs cookies).")
+            return None, None
+    except (requests.RequestException, ValueError) as e:
+        if verbose:
+            print(f"[WARN] Twitch token fetch failed for {vod_id}: {e}")
+        return None, None
+    params = {'sig': sig, 'token': value, 'allow_source': 'true', 'allow_audio_only': 'true',
+              'allow_spectre': 'false', 'p': str(random.randint(0, 9999999)),
+              'player': 'twitchweb', 'platform': 'web', 'supported_codecs': 'av1,h265,h264',
+              'playlist_include_framerate': 'true', 'reassignments_supported': 'true', 'type': 'any'}
+    master = f"https://usher.ttvnw.net/vod/{vod_id}.m3u8?" + urlencode(params)
+    return master, (_twitch_vod_title(vod_id, session) or f"twitch_{vod_id}")
+
+
 def resolve_master(video, session, verbose):
     """Resolve a video descriptor to (hls_master_url, headers). Returns (None, {}) on failure."""
-    if video.get('source') == 'mux':
+    src = video.get('source')
+    if src == 'mux':
         return video.get('master_url'), MUX_HEADERS
+    if src == 'twitch':
+        if video.get('twitch_id'):
+            master, _t = resolve_twitch(video['twitch_id'], session, verbose)
+            return master, TWITCH_HEADERS
+        return video.get('master_url'), TWITCH_HEADERS
+    if src == 'youtube':
+        if video.get('youtube_id'):
+            master, _t, _d = resolve_youtube(video['youtube_id'], session, verbose)
+            return master, YOUTUBE_HEADERS
+        return video.get('master_url'), YOUTUBE_HEADERS
     master, _title, _dur = resolve_vimeo(video['vimeo_id'], video['vimeo_hash'], session, verbose)
     return master, VIMEO_HEADERS
 
@@ -3422,6 +4793,83 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
     return result
 
 
+def _has_ytdlp():
+    """True if a yt-dlp executable is available on PATH."""
+    import shutil as _sh
+    return bool(_sh.which('yt-dlp') or _sh.which('yt-dlp.exe'))
+
+
+def process_youtube(video_id, session, max_connections, max_height, verbose, list_only, out_dir,
+                    output_file=None):
+    print(f"[INFO] Reading YouTube video {video_id} ...")
+    if list_only:
+        master, title, _dur = resolve_youtube(video_id, session, verbose)
+        print(f"   1) [YouTube] {title or video_id}")
+        if verbose:
+            print(f"        id: {video_id} | node solver: "
+                  f"{'available' if _yt_can_solve() else 'MISSING (node + yt_solver_bundle.js)'}")
+        return True
+    # Fast path: live streams / videos that expose an HLS manifest need no signature solving.
+    master, title, _dur = resolve_youtube(video_id, session, verbose)
+    if master:
+        if not ensure_ffmpeg(verbose):
+            print("[ERROR] ffmpeg is required to mux the stream.")
+            return False
+        if output_file:
+            title = os.path.splitext(os.path.basename(output_file))[0]
+        download_hls_pooled([{'source': 'youtube', 'youtube_id': video_id,
+                              'master_url': master, 'title': title or video_id}],
+                            session, None, max_connections, max_height, verbose)
+        return True
+    # Regular VOD: DASH formats decoded via the node signature/n solver, muxed with ffmpeg.
+    download_youtube([{'youtube_id': video_id, 'title': output_file and
+                       os.path.splitext(os.path.basename(output_file))[0] or video_id}],
+                     session, DEFAULT_CHUNK_SIZE, max_connections, max_height, verbose)
+    return True
+
+
+def process_youtube_playlist(playlist_id, session, max_connections, max_height, verbose,
+                             list_only, out_dir):
+    print(f"[INFO] Reading YouTube playlist {playlist_id} ...")
+    title = youtube_playlist_title(playlist_id, session, verbose)
+    global _active_collection_title
+    _active_collection_title = (title or '').strip() or None
+    videos = youtube_playlist_videos(playlist_id, session, verbose)
+    if not videos:
+        print("[ERROR] No videos found in the playlist (private, empty, or removed).")
+        return
+    print(f"[INFO] Playlist '{title or playlist_id}': {len(videos)} video(s).")
+    if list_only:
+        for i, v in enumerate(videos, 1):
+            print(f"   {i:>3}) [YouTube] {v['title']}")
+            if verbose:
+                print(f"        id: {v['youtube_id']}")
+        return
+    download_youtube(videos, session, DEFAULT_CHUNK_SIZE, max_connections, max_height, verbose)
+
+
+def process_twitch(vod_id, session, max_connections, max_height, verbose, list_only, out_dir,
+                   output_file=None):
+    if not ensure_ffmpeg(verbose):
+        print("[ERROR] Twitch VODs are HLS and need ffmpeg to mux into MP4.")
+        return False
+    print(f"[INFO] Reading Twitch VOD {vod_id} ...")
+    master, title = resolve_twitch(vod_id, session, verbose)
+    if not master:
+        print("[ERROR] Could not get the Twitch VOD stream (sub-only VODs need your Twitch cookies).")
+        return False
+    if output_file:
+        title = os.path.splitext(os.path.basename(output_file))[0]
+    desc = {'source': 'twitch', 'twitch_id': vod_id, 'title': title or f'twitch_{vod_id}'}
+    if list_only:
+        print(f"   1) [Twitch] {desc['title']}")
+        if verbose:
+            print(f"        src: {master}")
+        return True
+    download_hls_pooled([desc], session, None, max_connections, max_height, verbose)
+    return True
+
+
 def _classify_input(id_or_url: str):
     """Return (kind, target) for any supported input."""
     pid = extract_patreon_collection_id(id_or_url)
@@ -3434,6 +4882,19 @@ def _classify_input(id_or_url: str):
         return 'patreon_bad', None
     if 'dropbox.com' in id_or_url:
         return 'dropbox', id_or_url
+    if 'twitch.tv' in id_or_url:
+        vod = _twitch_vod_id(id_or_url)
+        if vod:
+            return 'twitch', vod
+    if 'youtube.com' in id_or_url or 'youtu.be' in id_or_url:
+        pl = _yt_playlist_id(id_or_url)
+        vid = _yt_video_id(id_or_url)
+        # A watch URL can carry both ?v= and &list=; a single video wins unless it's a pure
+        # playlist URL (/playlist?list=...) with no video id.
+        if vid:
+            return 'youtube', vid
+        if pl:
+            return 'youtube_playlist', pl
     if 'vimeo.com' in id_or_url:
         vid = re.search(r'vimeo\.com/(?:video/)?(\d+)', id_or_url)
         if vid:
@@ -3565,6 +5026,19 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                 target_id['title'] = os.path.splitext(os.path.basename(output_file))[0]
             _with_out_dir(lambda: download_hls_pooled([target_id], session, None,
                                                       max_connections, max_height, verbose))
+        elif kind == 'twitch':
+            _with_out_dir(lambda: process_twitch(target_id, session, max_connections,
+                                                 max_height, verbose, list_only, out_dir,
+                                                 output_file=output_file))
+        elif kind == 'youtube':
+            _with_out_dir(lambda: process_youtube(target_id, session, max_connections,
+                                                  max_height, verbose, list_only, out_dir,
+                                                  output_file=output_file))
+        elif kind == 'youtube_playlist':
+            if output_file:
+                print("[WARN] -o/--output is ignored for playlists; names come from YouTube.")
+            _with_out_dir(lambda: process_youtube_playlist(target_id, session, max_connections,
+                                                           max_height, verbose, list_only, out_dir))
         elif kind == 'folder':
             if output_file:
                 print("[WARN] -o/--output is ignored for folders; names come from Drive.")
@@ -4059,7 +5533,7 @@ if __name__ == "__main__":
         return iv
 
     parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder), Dropbox, Vimeo, or a Patreon collection. A Patreon collection is fully mined: Google Drive links, Dropbox links, AND native Patreon/Vimeo/Mux videos are all downloaded.")
-    parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, or a Patreon COLLECTION/POST URL. Folders and collections download every video found. Omit when using --url-list.")
+    parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL. Folders, collections and playlists download every video found. Omit when using --url-list.")
     parser.add_argument("--url-list", type=str, default=None, help="Path to a text file with ONE URL per line (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders/collections).")
     parser.add_argument("-d", "--output-dir", type=str, default=None, help="Directory to save into (applies to any mode; created if missing). Default: current directory.")
@@ -4081,7 +5555,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.26.2")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.29.3")
 
     args = parser.parse_args()
 
