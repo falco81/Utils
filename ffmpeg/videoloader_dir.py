@@ -861,6 +861,17 @@ def normalize_dropbox_url(url: str) -> str:
     return urlunparse(parsed._replace(query=new_query))
 
 
+def _dropbox_raw_variant(url: str) -> str:
+    """Alternative direct form: drop dl and use raw=1 (bypasses Dropbox's preview page for
+    public links), keeping rlkey. Used as a fallback when dl=1 returns an HTML page."""
+    from urllib.parse import parse_qsl, urlencode as _ue, urlunparse
+    parsed = urlparse(url)
+    q = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    q.pop('dl', None)
+    q['raw'] = '1'
+    return urlunparse(parsed._replace(query=_ue(q)))
+
+
 def dropbox_filename(url: str, fallback: str) -> str:
     """Derive a filename from a Dropbox URL's path (URL-decoded), else use the fallback."""
     path = urlparse(url).path
@@ -899,23 +910,38 @@ def _looks_like_dropbox_id(name: str) -> bool:
 def _dropbox_probe(url: str, session: requests.Session):
     """One ranged GET that returns (size_bytes, real_filename) for a Dropbox direct URL:
     total size from Content-Range, real name from Content-Disposition (or the final URL)."""
-    size, name = 0, ''
-    try:
-        with connection_slot():
-            with session.get(url, stream=True, allow_redirects=True,
-                             headers={'User-Agent': USER_AGENT, 'Range': 'bytes=0-0'},
-                             timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)) as r:
-                cr = r.headers.get('content-range', '')
-                if '/' in cr and cr.rsplit('/', 1)[-1].strip().isdigit():
-                    size = int(cr.rsplit('/', 1)[-1].strip())
-                elif r.status_code == 200 and (r.headers.get('content-length', '') or '').isdigit():
-                    size = int(r.headers['content-length'])
-                name = _parse_content_disposition_filename(r.headers.get('Content-Disposition', ''))
-                if not name:
-                    name = unquote(os.path.basename(urlparse(r.url).path))
-    except requests.RequestException:
-        pass
-    return size, name
+    size, name, saw_html = 0, '', False
+    working = url
+    for variant in (url, _dropbox_raw_variant(url)):
+        try:
+            with connection_slot():
+                with session.get(variant, stream=True, allow_redirects=True,
+                                 headers={'User-Agent': USER_AGENT, 'Accept': '*/*',
+                                          'Range': 'bytes=0-0'},
+                                 timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)) as r:
+                    cr = r.headers.get('content-range', '')
+                    if '/' in cr and cr.rsplit('/', 1)[-1].strip().isdigit():
+                        size = int(cr.rsplit('/', 1)[-1].strip())
+                    elif r.status_code == 200 and (r.headers.get('content-length', '') or '').isdigit():
+                        size = int(r.headers['content-length'])
+                    if not name:
+                        name = _parse_content_disposition_filename(
+                            r.headers.get('Content-Disposition', '')) or \
+                            unquote(os.path.basename(urlparse(r.url).path))
+                    if 'text/html' in (r.headers.get('Content-Type') or '').lower():
+                        saw_html = True
+                    else:
+                        saw_html = False
+                        working = variant          # this variant serves the file
+                        if size:
+                            return size, name, variant
+        except requests.RequestException:
+            pass
+    if saw_html and not size:
+        tqdm.write(f"[WARN] Dropbox returned an HTML page (not a file) for '{name or url}'. "
+                   f"The link may point to a folder, be rate-limited, or be download-blocked; "
+                   f"it will be reported as failed, not saved.")
+    return size, name, working
 
 
 def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers, recursive,
@@ -996,12 +1022,24 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
     if list_only:
         n = 0
         for v in drive_videos:
-            n += 1; print(f"   {n:>3}) [Drive]   {v['title']}")
+            n += 1
+            print(f"   {n:>3}) [Drive]   {v['title']}")
+            if verbose:
+                print(f"        url: https://drive.google.com/file/d/{v.get('id')}/view")
         for d in dropbox_items:
-            n += 1; print(f"   {n:>3}) [Dropbox] {d['title']}")
+            n += 1
+            print(f"   {n:>3}) [Dropbox] {d['title']}")
+            if verbose:
+                print(f"        url: {d.get('url')}")
         for h in hls_videos:
             tag = 'Mux' if h.get('source') == 'mux' else f"Vimeo {h.get('vimeo_id')}"
-            n += 1; print(f"   {n:>3}) [{tag}] {h['title']}")
+            n += 1
+            print(f"   {n:>3}) [{tag}] {h['title']}")
+            if verbose:
+                src = h.get('master_url') or \
+                    (f"vimeo {h.get('vimeo_id')}/{h.get('vimeo_hash')}" if h.get('source') == 'vimeo' else '')
+                if src:
+                    print(f"        src: {src}")
         return
 
     # Combined interactive selection across all three kinds.
@@ -1228,7 +1266,9 @@ def get_file_size(url: str, session: requests.Session, attempts: int = 3) -> int
     ignores HEAD content-length). Retries a few times, because during a parallel resolve
     of many large files Google occasionally throttles a probe and returns no size — which
     previously left that file with an unknown size and a broken, single-connection download."""
-    headers = {'Referer': 'https://drive.google.com/'}
+    headers = ({'Referer': 'https://drive.google.com/'}
+               if 'google' in (url or '').lower()
+               else {'User-Agent': USER_AGENT, 'Accept': '*/*'})
     for attempt in range(max(1, attempts)):
         try:
             with connection_slot():
@@ -1676,9 +1716,15 @@ def _download_segment(job: '_FileJob', seg: dict, session: requests.Session, chu
 
     attempts = 6
     retryable = (429, 500, 502, 503, 504)
+    is_dropbox = bool(getattr(job, 'direct_url', '')) and 'dropbox' in (job.url or '').lower()
     for attempt in range(attempts):
         lo = start + downloaded
-        headers = {'Referer': 'https://drive.google.com/'}
+        if getattr(job, 'direct_url', ''):
+            # Dropbox / other direct hosts: send a normal browser UA and NO Google referer,
+            # otherwise Dropbox serves an HTML preview/interstitial instead of the file bytes.
+            headers = {'User-Agent': USER_AGENT, 'Accept': '*/*'}
+        else:
+            headers = {'Referer': 'https://drive.google.com/'}
         if end is not None:
             headers['Range'] = f'bytes={lo}-{end}'
         elif downloaded:
@@ -1709,6 +1755,25 @@ def _download_segment(job: '_FileJob', seg: dict, session: requests.Session, chu
                         continue
                     return False
                 if r.status_code not in (200, 206):
+                    return False
+                # The body must be the file, not an HTML interstitial/error page (Dropbox and
+                # Drive both do this when a link needs confirmation, is a folder, or is rate-
+                # limited). Writing that as the video would leave a tiny broken "success", so
+                # back off and retry, then fail honestly.
+                ctype = (r.headers.get('Content-Type') or '').lower()
+                if 'text/html' in ctype or 'application/json' in ctype:
+                    # Dropbox served a preview/interstitial page, not the file. For Dropbox,
+                    # try the raw=1 variant (bypasses the preview for public links); otherwise
+                    # back off and retry, then fail honestly.
+                    if is_dropbox and 'raw=1' not in (job.url or ''):
+                        with job.url_lock:
+                            job.url = _dropbox_raw_variant(job.url)
+                        if verbose:
+                            tqdm.write(f"[INFO] Dropbox returned HTML; retrying with raw=1: {job.title}")
+                        continue
+                    if attempt < attempts - 1:
+                        time.sleep(min(10.0, 0.8 * (2 ** attempt)))
+                        continue
                     return False
                 # Whole-file part (unknown size) whose resume was ignored (200 to a Range): the
                 # server restarted from 0, so discard what we had and rewrite from scratch.
@@ -1779,10 +1844,12 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         # abort the whole batch, so failures are caught and the file is simply skipped.
         try:
             if job.direct_url:
-                # Direct download (e.g. Dropbox): probe size AND the real filename in one go.
-                job.url = job.direct_url
-                size, real = _dropbox_probe(job.direct_url, session)
-                job.size = size if size > 0 else get_file_size(job.direct_url, session)
+                # Direct download (e.g. Dropbox): probe size, real filename, AND the URL
+                # variant (dl=1 vs raw=1) that actually serves the file, in one go.
+                size, real, working = _dropbox_probe(job.direct_url, session)
+                job.direct_url = working
+                job.url = working
+                job.size = size if size > 0 else get_file_size(working, session)
                 preferred = (job.entry.get('name') or job.entry.get('title') or job.id)
                 # Old /s/<id> share links carry no filename in the URL, so the caller's name is
                 # just the Dropbox id. Replace it with the real name from Content-Disposition.
@@ -4014,7 +4081,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.25.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.26.2")
 
     args = parser.parse_args()
 
