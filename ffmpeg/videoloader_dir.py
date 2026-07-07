@@ -2563,7 +2563,8 @@ def resolve_youtube(video_id, session, verbose):
 def _yt_pywebview_import_error():
     """Return None if pywebview imports, else a short error string explaining why."""
     try:
-        import webview  # noqa: F401
+        import importlib
+        importlib.import_module('webview')
         return None
     except Exception as e:
         return f"{type(e).__name__}: {e}"
@@ -5797,7 +5798,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.37.1")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.37.2")
 
     args = parser.parse_args()
 
