@@ -102,6 +102,17 @@ DOWNLOAD_READ_TIMEOUT = 120      # max gap between received chunks during an act
 DEFAULT_MAX_HEIGHT = 0            # -q : cap HLS video height (e.g. 720). 0 = best available.
 FFMPEG = "ffmpeg"                 # ffmpeg exe, a FOLDER containing it, or "ffmpeg" if on PATH
 FFMPEG_DOWNLOAD_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+# Extra install locations searched (depth-limited) BEFORE any download. PATH is always tried
+# first. On Linux/macOS the system dirs are already on PATH, so downloading is not attempted
+# there (the URL above is a Windows build) — an install hint is shown instead.
+FFMPEG_PROGRAM_FILES_DIRS = [
+    r"C:\Program Files\ffmpeg",
+    r"C:\Program Files (x86)\ffmpeg",
+]
+MKV_PROGRAM_FILES_DIRS = [        # reserved: this downloader muxes with ffmpeg, not mkvtoolnix
+    r"C:\Program Files\MKVToolNix",
+    r"C:\Program Files (x86)\MKVToolNix",
+]
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 VIMEO_REFERER = "https://player.vimeo.com/"
@@ -1698,6 +1709,7 @@ class _FileJob:
         # Direct-download jobs (e.g. Dropbox) carry a ready URL and skip Drive resolution.
         self.direct_url = entry.get('direct_url') if isinstance(entry, dict) else None
         self.ua = entry.get('ua') if isinstance(entry, dict) else None   # override UA (googlevideo)
+        self.dl_headers = entry.get('headers') if isinstance(entry, dict) else None
         self.url = None
         self.size = 0
         self.filename = None
@@ -1706,6 +1718,7 @@ class _FileJob:
         self.segments = []          # list of dicts: {start, end, path}
         self.remaining = 0
         self.failed = False
+        self.fail_reason = None
         self.locked = False
         self.url_lock = threading.Lock()
         self.bar = None
@@ -1757,8 +1770,9 @@ def _download_segment(job: '_FileJob', seg: dict, session: requests.Session, chu
             # Dropbox / other direct hosts: send a normal browser UA and NO Google referer,
             # otherwise Dropbox serves an HTML preview/interstitial instead of the file bytes.
             # For googlevideo, use the UA of the client that issued the URL (helps avoid extra
-            # server-side throttling).
-            headers = {'User-Agent': getattr(job, 'ua', None) or USER_AGENT, 'Accept': '*/*'}
+            # server-side throttling). --scan can supply a page-derived Referer/Origin.
+            headers = dict(getattr(job, 'dl_headers', None)
+                           or {'User-Agent': getattr(job, 'ua', None) or USER_AGENT, 'Accept': '*/*'})
         else:
             headers = {'Referer': 'https://drive.google.com/'}
         if end is not None:
@@ -1791,6 +1805,12 @@ def _download_segment(job: '_FileJob', seg: dict, session: requests.Session, chu
                         continue
                     return False
                 if r.status_code not in (200, 206):
+                    if getattr(job, 'fail_reason', None) is None:
+                        job.fail_reason = (
+                            f"HTTP {r.status_code} (expired/invalid signed URL — re-run to refresh)"
+                            if r.status_code in (403, 410)
+                            else "rate-limited (HTTP 429)" if r.status_code == 429
+                            else f"HTTP {r.status_code}")
                     if verbose:
                         tqdm.write(f"[DBG] download HTTP {r.status_code} for "
                                    f"{os.path.basename(seg['path'])}"
@@ -2017,7 +2037,7 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         ok, reason = False, None
         _final = job.out_path or job.filename
         if job.failed:
-            reason = "download failed"
+            reason = getattr(job, 'fail_reason', None) or "download failed"
         else:
             got = sum(os.path.getsize(s['path']) for s in job.segments if os.path.exists(s['path']))
             if job.size > 0:
@@ -2256,21 +2276,34 @@ def _ffmpeg_cache_dir():
     return os.path.join(base, '.ffmpeg')
 
 
-def _find_cached_ffmpeg():
+def _find_ffmpeg_in(dirs, max_depth=None):
+    """Walk each directory (optionally depth-limited so we don't crawl huge trees like Program
+    Files) looking for a working ffmpeg binary. Returns its path or None."""
     name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
-    cache = _ffmpeg_cache_dir()
-    if not os.path.isdir(cache):
-        return None
-    for root, _dirs, files in os.walk(cache):
-        if name in files:
-            p = os.path.join(root, name)
-            if os.name != 'nt':
-                try:
-                    os.chmod(p, 0o755)
-                except OSError:
-                    pass
-            return p
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        base_depth = os.path.abspath(d).rstrip(os.sep).count(os.sep)
+        for root, subdirs, files in os.walk(d):
+            if max_depth is not None:
+                depth = os.path.abspath(root).rstrip(os.sep).count(os.sep) - base_depth
+                if depth >= max_depth:
+                    subdirs[:] = []
+                    continue
+            if name in files:
+                p = os.path.join(root, name)
+                if os.name != 'nt':
+                    try:
+                        os.chmod(p, 0o755)
+                    except OSError:
+                        pass
+                if _try_ffmpeg(p):
+                    return p
     return None
+
+
+def _find_cached_ffmpeg():
+    return _find_ffmpeg_in([_ffmpeg_cache_dir()])
 
 
 def _extract_archive(path, dest, url):
@@ -2313,10 +2346,13 @@ def _download_and_extract_ffmpeg(url, verbose):
 
 
 def ensure_ffmpeg(verbose):
-    """Make sure FFMPEG points to a working ffmpeg, downloading it if needed."""
+    """Locate a working ffmpeg, in order: explicit --ffmpeg/FFMPEG + PATH -> cached .ffmpeg ->
+    install folders (FFMPEG_PROGRAM_FILES_DIRS) + script dir + cwd (depth-limited) -> (Windows
+    only, last resort) download & unpack. On Linux/macOS it uses PATH and, if missing, prints a
+    package-manager hint instead of downloading a Windows build."""
     global FFMPEG
     resolved = _resolve_ffmpeg(FFMPEG)
-    if resolved and _try_ffmpeg(resolved):
+    if resolved and _try_ffmpeg(resolved):        # explicit path/folder, or bare name on PATH
         FFMPEG = resolved
         return True
     cached = _find_cached_ffmpeg()
@@ -2325,7 +2361,18 @@ def ensure_ffmpeg(verbose):
         if verbose:
             print(f"[INFO] Using cached ffmpeg: {cached}")
         return True
-    if FFMPEG_DOWNLOAD_URL:
+    # Look in the configured install folders (+ script dir + cwd) before downloading.
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0] or '.')) or os.getcwd()
+    if os.name == 'nt':
+        broad = list(FFMPEG_PROGRAM_FILES_DIRS) + [script_dir, os.getcwd()]
+    else:
+        broad = [script_dir, os.getcwd()]          # system dirs are already covered by PATH
+    found = _find_ffmpeg_in(broad, max_depth=4)
+    if found:
+        FFMPEG = found
+        print(f"[INFO] Found ffmpeg: {found}")
+        return True
+    if os.name == 'nt' and FFMPEG_DOWNLOAD_URL:
         try:
             path = _download_and_extract_ffmpeg(FFMPEG_DOWNLOAD_URL, verbose)
         except Exception as e:
@@ -2336,6 +2383,14 @@ def ensure_ffmpeg(verbose):
             print(f"[INFO] Using downloaded ffmpeg: {path}")
             return True
         print("[ERROR] Downloaded archive but could not find a working ffmpeg binary inside.")
+        return False
+    # Linux / macOS: don't fetch a Windows build — tell the user how to install it.
+    print("[ERROR] ffmpeg not found. Install it and/or put it on PATH:")
+    print("        Debian/Ubuntu:  sudo apt install ffmpeg")
+    print("        Fedora:         sudo dnf install ffmpeg")
+    print("        Arch:           sudo pacman -S ffmpeg")
+    print("        macOS (brew):   brew install ffmpeg")
+    print("        or pass --ffmpeg /path/to/ffmpeg (or a folder that contains it).")
     return False
 
 
@@ -3478,6 +3533,65 @@ def _yt_apply(base_url, sig_needed, s_val, sp_name, sig_map, n_map):
     return url
 
 
+_RES_LABELS = {4320: '8K', 2160: '4K', 1440: '2K', 1080: 'FHD', 720: 'HD', 480: 'SD'}
+
+
+def _res_label(h):
+    return _RES_LABELS.get(h, '')
+
+
+def _parse_res(v):
+    """Parse a --res value: None (not given), 'SCAN' (list qualities), or a target height int."""
+    if v is None:
+        return None
+    v = str(v).strip().lower()
+    if v in ('', 'scan', 'list', 'show'):
+        return 'SCAN'
+    aliases = {'8k': 4320, '4k': 2160, '2k': 1440, 'fhd': 1080, 'hd': 720, 'sd': 480}
+    if v in aliases:
+        return aliases[v]
+    v2 = v.rstrip('p')
+    return int(v2) if v2.isdigit() else None
+
+
+def _yt_scan_formats(video_id, session, verbose):
+    """Print the video qualities YouTube offers for this video, with codec/fps/size, so the
+    user can re-run with --res <height>."""
+    wp_player, _base_js, visitor = _yt_watch_player(video_id, session, verbose)
+    player, _client, _needs_js = _yt_streaming_data(video_id, session, verbose, visitor)
+    if player is None:
+        player = wp_player
+    if not player:
+        print(f"[ERROR] Could not read formats for {video_id}.")
+        return
+    sd = player.get('streamingData') or {}
+    title = ((player.get('videoDetails') or {}).get('title') or video_id).strip()
+    adaptive = sd.get('adaptiveFormats') or []
+    vids = [f for f in adaptive if f.get('mimeType', '').startswith('video/mp4') and f.get('height')]
+    if not vids:
+        vids = [f for f in adaptive if f.get('mimeType', '').startswith('video/') and f.get('height')]
+    if not vids:
+        print(f"[WARN] No downloadable video formats found for: {title}")
+        return
+    print(f"\n[INFO] Available qualities for: {title}")
+    seen = set()
+    for f in sorted(vids, key=lambda f: (f.get('height', 0), f.get('fps', 0)), reverse=True):
+        h = f.get('height')
+        fps = f.get('fps') or 0
+        if (h, fps) in seen:
+            continue
+        seen.add((h, fps))
+        mt = f.get('mimeType', '')
+        codec = ('AV1' if 'av01' in mt else 'VP9' if 'vp9' in mt
+                 else 'H.264' if 'avc1' in mt else '?')
+        cl = f.get('contentLength')
+        size = f"~{int(cl) / 1e6:.0f} MB" if cl and str(cl).isdigit() else '?'
+        tag = _res_label(h) + (' 60fps' if fps >= 50 else '')
+        print(f"   --res {str(h):<5} {tag:<10} {codec:<6} {str(fps) + 'fps':<7} {size}")
+    print("\nRe-run to download a quality, e.g.  --res 1080   or   --res 4k")
+    print("(no --res = best; --res N = best video up to N tall, preferring 60fps.)\n")
+
+
 def _yt_gather(video_id, session, max_height, verbose):
     """Resolve a video's formats and collect its sig/n challenges WITHOUT solving them (so a
     whole playlist can be solved in one webview session). Returns a plan dict, None, or
@@ -3504,7 +3618,8 @@ def _yt_gather(video_id, session, max_height, verbose):
     auds = [f for f in adaptive if f.get('mimeType', '').startswith('audio/mp4')]
     chosen, mode = [], None
     if vids and auds:
-        vids.sort(key=lambda f: f.get('height', 0))
+        # Best = highest resolution, then highest fps (so 1080p60 beats 1080p30), then bitrate.
+        vids.sort(key=lambda f: (f.get('height', 0), f.get('fps', 0), f.get('bitrate', 0)))
         pick = [f for f in vids if f.get('height', 0) <= cap] or vids
         a = max(auds, key=lambda f: f.get('bitrate', 0))
         chosen, mode = [('video', pick[-1]), ('audio', a)], 'adaptive'
@@ -3935,6 +4050,8 @@ def resolve_twitch(vod_id, session, verbose):
 def resolve_master(video, session, verbose):
     """Resolve a video descriptor to (hls_master_url, headers). Returns (None, {}) on failure."""
     src = video.get('source')
+    if video.get('headers') and video.get('master_url'):
+        return video['master_url'], video['headers']   # e.g. --scan HLS with page-derived headers
     if src == 'mux':
         return video.get('master_url'), MUX_HEADERS
     if src == 'twitch':
@@ -4042,29 +4159,50 @@ def _seg_session(base):
 
 
 def _download_hls_segment(url, path, session, headers):
-    """Download one HLS segment to `path` (atomic). Skips if already present."""
+    """Download one HLS segment to `path` (atomic). Returns (ok, reason). Retries with
+    exponential backoff on rate-limiting (429) and transient server/network errors, so busy
+    CDNs (which throttle bursts of parallel requests) don't fail the whole video."""
     if os.path.exists(path) and os.path.getsize(path) > 0:
-        return True
-    for attempt in range(3):
+        return True, None
+    attempts = 6
+    last = None
+    for attempt in range(attempts):
         try:
             with session.get(url, stream=True, headers=headers,
                              timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as r:
-                if r.status_code != 200:
-                    if attempt < 2:
+                if r.status_code in (429, 500, 502, 503, 504):
+                    last = ("rate-limited (HTTP 429)" if r.status_code == 429
+                            else f"server error (HTTP {r.status_code})")
+                    if attempt < attempts - 1:
+                        ra = r.headers.get('Retry-After')
+                        delay = (float(ra) if (ra and ra.isdigit()) else min(2 ** attempt, 20))
+                        time.sleep(delay + random.uniform(0, 0.5))
                         continue
-                    return False
+                    return False, last
+                if r.status_code != 200:
+                    if r.status_code in (403, 410):
+                        last = (f"HTTP {r.status_code} (expired/invalid signed URL — re-run to "
+                                f"refresh the link)")
+                    else:
+                        last = f"HTTP {r.status_code}"
+                    if attempt < 2:
+                        time.sleep(0.5)
+                        continue
+                    return False, last
                 tmp = path + '.tmp'
                 with open(tmp, 'wb') as f:
                     for chunk in r.iter_content(256 * 1024):
                         if chunk:
                             f.write(chunk)
                 os.replace(tmp, path)
-                return True
-        except requests.RequestException:
-            if attempt < 2:
+                return True, None
+        except requests.RequestException as e:
+            last = f"network error: {type(e).__name__}"
+            if attempt < attempts - 1:
+                time.sleep(min(2 ** attempt, 10) + random.uniform(0, 0.4))
                 continue
-            return False
-    return False
+            return False, last
+    return False, last
 
 
 def _concat_stream(parts, out_file):
@@ -4112,6 +4250,7 @@ class _HlsJob:
         self.tasks = []            # (stream_key, idx, url, path)
         self.remaining = 0
         self.failed = False
+        self.fail_reason = None
         self.bar = None
 
 
@@ -4223,7 +4362,7 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
     def finalize(job):
         ok, reason = False, None
         if job.failed:
-            reason = "segment download failed"
+            reason = getattr(job, 'fail_reason', None) or "segment download failed"
         else:
             try:
                 vfile = _temp_artifact(job.out_path, ".video")
@@ -4271,8 +4410,13 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
     def run_task(job, key, idx, url, path):
         if not job.failed:
             sess = _seg_session(session)
-            if not _download_hls_segment(url, path, sess, job.headers):
+            ok_seg, why = _download_hls_segment(url, path, sess, job.headers)
+            if not ok_seg:
                 job.failed = True
+                if getattr(job, 'fail_reason', None) is None:
+                    job.fail_reason = why
+                if verbose and why:
+                    tqdm.write(f"[DBG] segment failed ({job.title}): {why}")
             with bar_lock:
                 if job.bar is not None:
                     job.bar.update(1)
@@ -5018,14 +5162,17 @@ def _has_ytdlp():
 
 
 def process_youtube(video_id, session, max_connections, max_height, verbose, list_only, out_dir,
-                    output_file=None):
+                    output_file=None, res_scan=False):
     print(f"[INFO] Reading YouTube video {video_id} ...")
+    if res_scan:
+        _yt_scan_formats(video_id, session, verbose)
+        return True
     if list_only:
         master, title, _dur = resolve_youtube(video_id, session, verbose)
         print(f"   1) [YouTube] {title or video_id}")
         if verbose:
-            print(f"        id: {video_id} | node solver: "
-                  f"{'available' if _yt_can_solve() else 'MISSING (node + yt_solver_bundle.js)'}")
+            print(f"        id: {video_id} | solver: "
+                  f"{'pywebview available' if _yt_can_solve() else 'pywebview MISSING'}")
         return True
     # Fast path: live streams / videos that expose an HLS manifest need no signature solving.
     master, title, _dur = resolve_youtube(video_id, session, verbose)
@@ -5047,11 +5194,15 @@ def process_youtube(video_id, session, max_connections, max_height, verbose, lis
 
 
 def process_youtube_playlist(playlist_id, session, max_connections, max_height, verbose,
-                             list_only, out_dir):
+                             list_only, out_dir, res_scan=False):
     print(f"[INFO] Reading YouTube playlist {playlist_id} ...")
     videos, title = youtube_playlist_videos(playlist_id, session, verbose)
     if not videos:
         print("[ERROR] No videos found in the playlist (private, empty, or removed).")
+        return
+    if res_scan:
+        print("[INFO] Scanning qualities of the first video (playlists usually share the set).")
+        _yt_scan_formats(videos[0]['youtube_id'], session, verbose)
         return
     if _yt_bad_title(title):
         title = youtube_playlist_title(playlist_id, session, verbose)
@@ -5127,6 +5278,153 @@ def _classify_input(id_or_url: str):
     return kind, tid
 
 
+def _url_resolution(url):
+    """Height (+ optional bitrate) from a clear resolution marker in the URL, e.g. 720P_4000K,
+    240p, 1080P. Returns (0, 0) when there is no such NNNp marker."""
+    u = url.lower()
+    m = re.search(r'(\d{3,4})p(?![0-9])', u)              # 240p, 720P, 1080P
+    if not m:
+        return 0, 0
+    h = int(m.group(1))
+    bm = re.search(r'(\d{3,5})\s*k(?:bps)?(?![0-9a-z])', u)   # 4000K (tie-breaker)
+    return h, (int(bm.group(1)) if bm else 0)
+
+
+def _res_signature(url):
+    """A resolution-agnostic key so different renditions of the SAME stream collapse together,
+    even when each rendition URL carries its own signed token. Uses host+path (drops the query),
+    removes the resolution/bitrate token, and strips long random/signed segments (auth tokens),
+    while keeping shorter stable ids (like a numeric video id) so different videos stay distinct."""
+    p = urlparse(url)
+    s = (p.netloc + p.path).lower()
+    s = re.sub(r'\d{3,4}\s*p[_\-]?\d{0,5}k?', '', s)     # 720p / 720p_4000k
+    s = re.sub(r'[a-z0-9=+_\-]{20,}', '', s)            # long signed/random segments
+    return s
+
+
+def _scan_resolution_winners(found):
+    """Collapse same-stream renditions that encode a resolution in the URL down to the best one
+    (highest height, then bitrate); keep everything else (other videos, known embeds, streams
+    with no resolution hint). Preserves order."""
+    best = {}   # signature -> (height, bitrate, id(item))
+    for f in found:
+        if f['kind'] not in ('hls', 'direct'):
+            continue
+        h, br = _url_resolution(f['url'])
+        if h == 0:
+            continue
+        sig = _res_signature(f['url'])
+        cur = best.get(sig)
+        if cur is None or (h, br) > (cur[0], cur[1]):
+            best[sig] = (h, br, id(f))
+    winners = {v[2] for v in best.values()}
+    keep = []
+    for f in found:
+        if f['kind'] in ('hls', 'direct') and _url_resolution(f['url'])[0] > 0:
+            if id(f) in winners:
+                keep.append(f)
+        else:
+            keep.append(f)
+    return keep
+
+
+def _page_title(html_text):
+    """Best-effort human title of a page: og:title -> twitter:title -> <title> -> <h1>."""
+    import html as _h
+    for pat in (r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<meta[^>]+name=["\']twitter:title["\'][^>]+content=["\']([^"\']+)["\']',
+                r'<title[^>]*>([^<]+)</title>',
+                r'<h1[^>]*>([^<]+)</h1>'):
+        m = re.search(pat, html_text, re.I | re.S)
+        if m:
+            t = re.sub(r'\s+', ' ', _h.unescape(m.group(1))).strip()
+            if t:
+                return t
+    return None
+
+
+def _scan_unique_name(base, used):
+    """Return a unique '<base>.mp4' filename within one --scan run (adds ' (2)', ' (3)' ...) so
+    several title-named streams don't overwrite each other. Records the choice in `used`."""
+    root = re.sub(r'\.(mp4|m4v|webm|mov|mkv)$', '', base, flags=re.I).strip() or 'video'
+    name = root + '.mp4'
+    i = 2
+    while name.lower() in used:
+        name = f"{root} ({i}).mp4"
+        i += 1
+    used.add(name.lower())
+    return name
+
+
+def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
+    """Fetch any page and discover downloadable media on it, independent of the URL's shape:
+    YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.webm/.mov URLs.
+    Follows unknown player <iframe>s one level deep. Direct/HLS items carry a 'name' taken from
+    the page title so the output isn't called 'master.mp4'. Returns a de-duplicated list of
+    {'kind': 'url'|'direct'|'hls', 'url', 'label', 'name'}."""
+    try:
+        r = session.get(page_url, headers={'User-Agent': USER_AGENT,
+                                            'Accept-Language': 'en-US,en;q=0.9'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        html = r.text
+    except requests.RequestException as e:
+        if _depth == 0:
+            print(f"[ERROR] --scan: could not fetch the page: {e}")
+        return []
+    title = _title or _page_title(html)     # outer page's title wins (passed down into iframes)
+    text = html.replace('\\/', '/').replace('\\u0026', '&').replace('&amp;', '&')
+    found, seen, all_urls = [], set(), set()
+
+    def add(kind, url, label, name=None, page=None):
+        if not url or (kind, url) in seen:
+            return
+        # A known-source URL (added earlier) that also ends in .mp4 shouldn't be re-added as a
+        # raw direct/HLS download.
+        if kind in ('direct', 'hls') and url in all_urls:
+            return
+        seen.add((kind, url))
+        all_urls.add(url)
+        found.append({'kind': kind, 'url': url, 'label': label, 'name': name,
+                      'page': page or page_url})
+
+    for m in re.finditer(r'(?:youtube(?:-nocookie)?\.com/(?:watch\?v=|embed/|v/|shorts/|live/)'
+                         r'|youtu\.be/)([0-9A-Za-z_-]{11})', text):
+        add('url', f'https://www.youtube.com/watch?v={m.group(1)}', f'YouTube {m.group(1)}')
+    for m in re.finditer(r'(?:player\.)?vimeo\.com/(?:video/)?(\d{6,})', text):
+        add('url', f'https://vimeo.com/{m.group(1)}', f'Vimeo {m.group(1)}')
+    for m in re.finditer(r'twitch\.tv/videos/(\d+)', text):
+        add('url', f'https://www.twitch.tv/videos/{m.group(1)}', f'Twitch VOD {m.group(1)}')
+    for m in re.finditer(r'drive\.google\.com/file/d/([0-9A-Za-z_-]+)', text):
+        add('url', f'https://drive.google.com/file/d/{m.group(1)}/view', f'Drive {m.group(1)}')
+    for m in re.finditer(r'https?://(?:www\.)?dropbox\.com/(?:s|scl/fi)/[^\s"\'<>\\]+', text):
+        add('url', m.group(0), 'Dropbox file')
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.m3u8[^\s"\'<>\\]*', text):
+        add('hls', m.group(0), 'HLS stream (.m3u8)', name=title)
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s"\'<>\\]*)?', text):
+        add('direct', m.group(0), 'Direct video file', name=title)
+
+    # Follow unknown player iframes one level deep (known hosts are already captured above).
+    if _depth < 1:
+        known = ('youtube', 'youtu.be', 'vimeo', 'twitch.tv', 'drive.google', 'dropbox')
+        iframes, done = [], 0
+        for m in re.finditer(r'<iframe[^>]+src=["\']([^"\']+)["\']', html):
+            src = m.group(1).replace('&amp;', '&')
+            if src.startswith('//'):
+                src = 'https:' + src
+            if src.startswith('http') and not any(h in src.lower() for h in known):
+                iframes.append(src)
+        for src in iframes:
+            if done >= 6:                       # safety cap on how many iframes we chase
+                break
+            done += 1
+            if verbose:
+                print(f"[DBG] --scan: following iframe {src[:80]}")
+            for s in scan_page_for_media(src, session, verbose, _depth + 1, _title=title):
+                add(s['kind'], s['url'], s['label'] + ' (iframe)', name=s.get('name'),
+                    page=s.get('page'))
+    return found
+
+
 def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUNK_SIZE,
          num_threads: int = None, verbose: bool = False, cookies_file: str = None,
          folder_workers: int = DEFAULT_FOLDER_WORKERS, recursive: bool = DEFAULT_RECURSIVE,
@@ -5134,7 +5432,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          auto_cookies: bool = AUTO_COOKIES, select: bool = False, auto: bool = False,
          out_dir: str = None, max_height: int = DEFAULT_MAX_HEIGHT, list_only: bool = False,
          ffmpeg_path: str = None, ffmpeg_url: str = None, do_rename: bool = True,
-         rename_mode: str = 'ask', return_summary: bool = False):
+         rename_mode: str = 'ask', return_summary: bool = False, res_scan: bool = False,
+         scan_mode: bool = False):
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
     summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
@@ -5148,11 +5447,18 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
 
     kind, target_id = _classify_input(id_or_url)
     summary['kind'] = kind
-    if kind == 'youtube_playlist' and _yt_video_id(id_or_url):
+    if not scan_mode and kind == 'youtube_playlist' and _yt_video_id(id_or_url):
         print("[INFO] This URL has a playlist (list=...) — using the WHOLE playlist.")
         print("       For just the single video, use the plain watch URL without &list=:")
         print(f'         videoloader_dir.py "https://www.youtube.com/watch?v={_yt_video_id(id_or_url)}"')
-    if kind == 'patreon_bad':
+    if not scan_mode and res_scan and kind not in ('youtube', 'youtube_playlist'):
+        print("[INFO] Listing qualities with a bare --res works only for YouTube right now.")
+        print(f"       For {kind}, use --res <height> to cap quality, e.g. --res 720 or --res 1080.")
+        summary['error'] = 'res-scan unsupported for this source'
+        if return_summary:
+            return summary
+        return
+    if not scan_mode and kind == 'patreon_bad':
         print("[ERROR] That looks like a Patreon URL but I couldn't find a collection or post id.")
         print("        Expected a collection like https://www.patreon.com/collection/122162")
         print("        or a post like https://www.patreon.com/<creator>/posts/<slug>-162557660")
@@ -5218,6 +5524,98 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     _active_collection_title = None
     _patreon_creator = None
 
+    if scan_mode:
+        found = scan_page_for_media(id_or_url, session, verbose)
+        if not found:
+            print("[INFO] --scan: found no downloadable media on that page.")
+            if return_summary:
+                return summary
+            return
+        # Default prioritisation: if an HLS (.m3u8) stream is present, prefer it (it is adaptive,
+        # so it yields the best resolution) and drop the raw direct files, which are usually the
+        # same video at a single fixed quality. Known-source embeds (YouTube/Vimeo/...) are kept.
+        # With --select the user sees everything and decides, so we skip this there.
+        if not select:
+            has_hls = any(f['kind'] == 'hls' for f in found)
+            has_direct = any(f['kind'] == 'direct' for f in found)
+            if has_hls and has_direct:
+                dropped = sum(1 for f in found if f['kind'] == 'direct')
+                found = [f for f in found if f['kind'] != 'direct']
+                print(f"[INFO] --scan: HLS stream found; preferring it over {dropped} direct "
+                      f"file(s) (use --select to choose manually).")
+            # If the URLs encode a resolution (e.g. 720P_4000K, 480P_2000K), keep only the best
+            # rendition of each stream.
+            before = len(found)
+            found = _scan_resolution_winners(found)
+            if len(found) < before:
+                print(f"[INFO] --scan: chose the best resolution from URL hints; dropped "
+                      f"{before - len(found)} lower rendition(s) (use --select to choose manually).")
+        if select and len(found) > 1:
+            # Let the user pick which discovered items to act on (full URLs shown).
+            picked = _prompt_file_selection(
+                [dict(it, title=f"{it['label']} — {it['url']}") for it in found])
+            if not picked:
+                print("[INFO] --scan: nothing selected.")
+                if return_summary:
+                    return summary
+                return
+            found = picked
+        else:
+            verb = "found (listing only)" if list_only else "found"
+            print(f"[INFO] --scan {verb} {len(found)} item(s):")
+            for it in found:
+                print(f"   - {it['label']}: {it['url']}")
+        _kw = dict(chunk_size=chunk_size, num_threads=num_threads, verbose=verbose,
+                   folder_workers=folder_workers, recursive=recursive,
+                   max_connections=max_connections, use_color=use_color, auto_cookies=auto_cookies,
+                   select=False, auto=False, out_dir=out_dir, max_height=max_height,
+                   list_only=list_only, ffmpeg_path=ffmpeg_path, ffmpeg_url=ffmpeg_url,
+                   do_rename=do_rename, rename_mode=rename_mode, res_scan=res_scan, scan_mode=False)
+        _scan_used = set()
+        for it in found:
+            try:
+                if it['kind'] == 'url':
+                    # Known source: reuse the normal pipeline, so --list / --res behave as usual.
+                    main(it['url'], output_file=None, cookies_file=cookies_file, **_kw)
+                    continue
+                # Direct file / HLS: --list or a bare --res just shows it (no variants to pick).
+                if list_only or res_scan:
+                    print(f"   [{it['kind']}] {it['url']}")
+                    continue
+                # Headers the CDN expects: browser UA + Referer/Origin of the page the stream was
+                # found on (many CDNs reject hot-linked HLS/masters with 403/412 otherwise).
+                pg = urlparse(it.get('page') or id_or_url)
+                origin = f"{pg.scheme}://{pg.netloc}" if pg.scheme and pg.netloc else None
+                hdrs = {'User-Agent': USER_AGENT, 'Accept': '*/*'}
+                if origin:
+                    hdrs['Referer'] = origin + '/'
+                    hdrs['Origin'] = origin
+                if it['kind'] == 'direct':
+                    base = it.get('name') or os.path.basename(urlparse(it['url']).path) or 'video'
+                    final = _scan_unique_name(safe_filename(base, 'video'), _scan_used)
+                    entry = {'id': it['url'], 'title': final, 'name': final,
+                             'direct_url': it['url'], 'headers': hdrs}
+                    _with_out_dir(lambda e=entry: download_folder_pooled(
+                        [e], session, chunk_size, verbose, label="Direct", conn_cap=16))
+                elif it['kind'] == 'hls':
+                    if not ensure_ffmpeg(verbose):
+                        print("[WARN] --scan: skipping HLS stream (ffmpeg needed).")
+                        continue
+                    base = it.get('name') or \
+                        os.path.basename(urlparse(it['url']).path).replace('.m3u8', '') or 'video'
+                    final = _scan_unique_name(safe_filename(base, 'video'), _scan_used)
+                    desc = {'source': 'mux', 'master_url': it['url'], 'headers': hdrs,
+                            'title': os.path.splitext(final)[0]}   # HLS pipeline re-adds .mp4
+                    _with_out_dir(lambda d=desc: download_hls_pooled(
+                        [d], session, None, min(max_connections, 16), max_height, verbose))
+            except SystemExit:
+                pass
+            except Exception as e:
+                print(f"[WARN] --scan: failed on {it['url'][:60]}: {e}")
+        if return_summary:
+            return summary
+        return
+
     try:
         if kind == 'patreon':
             if output_file:
@@ -5258,12 +5656,13 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         elif kind == 'youtube':
             _with_out_dir(lambda: process_youtube(target_id, session, max_connections,
                                                   max_height, verbose, list_only, out_dir,
-                                                  output_file=output_file))
+                                                  output_file=output_file, res_scan=res_scan))
         elif kind == 'youtube_playlist':
             if output_file:
                 print("[WARN] -o/--output is ignored for playlists; names come from YouTube.")
             _with_out_dir(lambda: process_youtube_playlist(target_id, session, max_connections,
-                                                           max_height, verbose, list_only, out_dir))
+                                                           max_height, verbose, list_only, out_dir,
+                                                           res_scan=res_scan))
         elif kind == 'folder':
             if output_file:
                 print("[WARN] -o/--output is ignored for folders; names come from Drive.")
@@ -5789,6 +6188,8 @@ if __name__ == "__main__":
     parser.add_argument("-s", "--select", action="store_true", help="For a folder or Patreon collection: list all items first and interactively choose which to download.")
     parser.add_argument("-l", "--list", action="store_true", help="Only list what was found (Patreon collection/post: Drive/Dropbox/native; folder: files; YouTube playlist/video and Twitch: titles) WITHOUT downloading. Add -v to also show source URLs/IDs.")
     parser.add_argument("--ascii", action="store_true", help="Force plain-ASCII filenames: strip accents (é->e) and drop non-Latin characters (Korean, etc.). Useful so Windows cmd shows names correctly and progress bars line up. Files keep their content; only names change.")
+    parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
+    parser.add_argument("--scan", action="store_true", help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.webm/.mov), and download them all. Works regardless of the page's own type.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
@@ -5798,12 +6199,17 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.37.2")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.47.0")
 
     args = parser.parse_args()
 
     if args.ascii:
         ASCII_FILENAMES = True
+
+    _res = _parse_res(args.res)
+    if isinstance(_res, int):
+        args.max_height = _res              # --res 1080 -> cap height (best up to 1080)
+    _res_scan = (_res == 'SCAN')
 
     if args.test_notify:
         if not _ntfy_enabled():
@@ -5830,7 +6236,7 @@ if __name__ == "__main__":
         auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), select=args.select,
         auto=(not args.no_auto), out_dir=args.output_dir, max_height=args.max_height,
         list_only=args.list, ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
-        do_rename=(not args.no_rename),
+        do_rename=(not args.no_rename), res_scan=_res_scan, scan_mode=args.scan,
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.
