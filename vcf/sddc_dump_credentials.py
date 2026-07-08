@@ -1041,6 +1041,56 @@ class SDDCClient:
 
     # ---------- credentials ----------
 
+    def get_system_service_credentials(self) -> list[dict]:
+        """
+        GET /v1/system/credentials/service - undocumented but SDDC-Manager-owned
+        endpoint that returns credentials for VCF built-in SERVICE accounts
+        (svc-vcf-*, svc-sddclcm-*, svc-opssr-*, svc-vcfa-* etc.) INCLUDING the
+        plaintext password (in the field named `secret`, not `password`).
+
+        Source: Broadcom KB 327195 "Retrieve the service accounts credentials
+        from SDDC Manager". This is what SDDC Manager uses internally when it
+        needs to talk to ESXi/vCenter/NSX/... as its own service identity.
+
+        Response schema (per KB 327195):
+          [{
+             "serviceType":    "SDDC_MANAGER",  // owner
+             "entityType":     "ESXI",          // target kind
+             "targetType":     "ESXI",
+             "entityId":       "<uuid>",        // target resource UUID
+             "serviceId":      "<uuid>",        // account identity UUID
+             "id":             "<uuid>",        // credential UUID
+             "username":       "svc-vcf-<esxi-shortname>",
+             "secret":         "<plaintext-password>",
+             "credentialType": "SSH" | "SSO" | ...,
+             "creationTime":   <epoch>,
+             "modificationTime": <epoch>
+          }, ...]
+
+        Requires SSO admin (administrator@vsphere.local) or local admin@local -
+        regular users typically get 403.
+        """
+        try:
+            r = self._authed_request("GET", "/v1/system/credentials/service")
+        except Exception as e:
+            log.warning("GET /v1/system/credentials/service failed: %s "
+                        "(needs SSO admin; older VCF may not have this "
+                        "endpoint) - service account passwords will not be "
+                        "included.", e)
+            return []
+        try:
+            body = r.json()
+        except ValueError:
+            log.warning("/v1/system/credentials/service returned non-JSON body")
+            return []
+        # Endpoint returns a bare list, but be defensive: some builds may
+        # wrap it in {"elements": [...]}
+        if isinstance(body, list):
+            return body
+        if isinstance(body, dict):
+            return body.get("elements") or body.get("credentials") or []
+        return []
+
     def get_credentials(
         self,
         resource_type: str | None = None,
@@ -1153,7 +1203,131 @@ class SDDCClient:
         return all_users
 
 
-def print_users_table(users: list[dict]) -> None:
+def _match_username(user_name: str, cred_username: str) -> bool:
+    """
+    Match a name from /v1/users to a username from /v1/credentials. The two
+    endpoints don't always agree on domain suffix - /v1/users typically shows
+    'svc-nsx-vsphere@vsphere.local' while /v1/credentials shows just
+    'svc-nsx-vsphere' (or vice versa). We compare case-insensitively and,
+    if either side omits the '@domain' part, fall back to comparing local
+    parts only.
+    """
+    if not user_name or not cred_username:
+        return False
+    u = user_name.strip().lower()
+    c = cred_username.strip().lower()
+    if u == c:
+        return True
+    u_local, _, u_dom = u.partition("@")
+    c_local, _, c_dom = c.partition("@")
+    if u_local and u_local == c_local:
+        # If both sides have a domain, they must match; otherwise local-part
+        # equality is enough (SDDC Manager sometimes stores only the local part)
+        if not u_dom or not c_dom or u_dom == c_dom:
+            return True
+    return False
+
+
+def _is_sddcm_api_key_account(name: str) -> bool:
+    """
+    Detect SDDC Manager INTERNAL machine-to-machine service accounts:
+      svc-sddclcm-sddcm-<uuid>   SDDC Lifecycle Manager
+      svc-opssr-sddcm-<uuid>     VCF Operations Services Runtime
+      svc-vcfa-sddcm-<uuid>      VCF Automation Services Runtime
+      svc-*-sddcm-*              future variants
+    These use API keys (per Broadcom token-based auth docs), NOT passwords.
+    The API key is only shown once at creation; SDDC Manager does not expose
+    it afterward via any documented endpoint. Only reset/regenerate is possible.
+    """
+    if not name:
+        return False
+    n = name.lower()
+    return n.startswith("svc-") and "-sddcm-" in n
+
+
+def enrich_users_with_credentials(users: list[dict],
+                                   creds: list[dict],
+                                   svc_creds: list[dict] | None = None,
+                                   ) -> tuple[int, int]:
+    """
+    Attach any matching credential records (with plaintext passwords) to each
+    user record under `credentials`. Returns (users_with_password, total_matches).
+
+    Two credential sources are merged:
+      * `creds` from GET /v1/credentials - resource-tied credentials
+        (SSH/SSO/API for ESXi, vCenter, NSX etc.), field name `password`
+      * `svc_creds` from GET /v1/system/credentials/service - VCF built-in
+        SERVICE account credentials (svc-vcf-*, svc-sddclcm-* ...), field
+        name `secret` per Broadcom KB 327195
+
+    An account CAN have zero, one, or many matches - a single service account
+    like svc-vcf-vc-mgmt may have credentials against every ESXi it's used
+    with, hence a list.
+    """
+    users_with_password = 0
+    total_matches = 0
+    svc_creds = svc_creds or []
+    for u in users:
+        u_name = u.get("name", "")
+        matches: list[dict] = []
+        # 1) Standard /v1/credentials records
+        for c in creds:
+            cred_user = c.get("username", "")
+            if _match_username(u_name, cred_user):
+                res = c.get("resource") or {}
+                matches.append({
+                    "source":         "/v1/credentials",
+                    "resourceName":   res.get("resourceName", ""),
+                    "resourceType":   res.get("resourceType", ""),
+                    "resourceIp":     res.get("resourceIp", ""),
+                    "domainName":     res.get("domainName", ""),
+                    "accountType":    c.get("accountType", ""),
+                    "credentialType": c.get("credentialType", ""),
+                    "username":       cred_user,
+                    "password":       c.get("password", ""),
+                })
+        # 2) /v1/system/credentials/service records (schema differs: `secret`
+        #    holds the plaintext, entityType/targetType instead of resource.*)
+        for s in svc_creds:
+            cred_user = s.get("username", "")
+            if _match_username(u_name, cred_user):
+                matches.append({
+                    "source":         "/v1/system/credentials/service",
+                    "resourceName":   "",   # KB response has no name, only IDs
+                    "resourceType":   s.get("entityType", ""),
+                    "resourceIp":     "",
+                    "domainName":     "",
+                    "accountType":    "SERVICE",
+                    "credentialType": s.get("credentialType", ""),
+                    "username":       cred_user,
+                    "password":       s.get("secret", ""),   # note: `secret`
+                    "entityId":       s.get("entityId", ""),
+                    "serviceId":      s.get("serviceId", ""),
+                    "serviceType":    s.get("serviceType", ""),
+                })
+        u["credentials"] = matches
+        u["hasPassword"] = any(m.get("password") for m in matches)
+        # Annotate SDDC-Manager-internal OAuth clients that use API keys
+        # (never passwords) - so the UI can distinguish "not found" from
+        # "no password by design"
+        if _is_sddcm_api_key_account(u_name):
+            u["authMethod"] = "API_KEY"
+            u["authMethodNote"] = ("SDDC Manager internal identity - "
+                                    "authenticates via API key (Bearer token), "
+                                    "not password. API key was shown once "
+                                    "at creation and cannot be retrieved via "
+                                    "any documented API.")
+        elif u.get("type") == "SERVICE":
+            u["authMethod"] = "PASSWORD" if u["hasPassword"] else "UNKNOWN"
+        else:
+            u["authMethod"] = "SSO"
+        if u["hasPassword"]:
+            users_with_password += 1
+        total_matches += len(matches)
+    return users_with_password, total_matches
+
+
+def print_users_table(users: list[dict], with_passwords: bool = False) -> None:
     """Pretty-print users to stderr so it's visible even when JSON is piped."""
     if not users:
         sys.stderr.write(C("No users returned.\n", Fore.YELLOW))
@@ -1165,22 +1339,55 @@ def print_users_table(users: list[dict]) -> None:
         domain = u.get("domain", "")
         utype = u.get("type", "")          # USER / GROUP / SERVICE
         role = u.get("resolvedRoleName", "(no role)")
-        rows.append((name, domain, utype, role))
+        creds = u.get("credentials") or []
+        # Password column: '<none>' | '<count> match(es)'.
+        # Never print the actual password to stderr - too easy to end up in
+        # someone's terminal scrollback / shared screenshot.
+        if with_passwords:
+            auth = u.get("authMethod", "")
+            if creds:
+                if any(c.get("password") for c in creds):
+                    pw_status = f"YES ({len(creds)})"
+                else:
+                    pw_status = f"empty ({len(creds)})"
+            elif auth == "API_KEY":
+                pw_status = "API-KEY"
+            else:
+                pw_status = "-"
+        else:
+            pw_status = None
+        rows.append((name, domain, utype, role, pw_status))
 
     w_name = max(len("NAME"), *(len(r[0]) for r in rows))
-    w_dom = max(len("DOMAIN"), *(len(r[1]) for r in rows))
+    w_dom  = max(len("DOMAIN"), *(len(r[1]) for r in rows))
     w_type = max(len("TYPE"), *(len(r[2]) for r in rows))
 
-    header = (f"{'NAME':<{w_name}}  {'DOMAIN':<{w_dom}}  "
-              f"{'TYPE':<{w_type}}  ROLE")
+    if with_passwords:
+        w_pw = max(len("PASSWORD"),
+                   *(len(r[4] or "") for r in rows))
+        header = (f"{'NAME':<{w_name}}  {'DOMAIN':<{w_dom}}  "
+                  f"{'TYPE':<{w_type}}  {'PASSWORD':<{w_pw}}  ROLE")
+    else:
+        header = (f"{'NAME':<{w_name}}  {'DOMAIN':<{w_dom}}  "
+                  f"{'TYPE':<{w_type}}  ROLE")
     sys.stderr.write(C(header + "\n", Fore.CYAN, bold=True))
     sys.stderr.write("-" * len(header) + "\n")
-    for name, domain, utype, role in rows:
-        line = (f"{name:<{w_name}}  {domain:<{w_dom}}  "
-                f"{utype:<{w_type}}  {role}")
+    for name, domain, utype, role, pw_status in rows:
+        if with_passwords:
+            pw_col = pw_status or "-"
+            line = (f"{name:<{w_name}}  {domain:<{w_dom}}  "
+                    f"{utype:<{w_type}}  {pw_col:<{w_pw}}  {role}")
+        else:
+            line = (f"{name:<{w_name}}  {domain:<{w_dom}}  "
+                    f"{utype:<{w_type}}  {role}")
         # Highlight accounts with no role - these cause PERMISSION_NOT_FOUND
         if role == "(no role)":
             sys.stderr.write(C(line + "   <-- NO ROLE\n", Fore.RED, bold=True))
+        elif with_passwords and pw_status and pw_status.startswith("YES"):
+            sys.stderr.write(C(line + "\n", Fore.GREEN))
+        elif with_passwords and pw_status == "API-KEY":
+            sys.stderr.write(C(line + "   <-- uses API key, no password\n",
+                               Fore.YELLOW))
         else:
             sys.stderr.write(line + "\n")
     sys.stderr.write("\n")
@@ -1409,6 +1616,14 @@ def parse_args() -> argparse.Namespace:
                           "credentials. Useful for diagnosing PERMISSION_NOT_"
                           "FOUND / 401 on /v1/tokens. Prints a table and writes "
                           "full JSON to --output.")
+    out.add_argument("--with-passwords", action="store_true",
+                     help="Only meaningful with --list-users. Additionally "
+                          "fetches /v1/credentials and cross-references by "
+                          "username to attach passwords for built-in SERVICE / "
+                          "SYSTEM accounts (svc-*, root, admin, etc). Works "
+                          "only for accounts SDDC Manager owns / rotates - SSO "
+                          "admin (Administrator@vsphere.local) and CyberArk-"
+                          "managed accounts are NOT retrievable this way.")
 
     misc = p.add_argument_group("misc")
     misc.add_argument("--insecure", action="store_true",
@@ -1692,7 +1907,45 @@ def main() -> int:
             users = client.get_users()
             log.info("Fetched %d user/group/service account record(s).",
                      len(users))
-            print_users_table(users)
+
+            # Optionally cross-reference with /v1/credentials to attach
+            # plaintext passwords for built-in SERVICE / SYSTEM accounts
+            # that SDDC Manager owns and rotates.
+            if args.with_passwords:
+                log.info("Fetching /v1/credentials to cross-reference "
+                         "usernames (--with-passwords) ...")
+                creds_for_lookup = client.get_credentials(
+                    page_size=args.page_size,
+                )
+                log.info("Fetched %d credential record(s) from /v1/credentials.",
+                         len(creds_for_lookup))
+
+                # /v1/system/credentials/service is where SDDC Manager stores
+                # its OWN service accounts (svc-vcf-*, svc-sddclcm-*, ...) with
+                # their plaintext passwords in the `secret` field.
+                # Documented in Broadcom KB 327195.
+                log.info("Fetching /v1/system/credentials/service (Broadcom "
+                         "KB 327195 endpoint for built-in service accounts) ...")
+                svc_creds_for_lookup = client.get_system_service_credentials()
+                log.info("Fetched %d service-credential record(s) from "
+                         "/v1/system/credentials/service.",
+                         len(svc_creds_for_lookup))
+
+                matched_users, total_matches = enrich_users_with_credentials(
+                    users, creds_for_lookup, svc_creds_for_lookup)
+                log.info("Attached credentials to %d user(s) "
+                         "(%d resource-level matches in total, across both "
+                         "credential sources).",
+                         matched_users, total_matches)
+                unmatched = len(users) - matched_users
+                if unmatched:
+                    log.info("%d user(s) have no matching credential - these "
+                             "are usually SSO-only accounts, groups, or "
+                             "internal SDDC Manager identities using API-key/"
+                             "OAuth (like svc-sddclcm-sddcm-*) that don't have "
+                             "a password at all.", unmatched)
+
+            print_users_table(users, with_passwords=args.with_passwords)
 
             output_path = args.output
             if output_path:
@@ -1706,20 +1959,68 @@ def main() -> int:
                          output_path)
 
             if fmt == "csv":
-                # Flat, CSV-friendly subset of the user records
-                flat = [{
-                    "name": u.get("name", ""),
-                    "domain": u.get("domain", ""),
-                    "type": u.get("type", ""),
-                    "role": u.get("resolvedRoleName", ""),
-                    "id": u.get("id", ""),
-                } for u in users]
+                if args.with_passwords:
+                    # Flatten one row per user PLUS one row per matched
+                    # credential - lets you sort/filter by resource in Excel
+                    flat: list[dict] = []
+                    for u in users:
+                        creds_list = u.get("credentials") or []
+                        if not creds_list:
+                            flat.append({
+                                "name": u.get("name", ""),
+                                "domain": u.get("domain", ""),
+                                "type": u.get("type", ""),
+                                "role": u.get("resolvedRoleName", ""),
+                                "id": u.get("id", ""),
+                                "resourceType": "",
+                                "resourceName": "",
+                                "credentialType": "",
+                                "accountType": "",
+                                "credUsername": "",
+                                "password": "",
+                            })
+                            continue
+                        for m in creds_list:
+                            flat.append({
+                                "name": u.get("name", ""),
+                                "domain": u.get("domain", ""),
+                                "type": u.get("type", ""),
+                                "role": u.get("resolvedRoleName", ""),
+                                "id": u.get("id", ""),
+                                "source":         m.get("source", ""),
+                                "resourceType":   m.get("resourceType", ""),
+                                "resourceName":   m.get("resourceName", ""),
+                                "credentialType": m.get("credentialType", ""),
+                                "accountType":    m.get("accountType", ""),
+                                "credUsername":   m.get("username", ""),
+                                "password":       m.get("password", ""),
+                            })
+                    fields = ["name", "domain", "type", "role", "id",
+                              "source", "resourceType", "resourceName",
+                              "credentialType", "accountType",
+                              "credUsername", "password"]
+                else:
+                    # Original CSV subset - no passwords
+                    flat = [{
+                        "name": u.get("name", ""),
+                        "domain": u.get("domain", ""),
+                        "type": u.get("type", ""),
+                        "role": u.get("resolvedRoleName", ""),
+                        "id": u.get("id", ""),
+                    } for u in users]
+                    fields = ["name", "domain", "type", "role", "id"]
+
                 with open(output_path, "w", newline="", encoding="utf-8") as fh:
-                    writer = csv.DictWriter(
-                        fh, fieldnames=["name", "domain", "type", "role", "id"])
+                    writer = csv.DictWriter(fh, fieldnames=fields)
                     writer.writeheader()
                     writer.writerows(flat)
             else:
+                # Optionally mask passwords in the JSON output too
+                if args.with_passwords and args.mask:
+                    for u in users:
+                        for m in (u.get("credentials") or []):
+                            if m.get("password"):
+                                m["password"] = "***MASKED***"
                 save_json(users, output_path)
             log.info("Saved %d user record(s) to %s", len(users), output_path)
             return 0
