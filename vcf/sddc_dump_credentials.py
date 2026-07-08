@@ -1235,9 +1235,14 @@ def _is_sddcm_api_key_account(name: str) -> bool:
       svc-opssr-sddcm-<uuid>     VCF Operations Services Runtime
       svc-vcfa-sddcm-<uuid>      VCF Automation Services Runtime
       svc-*-sddcm-*              future variants
-    These use API keys (per Broadcom token-based auth docs), NOT passwords.
-    The API key is only shown once at creation; SDDC Manager does not expose
-    it afterward via any documented endpoint. Only reset/regenerate is possible.
+    These are OAuth-style SERVICE users that authenticate via API key
+    (Bearer token exchange). The API key IS returned in the /v1/users
+    response as the `apiKey` field on VCF 9.x - contrary to older docs
+    that implied it's write-once. Grabbing it lets you either:
+      - recreate the identity on another SDDC Manager (POST /v1/users
+        + reuse the key OR mint a new one via POST /v1/users/{id}/api-keys)
+      - script actions against SDDC Manager as that identity, without
+        needing the sso admin password
     """
     if not name:
         return False
@@ -1307,20 +1312,58 @@ def enrich_users_with_credentials(users: list[dict],
                 })
         u["credentials"] = matches
         u["hasPassword"] = any(m.get("password") for m in matches)
-        # Annotate SDDC-Manager-internal OAuth clients that use API keys
-        # (never passwords) - so the UI can distinguish "not found" from
-        # "no password by design"
+
+        # The apiKey field on the user record itself IS the credential for
+        # SERVICE users using API-key auth (VCF 9.x returns it in /v1/users).
+        api_key = u.get("apiKey")
         if _is_sddcm_api_key_account(u_name):
             u["authMethod"] = "API_KEY"
-            u["authMethodNote"] = ("SDDC Manager internal identity - "
-                                    "authenticates via API key (Bearer token), "
-                                    "not password. API key was shown once "
-                                    "at creation and cannot be retrieved via "
-                                    "any documented API.")
+            if api_key:
+                u["authMethodNote"] = (
+                    "SDDC Manager internal identity - authenticates via API "
+                    "key. The apiKey field above IS the working credential; "
+                    "exchange it for an access token by POSTing to /v1/tokens "
+                    "with body { \"apiKey\": \"<value>\" }.")
+                # Also expose in the same shape as other credential entries
+                # so CSV / downstream tools can handle uniformly.
+                matches.append({
+                    "source":         "/v1/users (apiKey field)",
+                    "resourceName":   "",
+                    "resourceType":   "SDDC_MANAGER",
+                    "resourceIp":     "",
+                    "domainName":     "",
+                    "accountType":    "SERVICE",
+                    "credentialType": "API_KEY",
+                    "username":       u_name,
+                    "password":       api_key,
+                })
+                u["hasPassword"] = True
+            else:
+                u["authMethodNote"] = (
+                    "SDDC Manager internal identity using API-key auth, but "
+                    "the apiKey field is not populated in this /v1/users "
+                    "response (older VCF build or restricted user). "
+                    "Reset with POST /v1/users/{id}/api-keys to get a new one.")
         elif u.get("type") == "SERVICE":
             u["authMethod"] = "PASSWORD" if u["hasPassword"] else "UNKNOWN"
+            if api_key and not u["hasPassword"]:
+                # SSO service accounts with API keys (uncommon but possible)
+                u["authMethod"] = "API_KEY"
+                matches.append({
+                    "source":         "/v1/users (apiKey field)",
+                    "resourceName":   "",
+                    "resourceType":   "SDDC_MANAGER",
+                    "resourceIp":     "",
+                    "domainName":     "",
+                    "accountType":    "SERVICE",
+                    "credentialType": "API_KEY",
+                    "username":       u_name,
+                    "password":       api_key,
+                })
+                u["hasPassword"] = True
         else:
             u["authMethod"] = "SSO"
+
         if u["hasPassword"]:
             users_with_password += 1
         total_matches += len(matches)
