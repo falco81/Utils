@@ -2517,7 +2517,7 @@ def _innertube_player(video_id, session, verbose):
         return r.json()
     except (requests.RequestException, ValueError) as e:
         if verbose:
-            print(f"[WARN] YouTube player fetch failed for {video_id}: {e}")
+            tqdm.write(f"[WARN] YouTube player fetch failed for {video_id}: {e}")
         return None
 
 
@@ -2541,6 +2541,10 @@ _YT_CLIENTS = [
                  'osName': 'Android', 'osVersion': '11',
                  'userAgent': 'com.google.android.youtube/21.02.35 (Linux; U; Android 11) gzip'},
      3, False),
+    ('web', {'clientName': 'WEB', 'clientVersion': '2.20250312.04.00',
+             'userAgent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+                          '(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'},
+     1, True),
     ('tv', {'clientName': 'TVHTML5', 'clientVersion': '7.20260114.12.00',
             'userAgent': 'Mozilla/5.0 (ChromiumStylePlatform) Cobalt/25.lts.30.1034943-gold '
                          '(unlike Gecko), Unknown_TV_Unknown_0/Unknown (Unknown, Unknown)'},
@@ -2548,7 +2552,152 @@ _YT_CLIENTS = [
 ]
 
 
-def _innertube_call(video_id, session, name, client, cnum, verbose, visitor=None):
+def _yt_cookie(session, *names):
+    """First cookie value matching any of `names`, across any domain — avoids the
+    CookieConflictError you'd get from session.cookies.get() when SAPISID exists on both
+    .google.com and .youtube.com."""
+    for c in session.cookies:
+        if c.name in names:
+            return c.value
+    return None
+
+
+_YT_AUTH_LOGGED = False
+
+
+def _yt_auth_headers(session):
+    """If the session carries logged-in YouTube cookies, return the SAPISIDHASH Authorization
+    headers so InnerTube requests are treated as authenticated (this is what lets cookies bypass
+    the 'confirm you're not a bot' wall). Returns {} when not logged in."""
+    global _YT_AUTH_LOGGED
+    # Prefer __Secure-3PAPISID: it's the value actually sent to youtube.com in a 3rd-party context.
+    apisid = _yt_cookie(session, '__Secure-3PAPISID', 'SAPISID', '__Secure-1PAPISID')
+    if not apisid:
+        return {}
+    import hashlib
+    origin = 'https://www.youtube.com'
+    ts = int(time.time())
+    h = hashlib.sha1(f"{ts} {apisid} {origin}".encode()).hexdigest()
+    # Browsers send all three variants; YouTube accepts whichever matches the cookies it received.
+    auth = f"SAPISIDHASH {ts}_{h} SAPISID1PHASH {ts}_{h} SAPISID3PHASH {ts}_{h}"
+    if not _YT_AUTH_LOGGED:
+        _YT_AUTH_LOGGED = True
+        tqdm.write("[INFO] Using your logged-in YouTube cookies (SAPISIDHASH auth) for requests.")
+    return {'Authorization': auth, 'X-Origin': origin,
+            'X-Goog-AuthUser': '0'}
+
+
+_YT_POTOKEN_ACTIVE = None          # PO token (bound to visitorData) to append to stream URLs
+_YT_POTOKEN_CACHE = {}             # visitorData -> token
+_YT_POTOKEN_TRIED = False          # generate at most once per run
+
+_YT_POTOKEN_SCRIPT = r'''// Generate a YouTube PO token bound to visitorData, via bgutils-js + jsdom.
+const { BG, USER_AGENT } = require('bgutils-js');
+const { JSDOM } = require('jsdom');
+const visitorData = process.argv[2];
+const requestKey = 'O43z0dpjhgX20SCx4KAo';
+(async () => {
+  if (!visitorData) throw new Error('missing visitorData');
+  const dom = new JSDOM('<!DOCTYPE html><html><head></head><body></body></html>', {
+    url: 'https://www.youtube.com/', referrer: 'https://www.youtube.com/', userAgent: USER_AGENT,
+  });
+  Object.assign(globalThis, {
+    window: dom.window, document: dom.window.document,
+    location: dom.window.location, origin: dom.window.origin,
+  });
+  if (!Object.getOwnPropertyDescriptor(globalThis, 'navigator')) {
+    Object.defineProperty(globalThis, 'navigator', { value: dom.window.navigator, configurable: true });
+  }
+  const bgConfig = {
+    fetch: (url, options) => fetch(url, options),
+    globalObj: globalThis, identifier: visitorData, requestKey,
+  };
+  const challenge = await BG.Challenge.create(bgConfig);
+  if (!challenge) throw new Error('could not create BotGuard challenge');
+  const jsCode = challenge.interpreterJavascript &&
+    challenge.interpreterJavascript.privateDoNotAccessOrElseSafeScriptWrappedValue;
+  if (jsCode) { new Function(jsCode)(); } else { throw new Error('no interpreter js'); }
+  const res = await BG.PoToken.generate({
+    program: challenge.program, globalName: challenge.globalName, bgConfig,
+  });
+  process.stdout.write(JSON.stringify({ poToken: res.poToken, visitorData }));
+})().catch((e) => { process.stderr.write(String((e && e.stack) || e)); process.exit(1); });
+'''
+
+
+def _yt_potoken_dir():
+    base = os.path.dirname(os.path.abspath(sys.argv[0] or '.')) or os.getcwd()
+    return os.path.join(base, '.potoken')
+
+
+def _yt_ensure_potoken_deps(verbose):
+    """Set up a .potoken folder with bgutils-js + jsdom (one-time npm install). Returns
+    (node_path, script_path) or (None, None) if node/npm are missing or the install failed."""
+    import shutil
+    node = shutil.which('node')
+    if not node:
+        if verbose:
+            tqdm.write("[WARN] Node.js not found; cannot generate a PO token for high quality.")
+        return None, None
+    d = _yt_potoken_dir()
+    try:
+        os.makedirs(d, exist_ok=True)
+        script = os.path.join(d, 'potoken.js')
+        if not os.path.exists(script):
+            with open(script, 'w', encoding='utf-8') as f:
+                f.write(_YT_POTOKEN_SCRIPT)
+        if not os.path.isdir(os.path.join(d, 'node_modules', 'bgutils-js')):
+            npm = shutil.which('npm') or shutil.which('npm.cmd')
+            if not npm:
+                if verbose:
+                    tqdm.write("[WARN] npm not found; cannot install PO-token deps (bgutils-js).")
+                return None, None
+            print("[INFO] Setting up PO-token support (npm install bgutils-js jsdom) — one-time, "
+                  "needs internet...")
+            subprocess.run([npm, 'install', 'bgutils-js', 'jsdom', '--no-fund', '--no-audit',
+                            '--loglevel', 'error'], cwd=d, capture_output=True, text=True,
+                           timeout=300)
+        if not os.path.isdir(os.path.join(d, 'node_modules', 'bgutils-js')):
+            return None, None
+        return node, script
+    except Exception as e:
+        if verbose:
+            tqdm.write(f"[WARN] PO-token setup failed: {e}")
+        return None, None
+
+
+def _yt_get_potoken(visitor_data, verbose):
+    """Generate a YouTube PO token (BotGuard) bound to visitorData via Node + bgutils-js, cached
+    per visitorData. This is what unlocks non-SABR (downloadable) high-quality formats from the
+    WEB client. Returns the token string or None."""
+    if not visitor_data:
+        return None
+    if visitor_data in _YT_POTOKEN_CACHE:
+        return _YT_POTOKEN_CACHE[visitor_data]
+    node, script = _yt_ensure_potoken_deps(verbose)
+    if not node:
+        return None
+    try:
+        if verbose:
+            tqdm.write("[DBG] generating PO token via bgutils-js (BotGuard)...")
+        proc = subprocess.run([node, script, visitor_data], cwd=_yt_potoken_dir(),
+                              capture_output=True, text=True, timeout=90)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            if verbose:
+                tqdm.write(f"[WARN] PO token generation failed: {(proc.stderr or '').strip()[:200]}")
+            return None
+        tok = (json.loads(proc.stdout) or {}).get('poToken')
+        _YT_POTOKEN_CACHE[visitor_data] = tok
+        if verbose:
+            tqdm.write(f"[DBG] PO token generated ({len(tok or '')} chars)")
+        return tok
+    except Exception as e:
+        if verbose:
+            tqdm.write(f"[WARN] PO token error: {e}")
+        return None
+
+
+def _innertube_call(video_id, session, name, client, cnum, verbose, visitor=None, po_token=None):
     ctx = {'clientName': client['clientName'], 'clientVersion': client['clientVersion'],
            'hl': 'en', 'gl': 'US'}
     ctx.update({k: v for k, v in client.items() if k not in ('clientName', 'clientVersion')})
@@ -2557,39 +2706,94 @@ def _innertube_call(video_id, session, name, client, cnum, verbose, visitor=None
     body = {'videoId': video_id, 'context': {'client': ctx},
             'playbackContext': {'contentPlaybackContext': {'html5Preference': 'HTML5_PREF_WANTS'}},
             'contentCheckOk': True, 'racyCheckOk': True}
+    if po_token:
+        body['serviceIntegrityDimensions'] = {'poToken': po_token}
     url = 'https://www.youtube.com/youtubei/v1/player?prettyPrint=false'
     headers = {'Content-Type': 'application/json', 'User-Agent': client.get('userAgent', USER_AGENT),
                'X-YouTube-Client-Name': str(cnum), 'X-YouTube-Client-Version': client['clientVersion'],
                'Origin': 'https://www.youtube.com'}
     if visitor:
         headers['X-Goog-Visitor-Id'] = visitor
+    # Cookie-based SAPISIDHASH auth only makes sense for web-style clients (TVHTML5/WEB/MWEB).
+    # App clients (ANDROID*/IOS) authenticate differently and return an EMPTY response if we send
+    # it — which is why android_vr/ios were coming back with 0 formats. They rely on visitorData
+    # to get past the bot check instead.
+    if not str(client.get('clientName', '')).startswith(('ANDROID', 'IOS')):
+        headers.update(_yt_auth_headers(session))
     try:
         r = session.post(url, json=body, headers=headers,
                          timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
         return r.json()
     except (requests.RequestException, ValueError) as e:
         if verbose:
-            print(f"[WARN] YouTube {name} player failed: {e}")
+            tqdm.write(f"[WARN] YouTube {name} player failed: {e}")
         return None
+
+
+_YT_BOT_HINT_SHOWN = False
+
+
+def _yt_bot_hint(has_login_cookies=False):
+    """Explain YouTube's 'confirm you're not a bot' wall (shown once)."""
+    global _YT_BOT_HINT_SHOWN
+    if _YT_BOT_HINT_SHOWN:
+        return
+    _YT_BOT_HINT_SHOWN = True
+    lines = ["[INFO] YouTube returned 'Sign in to confirm you're not a bot' for every client."]
+    if has_login_cookies:
+        lines += [
+            "       You DID supply logged-in YouTube cookies, but YouTube still blocked the",
+            "       requests. That usually means the cookies are stale/expired, are for a",
+            "       different profile, or this account/IP is temporarily flagged. Try:",
+            "        - re-export FRESH cookies from a browser tab open on youtube.com (logged",
+            "          in) right before running, then pass --cookies <file>,",
+            "        - or wait ~15-60 min / switch network / use a VPN."]
+    else:
+        lines += [
+            "       No logged-in YouTube cookies were found in your session, so this is your IP",
+            "       being rate-limited. The reliable fix:",
+            "        - export YouTube cookies from a browser signed in to youtube.com (a",
+            "          cookies.txt with SAPISID / __Secure-3PAPISID) and run  --cookies <file>",
+            "          — the tool sends them authenticated (SAPISIDHASH) to bypass this wall.",
+            "        - or wait ~15-60 min / switch network / use a VPN, and slow down."]
+    tqdm.write("\n".join(lines))
 
 
 def _yt_streaming_data(video_id, session, verbose, visitor=None):
     """Return (player_dict_with_usable_formats, client_name, needs_js_player) or (None, None, False)."""
+    global _YT_POTOKEN_ACTIVE, _YT_POTOKEN_TRIED
+    saw_bot = False
     for name, client, cnum, needs_js in _YT_CLIENTS:
-        d = _innertube_call(video_id, session, name, client, cnum, verbose, visitor)
+        is_web = str(client.get('clientName', '')) in ('WEB', 'MWEB')
+        po = None
+        if is_web:
+            # WEB returns downloadable (non-SABR) high-quality formats only with a valid PO token.
+            # Generate it once, lazily (app clients are tried first and need no token when they work).
+            if not _YT_POTOKEN_TRIED:
+                _YT_POTOKEN_TRIED = True
+                _YT_POTOKEN_ACTIVE = _yt_get_potoken(visitor, verbose)
+            po = _YT_POTOKEN_ACTIVE
+            if not po:
+                continue                       # no token -> WEB would only be SABR; skip it
+        d = _innertube_call(video_id, session, name, client, cnum, verbose, visitor, po)
         if not d:
             continue
         sd = d.get('streamingData') or {}
         fmts = (sd.get('adaptiveFormats') or []) + (sd.get('formats') or [])
         usable = any(f.get('url') or f.get('signatureCipher') for f in fmts)
+        st_obj = d.get('playabilityStatus') or {}
+        st = st_obj.get('status')
+        reason = st_obj.get('reason') or ''
+        if st == 'LOGIN_REQUIRED' and 'bot' in reason.lower():
+            saw_bot = True
         if verbose:
-            st = (d.get('playabilityStatus') or {}).get('status')
-            reason = (d.get('playabilityStatus') or {}).get('reason') or ''
-            print(f"[DBG] client {name}: status={st}{(' - ' + reason) if reason else ''}, "
+            tqdm.write(f"[DBG] client {name}: status={st}{(' - ' + reason) if reason else ''}, "
                   f"formats={len(fmts)}, "
                   f"{'direct URLs' if usable else 'no url/cipher (SABR) - trying next'}")
         if usable:
             return d, name, needs_js
+    if saw_bot:
+        _yt_bot_hint(bool(_yt_cookie(session, 'SAPISID', '__Secure-3PAPISID', '__Secure-1PAPISID')))
     return None, None, False
 
 
@@ -2601,7 +2805,7 @@ def resolve_youtube(video_id, session, verbose):
         return None, None, 0
     status = (d.get('playabilityStatus') or {})
     if status.get('status') and status.get('status') != 'OK' and verbose:
-        print(f"[WARN] YouTube {video_id}: {status.get('status')} - {status.get('reason')}")
+        tqdm.write(f"[WARN] YouTube {video_id}: {status.get('status')} - {status.get('reason')}")
     sd = d.get('streamingData') or {}
     master = sd.get('hlsManifestUrl')
     vd = d.get('videoDetails') or {}
@@ -3340,8 +3544,41 @@ def _yt_webview_worker(html, conn):
         except Exception:
             pass
 
+    # Serve the solver page over localhost HTTP. This avoids WebView2's NavigateToString ~2 MB
+    # cap on html=... (the embedded base.js is ~2 MB) AND the script/security quirks of file://
+    # URLs, which can silently fail to run the page's scripts.
+    import http.server
+    import threading
+    html_bytes = html.encode('utf-8')
+
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
+            self.send_header('Content-Length', str(len(html_bytes)))
+            self.end_headers()
+            try:
+                self.wfile.write(html_bytes)
+            except Exception:
+                pass
+
+        def log_message(self, *a):
+            pass
+
     try:
-        w = webview.create_window('yt', html=html, hidden=True)
+        srv = http.server.HTTPServer(('127.0.0.1', 0), _Handler)
+    except Exception as e:
+        try:
+            conn.send({'error': f'local server failed: {e}'})
+            conn.close()
+        except Exception:
+            pass
+        return
+    port = srv.server_address[1]
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+
+    try:
+        w = webview.create_window('yt', url=f'http://127.0.0.1:{port}/', hidden=True)
         webview.start(_on_start, (w,))
     except Exception as e:
         try:
@@ -3350,6 +3587,11 @@ def _yt_webview_worker(html, conn):
         except Exception:
             pass
         return
+    finally:
+        try:
+            srv.shutdown()
+        except Exception:
+            pass
     try:
         conn.send({'result': holder.get('r')})
         conn.close()
@@ -3357,20 +3599,57 @@ def _yt_webview_worker(html, conn):
         pass
 
 
-def _yt_solve(base_js, sig_list, n_list, verbose):
-    """Solve signature + n challenges via a system webview (pywebview). Returns (sig_map, n_map)."""
-    reqs = []
-    if sig_list:
-        reqs.append({'type': 'sig', 'challenges': list(sig_list)})
-    if n_list:
-        reqs.append({'type': 'n', 'challenges': list(n_list)})
-    if not reqs:
-        return {}, {}
+def _yt_solve_node(data, verbose):
+    """Solve via Node.js if it's on PATH — deterministic and far more reliable than a headless
+    webview. Returns the parsed solver output dict, or None if node is unavailable/failed."""
+    import shutil
+    node = shutil.which('node')
+    if not node:
+        return None
+    import tempfile
+    import subprocess
+    d = tempfile.mkdtemp(prefix='ytsolve_')
+    try:
+        bundle_path = os.path.join(d, 'bundle.js')
+        input_path = os.path.join(d, 'input.json')
+        runner_path = os.path.join(d, 'run.js')
+        with open(bundle_path, 'w', encoding='utf-8') as f:
+            f.write(_yt_bundle_js())
+        with open(input_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f)
+        runner = (
+            "const fs=require('fs');"
+            "const b=fs.readFileSync(" + json.dumps(bundle_path) + ",'utf8');"
+            "eval('(function(module,exports,define){'+b+"
+            "';globalThis.__jsc=jsc;})(undefined,undefined,undefined);');"
+            "const input=JSON.parse(fs.readFileSync(" + json.dumps(input_path) + ",'utf8'));"
+            "process.stdout.write(JSON.stringify(globalThis.__jsc(input)));"
+        )
+        with open(runner_path, 'w', encoding='utf-8') as f:
+            f.write(runner)
+        if verbose:
+            tqdm.write("[DBG] solving via Node.js...")
+        proc = subprocess.run([node, runner_path], capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0 or not proc.stdout.strip():
+            if verbose:
+                tqdm.write(f"[WARN] node solver failed: {(proc.stderr or '').strip()[:200]}")
+            return None
+        return json.loads(proc.stdout)
+    except Exception as e:
+        if verbose:
+            tqdm.write(f"[WARN] node solver error: {e}")
+        return None
+    finally:
+        import shutil as _sh
+        _sh.rmtree(d, ignore_errors=True)
+
+
+def _yt_solve_webview(data, verbose):
+    """Solve via a hidden system webview (pywebview). Returns the parsed output dict or None."""
     if not _yt_pywebview_available():
         if verbose:
             print("[WARN] pywebview is not installed; cannot solve YouTube signatures.")
-        return {}, {}
-    data = {'type': 'player', 'player': base_js, 'output_preprocessed': False, 'requests': reqs}
+        return None
     html = _yt_solver_html(data)
     import multiprocessing as _mp
     got = None
@@ -3379,35 +3658,53 @@ def _yt_solve(base_js, sig_list, n_list, verbose):
         parent, child = ctx.Pipe()
         proc = ctx.Process(target=_yt_webview_worker, args=(html, child), daemon=True)
         if verbose:
-            print("[DBG] launching webview solver process...")
+            tqdm.write("[DBG] launching webview solver process...")
         proc.start()
-        got = parent.recv() if parent.poll(200) else None
+        got = parent.recv() if parent.poll(90) else None
         proc.join(5)
         if proc.is_alive():
             proc.terminate()
     except Exception as e:
         if verbose:
-            print(f"[WARN] YouTube webview process failed: {e}")
-        return {}, {}
+            tqdm.write(f"[WARN] YouTube webview process failed: {e}")
+        return None
     if verbose:
         if got is None:
-            print("[WARN] webview solver: no response within 200s (window didn't return a result).")
+            print("[WARN] webview solver: no response within 90s (WebView2 didn't return a "
+                  "result — install Node.js for a reliable solver: https://nodejs.org).")
         elif got.get('error'):
             print(f"[WARN] webview solver error: {got['error']}")
         elif not got.get('result'):
-            print("[WARN] webview solver: empty result (evaluate_js returned nothing — WebView2 "
-                  "backend issue or the page didn't run).")
+            print("[WARN] webview solver: empty result (WebView2 backend issue).")
         else:
-            print(f"[DBG] webview solver returned {len(got['result'])} chars")
+            tqdm.write(f"[DBG] webview solver returned {len(got['result'])} chars")
     if not got or got.get('error') or not got.get('result'):
-        return {}, {}
+        return None
     try:
-        out = json.loads(got['result'])
+        return json.loads(got['result'])
     except (ValueError, TypeError):
+        return None
+
+
+def _yt_solve(base_js, sig_list, n_list, verbose):
+    """Solve signature + n challenges. Tries Node.js first (reliable), then a webview fallback.
+    Returns (sig_map, n_map)."""
+    reqs = []
+    if sig_list:
+        reqs.append({'type': 'sig', 'challenges': list(sig_list)})
+    if n_list:
+        reqs.append({'type': 'n', 'challenges': list(n_list)})
+    if not reqs:
+        return {}, {}
+    data = {'type': 'player', 'player': base_js, 'output_preprocessed': False, 'requests': reqs}
+    out = _yt_solve_node(data, verbose)
+    if out is None:
+        out = _yt_solve_webview(data, verbose)
+    if not out:
         return {}, {}
     if out.get('type') != 'result':
         if verbose:
-            print(f"[WARN] YouTube solver: {out.get('error')}")
+            tqdm.write(f"[WARN] YouTube solver: {out.get('error')}")
         return {}, {}
     sig_map, n_map = {}, {}
     for req, resp in zip(reqs, out.get('responses', [])):
@@ -3439,10 +3736,10 @@ def _yt_watch_player(video_id, session, verbose):
         html = r.text
     except requests.RequestException as e:
         if verbose:
-            print(f"[WARN] YouTube watch page fetch failed: {e}")
+            tqdm.write(f"[WARN] YouTube watch page fetch failed: {e}")
         return None, None, None
     if verbose:
-        print(f"[DBG] watch page: HTTP {r.status_code}, {len(html)} bytes, "
+        tqdm.write(f"[DBG] watch page: HTTP {r.status_code}, {len(html)} bytes, "
               f"final url {urlparse(r.url).netloc}{urlparse(r.url).path}")
     player = _extract_json_after(html, 'ytInitialPlayerResponse')
     if player is None:
@@ -3460,10 +3757,10 @@ def _yt_watch_player(video_id, session, verbose):
                                   timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)).text
         except requests.RequestException as e:
             if verbose:
-                print(f"[WARN] base.js fetch failed: {e}")
+                tqdm.write(f"[WARN] base.js fetch failed: {e}")
     if verbose:
         sd = (player or {}).get('streamingData') or {}
-        print(f"[DBG] playerResponse: {'found' if player else 'MISSING'} | "
+        tqdm.write(f"[DBG] playerResponse: {'found' if player else 'MISSING'} | "
               f"base.js: {'found' if base_js else 'MISSING'} | "
               f"visitorData: {'found' if visitor else 'MISSING'} | "
               f"formats: {len(sd.get('formats') or [])} progressive, "
@@ -3505,6 +3802,26 @@ def _extract_json_after(text, marker):
     return None
 
 
+def _yt_usable_fmt(f):
+    """A format we can actually build a URL for: it has a direct url or a (signature)cipher.
+    Formats with neither are SABR-only (server-driven) and cannot be downloaded this way."""
+    return bool(f.get('url') or f.get('signatureCipher') or f.get('cipher'))
+
+
+def _yt_merge_by_itag(*groups):
+    """Merge format lists, deduping by itag and preferring a usable (url/cipher) copy over a
+    SABR-only one. Lets us combine the client's formats with the watch page's."""
+    by = {}
+    for group in groups:
+        for f in group or []:
+            it = f.get('itag')
+            if it is None:
+                continue
+            if it not in by or (_yt_usable_fmt(f) and not _yt_usable_fmt(by[it])):
+                by[it] = f
+    return list(by.values())
+
+
 def _yt_cipher_parts(fmt):
     """Return (needs_sig, s_value, sp_name, base_url) for a format's URL or signatureCipher."""
     if fmt.get('url'):
@@ -3530,6 +3847,9 @@ def _yt_apply(base_url, sig_needed, s_val, sp_name, sig_map, n_map):
     if q.get('n') and n_map.get(q['n']):
         q['n'] = n_map[q['n']]
         url = urlunparse(parts._replace(query=urlencode(q)))
+    # A PO token (BotGuard) must ride along on the stream URL for WEB-issued formats.
+    if _YT_POTOKEN_ACTIVE and 'googlevideo' in url and 'pot=' not in url:
+        url += ('&' if '?' in url else '?') + f"pot={quote(_YT_POTOKEN_ACTIVE, safe='')}"
     return url
 
 
@@ -3554,6 +3874,19 @@ def _parse_res(v):
     return int(v2) if v2.isdigit() else None
 
 
+def _parse_track_sel(v):
+    """Parse --audio/--sub: None (not given -> all), 'SCAN' (list), 'ALL', or [ints] (1-based)."""
+    if v is None:
+        return None
+    v = str(v).strip().lower()
+    if v in ('', 'scan', 'list', 'show'):
+        return 'SCAN'
+    if v in ('all', 'a'):
+        return 'ALL'
+    idxs = [int(p) for p in v.replace(' ', '').split(',') if p.isdigit()]
+    return idxs or 'ALL'
+
+
 def _yt_scan_formats(video_id, session, verbose):
     """Print the video qualities YouTube offers for this video, with codec/fps/size, so the
     user can re-run with --res <height>."""
@@ -3565,8 +3898,15 @@ def _yt_scan_formats(video_id, session, verbose):
         print(f"[ERROR] Could not read formats for {video_id}.")
         return
     sd = player.get('streamingData') or {}
-    title = ((player.get('videoDetails') or {}).get('title') or video_id).strip()
-    adaptive = sd.get('adaptiveFormats') or []
+    wp_sd = (wp_player or {}).get('streamingData') or {}
+    title = (player.get('videoDetails') or {}).get('title')
+    if not title and wp_player:
+        title = (wp_player.get('videoDetails') or {}).get('title')
+    title = (title or video_id).strip()
+    # Merge client + watch-page formats and only list ones we can actually download (usable),
+    # so the scan matches what --res N will really fetch.
+    adaptive = [f for f in _yt_merge_by_itag(sd.get('adaptiveFormats'), wp_sd.get('adaptiveFormats'))
+                if _yt_usable_fmt(f)]
     vids = [f for f in adaptive if f.get('mimeType', '').startswith('video/mp4') and f.get('height')]
     if not vids:
         vids = [f for f in adaptive if f.get('mimeType', '').startswith('video/') and f.get('height')]
@@ -3605,17 +3945,29 @@ def _yt_gather(video_id, session, max_height, verbose):
     status = (player.get('playabilityStatus') or {})
     if status.get('status') and status.get('status') != 'OK':
         if verbose:
-            print(f"[WARN] YouTube {video_id}: {status.get('status')} - {status.get('reason')}")
+            tqdm.write(f"[WARN] YouTube {video_id}: {status.get('status')} - {status.get('reason')}")
         if status.get('status') in ('LOGIN_REQUIRED', 'UNPLAYABLE', 'ERROR'):
             return None
     sd = player.get('streamingData') or {}
-    title = ((player.get('videoDetails') or {}).get('title') or video_id).strip()
-    adaptive = sd.get('adaptiveFormats') or []
-    progressive = sd.get('formats') or []
+    title = (player.get('videoDetails') or {}).get('title')
+    if not title and wp_player:
+        # The TV/embedded client player often omits videoDetails; the watch page always has it.
+        title = (wp_player.get('videoDetails') or {}).get('title')
+    title = (title or video_id).strip()
+
+    # Merge the chosen client's formats with the watch-page (WEB) formats and dedupe by itag,
+    # preferring a usable copy (direct url or signatureCipher) over a SABR-only one. The client
+    # often returns high-res formats as SABR (no URL), while the watch page carries the same
+    # itags with a signatureCipher we CAN solve — so this recovers the best downloadable quality.
+    wp_sd = (wp_player or {}).get('streamingData') or {}
+    adaptive = _yt_merge_by_itag(sd.get('adaptiveFormats'), wp_sd.get('adaptiveFormats'))
+    progressive = _yt_merge_by_itag(sd.get('formats'), wp_sd.get('formats'))
     cap = max_height or 10000
 
-    vids = [f for f in adaptive if (f.get('mimeType', '').startswith('video/mp4')) and f.get('height')]
-    auds = [f for f in adaptive if f.get('mimeType', '').startswith('audio/mp4')]
+    vids = [f for f in adaptive if (f.get('mimeType', '').startswith('video/mp4'))
+            and f.get('height') and _yt_usable_fmt(f)]
+    auds = [f for f in adaptive if f.get('mimeType', '').startswith('audio/mp4')
+            and _yt_usable_fmt(f)]
     chosen, mode = [], None
     if vids and auds:
         # Best = highest resolution, then highest fps (so 1080p60 beats 1080p30), then bitrate.
@@ -3624,13 +3976,13 @@ def _yt_gather(video_id, session, max_height, verbose):
         a = max(auds, key=lambda f: f.get('bitrate', 0))
         chosen, mode = [('video', pick[-1]), ('audio', a)], 'adaptive'
     elif progressive:
-        pr = [f for f in progressive if f.get('height')]
+        pr = [f for f in progressive if f.get('height') and _yt_usable_fmt(f)]
         pr.sort(key=lambda f: f.get('height', 0))
         pick = [f for f in pr if f.get('height', 0) <= cap] or pr
         chosen, mode = [('muxed', pick[-1] if pick else progressive[-1])], 'progressive'
     else:
         if verbose:
-            print(f"[WARN] {video_id}: no usable mp4 formats "
+            tqdm.write(f"[WARN] {video_id}: no usable mp4 formats "
                   f"(adaptive={len(adaptive)}, progressive={len(progressive)}). "
                   f"YouTube likely wants a PO-token / sign-in for this request.")
         return None
@@ -3648,7 +4000,7 @@ def _yt_gather(video_id, session, max_height, verbose):
     if needs_js and sig_needed and not (_yt_can_solve() and base_js is not None):
         return {'__no_solver__': True, 'title': title}
     if verbose:
-        print(f"[DBG] {video_id}: {mode} itag {chosen[0][1].get('itag')} | client '{client}' "
+        tqdm.write(f"[DBG] {video_id}: {mode} itag {chosen[0][1].get('itag')} | client '{client}' "
               f"needs_js={needs_js} | {len(sig_needed)} sig, {len(n_needed)} n")
     return {'title': title, 'mode': mode, 'parsed': parsed, 'needs_js': needs_js,
             'base_js': base_js, 'sig': sig_needed, 'n': n_needed}
@@ -3663,7 +4015,7 @@ def _yt_build(plan, sig_map, n_map, verbose):
         final = _yt_apply(base_url, needs and plan['needs_js'], s_val, sp, sig_map, n_map)
         if not final:
             if verbose:
-                print(f"[WARN] {plan['title']}: could not build final URL for {role}.")
+                tqdm.write(f"[WARN] {plan['title']}: could not build final URL for {role}.")
             return None
         out[role + '_url' if role != 'muxed' else 'url'] = final
     return out
@@ -3682,7 +4034,7 @@ def _yt_pick_streams(video_id, session, max_height, verbose):
                                        plan['sig'] if plan['needs_js'] else set(),
                                        plan['n'], verbose)
         elif plan['n'] and verbose:
-            print(f"[WARN] {video_id}: no webview — 'n' left untransformed; download will be "
+            tqdm.write(f"[WARN] {video_id}: no webview — 'n' left untransformed; download will be "
                   f"throttled. Install pywebview for full speed.")
     return _yt_build(plan, sig_map, n_map, verbose)
 
@@ -3729,7 +4081,7 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
               f"in one webview pass...")
         sig_map, n_map = _yt_solve(base_js, all_sig, all_n, verbose)
         if verbose:
-            print(f"[DBG] batch solved {len(sig_map)}/{len(all_sig)} sig, {len(n_map)}/{len(all_n)} n")
+            tqdm.write(f"[DBG] batch solved {len(sig_map)}/{len(all_sig)} sig, {len(n_map)}/{len(all_n)} n")
     elif all_n and not _yt_can_solve():
         print("[WARN] pywebview not available — 'n' left untransformed; downloads will be slow.")
 
@@ -3908,7 +4260,7 @@ def youtube_playlist_videos(playlist_id, session, verbose):
         if vm:
             visitor = vm.group(1).encode().decode('unicode_escape')
         if verbose:
-            print(f"[DBG] playlist page: HTTP {r.status_code}, ytInitialData "
+            tqdm.write(f"[DBG] playlist page: HTTP {r.status_code}, ytInitialData "
                   f"{'found' if first_json else 'MISSING'}, visitorData "
                   f"{'found' if visitor else 'MISSING'}")
     except requests.RequestException as e:
@@ -3924,7 +4276,7 @@ def youtube_playlist_videos(playlist_id, session, verbose):
                 seen.add(vid)
                 videos.append({'source': 'youtube', 'youtube_id': vid, 'title': title or vid})
         if verbose:
-            print(f"[DBG] playlist page: {len(items)} item(s), "
+            tqdm.write(f"[DBG] playlist page: {len(items)} item(s), "
                   f"continuation {'yes' if token else 'no'}")
     if token is None and not videos:
         # Fall back to a direct InnerTube browse (VL<id>).
@@ -3959,7 +4311,7 @@ def youtube_playlist_videos(playlist_id, session, verbose):
                 videos.append({'source': 'youtube', 'youtube_id': vid, 'title': title or vid})
                 added += 1
         if verbose:
-            print(f"[DBG] playlist continuation: +{added} (total {len(videos)})")
+            tqdm.write(f"[DBG] playlist continuation: +{added} (total {len(videos)})")
         if added == 0:
             break
     return videos, (None if _yt_bad_title(pl_title) else pl_title)
@@ -4066,6 +4418,106 @@ def resolve_master(video, session, verbose):
         return video.get('master_url'), YOUTUBE_HEADERS
     master, _title, _dur = resolve_vimeo(video['vimeo_id'], video['vimeo_hash'], session, verbose)
     return master, VIMEO_HEADERS
+
+
+AUDIO_SEL = None                  # None/'ALL' = all audio tracks; 'SCAN' = list; [ints] = selection
+SUB_SEL = None                    # None/'ALL' = all subtitles; 'SCAN' = list; [ints] = selection
+
+
+def _parse_media_attrs(line):
+    """Parse KEY=VALUE attributes off an #EXT-X-MEDIA line (values may be quoted)."""
+    attrs = {}
+    for m in re.finditer(r'([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))', line):
+        attrs[m.group(1)] = m.group(2) if m.group(2) is not None else m.group(3)
+    return attrs
+
+
+def parse_master_tracks(master_url, session, max_height, headers, verbose):
+    """Fetch the HLS master and return {'video':url, 'audios':[{uri,name,lang,default}],
+    'subs':[...]} for the chosen video quality, or None."""
+    try:
+        r = session.get(master_url, headers=headers, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+    except requests.RequestException as e:
+        if verbose:
+            print(f"[WARN] HLS master fetch failed: {e}")
+        return None
+    if r.status_code != 200:
+        if verbose:
+            print(f"[WARN] HLS master returned {r.status_code}")
+        return None
+    lines = r.text.splitlines()
+    audios, subs = [], []
+    for line in lines:
+        if line.startswith('#EXT-X-MEDIA:'):
+            a = _parse_media_attrs(line)
+            typ, uri = a.get('TYPE'), a.get('URI')
+            if not uri:
+                continue
+            entry = {'uri': urljoin(master_url, uri),
+                     'name': a.get('NAME') or a.get('LANGUAGE') or '',
+                     'lang': a.get('LANGUAGE') or '', 'default': a.get('DEFAULT') == 'YES'}
+            if typ == 'AUDIO':
+                entry['name'] = entry['name'] or f"audio{len(audios) + 1}"
+                audios.append(entry)
+            elif typ == 'SUBTITLES':
+                entry['name'] = entry['name'] or f"sub{len(subs) + 1}"
+                subs.append(entry)
+    variants = []
+    for i, line in enumerate(lines):
+        if line.startswith('#EXT-X-STREAM-INF'):
+            res = re.search(r'RESOLUTION=(\d+)x(\d+)', line)
+            bw = re.search(r'BANDWIDTH=(\d+)', line)
+            height = int(res.group(2)) if res else 0
+            band = int(bw.group(1)) if bw else 0
+            uri = ''
+            for j in range(i + 1, len(lines)):
+                if lines[j] and not lines[j].startswith('#'):
+                    uri = lines[j].strip()
+                    break
+            if uri:
+                variants.append((height, band, urljoin(master_url, uri)))
+    if not variants:
+        return None
+    variants.sort(key=lambda v: (v[0], v[1]))
+    if max_height and max_height > 0:
+        eligible = [v for v in variants if v[0] <= max_height]
+        chosen = eligible[-1] if eligible else variants[0]
+    else:
+        chosen = variants[-1]
+    if verbose:
+        print(f"[INFO] Selected video {chosen[0]}p | {len(audios)} audio, {len(subs)} subtitle "
+              f"track(s)")
+    return {'video': chosen[2], 'audios': audios, 'subs': subs}
+
+
+def _select_tracks(tracks, sel):
+    """Filter a track list by a selection: None/'ALL' -> all, [ints] -> those 1-based indices."""
+    if not tracks or sel in (None, 'ALL'):
+        return list(tracks)
+    if isinstance(sel, list):
+        return [tracks[i - 1] for i in sel if 1 <= i <= len(tracks)]
+    return list(tracks)
+
+
+def _hls_list_tracks(title, audios, subs):
+    """Print the audio/subtitle tracks a stream offers so the user can pick with --audio/--sub."""
+    out = [f"\n[INFO] Tracks for: {title}"]
+    if audios:
+        out.append("  Audio (choose with --audio N[,N...] ; default = all):")
+        for i, a in enumerate(audios, 1):
+            out.append(f"     --audio {i:<2} {a['name']} [{a['lang'] or '?'}]"
+                       + ("  (default)" if a['default'] else ""))
+    else:
+        out.append("  Audio: single/muxed track — nothing to choose (this stream has one audio).")
+    if subs:
+        out.append("  Subtitles (choose with --sub N[,N...] ; default = all):")
+        for i, s in enumerate(subs, 1):
+            out.append(f"     --sub {i:<2} {s['name']} [{s['lang'] or '?'}]"
+                       + ("  (default)" if s['default'] else ""))
+    else:
+        out.append("  Subtitles: none found in this stream.")
+    out.append("")
+    tqdm.write("\n".join(out))
 
 
 def parse_master_playlist(master_url, session, max_height, headers, verbose):
@@ -4213,6 +4665,49 @@ def _concat_stream(parts, out_file):
                 shutil.copyfileobj(f, out, length=8 * 1024 * 1024)
 
 
+def _ffmpeg_mux_multi(video_file, audio_files, sub_files, audio_langs, sub_langs, out_path, verbose):
+    """Mux a video file + N audio files + M subtitle (WebVTT) files into one mp4. When audio_files
+    is empty the video's own (muxed) audio is kept. Returns (ok, error_text)."""
+    tmp = _temp_artifact(out_path, ".part.mp4")
+    cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', video_file]
+    for af in audio_files:
+        cmd += ['-i', af]
+    for sf in sub_files:
+        cmd += ['-i', sf]
+    cmd += ['-map', '0:v:0']
+    if audio_files:
+        for i in range(len(audio_files)):
+            cmd += ['-map', f'{1 + i}:a:0']
+    else:
+        cmd += ['-map', '0:a?']                    # keep audio muxed into the video variant
+    sub_base = 1 + len(audio_files)
+    for i in range(len(sub_files)):
+        cmd += ['-map', f'{sub_base + i}:0']
+    cmd += ['-c:v', 'copy', '-c:a', 'copy']
+    if sub_files:
+        cmd += ['-c:s', 'mov_text']
+    for i, lang in enumerate(audio_langs):
+        if lang:
+            cmd += [f'-metadata:s:a:{i}', f'language={lang}']
+    for i, lang in enumerate(sub_langs):
+        if lang:
+            cmd += [f'-metadata:s:s:{i}', f'language={lang}']
+    cmd += ['-movflags', '+faststart', '-y', tmp]
+    if verbose:
+        tqdm.write("[INFO] ffmpeg " + " ".join(cmd[1:]))
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0:
+        tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-3:] if l.strip()) or "(no error text)"
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False, tail
+    os.replace(tmp, out_path)
+    return True, None
+
+
 def _ffmpeg_mux(video_file, audio_file, out_path, verbose):
     """Mux already-downloaded local stream files into out_path. Returns (ok, error_text)."""
     tmp = _temp_artifact(out_path, ".part.mp4")
@@ -4246,7 +4741,9 @@ class _HlsJob:
         self.lock_path = _temp_artifact(out_path, ".lock")
         self.locked = False
         self.parts_dir = _temp_artifact(out_path, ".parts")
-        self.streams = {}          # 'v'/'a' -> {'parts': [paths in order]}
+        self.streams = {}          # 'v'/'a0'/'a1'/'s0'... -> {'parts': [paths in order]}
+        self.audio_meta = []       # [(stream_key, lang, name)] for separate audio tracks
+        self.sub_meta = []         # [(stream_key, lang, name)] for subtitle tracks
         self.tasks = []            # (stream_key, idx, url, path)
         self.remaining = 0
         self.failed = False
@@ -4254,8 +4751,28 @@ class _HlsJob:
         self.bar = None
 
 
+def _add_hls_stream(job, key, murl, session, headers):
+    """Fetch a media playlist and register its (init + ordered segment) download tasks under key.
+    Returns True if it has any segments."""
+    init, segs = parse_media_playlist(murl, session, headers)
+    parts = []
+    if init:
+        p = os.path.join(job.parts_dir, f"{key}_init")
+        job.tasks.append((key, -1, init, p))
+        parts.append(p)
+    for i, su in enumerate(segs):
+        p = os.path.join(job.parts_dir, f"{key}_{i:05d}")
+        job.tasks.append((key, i, su, p))
+        parts.append(p)
+    if parts:
+        job.streams[key] = {'parts': parts}
+        return True
+    return False
+
+
 def _build_hls_job(video, session, out_dir, max_height, verbose):
-    """Resolve a video (Vimeo or Mux) to its HLS segment lists. Returns a ready _HlsJob or None."""
+    """Resolve a video (Vimeo/Mux/Twitch/scan) to its HLS segment lists, honouring --audio/--sub.
+    Returns a ready _HlsJob, or None (also None when just listing tracks with a bare --audio/--sub)."""
     fallback = video.get('vimeo_id') or video.get('title') or 'video'
     filename = safe_filename(video['title'] or fallback, fallback)
     if not filename.lower().endswith('.mp4'):
@@ -4270,25 +4787,32 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
     if not master:
         tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} No HLS for {video['title']} (private/unavailable).")
         return None
-    video_url, audio_url = parse_master_playlist(master, session, max_height, headers, verbose)
-    if not video_url:
+    tracks = parse_master_tracks(master, session, max_height, headers, verbose)
+    if not tracks or not tracks.get('video'):
         tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} No video stream for {video['title']}.")
         return None
+    audios, subs = tracks['audios'], tracks['subs']
+
+    # Bare --audio / --sub: just list what's available and skip the download.
+    if AUDIO_SEL == 'SCAN' or SUB_SEL == 'SCAN':
+        _hls_list_tracks(video['title'], audios, subs)
+        return None
+
+    sel_audios = _select_tracks(audios, AUDIO_SEL)
+    sel_subs = _select_tracks(subs, SUB_SEL)
 
     job = _HlsJob(video, out_path, headers)
     os.makedirs(job.parts_dir, exist_ok=True)
-    for key, murl in (('v', video_url), ('a', audio_url)):
-        if not murl:
-            continue
-        init, segs = parse_media_playlist(murl, session, headers)
-        parts = []
-        if init:
-            p = os.path.join(job.parts_dir, f"{key}_init")
-            job.tasks.append((key, -1, init, p)); parts.append(p)
-        for i, su in enumerate(segs):
-            p = os.path.join(job.parts_dir, f"{key}_{i:05d}")
-            job.tasks.append((key, i, su, p)); parts.append(p)
-        job.streams[key] = {'parts': parts}
+    _add_hls_stream(job, 'v', tracks['video'], session, headers)
+    for idx, a in enumerate(sel_audios):
+        key = f'a{idx}'
+        if _add_hls_stream(job, key, a['uri'], session, headers):
+            job.audio_meta.append((key, a['lang'], a['name']))
+    for idx, s in enumerate(sel_subs):
+        key = f's{idx}'
+        if _add_hls_stream(job, key, s['uri'], session, headers):
+            job.sub_meta.append((key, s['lang'], s['name']))
+
     if 'v' not in job.streams or not job.streams['v']['parts']:
         tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} Empty playlist for {video['title']}.")
         return None
@@ -4367,16 +4891,29 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
             try:
                 vfile = _temp_artifact(job.out_path, ".video")
                 _concat_stream(job.streams['v']['parts'], vfile)
-                afile = None
-                if 'a' in job.streams:
-                    afile = _temp_artifact(job.out_path, ".audio")
-                    _concat_stream(job.streams['a']['parts'], afile)
-                ok, reason = _ffmpeg_mux(vfile, afile, job.out_path, verbose)
+                afiles, alangs = [], []
+                for key, lang, _name in job.audio_meta:
+                    af = _temp_artifact(job.out_path, f".{key}")
+                    _concat_stream(job.streams[key]['parts'], af)
+                    afiles.append(af)
+                    alangs.append(lang)
+                sfiles, slangs = [], []
+                for key, lang, _name in job.sub_meta:
+                    sf = _temp_artifact(job.out_path, f".{key}.vtt")
+                    _concat_stream(job.streams[key]['parts'], sf)
+                    sfiles.append(sf)
+                    slangs.append(lang)
+                ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, alangs, slangs,
+                                               job.out_path, verbose)
             except Exception as exc:
                 reason = str(exc)
             finally:
-                for extra in (_temp_artifact(job.out_path, ".video"),
-                              _temp_artifact(job.out_path, ".audio")):
+                cleanup = [_temp_artifact(job.out_path, ".video")]
+                for key, _l, _n in job.audio_meta:
+                    cleanup.append(_temp_artifact(job.out_path, f".{key}"))
+                for key, _l, _n in job.sub_meta:
+                    cleanup.append(_temp_artifact(job.out_path, f".{key}.vtt"))
+                for extra in cleanup:
                     if os.path.exists(extra):
                         try:
                             os.remove(extra)
@@ -5356,6 +5893,135 @@ def _scan_unique_name(base, used):
     return name
 
 
+def _classify_media_url(u):
+    """Turn a raw media URL into a (kind, canonical_url, label) tuple, or None if not media."""
+    m = re.search(r'(?:youtube(?:-nocookie)?\.com/(?:watch\?v=|embed/|v/|shorts/|live/)'
+                  r'|youtu\.be/)([0-9A-Za-z_-]{11})', u)
+    if m:
+        return 'url', f'https://www.youtube.com/watch?v={m.group(1)}', f'YouTube {m.group(1)}'
+    m = re.search(r'(?:player\.)?vimeo\.com/(?:video/)?(\d{6,})', u)
+    if m:
+        return 'url', f'https://vimeo.com/{m.group(1)}', f'Vimeo {m.group(1)}'
+    m = re.search(r'twitch\.tv/videos/(\d+)', u)
+    if m:
+        return 'url', f'https://www.twitch.tv/videos/{m.group(1)}', f'Twitch VOD {m.group(1)}'
+    m = re.search(r'drive\.google\.com/file/d/([0-9A-Za-z_-]+)', u)
+    if m:
+        return 'url', f'https://drive.google.com/file/d/{m.group(1)}/view', f'Drive {m.group(1)}'
+    if re.search(r'dropbox\.com/(?:s|scl/fi)/', u):
+        return 'url', u, 'Dropbox file'
+    if u.startswith('blob:') or u.startswith('data:'):
+        return None                    # can't fetch these directly (MediaSource/inline)
+    if re.search(r'\.m3u8(?:[?#/]|$)', u, re.I):
+        return 'hls', u, 'HLS stream (.m3u8)'
+    if re.search(r'\.(mp4|webm|mov|m4v)(?:[?#]|$)', u, re.I):
+        return 'direct', u, 'Direct video file'
+    return None
+
+
+_BROWSER_COLLECT_JS = r"""
+(function(){
+  var out = {urls: [], title: document.title || ''};
+  try {
+    var og = document.querySelector('meta[property="og:title"]');
+    if (og && og.content) out.title = og.content;
+    document.querySelectorAll('video,source,audio').forEach(function(e){
+      if (e.src) out.urls.push(e.src);
+      if (e.currentSrc) out.urls.push(e.currentSrc);
+    });
+    document.querySelectorAll('iframe').forEach(function(e){ if (e.src) out.urls.push(e.src); });
+    var res = (window.performance && performance.getEntriesByType) ?
+              performance.getEntriesByType('resource') : [];
+    res.forEach(function(e){
+      var n = e.name || '';
+      if (/\.(m3u8|mp4|webm|mov|m4v)(\?|$)/i.test(n) ||
+          /(youtube|youtu\.be|vimeo|twitch\.tv|drive\.google|dropbox)\.?/i.test(n)) out.urls.push(n);
+    });
+  } catch (err) {}
+  return JSON.stringify(out);
+})()
+"""
+
+
+def _browser_worker(url, wait_s, conn):
+    """Separate process: open the page in a real webview, let JS/players run, then collect media
+    URLs from the DOM + performance resource timings."""
+    try:
+        import webview
+    except Exception as e:
+        try:
+            conn.send({'error': 'pywebview not installed: {}'.format(e)})
+            conn.close()
+        except Exception:
+            pass
+        return
+    holder = {}
+
+    def _on_start(window):
+        import time as _t
+        _t.sleep(wait_s)                     # let the page's JS build the player / fetch media
+        for _ in range(20):
+            try:
+                holder['r'] = window.evaluate_js(_BROWSER_COLLECT_JS)
+            except Exception:
+                holder['r'] = None
+            if holder.get('r'):
+                break
+            _t.sleep(0.5)
+        try:
+            window.destroy()
+        except Exception:
+            pass
+
+    try:
+        w = webview.create_window('scan', url=url, hidden=True)
+        webview.start(_on_start, (w,))
+    except Exception as e:
+        try:
+            conn.send({'error': str(e)})
+            conn.close()
+        except Exception:
+            pass
+        return
+    try:
+        conn.send({'result': holder.get('r')})
+        conn.close()
+    except Exception:
+        pass
+
+
+def _browser_collect_media(page_url, verbose, wait_s=6):
+    """Load a page in a headless system webview and return (media_urls, page_title). Requires
+    pywebview (same engine used for YouTube signatures)."""
+    if not _yt_pywebview_available():
+        print("[ERROR] --scan-browser needs pywebview. Install it with:  pip install pywebview")
+        return [], None
+    import multiprocessing as _mp
+    got = None
+    try:
+        ctx = _mp.get_context('spawn')
+        parent, child = ctx.Pipe()
+        proc = ctx.Process(target=_browser_worker, args=(page_url, wait_s, child), daemon=True)
+        proc.start()
+        got = parent.recv() if parent.poll(wait_s + 60) else None
+        proc.join(5)
+        if proc.is_alive():
+            proc.terminate()
+    except Exception as e:
+        if verbose:
+            print(f"[WARN] --scan-browser webview failed: {e}")
+        return [], None
+    if not got or got.get('error') or not got.get('result'):
+        if got and got.get('error'):
+            print(f"[WARN] --scan-browser: {got['error']}")
+        return [], None
+    try:
+        data = json.loads(got['result'])
+    except (ValueError, TypeError):
+        return [], None
+    return list(dict.fromkeys(data.get('urls') or [])), (data.get('title') or None)
+
+
 def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
     """Fetch any page and discover downloadable media on it, independent of the URL's shape:
     YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.webm/.mov URLs.
@@ -5418,7 +6084,7 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
                 break
             done += 1
             if verbose:
-                print(f"[DBG] --scan: following iframe {src[:80]}")
+                tqdm.write(f"[DBG] --scan: following iframe {src[:80]}")
             for s in scan_page_for_media(src, session, verbose, _depth + 1, _title=title):
                 add(s['kind'], s['url'], s['label'] + ' (iframe)', name=s.get('name'),
                     page=s.get('page'))
@@ -5433,7 +6099,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          out_dir: str = None, max_height: int = DEFAULT_MAX_HEIGHT, list_only: bool = False,
          ffmpeg_path: str = None, ffmpeg_url: str = None, do_rename: bool = True,
          rename_mode: str = 'ask', return_summary: bool = False, res_scan: bool = False,
-         scan_mode: bool = False):
+         scan_mode: bool = False, browser_scan: bool = False):
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
     summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
@@ -5526,6 +6192,21 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
 
     if scan_mode:
         found = scan_page_for_media(id_or_url, session, verbose)
+        if browser_scan:
+            print("[INFO] --scan-browser: loading the page in a browser (JS) to find media...")
+            burls, btitle = _browser_collect_media(id_or_url, verbose)
+            if verbose:
+                tqdm.write(f"[DBG] browser collected {len(burls)} candidate URL(s):")
+                for u in burls:
+                    print(f"      {u[:160]}")
+            for u in burls:
+                cls = _classify_media_url(u)
+                if not cls:
+                    continue
+                k, cu, lbl = cls
+                if not any(f['url'] == cu for f in found):
+                    found.append({'kind': k, 'url': cu, 'label': lbl + ' (browser)',
+                                  'name': btitle, 'page': id_or_url})
         if not found:
             print("[INFO] --scan: found no downloadable media on that page.")
             if return_summary:
@@ -5581,6 +6262,12 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                 # Direct file / HLS: --list or a bare --res just shows it (no variants to pick).
                 if list_only or res_scan:
                     print(f"   [{it['kind']}] {it['url']}")
+                    continue
+                if it['kind'] == 'direct' and (AUDIO_SEL == 'SCAN' or SUB_SEL == 'SCAN'):
+                    print(f"   [direct file] {it['url']}")
+                    print("   --audio/--sub track selection applies to HLS streams; this is a "
+                          "single file with no separate tracks. Re-run without --audio/--sub to "
+                          "download it.")
                     continue
                 # Headers the CDN expects: browser UA + Referer/Origin of the page the stream was
                 # found on (many CDNs reject hot-linked HLS/masters with 403/412 otherwise).
@@ -6190,6 +6877,9 @@ if __name__ == "__main__":
     parser.add_argument("--ascii", action="store_true", help="Force plain-ASCII filenames: strip accents (é->e) and drop non-Latin characters (Korean, etc.). Useful so Windows cmd shows names correctly and progress bars line up. Files keep their content; only names change.")
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
     parser.add_argument("--scan", action="store_true", help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.webm/.mov), and download them all. Works regardless of the page's own type.")
+    parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
+    parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
+    parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
@@ -6199,12 +6889,16 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.47.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.54.0")
 
     args = parser.parse_args()
 
     if args.ascii:
         ASCII_FILENAMES = True
+    if args.audio is not None:
+        AUDIO_SEL = _parse_track_sel(args.audio)
+    if args.sub is not None:
+        SUB_SEL = _parse_track_sel(args.sub)
 
     _res = _parse_res(args.res)
     if isinstance(_res, int):
@@ -6236,7 +6930,8 @@ if __name__ == "__main__":
         auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), select=args.select,
         auto=(not args.no_auto), out_dir=args.output_dir, max_height=args.max_height,
         list_only=args.list, ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
-        do_rename=(not args.no_rename), res_scan=_res_scan, scan_mode=args.scan,
+        do_rename=(not args.no_rename), res_scan=_res_scan,
+        scan_mode=(args.scan or args.scan_browser), browser_scan=args.scan_browser,
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.
