@@ -113,6 +113,15 @@ MKV_PROGRAM_FILES_DIRS = [        # reserved: this downloader muxes with ffmpeg,
     r"C:\Program Files\MKVToolNix",
     r"C:\Program Files (x86)\MKVToolNix",
 ]
+# mp4decrypt (Bento4) — for decrypting CENC/Widevine with a key you already hold. Same handling
+# as ffmpeg: PATH -> cache -> install folders -> download (NAS first, then the internet).
+MP4DECRYPT_DOWNLOAD_URL = "http://nas.falco81.net/mp4decrypt.zip"
+MP4DECRYPT_FALLBACK_URL = ("https://github.com/axiomatic-systems/Bento4/releases/download/"
+                           "v1.6.0-641/Bento4-SDK-1-6-0-641.x86_64-microsoft-win32.zip")
+MP4DECRYPT_PROGRAM_FILES_DIRS = [
+    r"C:\Program Files\mp4decrypt",
+    r"C:\Program Files (x86)\mp4decrypt",
+]
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 VIMEO_REFERER = "https://player.vimeo.com/"
@@ -3874,6 +3883,38 @@ def _parse_res(v):
     return int(v2) if v2.isdigit() else None
 
 
+def _parse_cenc_keys(key_args, keys_file):
+    """Collect user-supplied decryption keys from --key / --keys, for content the user ALREADY
+    holds keys for (their own protected storage). Accepts 'KID:KEY' (preferred) or a bare 32-hex
+    'KEY'. Returns validated 'KID:KEY'/'KEY' strings for mp4decrypt. This is not key extraction
+    or DRM circumvention — the user supplies their own keys."""
+    raw = list(key_args or [])
+    if keys_file:
+        try:
+            with open(keys_file, encoding='utf-8') as f:
+                raw += [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith('#')]
+        except OSError as e:
+            print(f"[WARN] --keys: could not read {keys_file}: {e}")
+    specs = []
+    for item in raw:
+        item = item.strip()
+        if ':' in item:
+            kid, key = item.split(':', 1)
+            kid = kid.strip().lower().replace('0x', '')
+            key = key.strip().lower().replace('0x', '')
+            if re.fullmatch(r'[0-9a-f]{32}', key) and re.fullmatch(r'[0-9a-f]{1,32}', kid):
+                specs.append(f"{kid}:{key}")
+                continue
+        else:
+            key = item.lower().replace('0x', '')
+            if re.fullmatch(r'[0-9a-f]{32}', key):
+                specs.append(key)
+                continue
+        if item:
+            print(f"[WARN] --key: ignoring '{item[:40]}' (need 32-hex KEY, optionally KID:KEY).")
+    return specs
+
+
 def _parse_track_sel(v):
     """Parse --audio/--sub: None (not given -> all), 'SCAN' (list), 'ALL', or [ints] (1-based)."""
     if v is None:
@@ -4422,6 +4463,8 @@ def resolve_master(video, session, verbose):
 
 AUDIO_SEL = None                  # None/'ALL' = all audio tracks; 'SCAN' = list; [ints] = selection
 SUB_SEL = None                    # None/'ALL' = all subtitles; 'SCAN' = list; [ints] = selection
+CENC_KEYS = []                    # user-supplied CENC/Widevine content keys (hex), for content you
+#                                   already hold keys for (own storage). NOT key extraction/DRM bypass.
 
 
 def _parse_media_attrs(line):
@@ -4665,10 +4708,736 @@ def _concat_stream(parts, out_file):
                 shutil.copyfileobj(f, out, length=8 * 1024 * 1024)
 
 
-def _ffmpeg_mux_multi(video_file, audio_files, sub_files, audio_langs, sub_langs, out_path, verbose):
-    """Mux a video file + N audio files + M subtitle (WebVTT) files into one mp4. When audio_files
-    is empty the video's own (muxed) audio is kept. Returns (ok, error_text)."""
+def _ffprobe_duration(url, headers, verbose):
+    """Best-effort total duration (seconds) via ffprobe, so the ffmpeg grab can show a % bar.
+    Returns a float or None."""
+    import shutil
+    p = FFMPEG or 'ffmpeg'
+    d, name = os.path.split(p)
+    probe = os.path.join(d, name.lower().replace('ffmpeg', 'ffprobe')) if 'ffmpeg' in name.lower() \
+        else 'ffprobe'
+    if not os.path.isfile(probe):
+        probe = shutil.which('ffprobe')
+    if not probe:
+        return None
+    ua = (headers or {}).get('User-Agent', USER_AGENT)
+    extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items() if k.lower() != 'user-agent')
+    cmd = [probe, '-v', 'quiet', '-user_agent', ua]
+    if extra:
+        cmd += ['-headers', extra]
+    cmd += ['-show_entries', 'format=duration', '-of', 'default=nw=1:nk=1', url]
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=30).stdout.strip()
+        return float(out) if out.replace('.', '', 1).isdigit() else None
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
+
+
+def _run_ffmpeg_progress(cmd, tmp, out_path, label, total_dur, verbose):
+    """Run an ffmpeg command (which must end with the temp output path) while showing a live
+    progress bar parsed from ffmpeg -progress. Returns (ok, error_text)."""
+    full = cmd[:1] + ['-progress', 'pipe:1', '-nostats'] + cmd[1:]
+    if total_dur and total_dur > 0:
+        bar = make_bar(total=int(total_dur), desc=label, unit='s', leave=True,
+                       bar_format='{desc} {percentage:3.0f}% |{bar}| {n_fmt}/{total_fmt}s')
+    else:
+        bar = make_bar(desc=label, unit='s', leave=True,
+                       bar_format='{desc} {n_fmt}s processed  {elapsed}')
+    last = 0
+    try:
+        proc = subprocess.Popen(full, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, bufsize=1)
+    except OSError as e:
+        bar.close()
+        return False, str(e)
+    try:
+        for line in proc.stdout:
+            line = line.strip()
+            if line.startswith(('out_time_us=', 'out_time_ms=')):
+                try:
+                    val = int(line.split('=', 1)[1])
+                except ValueError:
+                    continue
+                sec = int(val / (1e6 if 'us=' in line else 1e3))
+                if total_dur and total_dur > 0:
+                    bar.update(max(0, min(int(total_dur), sec) - last))
+                    last = sec
+                else:
+                    bar.n = sec
+                    bar.refresh()
+    finally:
+        proc.wait()
+        if total_dur and total_dur > 0 and bar.n < int(total_dur):
+            bar.update(int(total_dur) - bar.n)
+        bar.close()
+    err = proc.stderr.read() if proc.stderr else ''
+    if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        tail = " | ".join(l for l in (err or '').splitlines()[-3:] if l.strip())
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False, tail or "ffmpeg failed"
+    os.replace(tmp, out_path)
+    return True, None
+
+
+MP4DECRYPT = None                 # resolved path to Bento4 mp4decrypt, once found
+
+
+def _mp4decrypt_cache_dir():
+    base = os.path.dirname(os.path.abspath(sys.argv[0] or '.')) or os.getcwd()
+    return os.path.join(base, '.mp4decrypt')
+
+
+def _try_mp4decrypt(path):
+    """True if `path` is a runnable mp4decrypt (it prints usage/version when run with no args)."""
+    if not path or not os.path.isfile(path):
+        return False
+    try:
+        r = subprocess.run([path], capture_output=True, text=True, timeout=15)
+        blob = ((r.stdout or '') + (r.stderr or '')).lower()
+        return 'mp4decrypt' in blob or 'usage' in blob or 'bento4' in blob
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _find_mp4decrypt_in(dirs, max_depth=None):
+    """Walk each directory (optionally depth-limited) for a working mp4decrypt. Returns path/None."""
+    name = 'mp4decrypt.exe' if os.name == 'nt' else 'mp4decrypt'
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        base_depth = os.path.abspath(d).rstrip(os.sep).count(os.sep)
+        for root, subdirs, files in os.walk(d):
+            if max_depth is not None:
+                depth = os.path.abspath(root).rstrip(os.sep).count(os.sep) - base_depth
+                if depth >= max_depth:
+                    subdirs[:] = []
+                    continue
+            if name in files:
+                p = os.path.join(root, name)
+                if os.name != 'nt':
+                    try:
+                        os.chmod(p, 0o755)
+                    except OSError:
+                        pass
+                if _try_mp4decrypt(p):
+                    return p
+    return None
+
+
+def _find_cached_mp4decrypt():
+    return _find_mp4decrypt_in([_mp4decrypt_cache_dir()])
+
+
+def _download_and_extract_mp4decrypt(url, verbose):
+    cache = _mp4decrypt_cache_dir()
+    os.makedirs(cache, exist_ok=True)
+    print(f"[INFO] mp4decrypt not found; downloading from {url}")
+    tmp = os.path.join(cache, 'mp4decrypt_download.tmp')
+    with requests.get(url, stream=True, headers={'User-Agent': USER_AGENT}, allow_redirects=True,
+                      timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as r:
+        r.raise_for_status()
+        total = int(r.headers.get('content-length', 0) or 0)
+        bar = make_bar(total=total or 1, unit='B', unit_scale=True, desc='mp4decrypt',
+                       disable=(total == 0))
+        with open(tmp, 'wb') as f:
+            for chunk in r.iter_content(256 * 1024):
+                if chunk:
+                    f.write(chunk)
+                    bar.update(len(chunk))
+        bar.close()
+    print("[INFO] Extracting mp4decrypt ...")
+    _extract_archive(tmp, cache, url)
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return _find_cached_mp4decrypt()
+
+
+def ensure_mp4decrypt(verbose):
+    """Locate Bento4's mp4decrypt (to decrypt CENC/Widevine with a key you hold), in the same order
+    as ffmpeg: explicit MP4DECRYPT + PATH -> cached .mp4decrypt -> install folders
+    (MP4DECRYPT_PROGRAM_FILES_DIRS) + script dir + cwd -> (Windows only) download from the NAS URL,
+    then the internet fallback. On Linux/macOS uses PATH and prints an install hint. Returns path
+    or None."""
+    global MP4DECRYPT
+    if MP4DECRYPT and _try_mp4decrypt(MP4DECRYPT):
+        return MP4DECRYPT
+    import shutil
+    onpath = shutil.which('mp4decrypt') or shutil.which('mp4decrypt.exe')
+    if onpath and _try_mp4decrypt(onpath):
+        MP4DECRYPT = onpath
+        return onpath
+    cached = _find_cached_mp4decrypt()
+    if cached:
+        MP4DECRYPT = cached
+        if verbose:
+            print(f"[INFO] Using cached mp4decrypt: {cached}")
+        return cached
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0] or '.')) or os.getcwd()
+    if os.name == 'nt':
+        broad = list(MP4DECRYPT_PROGRAM_FILES_DIRS) + [script_dir, os.getcwd()]
+    else:
+        broad = [script_dir, os.getcwd()]
+    found = _find_mp4decrypt_in(broad, max_depth=4)
+    if found:
+        MP4DECRYPT = found
+        print(f"[INFO] Found mp4decrypt: {found}")
+        return found
+    if os.name == 'nt':
+        for url in (MP4DECRYPT_DOWNLOAD_URL, MP4DECRYPT_FALLBACK_URL):
+            if not url:
+                continue
+            try:
+                path = _download_and_extract_mp4decrypt(url, verbose)
+            except Exception as e:
+                print(f"[WARN] mp4decrypt download from {url} failed: {e}")
+                continue
+            if path and _try_mp4decrypt(path):
+                MP4DECRYPT = path
+                print(f"[INFO] Using downloaded mp4decrypt: {path}")
+                return path
+        print("[ERROR] Could not obtain mp4decrypt from the NAS or the internet fallback.")
+        return None
+    print("[ERROR] mp4decrypt (Bento4) not found. Install it and/or put it on PATH:")
+    print("        download Bento4 from https://www.bento4.com/downloads/ and add its bin/ to PATH,")
+    print("        or drop mp4decrypt next to the script.")
+    return None
+
+
+def _download_hls_raw(media_url, headers, session, out_file, verbose, label):
+    """Download an HLS media playlist's init + media segments RAW (no decryption) and concat to
+    out_file, preserving CENC boxes so mp4decrypt can decrypt afterwards. Returns (ok, reason)."""
+    init, segs = parse_media_playlist(media_url, session, headers)
+    if not segs:
+        return False, "no segments in playlist"
+    tmpdir = out_file + ".segs"
+    os.makedirs(tmpdir, exist_ok=True)
+    items = ([('init', init)] if init else []) + [(f"{i:06d}", u) for i, u in enumerate(segs)]
+
+    def _dl(item):
+        name, u = item
+        path = os.path.join(tmpdir, name)
+        ok, reason = _download_hls_segment(u, path, _seg_session(session), headers)
+        return name, path, ok, reason
+
+    from concurrent.futures import ThreadPoolExecutor
+    results, bad = {}, None
+    bar = make_bar(total=len(items), desc=label, unit='seg', leave=True)
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for name, path, ok, reason in ex.map(_dl, items):
+            results[name] = path
+            if not ok:
+                bad = reason or "segment download failed"
+            bar.update(1)
+    bar.close()
+    if bad:
+        import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
+        return False, bad
+    ordered = ([results['init']] if init else []) + [results[f"{i:06d}"] for i in range(len(segs))]
+    _concat_stream(ordered, out_file)
+    import shutil as _sh
+    _sh.rmtree(tmpdir, ignore_errors=True)
+    return True, None
+
+
+def _mpd_duration_seconds(text):
+    """Parse an ISO-8601 duration (e.g. PT1H2M3.5S) to seconds."""
+    m = re.match(r'P(?:(\d+)D)?T?(?:(\d+)H)?(?:(\d+)M)?(?:([\d.]+)S)?', text or '')
+    if not m:
+        return 0.0
+    d, h, mi, s = m.groups()
+    return (int(d or 0) * 86400 + int(h or 0) * 3600 + int(mi or 0) * 60 + float(s or 0))
+
+
+def _parse_mpd(mpd_url, session, headers, max_height, verbose):
+    """Parse a DASH MPD into {'video': rep, 'audios': [rep...], 'subs': [rep...]} where each rep is
+    {'file': url} (single-file SegmentBase) OR {'init': url, 'segments': [urls]} (SegmentTemplate),
+    plus 'lang'/'name'/'kid'/'height'. Handles SegmentTimeline and $Number$. Returns None on
+    failure. Covers the common VOD shapes, not every exotic MPD."""
+    import xml.etree.ElementTree as ET
+    try:
+        r = session.get(mpd_url, headers=headers, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if r.status_code != 200:
+            return None
+        root = ET.fromstring(r.text)
+    except (requests.RequestException, ET.ParseError):
+        return None
+    ns = root.tag[1:root.tag.index('}')] if root.tag.startswith('{') else ''
+
+    def Q(t):
+        return f'{{{ns}}}{t}' if ns else t
+
+    def base_of(el, parent_base):
+        b = el.find(Q('BaseURL'))
+        return urljoin(parent_base, b.text.strip()) if (b is not None and b.text) else parent_base
+
+    total = _mpd_duration_seconds(root.get('mediaPresentationDuration'))
+    root_base = base_of(root, mpd_url)
+    period = root.find(Q('Period'))
+    if period is None:
+        return None
+    period_base = base_of(period, root_base)
+    video, audios, subs = None, [], []
+
+    def seglist(tmpl, rep, rep_base):
+        # Single-file (SegmentBase, or no template at all): the whole BaseURL is the fragmented mp4.
+        if tmpl is None or rep.find(Q('SegmentBase')) is not None:
+            return {'file': rep_base}
+        rid, bw = rep.get('id', ''), rep.get('bandwidth', '')
+
+        def sub(t, number=None, time=None):
+            t = t.replace('$RepresentationID$', rid).replace('$Bandwidth$', bw)
+            if number is not None:
+                t = re.sub(r'\$Number(%0\d+d)?\$',
+                           lambda m: (m.group(1) % number) if m.group(1) else str(number), t)
+            if time is not None:
+                t = t.replace('$Time$', str(time))
+            return urljoin(rep_base, t.replace('$$', '$'))
+
+        init = tmpl.get('initialization')
+        media = tmpl.get('media')
+        start = int(tmpl.get('startNumber') or 1)
+        init_url = sub(init) if init else None
+        segs = []
+        timeline = tmpl.find(Q('SegmentTimeline'))
+        if timeline is not None:
+            t, num = 0, start
+            for s in timeline.findall(Q('S')):
+                if s.get('t') is not None:
+                    t = int(s.get('t'))
+                d = int(s.get('d'))
+                for _ in range(int(s.get('r') or 0) + 1):
+                    segs.append(sub(media, number=num, time=t))
+                    t += d
+                    num += 1
+        elif media:
+            dur = int(tmpl.get('duration') or 0)
+            ts = int(tmpl.get('timescale') or 1)
+            if dur and total:
+                count = int(total / (dur / ts)) + 1
+                for i in range(count):
+                    segs.append(sub(media, number=start + i, time=i * dur))
+        return {'init': init_url, 'segments': segs}
+
+    video_cands = []            # (is_mp4, height, info_dict)
+    for aset in period.findall(Q('AdaptationSet')):
+        mime = aset.get('mimeType', '')
+        ctype = aset.get('contentType') or mime.split('/')[0]
+        lang = aset.get('lang', '')
+        aset_base = base_of(aset, period_base)
+        aset_tmpl = aset.find(Q('SegmentTemplate'))
+        kid = None
+        for cp in aset.findall(Q('ContentProtection')):
+            k = (cp.get('{urn:mpeg:cenc:2013}default_KID') or cp.get('default_KID')
+                 or cp.get('cenc:default_KID'))
+            if k:
+                kid = k.replace('-', '')
+        reps = aset.findall(Q('Representation'))
+        if not reps:
+            continue
+
+        def info(rep, _mime=mime, _lang=lang, _base=aset_base, _tmpl=aset_tmpl, _kid=kid, _aset=aset):
+            rep_base = base_of(rep, _base)
+            tmpl = rep.find(Q('SegmentTemplate')) or _tmpl
+            d = seglist(tmpl, rep, rep_base)
+            d.update({'lang': _lang, 'name': _aset.get('label') or _lang or rep.get('id', ''),
+                      'kid': _kid or rep.get('kid'), 'height': int(rep.get('height') or 0),
+                      'mime': rep.get('mimeType') or _mime})
+            return d
+
+        rep_mime = (reps[0].get('mimeType') or mime).lower()
+        if ctype == 'video' or mime.startswith('video') or 'video' in rep_mime:
+            for rp in reps:
+                video_cands.append(('mp4' in ((rp.get('mimeType') or mime).lower()),
+                                    int(rp.get('height') or 0), info(rp)))
+        elif ctype == 'audio' or mime.startswith('audio') or 'audio' in rep_mime:
+            audios.append(info(max(reps, key=lambda rp: int(rp.get('bandwidth') or 0))))
+        elif ctype == 'text' or mime.startswith('text') or 'ttml' in rep_mime or 'vtt' in rep_mime:
+            subs.append(info(reps[0]))
+
+    if not video_cands:
+        return None
+    cap = max_height or 100000
+    # Prefer mp4 (mp4decrypt/ffmpeg-friendly) over webm, then the highest resolution up to the cap.
+    within = [c for c in video_cands if c[1] <= cap] or video_cands
+    mp4s = [c for c in within if c[0]]
+    pool = mp4s or within
+    video = max(pool, key=lambda c: c[1])[2]
+    return {'video': video, 'audios': audios, 'subs': subs}
+
+
+def _download_file_progress(url, out_path, session, headers, label, verbose):
+    """Stream a single URL to out_path with a byte progress bar. Returns (ok, reason)."""
+    tmp = out_path + '.part'
+    try:
+        with session.get(url, stream=True, headers=headers,
+                         timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as r:
+            if r.status_code != 200:
+                return False, f"HTTP {r.status_code}"
+            total = int(r.headers.get('Content-Length') or 0)
+            bar = make_bar(total=total or None, desc=label, unit='B', unit_scale=True, leave=True)
+            with open(tmp, 'wb') as f:
+                for chunk in r.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        f.write(chunk)
+                        bar.update(len(chunk))
+            bar.close()
+    except requests.RequestException as e:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return False, str(e)
+    os.replace(tmp, out_path)
+    return True, None
+
+
+def _download_dash_raw(rep, headers, session, out_file, verbose, label):
+    """Download a DASH representation RAW (single file, or init + segments concatenated) so
+    mp4decrypt can decrypt it. Returns (ok, reason)."""
+    if rep.get('file'):
+        return _download_file_progress(rep['file'], out_file, session, headers, label, verbose)
+    segs = rep.get('segments') or []
+    if not segs:
+        return False, "no segments"
+    tmpdir = out_file + ".segs"
+    os.makedirs(tmpdir, exist_ok=True)
+    items = ([('init', rep['init'])] if rep.get('init') else []) + \
+            [(f"{i:06d}", u) for i, u in enumerate(segs)]
+
+    def _dl(item):
+        name, u = item
+        path = os.path.join(tmpdir, name)
+        ok, reason = _download_hls_segment(u, path, _seg_session(session), headers)
+        return name, path, ok, reason
+
+    from concurrent.futures import ThreadPoolExecutor
+    results, bad = {}, None
+    bar = make_bar(total=len(items), desc=label, unit='seg', leave=True)
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        for name, path, ok, reason in ex.map(_dl, items):
+            results[name] = path
+            if not ok:
+                bad = reason or "segment failed"
+            bar.update(1)
+    bar.close()
+    if bad:
+        import shutil as _sh
+        _sh.rmtree(tmpdir, ignore_errors=True)
+        return False, bad
+    ordered = ([results['init']] if rep.get('init') else []) + \
+              [results[f"{i:06d}"] for i in range(len(segs))]
+    _concat_stream(ordered, out_file)
+    import shutil as _sh
+    _sh.rmtree(tmpdir, ignore_errors=True)
+    return True, None
+
+
+def _cenc_tmp(out_path, name):
+    """An ASCII-only temp path under .temp. mp4decrypt (Bento4) on Windows uses ANSI argv and
+    mangles non-ASCII paths (é, Korean, …) to '?', so it can't open files named after a Unicode
+    title. Intermediate enc/dec files therefore get a plain ASCII name; the final output keeps its
+    real (Unicode) name because ffmpeg handles those fine."""
+    import hashlib
+    h = hashlib.md5(os.path.abspath(out_path).encode('utf-8', 'ignore')).hexdigest()[:12]
+    tdir = os.path.join(os.path.dirname(os.path.abspath(out_path)), TEMP_SUBDIR)
+    os.makedirs(tdir, exist_ok=True)
+    return os.path.join(tdir, f"cenc_{h}_{name}")
+
+
+def _cenc_grab_dash(mpd_url, headers, session, max_height, out_path, key_specs, verbose):
+    """Decrypt a DASH stream you hold keys for: parse the MPD, download each representation RAW,
+    mp4decrypt with your key, then mux (languages + names). Returns (ok, reason)."""
+    mp4d = ensure_mp4decrypt(verbose)
+    if not mp4d:
+        return False, "mp4decrypt (Bento4) not found — install it to decrypt with --key"
+    mpd = _parse_mpd(mpd_url, session, headers, max_height, verbose)
+    if not mpd:
+        return False, "could not parse the MPD (unsupported DASH layout — send me the .mpd)"
+    # Bare --audio / --sub: list what the MPD offers and stop (mirrors HLS behaviour).
+    if AUDIO_SEL == 'SCAN' or SUB_SEL == 'SCAN':
+        _hls_list_tracks(os.path.splitext(os.path.basename(out_path))[0],
+                         mpd['audios'], mpd['subs'])
+        return True, None
+    if verbose:
+        v = mpd['video']
+        tqdm.write(f"[INFO] DASH: video {v.get('height') or '?'}p ({v.get('mime', '?')}), "
+                   f"{len(mpd['audios'])} audio / {len(mpd['subs'])} subtitle track(s) available")
+    audios = _select_tracks(mpd['audios'], AUDIO_SEL)
+    subs = _select_tracks(mpd['subs'], SUB_SEL)
+    if len(audios) > 1 or subs:
+        out_path = os.path.splitext(out_path)[0] + '.mkv'
+    made = []
+
+    def _decrypt(rep, tag, label):
+        enc = _cenc_tmp(out_path, f"{tag}.enc")
+        dec = _cenc_tmp(out_path, f"{tag}.dec.mp4")
+        ok, why = _download_dash_raw(rep, headers, session, enc, verbose, label)
+        if not ok:
+            return None, why
+        dcmd = [mp4d]
+        for spec in key_specs:
+            dcmd += ['--key', spec if ':' in spec else f"1:{spec}"]
+        dcmd += [enc, dec]
+        if verbose:
+            tqdm.write(f"[INFO] mp4decrypt: decrypting {tag} with your key(s)...")
+        proc = subprocess.run(dcmd, capture_output=True, text=True)
+        try:
+            os.remove(enc)
+        except OSError:
+            pass
+        if proc.returncode != 0 or not os.path.exists(dec) or os.path.getsize(dec) == 0:
+            return None, (proc.stderr or '').strip()[:200] or "mp4decrypt failed"
+        return dec, None
+
+    vfile, why = _decrypt(mpd['video'], 'v', "video (enc)")
+    if not vfile:
+        return False, f"video: {why}"
+    made.append(vfile)
+    afiles, ameta = [], []
+    for i, a in enumerate(audios):
+        af, why = _decrypt(a, f"a{i}", f"audio {i} (enc)")
+        if not af:
+            for f in made:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            return False, f"audio {i}: {why}"
+        afiles.append(af)
+        ameta.append((a.get('lang'), a.get('name')))
+        made.append(af)
+    # Subtitles: DASH text tracks are normally unencrypted (WebVTT/TTML) — just fetch and mux.
+    sfiles, smeta = [], []
+    for i, s in enumerate(subs):
+        sf = _cenc_tmp(out_path, f"s{i}.sub")
+        ok, _why = _download_dash_raw(s, headers, session, sf, verbose, f"sub {i}")
+        if ok:
+            sfiles.append(sf)
+            smeta.append((s.get('lang'), s.get('name')))
+            made.append(sf)
+    ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, ameta, smeta, out_path, verbose)
+    for f in made:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return ok, reason
+
+
+def _cenc_grab_hls(master_url, headers, session, max_height, out_path, key_specs, verbose):
+    """Decrypt an HLS stream you hold keys for: download each track's segments RAW, decrypt each
+    with mp4decrypt using your key, then mux (with languages + names). Returns (ok, reason)."""
+    mp4d = ensure_mp4decrypt(verbose)
+    if not mp4d:
+        return False, "mp4decrypt (Bento4) not found — install it to decrypt with --key"
+    tracks = parse_master_tracks(master_url, session, max_height, headers, verbose)
+    if not tracks or not tracks.get('video'):
+        return False, "could not resolve tracks"
+    audios = _select_tracks(tracks['audios'], AUDIO_SEL if AUDIO_SEL != 'SCAN' else None)
+    subs = _select_tracks(tracks['subs'], SUB_SEL if SUB_SEL != 'SCAN' else None)
+    if len(audios) > 1 or subs:
+        out_path = os.path.splitext(out_path)[0] + '.mkv'   # reliable multi-track names/langs
+    made = []
+
+    def _decrypt(media_url, tag, label):
+        enc = _cenc_tmp(out_path, f"{tag}.enc")
+        dec = _cenc_tmp(out_path, f"{tag}.dec.mp4")
+        ok, why = _download_hls_raw(media_url, headers, session, enc, verbose, label)
+        if not ok:
+            return None, why
+        dcmd = [mp4d]
+        for spec in key_specs:
+            dcmd += ['--key', spec if ':' in spec else f"1:{spec}"]
+        dcmd += [enc, dec]
+        if verbose:
+            tqdm.write(f"[INFO] mp4decrypt: decrypting {tag} with your key(s)...")
+        proc = subprocess.run(dcmd, capture_output=True, text=True)
+        try:
+            os.remove(enc)
+        except OSError:
+            pass
+        if proc.returncode != 0 or not os.path.exists(dec) or os.path.getsize(dec) == 0:
+            return None, (proc.stderr or '').strip()[:200] or "mp4decrypt failed"
+        return dec, None
+
+    vfile, why = _decrypt(tracks['video'], 'v', "video (enc)")
+    if not vfile:
+        return False, f"video: {why}"
+    made.append(vfile)
+    afiles, ameta = [], []
+    for i, a in enumerate(audios):
+        af, why = _decrypt(a['uri'], f"a{i}", f"audio {i} (enc)")
+        if not af:
+            for f in made:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            return False, f"audio {i}: {why}"
+        afiles.append(af)
+        ameta.append((a.get('lang'), a.get('name')))
+        made.append(af)
+    sfiles, smeta = [], []
+    for i, s in enumerate(subs):
+        sf = _cenc_tmp(out_path, f"s{i}.vtt")
+        ok, _why = _download_hls_raw(s['uri'], headers, session, sf, verbose, f"sub {i}")
+        if ok:
+            sfiles.append(sf)
+            smeta.append((s.get('lang'), s.get('name')))
+            made.append(sf)
+    ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, ameta, smeta, out_path, verbose)
+    for f in made:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return ok, reason
+
+
+def _ffmpeg_grab_stream(url, headers, out_path, verbose):
+    """Download a stream straight through ffmpeg — it fetches the manifest and keys and DECRYPTS
+    AES-128/SAMPLE-AES HLS, and also handles DASH (.mpd). Maps ALL video/audio/subtitle streams
+    the input exposes. Slower than the parallel path but works on protected streams.
+    Returns (ok, error_text)."""
+    if not ensure_ffmpeg(verbose):
+        return False, "ffmpeg unavailable"
     tmp = _temp_artifact(out_path, ".part.mp4")
+    ua = (headers or {}).get('User-Agent', USER_AGENT)
+    extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items()
+                    if k.lower() not in ('user-agent',))
+    cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-user_agent', ua]
+    if extra:
+        cmd += ['-headers', extra]
+    cmd += ['-i', url,
+            '-map', '0:v?', '-map', '0:a?', '-map', '0:s?',   # every video/audio/subtitle stream
+            '-c', 'copy', '-c:s', 'mov_text', '-movflags', '+faststart', '-y', tmp]
+    if verbose:
+        tqdm.write(f"[INFO] ffmpeg grab (decrypt/all tracks) {url[:80]}")
+    dur = _ffprobe_duration(url, headers, verbose)
+    return _run_ffmpeg_progress(cmd, tmp, out_path, os.path.basename(out_path)[:24], dur, verbose)
+
+
+def _ffmpeg_grab_hls(master_url, headers, session, max_height, out_path, verbose):
+    """ffmpeg-based HLS grab that pulls the chosen video variant PLUS every separate audio and
+    subtitle rendition (EXT-X-MEDIA) as its own ffmpeg input, so ALL tracks end up in the file —
+    and ffmpeg decrypts AES-128 on each. Falls back to a single-input grab if the master can't be
+    parsed. Returns (ok, error_text)."""
+    if not ensure_ffmpeg(verbose):
+        return False, "ffmpeg unavailable"
+    tracks = parse_master_tracks(master_url, session, max_height, headers, verbose)
+    if not tracks or not tracks.get('video'):
+        return _ffmpeg_grab_stream(master_url, headers, out_path, verbose)
+    audios = _select_tracks(tracks['audios'], AUDIO_SEL if AUDIO_SEL != 'SCAN' else None)
+    subs = _select_tracks(tracks['subs'], SUB_SEL if SUB_SEL != 'SCAN' else None)
+    if len(audios) > 1 or subs:
+        out_path = os.path.splitext(out_path)[0] + '.mkv'   # reliable multi-track names/langs
+    is_mkv = out_path.lower().endswith('.mkv')
+    inputs = [tracks['video']] + [a['uri'] for a in audios] + [s['uri'] for s in subs]
+    tmp = _temp_artifact(out_path, ".part" + (os.path.splitext(out_path)[1] or ".mp4"))
+    ua = (headers or {}).get('User-Agent', USER_AGENT)
+    extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items()
+                    if k.lower() not in ('user-agent',))
+    cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-user_agent', ua]
+    for u in inputs:
+        if extra:
+            cmd += ['-headers', extra]
+        cmd += ['-i', u]
+    cmd += ['-map', '0:v:0']
+    if audios:
+        for i in range(len(audios)):
+            cmd += ['-map', f'{1 + i}:a:0']
+    else:
+        cmd += ['-map', '0:a?']                       # audio muxed in the video variant
+    sub_base = 1 + len(audios)
+    for i in range(len(subs)):
+        cmd += ['-map', f'{sub_base + i}:s:0']
+    cmd += ['-c', 'copy']
+    if subs:
+        cmd += ['-c:s', 'srt' if is_mkv else 'mov_text']
+    for i, a in enumerate(audios):
+        if a.get('lang'):
+            cmd += [f'-metadata:s:a:{i}', f"language={_iso639_2(a['lang'])}"]
+        if a.get('name'):
+            cmd += [f'-metadata:s:a:{i}', f"title={a['name']}"]
+            if not is_mkv:
+                cmd += [f'-metadata:s:a:{i}', f"handler_name={a['name']}"]
+    for i, s in enumerate(subs):
+        if s.get('lang'):
+            cmd += [f'-metadata:s:s:{i}', f"language={_iso639_2(s['lang'])}"]
+        if s.get('name'):
+            cmd += [f'-metadata:s:s:{i}', f"title={s['name']}"]
+            if not is_mkv:
+                cmd += [f'-metadata:s:s:{i}', f"handler_name={s['name']}"]
+    if not is_mkv:
+        cmd += ['-movflags', '+faststart']
+    cmd += ['-y', tmp]
+    if verbose:
+        tqdm.write(f"[INFO] ffmpeg grab: 1 video + {len(audios)} audio + {len(subs)} subtitle "
+                   f"track(s), decrypting as needed")
+    dur = _ffprobe_duration(tracks['video'], headers, verbose)
+    ok, why = _run_ffmpeg_progress(cmd, tmp, out_path, os.path.basename(out_path)[:24], dur, verbose)
+    if not ok and not os.path.exists(out_path):
+        return _ffmpeg_grab_stream(master_url, headers, out_path, verbose)
+    return ok, why
+
+
+def _hls_stream_encrypted(master_url, session, headers):
+    """Peek at the HLS master (and one variant) for AES-128/SAMPLE-AES encryption, which the
+    parallel segment path can't decrypt — such streams must go through ffmpeg."""
+    def _enc(text):
+        return (('#EXT-X-KEY' in text or '#EXT-X-SESSION-KEY' in text) and 'METHOD=NONE' not in text
+                and ('AES-128' in text or 'SAMPLE-AES' in text or 'cenc' in text.lower()))
+    try:
+        r = session.get(master_url, headers=headers, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if r.status_code != 200:
+            return False
+        if _enc(r.text):
+            return True
+        for line in r.text.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                rv = session.get(urljoin(master_url, line), headers=headers,
+                                 timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+                return rv.status_code == 200 and _enc(rv.text)
+    except requests.RequestException:
+        pass
+    return False
+
+
+_ISO639 = {'en': 'eng', 'ko': 'kor', 'ja': 'jpn', 'zh': 'chi', 'cs': 'cze', 'sk': 'slo',
+           'de': 'ger', 'fr': 'fre', 'es': 'spa', 'it': 'ita', 'pt': 'por', 'ru': 'rus',
+           'pl': 'pol', 'nl': 'dut', 'sv': 'swe', 'no': 'nor', 'da': 'dan', 'fi': 'fin',
+           'tr': 'tur', 'ar': 'ara', 'hi': 'hin', 'th': 'tha', 'vi': 'vie', 'id': 'ind',
+           'uk': 'ukr', 'ro': 'rum', 'hu': 'hun', 'el': 'gre', 'he': 'heb', 'fa': 'per'}
+
+
+def _iso639_2(code):
+    """Normalise a language tag (e.g. 'en', 'en-US', 'eng') to an ISO 639-2 3-letter code so
+    players show the right language. Unknown codes are passed through as-is."""
+    if not code:
+        return ''
+    c = code.strip().lower().replace('_', '-').split('-')[0]
+    if len(c) == 3:
+        return c
+    return _ISO639.get(c, c)
+
+
+def _ffmpeg_mux_multi(video_file, audio_files, sub_files, audio_meta, sub_meta, out_path, verbose):
+    """Mux a video file + N audio files + M subtitle files into one container. `audio_meta`/
+    `sub_meta` are lists of (language, name), applied as per-track language + title. The container
+    follows out_path's extension: .mkv (recommended for multiple audio/subtitle tracks — names and
+    languages show reliably) or .mp4. Returns (ok, error_text)."""
+    ext = os.path.splitext(out_path)[1].lower() or '.mp4'
+    is_mkv = ext == '.mkv'
+    tmp = _temp_artifact(out_path, ".part" + ext)
     cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', video_file]
     for af in audio_files:
         cmd += ['-i', af]
@@ -4685,14 +5454,24 @@ def _ffmpeg_mux_multi(video_file, audio_files, sub_files, audio_langs, sub_langs
         cmd += ['-map', f'{sub_base + i}:0']
     cmd += ['-c:v', 'copy', '-c:a', 'copy']
     if sub_files:
-        cmd += ['-c:s', 'mov_text']
-    for i, lang in enumerate(audio_langs):
+        cmd += ['-c:s', 'srt' if is_mkv else 'mov_text']   # mkv: SubRip; mp4: mov_text
+    for i, (lang, name) in enumerate(audio_meta):
         if lang:
-            cmd += [f'-metadata:s:a:{i}', f'language={lang}']
-    for i, lang in enumerate(sub_langs):
+            cmd += [f'-metadata:s:a:{i}', f'language={_iso639_2(lang)}']
+        if name:
+            cmd += [f'-metadata:s:a:{i}', f'title={name}']
+            if not is_mkv:
+                cmd += [f'-metadata:s:a:{i}', f'handler_name={name}']
+    for i, (lang, name) in enumerate(sub_meta):
         if lang:
-            cmd += [f'-metadata:s:s:{i}', f'language={lang}']
-    cmd += ['-movflags', '+faststart', '-y', tmp]
+            cmd += [f'-metadata:s:s:{i}', f'language={_iso639_2(lang)}']
+        if name:
+            cmd += [f'-metadata:s:s:{i}', f'title={name}']
+            if not is_mkv:
+                cmd += [f'-metadata:s:s:{i}', f'handler_name={name}']
+    if not is_mkv:
+        cmd += ['-movflags', '+faststart']
+    cmd += ['-y', tmp]
     if verbose:
         tqdm.write("[INFO] ffmpeg " + " ".join(cmd[1:]))
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -4774,14 +5553,8 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
     """Resolve a video (Vimeo/Mux/Twitch/scan) to its HLS segment lists, honouring --audio/--sub.
     Returns a ready _HlsJob, or None (also None when just listing tracks with a bare --audio/--sub)."""
     fallback = video.get('vimeo_id') or video.get('title') or 'video'
-    filename = safe_filename(video['title'] or fallback, fallback)
-    if not filename.lower().endswith('.mp4'):
-        filename += '.mp4'
-    out_path = os.path.join(out_dir, filename) if out_dir else filename
-
-    if os.path.exists(out_path):
-        tqdm.write(f"[INFO] Already have {filename}, skipping.")
-        return None
+    stem = safe_filename(video['title'] or fallback, fallback)
+    stem = re.sub(r'\.(mp4|mkv)$', '', stem, flags=re.I)
 
     master, headers = resolve_master(video, session, verbose)
     if not master:
@@ -4800,6 +5573,15 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
 
     sel_audios = _select_tracks(audios, AUDIO_SEL)
     sel_subs = _select_tracks(subs, SUB_SEL)
+
+    # Use MKV when there are several audio tracks or any subtitles — track NAMES and LANGUAGES
+    # display reliably there (mp4 players often ignore them). A single audio track stays .mp4.
+    ext = '.mkv' if (len(sel_audios) > 1 or sel_subs) else '.mp4'
+    filename = stem + ext
+    out_path = os.path.join(out_dir, filename) if out_dir else filename
+    if os.path.exists(out_path) or os.path.exists(os.path.splitext(out_path)[0] + '.mp4'):
+        tqdm.write(f"[INFO] Already have {filename}, skipping.")
+        return None
 
     job = _HlsJob(video, out_path, headers)
     os.makedirs(job.parts_dir, exist_ok=True)
@@ -4891,19 +5673,19 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
             try:
                 vfile = _temp_artifact(job.out_path, ".video")
                 _concat_stream(job.streams['v']['parts'], vfile)
-                afiles, alangs = [], []
-                for key, lang, _name in job.audio_meta:
+                afiles, ameta = [], []
+                for key, lang, name in job.audio_meta:
                     af = _temp_artifact(job.out_path, f".{key}")
                     _concat_stream(job.streams[key]['parts'], af)
                     afiles.append(af)
-                    alangs.append(lang)
-                sfiles, slangs = [], []
-                for key, lang, _name in job.sub_meta:
+                    ameta.append((lang, name))
+                sfiles, smeta = [], []
+                for key, lang, name in job.sub_meta:
                     sf = _temp_artifact(job.out_path, f".{key}.vtt")
                     _concat_stream(job.streams[key]['parts'], sf)
                     sfiles.append(sf)
-                    slangs.append(lang)
-                ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, alangs, slangs,
+                    smeta.append((lang, name))
+                ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, ameta, smeta,
                                                job.out_path, verbose)
             except Exception as exc:
                 reason = str(exc)
@@ -5914,6 +6696,8 @@ def _classify_media_url(u):
         return None                    # can't fetch these directly (MediaSource/inline)
     if re.search(r'\.m3u8(?:[?#/]|$)', u, re.I):
         return 'hls', u, 'HLS stream (.m3u8)'
+    if re.search(r'\.mpd(?:[?#/]|$)', u, re.I):
+        return 'mpd', u, 'DASH stream (.mpd)'
     if re.search(r'\.(mp4|webm|mov|m4v)(?:[?#]|$)', u, re.I):
         return 'direct', u, 'Direct video file'
     return None
@@ -6066,6 +6850,8 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
         add('url', m.group(0), 'Dropbox file')
     for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.m3u8[^\s"\'<>\\]*', text):
         add('hls', m.group(0), 'HLS stream (.m3u8)', name=title)
+    for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.mpd[^\s"\'<>\\]*', text):
+        add('mpd', m.group(0), 'DASH stream (.mpd)', name=title)
     for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s"\'<>\\]*)?', text):
         add('direct', m.group(0), 'Direct video file', name=title)
 
@@ -6099,7 +6885,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          out_dir: str = None, max_height: int = DEFAULT_MAX_HEIGHT, list_only: bool = False,
          ffmpeg_path: str = None, ffmpeg_url: str = None, do_rename: bool = True,
          rename_mode: str = 'ask', return_summary: bool = False, res_scan: bool = False,
-         scan_mode: bool = False, browser_scan: bool = False):
+         scan_mode: bool = False, browser_scan: bool = False, scan_pick: int = None):
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
     summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
@@ -6212,17 +6998,29 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             if return_summary:
                 return summary
             return
+        # --scan N: deterministically take just the N-th discovered item (1-indexed), in the
+        # order they were found — e.g. --scan 2 on a page with several .mpd grabs the second.
+        if scan_pick is not None:
+            if 1 <= scan_pick <= len(found):
+                chosen = found[scan_pick - 1]
+                print(f"[INFO] --scan {scan_pick}: {len(found)} item(s) found; taking #{scan_pick} "
+                      f"[{chosen['kind']}] {chosen['url'][:90]}")
+                found = [chosen]
+            else:
+                print(f"[WARN] --scan {scan_pick}: only {len(found)} item(s) found — index out of "
+                      f"range; downloading all instead.")
         # Default prioritisation: if an HLS (.m3u8) stream is present, prefer it (it is adaptive,
         # so it yields the best resolution) and drop the raw direct files, which are usually the
         # same video at a single fixed quality. Known-source embeds (YouTube/Vimeo/...) are kept.
-        # With --select the user sees everything and decides, so we skip this there.
-        if not select:
-            has_hls = any(f['kind'] == 'hls' for f in found)
+        # With --select the user sees everything and decides, so we skip this there. A specific
+        # --scan N pick also skips prioritisation (the user already chose exactly one).
+        if not select and scan_pick is None:
+            has_hls = any(f['kind'] in ('hls', 'mpd') for f in found)
             has_direct = any(f['kind'] == 'direct' for f in found)
             if has_hls and has_direct:
                 dropped = sum(1 for f in found if f['kind'] == 'direct')
                 found = [f for f in found if f['kind'] != 'direct']
-                print(f"[INFO] --scan: HLS stream found; preferring it over {dropped} direct "
+                print(f"[INFO] --scan: HLS/DASH stream found; preferring it over {dropped} direct "
                       f"file(s) (use --select to choose manually).")
             # If the URLs encode a resolution (e.g. 720P_4000K, 480P_2000K), keep only the best
             # rendition of each stream.
@@ -6284,17 +7082,59 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                              'direct_url': it['url'], 'headers': hdrs}
                     _with_out_dir(lambda e=entry: download_folder_pooled(
                         [e], session, chunk_size, verbose, label="Direct", conn_cap=16))
-                elif it['kind'] == 'hls':
+                elif it['kind'] in ('hls', 'mpd'):
                     if not ensure_ffmpeg(verbose):
-                        print("[WARN] --scan: skipping HLS stream (ffmpeg needed).")
+                        print("[WARN] --scan: skipping stream (ffmpeg needed).")
                         continue
+                    ext = '.mpd' if it['kind'] == 'mpd' else '.m3u8'
                     base = it.get('name') or \
-                        os.path.basename(urlparse(it['url']).path).replace('.m3u8', '') or 'video'
+                        os.path.basename(urlparse(it['url']).path).replace(ext, '') or 'video'
                     final = _scan_unique_name(safe_filename(base, 'video'), _scan_used)
-                    desc = {'source': 'mux', 'master_url': it['url'], 'headers': hdrs,
-                            'title': os.path.splitext(final)[0]}   # HLS pipeline re-adds .mp4
-                    _with_out_dir(lambda d=desc: download_hls_pooled(
-                        [d], session, None, min(max_connections, 16), max_height, verbose))
+
+                    def _grab(it=it, final=final, hdrs=hdrs):
+                        # DASH, or AES-128/SAMPLE-AES encrypted HLS -> ffmpeg (fetches keys +
+                        # decrypts). Plain HLS -> fast parallel path, with an ffmpeg fallback if it
+                        # produces nothing (e.g. a protection we didn't detect up front).
+                        encrypted = it['kind'] != 'mpd' and _hls_stream_encrypted(it['url'],
+                                                                                  session, hdrs)
+                        if it['kind'] == 'mpd' or encrypted:
+                            if CENC_KEYS and encrypted:
+                                print(f"[INFO] --scan: encrypted HLS + {len(CENC_KEYS)} key(s) "
+                                      f"provided — decrypting with mp4decrypt (all tracks).")
+                                ok, why = _cenc_grab_hls(it['url'], hdrs, session, max_height,
+                                                         final, CENC_KEYS, verbose)
+                            elif it['kind'] == 'mpd':
+                                if CENC_KEYS:
+                                    print(f"[INFO] --scan: DASH (.mpd) + {len(CENC_KEYS)} key(s) "
+                                          f"— decrypting with mp4decrypt (all tracks).")
+                                    ok, why = _cenc_grab_dash(it['url'], hdrs, session, max_height,
+                                                              final, CENC_KEYS, verbose)
+                                else:
+                                    ok, why = _ffmpeg_grab_stream(it['url'], hdrs, final, verbose)
+                            else:
+                                if CENC_KEYS:
+                                    print("[INFO] --scan: you passed --key, but this HLS isn't "
+                                          "detected as CENC/SAMPLE-AES encrypted; using ffmpeg "
+                                          "(no decrypt). If it IS encrypted, send me the -v master "
+                                          "playlist so I can fix detection.")
+                                else:
+                                    print("[INFO] --scan: encrypted HLS — ffmpeg (clear-key "
+                                          "AES-128 only; pass --key KID:KEY for Widevine/CENC).")
+                                ok, why = _ffmpeg_grab_hls(it['url'], hdrs, session, max_height,
+                                                           final, verbose)
+                            if not ok:
+                                print(f"[WARN] --scan: could not grab the stream: {why}")
+                            return
+                        download_hls_pooled([{'source': 'mux', 'master_url': it['url'],
+                                              'headers': hdrs, 'title': os.path.splitext(final)[0]}],
+                                            session, None, min(max_connections, 16), max_height,
+                                            verbose)
+                        if not os.path.exists(final):
+                            if verbose:
+                                tqdm.write("[INFO] --scan: native HLS produced nothing; retrying "
+                                           "via ffmpeg (handles encryption).")
+                            _ffmpeg_grab_stream(it['url'], hdrs, final, verbose)
+                    _with_out_dir(_grab)
             except SystemExit:
                 pass
             except Exception as e:
@@ -6876,10 +7716,12 @@ if __name__ == "__main__":
     parser.add_argument("-l", "--list", action="store_true", help="Only list what was found (Patreon collection/post: Drive/Dropbox/native; folder: files; YouTube playlist/video and Twitch: titles) WITHOUT downloading. Add -v to also show source URLs/IDs.")
     parser.add_argument("--ascii", action="store_true", help="Force plain-ASCII filenames: strip accents (é->e) and drop non-Latin characters (Korean, etc.). Useful so Windows cmd shows names correctly and progress bars line up. Files keep their content; only names change.")
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
-    parser.add_argument("--scan", action="store_true", help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.webm/.mov), and download them all. Works regardless of the page's own type.")
+    parser.add_argument("--scan", nargs='?', const=True, default=None, metavar='N', help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.mpd/.webm/.mov) and download them all. Give a number to grab only the N-th found item, e.g. --scan 2 (1-indexed, in discovery order).")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
     parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
+    parser.add_argument("--key", action='append', default=None, metavar='KID:KEY', help="Content decryption key you ALREADY hold (for your own DRM-protected storage), as KID:KEY or a bare 32-hex KEY. Repeatable for multiple tracks. Used to decrypt CENC/Widevine HLS/DASH via ffmpeg. This is NOT key extraction or DRM-bypass; you must supply your own keys.")
+    parser.add_argument("--keys", default=None, metavar='FILE', help="Read decryption keys (one KID:KEY per line) from a file, same purpose as --key.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
@@ -6889,7 +7731,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.54.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.60.0")
 
     args = parser.parse_args()
 
@@ -6899,6 +7741,7 @@ if __name__ == "__main__":
         AUDIO_SEL = _parse_track_sel(args.audio)
     if args.sub is not None:
         SUB_SEL = _parse_track_sel(args.sub)
+    CENC_KEYS = _parse_cenc_keys(args.key, args.keys)
 
     _res = _parse_res(args.res)
     if isinstance(_res, int):
@@ -6922,6 +7765,7 @@ if __name__ == "__main__":
     if args.url_list and args.video_id:
         parser.error("give either a single URL or --url-list, not both.")
 
+    _scan_pick = int(args.scan) if isinstance(args.scan, str) and args.scan.isdigit() else None
     common = dict(
         chunk_size=args.chunk_size, num_threads=args.threads, verbose=args.verbose,
         cookies_file=args.cookies, folder_workers=args.folder_workers,
@@ -6931,7 +7775,8 @@ if __name__ == "__main__":
         auto=(not args.no_auto), out_dir=args.output_dir, max_height=args.max_height,
         list_only=args.list, ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
         do_rename=(not args.no_rename), res_scan=_res_scan,
-        scan_mode=(args.scan or args.scan_browser), browser_scan=args.scan_browser,
+        scan_mode=(args.scan is not None or args.scan_browser), browser_scan=args.scan_browser,
+        scan_pick=_scan_pick,
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.
