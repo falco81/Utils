@@ -4548,15 +4548,15 @@ def _hls_list_tracks(title, audios, subs):
     if audios:
         out.append("  Audio (choose with --audio N[,N...] ; default = all):")
         for i, a in enumerate(audios, 1):
-            out.append(f"     --audio {i:<2} {a['name']} [{a['lang'] or '?'}]"
-                       + ("  (default)" if a['default'] else ""))
+            out.append(f"     --audio {i:<2} {a.get('name') or '?'} [{a.get('lang') or '?'}]"
+                       + ("  (default)" if a.get('default') else ""))
     else:
         out.append("  Audio: single/muxed track — nothing to choose (this stream has one audio).")
     if subs:
         out.append("  Subtitles (choose with --sub N[,N...] ; default = all):")
         for i, s in enumerate(subs, 1):
-            out.append(f"     --sub {i:<2} {s['name']} [{s['lang'] or '?'}]"
-                       + ("  (default)" if s['default'] else ""))
+            out.append(f"     --sub {i:<2} {s.get('name') or '?'} [{s.get('lang') or '?'}]"
+                       + ("  (default)" if s.get('default') else ""))
     else:
         out.append("  Subtitles: none found in this stream.")
     out.append("")
@@ -5048,7 +5048,9 @@ def _parse_mpd(mpd_url, session, headers, max_height, verbose):
             d = seglist(tmpl, rep, rep_base)
             d.update({'lang': _lang, 'name': _aset.get('label') or _lang or rep.get('id', ''),
                       'kid': _kid or rep.get('kid'), 'height': int(rep.get('height') or 0),
-                      'mime': rep.get('mimeType') or _mime})
+                      'mime': rep.get('mimeType') or _mime,
+                      'default': any(rl.get('value') == 'main'
+                                     for rl in _aset.findall(Q('Role')))})
             return d
 
         rep_mime = (reps[0].get('mimeType') or mime).lower()
@@ -5081,7 +5083,13 @@ def _download_file_progress(url, out_path, session, headers, label, verbose):
             if r.status_code != 200:
                 return False, f"HTTP {r.status_code}"
             total = int(r.headers.get('Content-Length') or 0)
-            bar = make_bar(total=total or None, desc=label, unit='B', unit_scale=True, leave=True)
+            if total:
+                bar = make_bar(total=total, desc=label, unit='B', unit_scale=True, leave=True)
+            else:
+                # No Content-Length (common for subtitle files) — show bytes + speed, not a
+                # misleading 0% bar that never fills.
+                bar = make_bar(desc=label, unit='B', unit_scale=True, leave=True,
+                               bar_format='{desc} {n_fmt}  {rate_fmt}  {elapsed}')
             with open(tmp, 'wb') as f:
                 for chunk in r.iter_content(chunk_size=1 << 20):
                     if chunk:
@@ -5138,6 +5146,63 @@ def _download_dash_raw(rep, headers, session, out_file, verbose, label):
     import shutil as _sh
     _sh.rmtree(tmpdir, ignore_errors=True)
     return True, None
+
+
+def _download_sub_quiet(s, headers, session, out_file):
+    """Download one subtitle track (DASH single-file/segments, or HLS media playlist) to out_file
+    with no progress bar of its own — used under a single consolidated 'subtitles' bar."""
+    try:
+        if s.get('file'):
+            ok, _ = _download_hls_segment(s['file'], out_file, _seg_session(session), headers)
+            return ok
+        uri = s.get('uri')
+        segs, init = (s.get('segments'), s.get('init'))
+        if uri and not segs:
+            init, segs = parse_media_playlist(uri, session, headers)
+        if segs:
+            parts = []
+            for j, u in enumerate(([init] if init else []) + list(segs)):
+                if not u:
+                    continue
+                p = out_file + f".{j:04d}"
+                ok, _ = _download_hls_segment(u, p, _seg_session(session), headers)
+                if not ok:
+                    return False
+                parts.append(p)
+            _concat_stream(parts, out_file)
+            for p in parts:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            return True
+    except (requests.RequestException, OSError):
+        return False
+    return False
+
+
+def _grab_subs(subs, out_path, headers, session, verbose, suffix='sub'):
+    """Download ALL subtitle tracks in parallel under one bar. Returns [(file, lang, name)]."""
+    if not subs:
+        return []
+    results = [None] * len(subs)
+    bar = make_bar(total=len(subs), desc='subtitles', unit='sub', leave=True)
+    lock = threading.Lock()
+
+    def _one(idx_s):
+        idx, s = idx_s
+        sf = _cenc_tmp(out_path, f"s{idx}.{suffix}")
+        ok = _download_sub_quiet(s, headers, session, sf)
+        with lock:
+            bar.update(1)
+        if ok:
+            results[idx] = (sf, s.get('lang'), s.get('name'))
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_one, enumerate(subs)))
+    bar.close()
+    return [r for r in results if r]
 
 
 def _cenc_tmp(out_path, name):
@@ -5197,13 +5262,15 @@ def _cenc_grab_dash(mpd_url, headers, session, max_height, out_path, key_specs, 
             return None, (proc.stderr or '').strip()[:200] or "mp4decrypt failed"
         return dec, None
 
-    vfile, why = _decrypt(mpd['video'], 'v', "video (enc)")
+    vlabel = f"video {mpd['video'].get('height') or '?'}p (enc)"
+    vfile, why = _decrypt(mpd['video'], 'v', vlabel)
     if not vfile:
         return False, f"video: {why}"
     made.append(vfile)
     afiles, ameta = [], []
     for i, a in enumerate(audios):
-        af, why = _decrypt(a, f"a{i}", f"audio {i} (enc)")
+        tag = a.get('lang') or a.get('name') or '?'
+        af, why = _decrypt(a, f"a{i}", f"audio {i} [{tag}] (enc)")
         if not af:
             for f in made:
                 try:
@@ -5214,15 +5281,12 @@ def _cenc_grab_dash(mpd_url, headers, session, max_height, out_path, key_specs, 
         afiles.append(af)
         ameta.append((a.get('lang'), a.get('name')))
         made.append(af)
-    # Subtitles: DASH text tracks are normally unencrypted (WebVTT/TTML) — just fetch and mux.
+    # Subtitles: DASH text tracks are normally unencrypted (WebVTT/TTML) — fetch all in parallel.
     sfiles, smeta = [], []
-    for i, s in enumerate(subs):
-        sf = _cenc_tmp(out_path, f"s{i}.sub")
-        ok, _why = _download_dash_raw(s, headers, session, sf, verbose, f"sub {i}")
-        if ok:
-            sfiles.append(sf)
-            smeta.append((s.get('lang'), s.get('name')))
-            made.append(sf)
+    for sf, lang, name in _grab_subs(subs, out_path, headers, session, verbose, suffix='sub'):
+        sfiles.append(sf)
+        smeta.append((lang, name))
+        made.append(sf)
     ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, ameta, smeta, out_path, verbose)
     for f in made:
         try:
@@ -5274,7 +5338,8 @@ def _cenc_grab_hls(master_url, headers, session, max_height, out_path, key_specs
     made.append(vfile)
     afiles, ameta = [], []
     for i, a in enumerate(audios):
-        af, why = _decrypt(a['uri'], f"a{i}", f"audio {i} (enc)")
+        tag = a.get('lang') or a.get('name') or '?'
+        af, why = _decrypt(a['uri'], f"a{i}", f"audio {i} [{tag}] (enc)")
         if not af:
             for f in made:
                 try:
@@ -5286,13 +5351,10 @@ def _cenc_grab_hls(master_url, headers, session, max_height, out_path, key_specs
         ameta.append((a.get('lang'), a.get('name')))
         made.append(af)
     sfiles, smeta = [], []
-    for i, s in enumerate(subs):
-        sf = _cenc_tmp(out_path, f"s{i}.vtt")
-        ok, _why = _download_hls_raw(s['uri'], headers, session, sf, verbose, f"sub {i}")
-        if ok:
-            sfiles.append(sf)
-            smeta.append((s.get('lang'), s.get('name')))
-            made.append(sf)
+    for sf, lang, name in _grab_subs(subs, out_path, headers, session, verbose, suffix='vtt'):
+        sfiles.append(sf)
+        smeta.append((lang, name))
+        made.append(sf)
     ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, ameta, smeta, out_path, verbose)
     for f in made:
         try:
@@ -7731,7 +7793,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.60.0")
+    parser.add_argument("--version", action="version", version="%(prog)s 2.61.1")
 
     args = parser.parse_args()
 
