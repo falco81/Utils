@@ -64,7 +64,36 @@ BAR_DESC_WIDTH = 26               # fixed filename column width so all bars line
 NTFY_TOPIC = ""                   # your ntfy topic/channel  (EMPTY = notifications OFF)
 NTFY_SERVER = "https://ntfy.sh"   # ntfy server hostname     (change for a self-hosted server)
 NTFY_TOKEN = ""                   # optional access token for private / self-hosted topics
+
+# ---- Auto-scan hosts (optional) ------------------------------------------- #
+# If you launch the script with a URL whose host matches an entry below, the script behaves as if
+# you had also typed --scan / --scan-browser — handy for sites you always want scanned. A host
+# matches itself AND its subdomains (idnes.cz also matches www.idnes.cz, sport.idnes.cz). The
+# value is the scan index (like --scan N) or None for plain --scan. Only an explicit
+# --scan / --scan-browser on the command line disables this (your explicit scan choice wins);
+# other flags like --res / --audio / --sub / --key / -v combine with it. Empty = feature off.
+SCAN_AUTO_HOSTS = {
+    # "idnes.cz": None,            # -> runs as: <url> --scan
+    # "nas.com": 3,               # -> runs as: <url> --scan 3
+}
+SCAN_BROWSER_AUTO_HOSTS = {
+    # "example.com": None,        # -> runs as: <url> --scan-browser
+    # "shop.example.org": 2,      # -> runs as: <url> --scan-browser 2
+}
+SCRIPT_VERSION = "2.69.0"
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
+
+
+def _auto_scan_match(host, hostmap):
+    """Return (matched, index) if `host` (or a parent domain of it) is listed in hostmap. An entry
+    'idnes.cz' matches idnes.cz and any subdomain (www.idnes.cz, sport.idnes.cz)."""
+    if not host or not hostmap:
+        return False, None
+    for entry, idx in hostmap.items():
+        e = str(entry).lower().strip().lstrip('*').lstrip('.')
+        if e and (host == e or host.endswith('.' + e)):
+            return True, idx
+    return False, None
 
 
 def _temp_dir_for(final_path: str) -> str:
@@ -656,6 +685,7 @@ def extract_drive_target(input_str: str) -> tuple[str, str]:
 PATREON_REFERER = "https://www.patreon.com/"
 _DRIVE_URL_RE = re.compile(r'https?://drive\.google\.com/[^\s"\'<>\\)]+')
 _DROPBOX_URL_RE = re.compile(r'https?://(?:www\.)?dropbox\.com/[^\s"\'<>\\)]+', re.IGNORECASE)
+_STREAMABLE_URL_RE = re.compile(r'https?://(?:www\.)?streamable\.com/[^\s"\'<>\\)]+', re.IGNORECASE)
 
 
 def extract_patreon_collection_id(input_str: str):
@@ -807,6 +837,11 @@ def extract_drive_links_from_post(post: dict) -> list:
 def extract_dropbox_links_from_post(post: dict) -> list:
     """Return an ordered, de-duplicated list of Dropbox URLs found anywhere in a post."""
     return _extract_links_from_post(post, ('dropbox.com',), (_DROPBOX_URL_RE,))
+
+
+def extract_streamable_links_from_post(post: dict) -> list:
+    """Return an ordered, de-duplicated list of Streamable URLs found anywhere in a post."""
+    return _extract_links_from_post(post, ('streamable.com',), (_STREAMABLE_URL_RE,))
 
 
 def _extract_links_from_post(post: dict, host_needles, url_res) -> list:
@@ -974,9 +1009,11 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
     collection flow and the single-post flow."""
     drive_videos = []
     dropbox_items = []   # {'url','filename','title'}
+    streamable_items = []  # {'shortcode','title'}
     hls_videos = []      # stream descriptors
     seen_ids = set()
     seen_dropbox = set()
+    seen_streamable = set()
     folder_targets = []  # (folder_id, post_title)
     posts_with_media = 0
 
@@ -1016,6 +1053,15 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             dropbox_items.append({'url': url, 'filename': fname, 'title': fname})
             had_media = True
 
+        # --- Streamable links (progressive MP4, resolved via its API) ---
+        for url in extract_streamable_links_from_post(post):
+            sc = _streamable_id(url)
+            if not sc or sc in seen_streamable:
+                continue
+            seen_streamable.add(sc)
+            streamable_items.append({'shortcode': sc, 'title': post_title or sc})
+            had_media = True
+
         # --- Native Patreon (Vimeo/Mux) streams ---
         for stream in extract_streams_from_post(post, verbose):
             hls_videos.append(stream)
@@ -1034,13 +1080,14 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             seen_ids.add(e['id'])
             drive_videos.append(e)
 
-    total = len(drive_videos) + len(dropbox_items) + len(hls_videos)
+    total = len(drive_videos) + len(dropbox_items) + len(streamable_items) + len(hls_videos)
     if total == 0:
         print("[ERROR] Found no downloadable videos (no Drive/Dropbox links or native videos).")
         return
 
     print(f"[INFO] Found {total} item(s) across {posts_with_media} post(s): "
-          f"{len(drive_videos)} Drive, {len(dropbox_items)} Dropbox, {len(hls_videos)} native.")
+          f"{len(drive_videos)} Drive, {len(dropbox_items)} Dropbox, "
+          f"{len(streamable_items)} Streamable, {len(hls_videos)} native.")
 
     if list_only:
         n = 0
@@ -1054,6 +1101,11 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             print(f"   {n:>3}) [Dropbox] {d['title']}")
             if verbose:
                 print(f"        url: {d.get('url')}")
+        for st in streamable_items:
+            n += 1
+            print(f"   {n:>3}) [Streamable] {st['title']}")
+            if verbose:
+                print(f"        url: https://streamable.com/{st['shortcode']}")
         for h in hls_videos:
             tag = 'Mux' if h.get('source') == 'mux' else f"Vimeo {h.get('vimeo_id')}"
             n += 1
@@ -1072,6 +1124,7 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
         if interactive:
             combined = ([{'title': f"[Drive]   {v['title']}", '_k': 'drive', '_p': v} for v in drive_videos]
                         + [{'title': f"[Dropbox] {d['title']}", '_k': 'dbx', '_p': d} for d in dropbox_items]
+                        + [{'title': f"[Streamable] {st['title']}", '_k': 'strm', '_p': st} for st in streamable_items]
                         + [{'title': f"[Native]  {h['title']}", '_k': 'hls', '_p': h} for h in hls_videos])
             chosen = _prompt_file_selection(combined)
             if not chosen:
@@ -1079,6 +1132,7 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                 return
             drive_videos = [c['_p'] for c in chosen if c['_k'] == 'drive']
             dropbox_items = [c['_p'] for c in chosen if c['_k'] == 'dbx']
+            streamable_items = [c['_p'] for c in chosen if c['_k'] == 'strm']
             hls_videos = [c['_p'] for c in chosen if c['_k'] == 'hls']
             print(f"[INFO] Selected {len(chosen)} item(s).")
         else:
@@ -1101,6 +1155,20 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             print(f"[INFO] Downloading {len(dbx_videos)} Dropbox file(s) ...")
             download_folder_pooled(dbx_videos, session, chunk_size, verbose, label="Dropbox",
                                    conn_cap=DROPBOX_DEFAULT_CONNECTIONS)
+        if streamable_items:
+            strm_videos = []
+            for st in streamable_items:
+                durl, title, _h = resolve_streamable(st['shortcode'], session, verbose)
+                if not durl:
+                    print(f"[WARN] Streamable {st['shortcode']}: could not resolve; skipping.")
+                    continue
+                fname = _streamable_fname(st['title'] or title, st['shortcode'])
+                strm_videos.append({'id': durl, 'title': fname, 'name': fname,
+                                    'direct_url': durl, 'headers': STREAMABLE_HEADERS})
+            if strm_videos:
+                print(f"[INFO] Downloading {len(strm_videos)} Streamable video(s) ...")
+                download_folder_pooled(strm_videos, session, chunk_size, verbose,
+                                       label="Streamable", conn_cap=max_connections)
         if hls_videos:
             if not ensure_ffmpeg(verbose):
                 print("[ERROR] Native (Vimeo/Mux) videos need ffmpeg to mux audio+video, and it "
@@ -2437,6 +2505,64 @@ def _extract_player_config(html):
                     except Exception:
                         return None
     return None
+
+
+# ---- Streamable (progressive MP4 via its public API) ---------------------- #
+STREAMABLE_HEADERS = {'User-Agent': USER_AGENT, 'Referer': 'https://streamable.com/'}
+_STREAMABLE_RESERVED = {'player', 'videos', 'video', 'image', 'about', 'login', 'signup',
+                        'terms', 'privacy', 'settings', 'help', 'e', 'o', 's'}
+_STREAMABLE_RE = r'(?<![\w.])(?:www\.)?streamable\.com/(?:[eos]/)?([a-z0-9]{4,12})'
+
+
+def _streamable_id(url):
+    """Extract a Streamable shortcode from streamable.com/<code> (also /e/, /o/, /s/ forms)."""
+    m = re.search(_STREAMABLE_RE, url or '', re.I)
+    if m and m.group(1).lower() not in _STREAMABLE_RESERVED:
+        return m.group(1)
+    return None
+
+
+def resolve_streamable(shortcode, session, verbose):
+    """Return (direct_mp4_url, title, height) for a Streamable video, picking the highest-quality
+    progressive MP4. Returns (None, None, 0) on failure."""
+    api = f"https://api.streamable.com/videos/{shortcode}"
+    try:
+        r = session.get(api, headers=STREAMABLE_HEADERS,
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if r.status_code != 200:
+            if verbose:
+                print(f"[WARN] Streamable API returned {r.status_code} for {shortcode}")
+            return None, None, 0
+        data = r.json()
+    except (requests.RequestException, ValueError) as e:
+        if verbose:
+            print(f"[WARN] Streamable fetch failed for {shortcode}: {e}")
+        return None, None, 0
+    files = data.get('files') or {}
+    best = None
+    for key, f in files.items():
+        if 'mp4' not in key or not f.get('url'):
+            continue
+        if best is None or (f.get('height') or 0) > (best.get('height') or 0):
+            best = f
+    if not best:
+        if verbose:
+            print(f"[WARN] Streamable: no downloadable MP4 for {shortcode}")
+        return None, None, 0
+    url = best['url']
+    if url.startswith('//'):
+        url = 'https:' + url
+    return url, data.get('title') or shortcode, best.get('height') or 0
+
+
+def _streamable_fname(base, shortcode):
+    """Build a safe .mp4 filename for a Streamable video. The explicit extension matters: without
+    it the direct-download engine treats the name as extension-less and replaces it with the CDN
+    URL basename (the shortcode)."""
+    fname = safe_filename(base or shortcode, shortcode)
+    if not os.path.splitext(fname)[1]:
+        fname += '.mp4'
+    return fname
 
 
 def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
@@ -4141,6 +4267,7 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
             print(f'        Fix: "{sys.executable}" -m pip install pywebview')
             return
         base = safe_filename(prefer_mp4_ext(desc['title']), it['youtube_id'])
+        base = os.path.splitext(base)[0] + _container_ext(False)
         stem = os.path.splitext(base)[0]
         if desc['mode'] == 'progressive':
             raw_jobs.append({'direct_url': desc['url'], 'id': it['youtube_id'],
@@ -4465,6 +4592,7 @@ AUDIO_SEL = None                  # None/'ALL' = all audio tracks; 'SCAN' = list
 SUB_SEL = None                    # None/'ALL' = all subtitles; 'SCAN' = list; [ints] = selection
 CENC_KEYS = []                    # user-supplied CENC/Widevine content keys (hex), for content you
 #                                   already hold keys for (own storage). NOT key extraction/DRM bypass.
+FORCE_CONTAINER = None            # None = auto (.mkv when multi-track, else .mp4); 'mp4'/'mkv' force it
 
 
 def _parse_media_attrs(line):
@@ -5237,8 +5365,7 @@ def _cenc_grab_dash(mpd_url, headers, session, max_height, out_path, key_specs, 
                    f"{len(mpd['audios'])} audio / {len(mpd['subs'])} subtitle track(s) available")
     audios = _select_tracks(mpd['audios'], AUDIO_SEL)
     subs = _select_tracks(mpd['subs'], SUB_SEL)
-    if len(audios) > 1 or subs:
-        out_path = os.path.splitext(out_path)[0] + '.mkv'
+    out_path = os.path.splitext(out_path)[0] + _container_ext(len(audios) > 1 or bool(subs))
     made = []
 
     def _decrypt(rep, tag, label):
@@ -5307,8 +5434,7 @@ def _cenc_grab_hls(master_url, headers, session, max_height, out_path, key_specs
         return False, "could not resolve tracks"
     audios = _select_tracks(tracks['audios'], AUDIO_SEL if AUDIO_SEL != 'SCAN' else None)
     subs = _select_tracks(tracks['subs'], SUB_SEL if SUB_SEL != 'SCAN' else None)
-    if len(audios) > 1 or subs:
-        out_path = os.path.splitext(out_path)[0] + '.mkv'   # reliable multi-track names/langs
+    out_path = os.path.splitext(out_path)[0] + _container_ext(len(audios) > 1 or bool(subs))
     made = []
 
     def _decrypt(media_url, tag, label):
@@ -5371,7 +5497,11 @@ def _ffmpeg_grab_stream(url, headers, out_path, verbose):
     Returns (ok, error_text)."""
     if not ensure_ffmpeg(verbose):
         return False, "ffmpeg unavailable"
-    tmp = _temp_artifact(out_path, ".part.mp4")
+    if FORCE_CONTAINER in ('mp4', 'mkv'):
+        out_path = os.path.splitext(out_path)[0] + '.' + FORCE_CONTAINER
+    ext = os.path.splitext(out_path)[1].lower() or '.mp4'
+    is_mkv = ext == '.mkv'
+    tmp = _temp_artifact(out_path, ".part" + ext)
     ua = (headers or {}).get('User-Agent', USER_AGENT)
     extra = "".join(f"{k}: {v}\r\n" for k, v in (headers or {}).items()
                     if k.lower() not in ('user-agent',))
@@ -5380,7 +5510,10 @@ def _ffmpeg_grab_stream(url, headers, out_path, verbose):
         cmd += ['-headers', extra]
     cmd += ['-i', url,
             '-map', '0:v?', '-map', '0:a?', '-map', '0:s?',   # every video/audio/subtitle stream
-            '-c', 'copy', '-c:s', 'mov_text', '-movflags', '+faststart', '-y', tmp]
+            '-c', 'copy', '-c:s', 'srt' if is_mkv else 'mov_text']
+    if not is_mkv:
+        cmd += ['-movflags', '+faststart']
+    cmd += ['-y', tmp]
     if verbose:
         tqdm.write(f"[INFO] ffmpeg grab (decrypt/all tracks) {url[:80]}")
     dur = _ffprobe_duration(url, headers, verbose)
@@ -5399,8 +5532,7 @@ def _ffmpeg_grab_hls(master_url, headers, session, max_height, out_path, verbose
         return _ffmpeg_grab_stream(master_url, headers, out_path, verbose)
     audios = _select_tracks(tracks['audios'], AUDIO_SEL if AUDIO_SEL != 'SCAN' else None)
     subs = _select_tracks(tracks['subs'], SUB_SEL if SUB_SEL != 'SCAN' else None)
-    if len(audios) > 1 or subs:
-        out_path = os.path.splitext(out_path)[0] + '.mkv'   # reliable multi-track names/langs
+    out_path = os.path.splitext(out_path)[0] + _container_ext(len(audios) > 1 or bool(subs))
     is_mkv = out_path.lower().endswith('.mkv')
     inputs = [tracks['video']] + [a['uri'] for a in audios] + [s['uri'] for s in subs]
     tmp = _temp_artifact(out_path, ".part" + (os.path.splitext(out_path)[1] or ".mp4"))
@@ -5481,6 +5613,14 @@ _ISO639 = {'en': 'eng', 'ko': 'kor', 'ja': 'jpn', 'zh': 'chi', 'cs': 'cze', 'sk'
            'uk': 'ukr', 'ro': 'rum', 'hu': 'hun', 'el': 'gre', 'he': 'heb', 'fa': 'per'}
 
 
+def _container_ext(multi_track):
+    """Chosen output extension. --container forces .mp4/.mkv; otherwise auto: .mkv when there are
+    multiple audio tracks or any subtitles (names/languages show reliably there), else .mp4."""
+    if FORCE_CONTAINER in ('mp4', 'mkv'):
+        return '.' + FORCE_CONTAINER
+    return '.mkv' if multi_track else '.mp4'
+
+
 def _iso639_2(code):
     """Normalise a language tag (e.g. 'en', 'en-US', 'eng') to an ISO 639-2 3-letter code so
     players show the right language. Unknown codes are passed through as-is."""
@@ -5551,13 +5691,17 @@ def _ffmpeg_mux_multi(video_file, audio_files, sub_files, audio_meta, sub_meta, 
 
 def _ffmpeg_mux(video_file, audio_file, out_path, verbose):
     """Mux already-downloaded local stream files into out_path. Returns (ok, error_text)."""
-    tmp = _temp_artifact(out_path, ".part.mp4")
+    ext = os.path.splitext(out_path)[1].lower() or '.mp4'
+    tmp = _temp_artifact(out_path, ".part" + ext)
     cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', video_file]
     if audio_file:
         cmd += ['-i', audio_file, '-map', '0:v:0', '-map', '1:a:0']
     else:
         cmd += ['-map', '0']
-    cmd += ['-c', 'copy', '-movflags', '+faststart', '-sn', '-y', tmp]
+    cmd += ['-c', 'copy']
+    if ext != '.mkv':
+        cmd += ['-movflags', '+faststart']
+    cmd += ['-sn', '-y', tmp]
     if verbose:
         tqdm.write("[INFO] ffmpeg " + " ".join(cmd[1:]))
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -5638,7 +5782,7 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
 
     # Use MKV when there are several audio tracks or any subtitles — track NAMES and LANGUAGES
     # display reliably there (mp4 players often ignore them). A single audio track stays .mp4.
-    ext = '.mkv' if (len(sel_audios) > 1 or sel_subs) else '.mp4'
+    ext = _container_ext(len(sel_audios) > 1 or bool(sel_subs))
     filename = stem + ext
     out_path = os.path.join(out_dir, filename) if out_dir else filename
     if os.path.exists(out_path) or os.path.exists(os.path.splitext(out_path)[0] + '.mp4'):
@@ -6150,7 +6294,97 @@ def strict_name(item, ref_ns, ref_keys, ref_trail, widths, ref_num_slots, ref_wo
     return render(out, widths, ref_trail)
 
 
+_EP_MARKERS = {'ep', 'eps', 'episode', 'episodes', 'episod', 'e',
+               'pt', 'part', 'chapter', 'ch'}
+_MONTHS = {'jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'sept', 'oct', 'nov',
+           'dec', 'january', 'february', 'march', 'april', 'june', 'july', 'august', 'september',
+           'october', 'november', 'december'}
+_ORDINAL_SUFFIX = {'th', 'st', 'nd', 'rd'}
+_SERIES_NOISE = DEFAULT_STOP | _MONTHS | _ORDINAL_SUFFIX
+
+
+def _ep_number(ns):
+    """The episode number from a tokenized name: the number right after an Ep/Episode/E/Part/#
+    marker (so a leading date like 'Feb 10th' is ignored). Returns int or None."""
+    found, prev = [], None
+    for lead, kind, text in ns:
+        if kind == 'num':
+            if (prev and prev.lower() in _EP_MARKERS) or '#' in lead:
+                found.append(int(text))
+            prev = None
+        elif kind == 'word':
+            prev = text
+    return found[-1] if found else None
+
+
+def _core_words(ns):
+    """The show-title words in a name: everything before the episode marker/number, with leading
+    date/noise words (months, 'th'/'st', 'uncut', articles) stripped."""
+    words, prev = [], None
+    for lead, kind, text in ns:
+        if kind == 'num':
+            if (prev and prev.lower() in _EP_MARKERS) or '#' in lead:
+                break                                    # reached the episode number -> stop
+            prev = None                                  # a date number: skip it, keep going
+        elif kind == 'word':
+            if text.lower() in _EP_MARKERS:
+                break                                    # reached the 'Ep' marker -> stop
+            words.append(text)
+            prev = text
+    while words and words[0].lower() in _SERIES_NOISE:
+        words = words[1:]
+    while words and words[-1].lower() in _SERIES_NOISE:
+        words = words[:-1]
+    return words
+
+
+def _sublist(run, seq):
+    n = len(run)
+    return n > 0 and any(seq[i:i + n] == run for i in range(len(seq) - n + 1))
+
+
+def _series_words(members):
+    """The show title: the MOST COMMON core-word sequence across the files (majority vote), so
+    typos ('Samdarl'), stray dates, and odd one-off files don't corrupt it. Original casing kept."""
+    cores = [_core_words(m['ns']) for m in members]
+    keyed = [(tuple(w.lower() for w in c), c) for c in cores if c]
+    if not keyed:
+        return []
+    common = Counter(k for k, _ in keyed).most_common(1)[0][0]
+    for k, c in keyed:
+        if k == common:
+            return c
+    return list(common)
+
+
+def _episode_series_plan(members, min_width):
+    """If most files carry an explicit episode number (Ep/Episode/E/Part/#N), rename them to
+    '<Series> <N>' — dropping date prefixes and parenthetical notes. Returns a plan or None."""
+    eps = [_ep_number(m['ns']) for m in members]
+    have = [e for e in eps if e is not None]
+    if len(have) < max(2, (len(members) + 1) // 2):
+        return None
+    series = _series_words(members)
+    if len(series) < 2:
+        return None
+    width = max(min_width or 0, max(len(str(e)) for e in have))
+    name = " ".join(case_word(w, "title", i == 0) for i, w in enumerate(series))
+    plan = []
+    for m, ep in zip(members, eps):
+        if ep is None:
+            plan.append((m["name"], m["name"]))          # leave odd ones out untouched
+        else:
+            plan.append((m["name"], f"{name} {str(ep).zfill(width)}" + m["ext"]))
+    return plan
+
+
 def process_group(members, do_pad, do_words, min_width, strict):
+    # Episode-series shortcut: when most files have an explicit Ep/Episode/#N, name them
+    # "<Series> <N>" (ignoring date prefixes and notes) instead of aligning every number.
+    if strict:
+        ep_plan = _episode_series_plan(members, min_width)
+        if ep_plan is not None:
+            return ep_plan
     widths = compute_widths([m["clean"] for m in members], min_width) if do_pad else {}
     patterns = [tuple(m["keys"]) for m in members]
     counts = Counter(patterns)
@@ -6350,6 +6584,25 @@ def _series_display_name(name):
     return finalize_stem("".join(t for _k, t in toks)) or (name or "").strip() or "video"
 
 
+def _ep_token_index(toks):
+    """In a tokenize() list, the index+value of the EPISODE number: the num right after an
+    Ep/Episode/E/Part marker (or after '#'), so a leading date ('March 11th') is ignored. Falls
+    back to the first number. Returns (index, value_str) or (None, None)."""
+    prev_word, prev_sep = None, ""
+    for i, (k, t) in enumerate(toks):
+        if k == 'num':
+            if (prev_word and prev_word.lower() in _EP_MARKERS) or '#' in prev_sep:
+                return i, t
+        elif k == 'word':
+            prev_word, prev_sep = t, ""
+        elif k == 'sep':
+            prev_sep = t
+    for i, (k, t) in enumerate(toks):        # fallback: first number in the name
+        if k == 'num':
+            return i, t
+    return None, None
+
+
 def build_collection_plan(files, collection_name):
     """Name files as '<Collection> <episode-number>' (zero-padded), taking the episode number
     from each original filename. When several files map to the same name (a collision), append
@@ -6364,8 +6617,7 @@ def build_collection_plan(files, collection_name):
     for name in files:
         stem, ext = os.path.splitext(name)
         toks = tokenize(clean_string(stem, ()))
-        first_idx = next((i for i, (k, _t) in enumerate(toks) if k == 'num'), None)
-        first = toks[first_idx][1] if first_idx is not None else None
+        first_idx, first = _ep_token_index(toks)          # episode number, not a leading date
         after = toks[first_idx + 1:] if first_idx is not None else list(toks)
         suffix = [(k, t) for (k, t) in after
                   if not (k == 'word' and t.lower() in series_words)]
@@ -6488,7 +6740,8 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
     result['changed'] = len(changed)
     result['conflicts'] = len(conflicts)
 
-    print(f"\n[INFO] {len(new_files)} file(s) downloaded. Intelligent --strict rename preview:")
+    print(f"\n[INFO] {len(new_files)} file(s) downloaded. Intelligent --strict rename preview "
+          f"(videoloader_dir v{SCRIPT_VERSION}):")
     print_preview(plan, skip, True, use_color)
 
     if not changed and not conflicts:
@@ -6655,6 +6908,10 @@ def _classify_input(id_or_url: str):
                 re.search(r'vimeo\.com/\d+/([0-9a-zA-Z]+)', id_or_url)
             return 'vimeo', {'source': 'vimeo', 'title': vid.group(1),
                              'vimeo_id': vid.group(1), 'vimeo_hash': h.group(1) if h else ''}
+    if 'streamable.com' in id_or_url:
+        sc = _streamable_id(id_or_url)
+        if sc:
+            return 'streamable', sc
     kind, tid = extract_drive_target(id_or_url)
     return kind, tid
 
@@ -6752,6 +7009,9 @@ def _classify_media_url(u):
     m = re.search(r'drive\.google\.com/file/d/([0-9A-Za-z_-]+)', u)
     if m:
         return 'url', f'https://drive.google.com/file/d/{m.group(1)}/view', f'Drive {m.group(1)}'
+    m = re.search(_STREAMABLE_RE, u, re.I)
+    if m and m.group(1).lower() not in _STREAMABLE_RESERVED:
+        return 'url', f'https://streamable.com/{m.group(1)}', f'Streamable {m.group(1)}'
     if re.search(r'dropbox\.com/(?:s|scl/fi)/', u):
         return 'url', u, 'Dropbox file'
     if u.startswith('blob:') or u.startswith('data:'):
@@ -6906,6 +7166,9 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
         add('url', f'https://vimeo.com/{m.group(1)}', f'Vimeo {m.group(1)}')
     for m in re.finditer(r'twitch\.tv/videos/(\d+)', text):
         add('url', f'https://www.twitch.tv/videos/{m.group(1)}', f'Twitch VOD {m.group(1)}')
+    for m in re.finditer(_STREAMABLE_RE, text, re.I):
+        if m.group(1).lower() not in _STREAMABLE_RESERVED:
+            add('url', f'https://streamable.com/{m.group(1)}', f'Streamable {m.group(1)}')
     for m in re.finditer(r'drive\.google\.com/file/d/([0-9A-Za-z_-]+)', text):
         add('url', f'https://drive.google.com/file/d/{m.group(1)}/view', f'Drive {m.group(1)}')
     for m in re.finditer(r'https?://(?:www\.)?dropbox\.com/(?:s|scl/fi)/[^\s"\'<>\\]+', text):
@@ -6919,7 +7182,7 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
 
     # Follow unknown player iframes one level deep (known hosts are already captured above).
     if _depth < 1:
-        known = ('youtube', 'youtu.be', 'vimeo', 'twitch.tv', 'drive.google', 'dropbox')
+        known = ('youtube', 'youtu.be', 'vimeo', 'twitch.tv', 'drive.google', 'dropbox', 'streamable.com')
         iframes, done = [], 0
         for m in re.finditer(r'<iframe[^>]+src=["\']([^"\']+)["\']', html):
             src = m.group(1).replace('&amp;', '&')
@@ -7227,6 +7490,21 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             entry = {'id': durl, 'title': fname, 'name': fname, 'direct_url': durl}
             _with_out_dir(lambda: download_folder_pooled([entry], session, chunk_size, verbose,
                                                          label="Dropbox", conn_cap=DROPBOX_DEFAULT_CONNECTIONS))
+        elif kind == 'streamable':
+            durl, title, _h = resolve_streamable(target_id, session, verbose)
+            if not durl:
+                print(f"[ERROR] Could not resolve Streamable video {target_id}.")
+                summary['error'] = "streamable resolve failed"
+                if return_summary:
+                    return summary
+                sys.exit(1)
+            fname = _streamable_fname(os.path.splitext(output_file)[0] if output_file
+                                     else title, target_id)
+            entry = {'id': durl, 'title': fname, 'name': fname, 'direct_url': durl,
+                     'headers': STREAMABLE_HEADERS}
+            _with_out_dir(lambda: download_folder_pooled([entry], session, chunk_size, verbose,
+                                                         label="Streamable",
+                                                         conn_cap=max_connections))
         elif kind == 'vimeo':
             if not ensure_ffmpeg(verbose):
                 print("[ERROR] Vimeo videos are HLS and need ffmpeg to mux audio+video into MP4.")
@@ -7784,6 +8062,7 @@ if __name__ == "__main__":
     parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
     parser.add_argument("--key", action='append', default=None, metavar='KID:KEY', help="Content decryption key you ALREADY hold (for your own DRM-protected storage), as KID:KEY or a bare 32-hex KEY. Repeatable for multiple tracks. Used to decrypt CENC/Widevine HLS/DASH via ffmpeg. This is NOT key extraction or DRM-bypass; you must supply your own keys.")
     parser.add_argument("--keys", default=None, metavar='FILE', help="Read decryption keys (one KID:KEY per line) from a file, same purpose as --key.")
+    parser.add_argument("--container", choices=['auto', 'mp4', 'mkv'], default='auto', help="Force the final container: 'mp4' or 'mkv'. Default 'auto' = .mkv when there are multiple audio tracks or subtitles (names/languages show reliably), otherwise .mp4.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
@@ -7793,7 +8072,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
-    parser.add_argument("--version", action="version", version="%(prog)s 2.61.1")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
 
     args = parser.parse_args()
 
@@ -7804,6 +8083,7 @@ if __name__ == "__main__":
     if args.sub is not None:
         SUB_SEL = _parse_track_sel(args.sub)
     CENC_KEYS = _parse_cenc_keys(args.key, args.keys)
+    FORCE_CONTAINER = args.container if args.container in ('mp4', 'mkv') else None
 
     _res = _parse_res(args.res)
     if isinstance(_res, int):
@@ -7826,6 +8106,26 @@ if __name__ == "__main__":
 
     if args.url_list and args.video_id:
         parser.error("give either a single URL or --url-list, not both.")
+
+    # Auto-scan: a URL whose host matches SCAN_AUTO_HOSTS / SCAN_BROWSER_AUTO_HOSTS runs as if
+    # --scan / --scan-browser was given. Only an explicit --scan / --scan-browser disables this
+    # (your explicit scan choice wins); other flags like --res/--audio/--sub/--key/-v combine
+    # with it normally.
+    if args.video_id and args.scan is None and not args.scan_browser:
+        _host = (urlparse(args.video_id).hostname or '').lower()
+        _m, _idx = _auto_scan_match(_host, SCAN_AUTO_HOSTS)
+        if _m:
+            args.scan = str(_idx) if _idx else True
+            print(f"[INFO] Auto-scan: {_host} matches SCAN_AUTO_HOSTS -> running with "
+                  f"--scan{(' ' + str(_idx)) if _idx else ''}")
+        else:
+            _m, _idx = _auto_scan_match(_host, SCAN_BROWSER_AUTO_HOSTS)
+            if _m:
+                args.scan_browser = True
+                if _idx:
+                    args.scan = str(_idx)
+                print(f"[INFO] Auto-scan: {_host} matches SCAN_BROWSER_AUTO_HOSTS -> running with "
+                      f"--scan-browser{(' ' + str(_idx)) if _idx else ''}")
 
     _scan_pick = int(args.scan) if isinstance(args.scan, str) and args.scan.isdigit() else None
     common = dict(
