@@ -10875,6 +10875,608 @@ def run_subs_download(args):
     run_rename_files(args, mode="subs")
 
 
+# ============================================================================
+# Re-time subtitles to a DIFFERENT video source (batch, auto-detect)
+# ----------------------------------------------------------------------------
+# In a folder there are pairs of the same episode from two sources: a SOURCE
+# video that already has a correctly-timed .srt, and a TARGET video (different
+# release, slightly different length) whose timing the subtitles don't match.
+# This tool auto-detects which is which (by episode SxxExx + which video the srt
+# belongs to), then re-times the srt to the target using the audio: it aligns
+# the two videos' speech (VAD) and, as a cross-check, the subtitle timings vs the
+# target speech - and applies the more reliable affine (offset + speed) transform.
+# Output: <target-name>.<lang>.srt. At the end it reports what it made and by how
+# much each was re-timed.
+# ============================================================================
+
+
+def _retime_is_lang(x):
+    x = (x or "").lower()
+    if len(x) not in (2, 3):
+        return False
+    if x in LANGUAGE_NAMES:
+        return True
+    c3 = _canon3(x)
+    return bool(c3 and c3 != "und")
+
+
+def _srt_lang_and_base(srt):
+    """('cze', 'Show_S01E01_episode 1') from 'Show_S01E01_episode 1.cze.srt'."""
+    stem = Path(srt).stem
+    if "." in stem:
+        base, last = stem.rsplit(".", 1)
+        if _retime_is_lang(last):
+            return last, base
+    return None, stem
+
+
+def _retime_scan(directory, recursive):
+    """Auto-detects (source srt, its source video, target video, output) jobs."""
+    videos = collect_videos(directory, recursive)
+    srts = []
+    walker = os.walk(directory) if recursive else [(directory, [], os.listdir(directory))]
+    for root, _dirs, files in walker:
+        for f in files:
+            if f.lower().endswith(".srt"):
+                srts.append(os.path.join(root, f))
+    ep_videos = {}
+    stem_video = {}
+    for v in videos:
+        ep_videos.setdefault(_episode_key(Path(v).name), []).append(v)
+        stem_video[Path(v).stem.lower()] = v
+    source_stems = {_srt_lang_and_base(s)[1].lower() for s in srts}
+
+    jobs = []
+    seen_out = set()
+    for srt in srts:
+        lang, base = _srt_lang_and_base(srt)
+        ep = _episode_key(Path(srt).name)
+        if ep is None:
+            continue
+        src_video = stem_video.get(base.lower())
+        for tv in ep_videos.get(ep, []):
+            if Path(tv).stem.lower() in source_stems:
+                continue   # this video is itself a source (has its own srt)
+            out = str(Path(tv).with_name(Path(tv).stem + (f".{lang}" if lang else "") + ".srt"))
+            if out in seen_out:
+                continue
+            seen_out.add(out)
+            jobs.append(dict(source_srt=srt, source_video=src_video, target=tv,
+                             out=out, lang=lang or "", ep=ep, exists=os.path.exists(out)))
+    jobs.sort(key=lambda j: (j["ep"] or (0, 0), j["out"]))
+    return jobs
+
+
+def _video_audio_tracks(ffprobe_bin, video):
+    """Lists audio tracks of a video as [{index(a:N), lang, codec, channels}]."""
+    tracks = []
+    try:
+        for s in _ffprobe_streams(ffprobe_bin, video):
+            if s.get("codec_type") == "audio":
+                tags = s.get("tags", {}) or {}
+                tracks.append(dict(index=len(tracks),
+                                   lang=(_canon3(tags.get("language")) or "und"),
+                                   codec=s.get("codec_name", "?"),
+                                   channels=s.get("channels")))
+    except Exception:
+        pass
+    return tracks
+
+
+def _audio_desc(t):
+    if not t:
+        return "audio #0"
+    ch = f" {t['channels']}ch" if t.get("channels") else ""
+    return f"{_lang3_name(t['lang'])} {t['codec']}{ch} #{t['index'] + 1}"
+
+
+def _pick_common_audio(src_tracks, tgt_tracks):
+    """Chooses the SAME-language audio track in both videos (they contain the same
+    audio, but the order can differ). Falls back to the first track of each."""
+    src_by = {}
+    for t in src_tracks:
+        src_by.setdefault(t["lang"], t)
+    tgt_by = {}
+    for t in tgt_tracks:
+        tgt_by.setdefault(t["lang"], t)
+    common = [l for l in src_by if l != "und" and l in tgt_by]
+    # prefer the language with the most channels (usually the main track)
+    common.sort(key=lambda l: -(src_by[l].get("channels") or 0))
+    if common:
+        l = common[0]
+        return src_by[l], tgt_by[l]
+    return (src_tracks[0] if src_tracks else None), (tgt_tracks[0] if tgt_tracks else None)
+
+
+def _video_vad(args, ffmpeg_bin, video, cache, audio_index=0):
+    """Extracts the given audio track (a:N) and returns its speech (VAD) events.
+    Cached per (video, audio_index); never raises (returns None on any problem)."""
+    key = (video, audio_index)
+    if key in cache:
+        return cache[key]
+    ev = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "a.wav"
+            extract_audio_wav(ffmpeg_bin, Path(video), audio_index, wav)
+            samples, sr = read_wav_mono(wav)
+        if samples is not None and len(samples):
+            ev = detect_speech_events(samples, sr, energy_percentile=getattr(args, "vad_percentile", None) or 55.0)
+    except SystemExit:
+        ev = None
+    except Exception:
+        ev = None
+    cache[key] = ev
+    return ev
+
+
+def _retime_local_offsets(src_vad, tgt_vad, win_s, step_s, max_shift):
+    """Windowed local time offsets between the two speech (VAD) tracks: for each
+    ~win_s window of source speech, find the shift that best matches the target
+    speech nearby. Returns [(src_time, target_time, weight)] anchors across the
+    whole episode - this is what reveals shifts in the MIDDLE / at several places."""
+    if not src_vad or not tgt_vad:
+        return []
+    anchors = []
+    tmax = src_vad[-1]["end"]
+    c = win_s / 2.0
+    while c < tmax:
+        lo, hi = c - win_s / 2.0, c + win_s / 2.0
+        sw = [e for e in src_vad if lo <= e["start"] < hi]
+        if len(sw) >= 4:
+            tw = [e for e in tgt_vad if (lo - max_shift) <= e["start"] <= (hi + max_shift)]
+            if len(tw) >= 4:
+                try:
+                    shift = coarse_offset(tw, sw, max_shift=max_shift)
+                    anchors.append((c, c + shift, len(sw)))
+                except Exception:
+                    pass
+        c += step_s
+    return anchors
+
+
+def _retime_clean_and_breaks(anchors, jump_thresh=0.75, tol=1.0):
+    """Rejects outlier anchors (robust local-median filter) and finds break points
+    where the offset jumps by more than jump_thresh seconds (a mid-episode cut).
+    Returns (clean_anchors, [(break_time, offset_delta), ...])."""
+    import numpy as np
+    if len(anchors) < 4:
+        return anchors, []
+    anchors = sorted(anchors, key=lambda a: a[0])
+    offs = np.array([a[1] - a[0] for a in anchors])
+    clean = []
+    for i in range(len(anchors)):
+        lo, hi = max(0, i - 4), min(len(anchors), i + 5)
+        if abs(offs[i] - np.median(offs[lo:hi])) <= tol:
+            clean.append(anchors[i])
+    if len(clean) < 4:
+        clean = anchors
+    coffs = [c[1] - c[0] for c in clean]
+    breaks = []
+    for i in range(1, len(clean)):
+        d = coffs[i] - coffs[i - 1]
+        if abs(d) > jump_thresh:
+            breaks.append(((clean[i - 1][0] + clean[i][0]) / 2.0, d))
+    # merge breaks that are very close (same cut detected twice)
+    merged = []
+    for b in breaks:
+        if merged and abs(b[0] - merged[-1][0]) < 8.0:
+            merged[-1] = (merged[-1][0], merged[-1][1] + b[1])
+        else:
+            merged.append(list(b))
+    return clean, [tuple(m) for m in merged]
+
+
+def _retime_fit_line(anchors):
+    import numpy as np
+    if len(anchors) == 1:
+        return 1.0, anchors[0][1] - anchors[0][0]
+    xs = np.array([a[0] for a in anchors], dtype=float)
+    ys = np.array([a[1] for a in anchors], dtype=float)
+    if np.ptp(xs) < 1e-6:
+        return 1.0, float(np.mean(ys - xs))
+    sc, off = np.polyfit(xs, ys, 1)
+    return float(sc), float(off)
+
+
+def _retime_segments(clean, breaks):
+    """Splits clean anchors at the break times and fits a line (scale+offset) per
+    segment. Returns [(src_lo, src_hi, scale, offset)]."""
+    bounds = sorted(b[0] for b in breaks)
+    groups = [[] for _ in range(len(bounds) + 1)]
+    for a in clean:
+        gi = 0
+        while gi < len(bounds) and a[0] >= bounds[gi]:
+            gi += 1
+        groups[gi].append(a)
+    segs = []
+    prev = -1e9
+    for gi, g in enumerate(groups):
+        hi = bounds[gi] if gi < len(bounds) else 1e9
+        if g:
+            sc, off = _retime_fit_line(g)
+        elif segs:
+            sc, off = segs[-1][2], segs[-1][3]
+        else:
+            sc, off = 1.0, 0.0
+        segs.append((prev, hi, sc, off))
+        prev = hi
+    return segs
+
+
+def _retime_apply_segments(events, segs):
+    def mp(t):
+        for lo, hi, sc, off in segs:
+            if lo <= t < hi:
+                return sc * t + off
+        lo, hi, sc, off = segs[-1]
+        return sc * t + off
+    out = []
+    last = -1e9
+    for e in events:
+        st = mp(e["start"])
+        en = mp(e["end"])
+        if st < last:
+            st = last
+        if en <= st:
+            en = st + 0.5
+        ne = dict(e)
+        ne["start"], ne["end"] = st, en
+        out.append(ne)
+        last = st
+    return out
+
+
+def _print_progress(i, n, prefix=""):
+    """One-line \\r progress bar (normal terminal mode)."""
+    if n <= 0:
+        return
+    frac = min(1.0, i / n)
+    bw = 28
+    fill = int(bw * frac)
+    sys.stdout.write(f"\r  {prefix}[{'#' * fill}{'-' * (bw - fill)}] {i}/{n} ({frac * 100:4.0f}%)")
+    sys.stdout.flush()
+    if i >= n:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0):
+    """Extracts one audio track ONCE and returns dict(vad, env, hz, dur): VAD speech
+    events (coarse structure) AND a full-track RMS energy envelope at 50 Hz (for
+    precise per-timestamp waveform correlation). Cached per (video, audio_index)."""
+    import numpy as np
+    key = (video, audio_index)
+    if key in cache:
+        return cache[key]
+    res = None
+    try:
+        with tempfile.TemporaryDirectory() as td:
+            wav = Path(td) / "a.wav"
+            extract_audio_wav(ffmpeg_bin, Path(video), audio_index, wav)
+            samples, sr = read_wav_mono(wav)
+        if samples is not None and len(samples):
+            try:
+                vad = detect_speech_events(samples, sr, energy_percentile=getattr(args, "vad_percentile", None) or 55.0)
+            except (SystemExit, Exception):
+                vad = []
+            hz = 50
+            fl = max(1, int(sr / hz))
+            n = len(samples) // fl
+            s = np.asarray(samples[:n * fl], dtype=np.float64).reshape(n, fl)
+            env = np.sqrt(np.mean(s * s, axis=1))
+            env = ((env - env.mean()) / (env.std() or 1.0)).astype(np.float32)
+            res = dict(vad=vad, env=env, hz=float(hz), dur=len(samples) / sr)
+    except (SystemExit, Exception):
+        res = None
+    cache[key] = res
+    return res
+
+
+def _ncc_locate(src_env, tgt_env, hz, t_src, t_guess, win_s=4.0, band_s=10.0):
+    """Finds where the SOURCE audio window around t_src appears in the TARGET audio
+    near t_guess, using normalized cross-correlation. Returns (t_target, confidence
+    in -1..1) or None. This is the real per-timestamp waveform check."""
+    import numpy as np
+    w = int(win_s * hz)
+    b = int(band_s * hz)
+    si = int(t_src * hz)
+    if w < 4 or si - w // 2 < 0 or si + w // 2 > len(src_env):
+        return None
+    seg = src_env[si - w // 2:si + w // 2].astype(np.float64)
+    seg = seg - seg.mean()
+    sn = float(np.linalg.norm(seg))
+    if sn < 1e-6:
+        return None
+    ci = int(t_guess * hz)
+    lo = max(0, ci - w // 2 - b)
+    hi = min(len(tgt_env), ci + w // 2 + b)
+    r = tgt_env[lo:hi].astype(np.float64)
+    L = len(seg)
+    if len(r) < L:
+        return None
+    c1 = np.concatenate([[0.0], np.cumsum(r)])
+    c2 = np.concatenate([[0.0], np.cumsum(r * r)])
+    wsum = c1[L:] - c1[:-L]
+    wss = c2[L:] - c2[:-L]
+    wnorm = np.sqrt(np.maximum(wss - (wsum * wsum) / L, 1e-9))
+    num = np.correlate(r, seg, mode="valid")     # seg is zero-mean -> already the covariance
+    ncc = num / (wnorm * sn)
+    k = int(np.argmax(ncc))
+    return (lo + k + w // 2) / hz, float(ncc[k])
+
+
+def _segs_map(segs):
+    def f(t):
+        for lo, hi, sc, off in segs:
+            if lo <= t < hi:
+                return sc * t + off
+        lo, hi, sc, off = segs[-1]
+        return sc * t + off
+    return f
+
+
+def _retime_map_from_anchors(anchors, guess):
+    """Monotonic map source_time -> target_time built from confident per-line anchors,
+    with linear extrapolation at the ends."""
+    import numpy as np
+    anchors = sorted(anchors)
+    xs = [anchors[0][0]]
+    ys = [anchors[0][1]]
+    for x, y in anchors[1:]:
+        if x > xs[-1] + 1e-6:
+            xs.append(x)
+            ys.append(max(y, ys[-1]))
+    xs = np.array(xs)
+    ys = np.array(ys)
+
+    def f(t):
+        if t <= xs[0]:
+            if len(xs) > 1:
+                sl = (ys[1] - ys[0]) / (xs[1] - xs[0])
+                return float(ys[0] + sl * (t - xs[0]))
+            return float(guess(t))
+        if t >= xs[-1]:
+            if len(xs) > 1:
+                sl = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
+                return float(ys[-1] + sl * (t - xs[-1]))
+            return float(guess(t))
+        return float(np.interp(t, xs, ys))
+    return f
+
+
+def _retime_apply_mapfn(events, mapf):
+    out = []
+    last = -1e9
+    for e in events:
+        st = mapf(e["start"])
+        en = mapf(e["end"])
+        if st < last:
+            st = last
+        if en <= st:
+            en = st + 0.4
+        ne = dict(e)
+        ne["start"], ne["end"] = st, en
+        out.append(ne)
+        last = st
+    return out
+
+
+def _retime_one(args, ffmpeg_bin, job, vad_cache):
+    """Re-times the source srt to the target video. PRIMARY method: real per-timestamp
+    audio verification - every source subtitle time is located in the target audio by
+    normalized cross-correlation of the actual audio envelope (with a progress bar).
+    A coarse VAD alignment provides the initial guess (and handles big shifts); the
+    per-line pass then verifies and precisely places every timestamp. Falls back to a
+    global affine when the source audio isn't usable."""
+    import numpy as np
+    src_events = parse_srt(Path(job["source_srt"]))
+    if not src_events:
+        return dict(ok=False, msg="empty or unreadable source .srt")
+
+    # pick matching (same-language) audio tracks in both videos
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+    tgt_tracks = _video_audio_tracks(ffprobe_bin, job["target"])
+    src_tracks = _video_audio_tracks(ffprobe_bin, job["source_video"]) if job["source_video"] else []
+    src_a, tgt_a = _pick_common_audio(src_tracks, tgt_tracks)
+    tgt_ai = tgt_a["index"] if tgt_a else 0
+    src_ai = src_a["index"] if src_a else 0
+    audio_info = dict(src=src_a, tgt=tgt_a)
+
+    log_info(f"    analysing target audio [{_audio_desc(tgt_a)}]...")
+    tgt_an = _video_analysis(args, ffmpeg_bin, job["target"], vad_cache, tgt_ai)
+    if not tgt_an or not tgt_an.get("vad"):
+        return dict(ok=False, msg="could not analyse the target audio")
+    src_an = None
+    if job["source_video"]:
+        log_info(f"    analysing source audio [{_audio_desc(src_a)}]...")
+        src_an = _video_analysis(args, ffmpeg_bin, job["source_video"], vad_cache, src_ai)
+
+    tgt_vad = tgt_an["vad"]
+
+    # coarse guess (structure): VAD piecewise when there are mid-episode shifts, else
+    # a global affine; used only to aim the per-line search
+    guess = None
+    guess_desc = ""
+    if src_an and src_an.get("vad"):
+        src_vad = src_an["vad"]
+        anchors = _retime_local_offsets(src_vad, tgt_vad, 60.0, 25.0, args.max_shift)
+        clean, breaks = _retime_clean_and_breaks(anchors)
+        if len(clean) >= 4 and breaks:
+            guess = _segs_map(_retime_segments(clean, breaks))
+            guess_desc = f"{len(breaks) + 1} segments"
+        else:
+            sh = coarse_offset(tgt_vad, src_vad, max_shift=args.max_shift)
+            sc, off, _n = refine_affine(tgt_vad, src_vad, sh, tolerance=args.tolerance)
+            guess = (lambda t, sc=sc, off=off: sc * t + off)
+            guess_desc = "uniform"
+    else:
+        sh = coarse_offset(tgt_vad, src_events, max_shift=args.max_shift)
+        sc, off, _n = refine_affine(tgt_vad, src_events, sh, tolerance=args.tolerance)
+        guess = (lambda t, sc=sc, off=off: sc * t + off)
+        guess_desc = "uniform (subs)"
+
+    # REAL per-timestamp audio verification against the full-track envelope
+    if (src_an and src_an.get("env") is not None and len(src_an["env"])
+            and tgt_an.get("env") is not None and len(tgt_an["env"])):
+        se, te, hz = src_an["env"], tgt_an["env"], tgt_an["hz"]
+        anchors = []
+        confs = []
+        n = len(src_events)
+        for i, e in enumerate(src_events):
+            res = _ncc_locate(se, te, hz, e["start"], guess(e["start"]), win_s=4.0, band_s=10.0)
+            if res and res[1] >= 0.30:
+                anchors.append((e["start"], res[0]))
+                confs.append(res[1])
+            if (i % 5 == 0) or (i + 1 == n):
+                _print_progress(i + 1, n, prefix=f"{_fmt_ep(job['ep'])} checking timestamps ")
+        if len(anchors) >= max(3, n // 8):
+            mapf = _retime_map_from_anchors(anchors, guess)
+            corrected = _retime_apply_mapfn(src_events, mapf)
+            Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
+            write_srt(corrected, Path(job["out"]))
+            offs = [b - a for a, b in anchors]
+            return dict(ok=True, method="audio per-line", perline=True,
+                        verified=len(anchors), total=n, count=len(corrected),
+                        conf=(float(np.median(confs)) if confs else 0.0),
+                        off_lo=min(offs), off_hi=max(offs), guess=guess_desc,
+                        audio=audio_info, span=(src_events[0]["start"], src_events[-1]["end"]))
+        log_warn("    per-line audio match was weak - falling back to global alignment.")
+
+    # fallback: VAD-based global affine (offset + speed)
+    cands = []
+    if src_an and src_an.get("vad"):
+        src_vad = src_an["vad"]
+        sh = coarse_offset(tgt_vad, src_vad, max_shift=args.max_shift)
+        sc, off, nn = refine_affine(tgt_vad, src_vad, sh, tolerance=args.tolerance)
+        cands.append(("audio<->audio", sc, off, nn, len(src_vad)))
+    sh2 = coarse_offset(tgt_vad, src_events, max_shift=args.max_shift)
+    sc2, off2, n2 = refine_affine(tgt_vad, src_events, sh2, tolerance=args.tolerance)
+    cands.append(("subs<->audio", sc2, off2, n2, len(src_events)))
+
+    def _sane(c):
+        return c is not None and c[3] >= 6 and 0.5 < c[1] < 2.0
+    aa = next((c for c in cands if c[0] == "audio<->audio"), None)
+    sa = next((c for c in cands if c[0] == "subs<->audio"), None)
+    best = aa if _sane(aa) else (sa if _sane(sa) else max(cands, key=lambda c: c[3]))
+    name, scale, offset, nmatched, _tot = best
+    corrected = apply_transform(src_events, scale, offset)
+    Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
+    write_srt(corrected, Path(job["out"]))
+    agree = None
+    disagree = False
+    if aa and sa:
+        mid = (src_events[0]["start"] + src_events[-1]["end"]) / 2.0
+        agree = abs((aa[1] * mid + aa[2]) - (sa[1] * mid + sa[2]))
+        disagree = agree > 1.0
+    return dict(ok=True, scale=scale, offset=offset, method=name, nmatched=nmatched,
+                count=len(corrected), agree=agree, disagree=disagree, audio=audio_info,
+                span=(src_events[0]["start"], src_events[-1]["end"]))
+
+
+def run_retime_batch(args):
+    """Scans a folder, auto-detects source(video+srt)/target(video) pairs of the
+    same episode and re-times each subtitle file to its target video by analysing
+    the audio of both. Writes <target>.<lang>.srt and reports what it changed."""
+    print(f"{Fore.MAGENTA}=== Re-time subtitles to a different video source (batch) ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+
+    jobs = _retime_scan(directory, recursive)
+    if not jobs:
+        log_warn("No source(video+srt) / target(video) pairs detected in this folder.")
+        log_info("Expected: one video with a matching .srt, plus another video of the SAME episode (SxxExx).")
+        return
+
+    log_info(f"Detected {len(jobs)} subtitle(s) to re-time:")
+    for j in jobs:
+        print(f"  {Fore.CYAN}{_fmt_ep(j['ep'])}{Style.RESET_ALL}  {Path(j['source_srt']).name}")
+        print(f"      source video: "
+              + (Path(j['source_video']).name if j['source_video'] else f"{Style.DIM}(none - will use the srt itself){Style.RESET_ALL}"))
+        print(f"      -> target:    {Path(j['target']).name}")
+        print(f"      => {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}"
+              + (f"   {Fore.YELLOW}[exists]{Style.RESET_ALL}" if j['exists'] else ""))
+
+    if any(j["exists"] for j in jobs):
+        if not ask_yes_no("Some outputs already exist - overwrite them?", default_no=True):
+            jobs = [j for j in jobs if not j["exists"]]
+    if not jobs:
+        log_info("Nothing to do.")
+        return
+
+    ffmpeg_bin = ensure_ffmpeg(directory, allow_download=not getattr(args, "no_ffmpeg_download", False))
+    if not ffmpeg_bin:
+        log_warn("ffmpeg is required (to read audio for the analysis) and was not found.")
+        return
+
+    args.method = getattr(args, "method", None) or "auto"
+    args.max_shift = getattr(args, "max_shift", None) or 240.0   # tolerate extra intro/recap at the start
+    args.tolerance = getattr(args, "tolerance", None) or 1.5
+    args.vad_percentile = getattr(args, "vad_percentile", None) or 55.0
+
+    if not ask_yes_no(f"Re-time {len(jobs)} subtitle file(s) now? (reads audio from each video - can take a while)",
+                      default_no=False):
+        log_info("Cancelled.")
+        return
+
+    vad_cache = {}
+    results = []
+    for i, j in enumerate(jobs, 1):
+        log_info(f"[{i}/{len(jobs)}] {_fmt_ep(j['ep'])}: {Path(j['source_srt']).name} -> {Path(j['target']).name}")
+        try:
+            r = _retime_one(args, ffmpeg_bin, j, vad_cache)
+        except Exception as e:
+            r = dict(ok=False, msg=str(e))
+        results.append((j, r))
+        if r.get("ok"):
+            log_done(f"    saved {Path(j['out']).name}")
+        else:
+            log_warn(f"    failed: {r.get('msg')}")
+
+    print()
+    log_info("=== Re-time report ===")
+    okc = 0
+    for j, r in results:
+        if r.get("ok"):
+            okc += 1
+            au = r.get("audio") or {}
+            atxt = ""
+            if au.get("src") or au.get("tgt"):
+                atxt = f"\n      audio: source [{_audio_desc(au.get('src'))}] <-> target [{_audio_desc(au.get('tgt'))}]"
+            if r.get("perline"):
+                rng = (f"{r['off_lo']:+.1f}s" if abs(r['off_hi'] - r['off_lo']) < 0.2
+                       else f"{r['off_lo']:+.1f}..{r['off_hi']:+.1f}s")
+                print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
+                      f"method {Fore.CYAN}audio per-line{Style.RESET_ALL} ({r['guess']} guess) | "
+                      f"verified {r['verified']}/{r['total']} timestamps by audio "
+                      f"(median match {r['conf']:.2f}) | offset {rng}{atxt}")
+                continue
+            if r.get("piecewise"):
+                brk = ", ".join(f"{int(b[0]) // 60:02d}:{int(b[0]) % 60:02d} ({b[1]:+.1f}s)"
+                                for b in r.get("breaks", []))
+                print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
+                      f"method {Fore.YELLOW}PIECEWISE{Style.RESET_ALL} - {r['segments']} segments, "
+                      f"shift changes at: {brk}{atxt}")
+                continue
+            span = max(0.001, r["span"][1] - r["span"][0])
+            drift = (r["scale"] - 1.0) * span
+            if r.get("agree") is not None:
+                extra = (f" | {Fore.YELLOW}methods DISAGREE by {r['agree']:.2f}s - check this one{Style.RESET_ALL}"
+                         if r.get("disagree") else f" | methods agree within {r['agree']:.2f}s")
+            else:
+                extra = f" | {Style.DIM}(no source video - subtitle match only){Style.RESET_ALL}"
+            print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
+                  f"offset {r['offset']:+.2f}s | speed {r['scale']:.4f}x | "
+                  f"drift {drift:+.1f}s over the episode | method {r['method']} ({r['nmatched']} anchors){extra}{atxt}")
+        else:
+            print(f"  {Fore.RED}FAILED{Style.RESET_ALL} {Path(j['target']).name}: {r.get('msg')}")
+    print()
+    log_done(f"Done: {okc}/{len(results)} subtitle file(s) re-timed to their target video.")
+
+
 _INTERACTIVE_COMMANDS = {
     "auto": ("Synchronize one subtitle file", "run_auto_single"),
     "auto-all": ("Synchronize the whole folder", "run_auto_all"),
@@ -10887,6 +11489,7 @@ _INTERACTIVE_COMMANDS = {
     "set-default": ("Set the default track", "run_set_default"),
     "rename-subs": ("Rename subtitles", "run_rename_subs"),
     "subs-download": ("Download subtitles (OpenSubtitles)", "run_subs_download"),
+    "retime-subs": ("Re-time subtitles to a different video source", "run_retime_batch"),
     "extract-audio": ("Extract audio track from videos", "run_extract_audio"),
     "import-audio": ("Insert (mux) external audio into videos", "run_import_audio"),
     "convert-audio": ("Convert audio (e.g. to AC-3)", "run_convert_audio"),
@@ -10903,7 +11506,7 @@ def dispatch_interactive_command(cmd, args):
         "translate-subs": run_translate_subs, "extract-subs": run_extract_subs,
         "merge-pro": run_transplant, "resync-pro": run_resync_pro,
         "import-subs": run_import_subs, "remove-tracks": run_remove_tracks,
-        "set-default": run_set_default, "rename-subs": run_rename_subs, "subs-download": run_subs_download,
+        "set-default": run_set_default, "rename-subs": run_rename_subs, "subs-download": run_subs_download, "retime-subs": run_retime_batch,
         "extract-audio": run_extract_audio, "import-audio": run_import_audio,
         "convert-audio": run_convert_audio, "rename-files": run_rename_files,
         "video-browser": run_video_browser,
@@ -11034,6 +11637,12 @@ def _wizard_action_specs():
             help="Renames .srt by the name of the matching video (paired via SxxExx), keeps the "
                  "language/forced suffix. Shows the plan first.",
             kind="wizard", run=run_rename_subs, flag="rename_subs", preset="rename-subs"),
+        "retime-subs": dict(
+            label="Re-time subtitles to a DIFFERENT video source (auto-detect, batch)",
+            help="Same episode from two sources: one video has correct .srt, the other (different length) does not. "
+                 "Auto-detects source/target by SxxExx, analyses BOTH videos' audio (speech VAD) plus the subtitle "
+                 "timing, and writes <target>.<lang>.srt re-timed to the new video. Reports the offset/speed per file.",
+            kind="wizard", run=run_retime_batch, flag="retime_subs", preset="retime-subs"),
         "subs-download": dict(
             label="Download subtitles from OpenSubtitles (multi-language)",
             help="Recognizes the show/episode from file names and downloads subtitles for one or MORE "
@@ -11110,7 +11719,7 @@ def _wizard_action_specs():
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
      ["sync-one", "sync-folder", "translate", "extract-subs", "merge-pro",
-      "resync-pro", "import-subs", "rename-subs", "subs-download", "fix-readability", "p1", "p2"]),
+      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "fix-readability", "p1", "p2"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
@@ -11124,7 +11733,7 @@ _WIZARD_CATEGORIES = [
 _WIZARD_MODE_FLAGS = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
                       "extract_subs", "import_subs", "remove_tracks", "set_default",
                       "rename_subs", "fix_readability", "extract_audio", "import_audio",
-                      "convert_audio", "rename_files", "subs_download")
+                      "convert_audio", "rename_files", "subs_download", "retime_subs")
 
 
 def _run_wizard_action(key, args):
@@ -11790,6 +12399,9 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--subs-download", dest="subs_download", action="store_true",
                         help="Interactive mode: download subtitles from OpenSubtitles for a folder of videos "
                              "(multi-language). Needs a free OpenSubtitles key/account (--config).")
+    parser.add_argument("--retime-subs", dest="retime_subs", action="store_true",
+                        help="Interactive mode: re-time subtitles to a different video source (auto-detect "
+                             "source/target by episode, analyse both videos' audio). Writes <target>.<lang>.srt.")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -11888,7 +12500,7 @@ DIFFERENT LANGUAGES (target vs reference):
             args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
             args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
             args.rename_subs, args.fix_readability, args.extract_audio, args.import_audio,
-            args.convert_audio, args.rename_files, args.video_browser, args.subs_download]):
+            args.convert_audio, args.rename_files, args.video_browser, args.subs_download, args.retime_subs]):
         run_master_wizard(args)
         return
 
@@ -11907,7 +12519,8 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "convert-audio" if args.convert_audio
                        else "rename-files" if args.rename_files
                        else "video-browser" if args.video_browser
-                       else "subs-download" if args.subs_download else None)
+                       else "subs-download" if args.subs_download
+                       else "retime-subs" if args.retime_subs else None)
     if args.save and args.load:
         die("--save and --load cannot be combined.")
     if args.save and not interactive_cmd:
@@ -11961,6 +12574,8 @@ DIFFERENT LANGUAGES (target vs reference):
             run_video_browser(args)
         elif interactive_cmd == "subs-download":
             run_subs_download(args)
+        elif interactive_cmd == "retime-subs":
+            run_retime_batch(args)
         preset_flush_if_save()
         return
 
@@ -12011,6 +12626,9 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if args.subs_download:
         run_subs_download(args)
+        return
+    if args.retime_subs:
+        run_retime_batch(args)
         return
 
     if args.all and args.fix_readability:
