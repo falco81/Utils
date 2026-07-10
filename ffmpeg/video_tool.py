@@ -292,7 +292,7 @@ def mkvmerge_tracks(mkvmerge_bin: str, mkv_path: Path, track_type: str):
     """track_type: 'subtitles' or 'audio'."""
     cmd = [mkvmerge_bin, "-J", str(mkv_path)]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
     except subprocess.CalledProcessError as e:
         die(f"mkvmerge failed: {e.stderr}")
     data = json.loads(result.stdout)
@@ -375,7 +375,7 @@ MKVEXTRACT_CONTAINER_EXTS = {".mkv", ".mka", ".webm"}
 def extract_subtitle_to_srt(mkvextract_bin: str, mkv_path: Path, track_id: int, out_srt: Path):
     """For Matroska containers (.mkv/.webm) - mkvextract can only extract from those."""
     cmd = [mkvextract_bin, "tracks", str(mkv_path), f"{track_id}:{out_srt}"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0 or not out_srt.exists() or out_srt.stat().st_size == 0:
         die(f"mkvextract could not extract subtitle track {track_id}:\n{result.stderr[-2000:]}")
 
@@ -385,7 +385,7 @@ def extract_subtitle_via_ffmpeg(ffmpeg_bin: str, video_path: Path, sub_position:
     mov_text) are extracted and converted to SRT by ffmpeg. sub_position = index
     among subtitle tracks (0 = first), matching the '0:s:N' specifier."""
     cmd = [ffmpeg_bin, "-y", "-i", str(video_path), "-map", f"0:s:{sub_position}", str(out_srt)]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0 or not out_srt.exists() or out_srt.stat().st_size == 0:
         die(f"ffmpeg could not extract the subtitle track:\n{result.stderr[-2000:]}")
 
@@ -507,7 +507,7 @@ def _extract_7z(path, dest):
     seven_zip = find_tool(["7z", "7z.exe", "7za", "7za.exe"])
     if seven_zip:
         result = subprocess.run([seven_zip, "x", f"-o{dest}", "-y", path],
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace")
         if result.returncode == 0:
             return True
         log_warn(f"Unpacking .7z via {seven_zip} failed: {result.stderr[-500:]}")
@@ -725,7 +725,7 @@ def extract_audio_wav(ffmpeg_bin: str, mkv_path: Path, audio_position: int, out_
         "-ac", "1", "-ar", str(sample_rate),
         "-f", "wav", str(out_wav),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0 or not out_wav.exists() or out_wav.stat().st_size == 0:
         die(f"ffmpeg could not extract/decode the audio track:\n{result.stderr[-2000:]}")
 
@@ -2494,7 +2494,7 @@ def try_list_tracks(mkvmerge_bin, video_path):
     pre-flight, where an error on one file should not stop the whole run."""
     try:
         result = subprocess.run([mkvmerge_bin, "-J", str(video_path)],
-                                 capture_output=True, text=True, timeout=60)
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
         data = json.loads(result.stdout)
     except Exception as e:
         return None, None, str(e)
@@ -4857,7 +4857,7 @@ def _mkv_probe_full(mkvmerge_bin, video):
     """Returns {'audio':[...], 'subs':[...]}; each track has id, lang, name, codec,
     default, forced, a selektor sel (a1/s1... pro mkvpropedit)."""
     try:
-        out = subprocess.run([mkvmerge_bin, "-J", str(video)], capture_output=True, text=True)
+        out = subprocess.run([mkvmerge_bin, "-J", str(video)], capture_output=True, text=True, encoding="utf-8", errors="replace")
         data = json.loads(out.stdout or "{}")
     except Exception:
         return {"audio": [], "subs": []}
@@ -5055,7 +5055,7 @@ def run_import_subs(args):
             cmd += ["--language", f"0:{lang3}", "--track-name", f"0:{name}",
                     "--default-track", "0:yes" if (chosen is not None and i == chosen) else "0:no",
                     "--forced-track", "0:yes" if forced else "0:no", str(subfile)]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if res.returncode >= 2 or not os.path.exists(tmp_out):
             tail = " | ".join([l for l in (res.stdout or "").splitlines() if l.strip()][-3:])
             log_warn(f"{vp.name}: mkvmerge failed: {tail}")
@@ -5165,7 +5165,7 @@ def run_remove_tracks(args):
         elif s_keep and len(s_keep) < len(s_all):
             cmd += ["--subtitle-tracks", ",".join(str(i) for i in s_keep)]
         cmd += [str(v)]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if res.returncode >= 2 or not os.path.exists(tmp_out):
             tail = " | ".join([l for l in (res.stdout or "").splitlines() if l.strip()][-3:])
             log_warn(f"{vp.name}: mkvmerge failed: {tail}")
@@ -5267,7 +5267,7 @@ def run_set_default(args):
             if not edits:
                 log_info(f"{vp.name}: unchanged.")
                 continue
-            res = subprocess.run([mp, str(v)] + edits, capture_output=True, text=True)
+            res = subprocess.run([mp, str(v)] + edits, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if res.returncode >= 2:
                 log_warn(f"{vp.name}: mkvpropedit error.")
                 failed += 1
@@ -5292,7 +5292,7 @@ def run_set_default(args):
                     disp += [f"-disposition:{tkey}:{rel}", "+".join(flags) if flags else "0"]
             tmp = str(v) + ".deftmp.mp4"
             cmd = [ffmpeg_bin, "-y", "-i", str(v), "-map", "0", "-c", "copy"] + disp + ["-default_mode", "passthrough", tmp]
-            res = subprocess.run(cmd, capture_output=True, text=True)
+            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if res.returncode != 0 or not os.path.exists(tmp):
                 log_warn(f"{vp.name}: ffmpeg error.")
                 failed += 1
@@ -6937,7 +6937,7 @@ def _ffprobe_streams(ffprobe_bin, path):
     """Returns the list of streams (ffprobe -show_streams) or []."""
     try:
         out = subprocess.run([ffprobe_bin, "-v", "error", "-print_format", "json",
-                              "-show_streams", str(path)], capture_output=True, text=True)
+                              "-show_streams", str(path)], capture_output=True, text=True, encoding="utf-8", errors="replace")
         return json.loads(out.stdout or "{}").get("streams", [])
     except Exception:
         return []
@@ -7068,7 +7068,7 @@ def run_extract_audio(args):
                 log_info(f"{out.name}: already exists - skipping.")
                 continue
             cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", f"0:a:{ordinal}", "-c:a", "copy", str(out)]
-            r = subprocess.run(cmd, capture_output=True, text=True)
+            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
             if r.returncode != 0 or not out.exists():
                 log_warn(f"{vp.name}: extracting audio #{t['id']} failed.")
                 continue
@@ -7229,7 +7229,7 @@ def _fix_merged_metadata(mkvmerge_bin, mkvpropedit_bin, mkv_path, default_audio_
         edit_args += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={flag}"]
     if not edit_args:
         return
-    r = subprocess.run([mkvpropedit_bin, str(mkv_path)] + edit_args, capture_output=True, text=True)
+    r = subprocess.run([mkvpropedit_bin, str(mkv_path)] + edit_args, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0:
         log_warn(f"  mkvpropedit: {r.stderr.strip()[:200]}")
     else:
@@ -8245,7 +8245,7 @@ def _vid_probe(args, path):
     if ffprobe:
         try:
             out = subprocess.run([ffprobe, "-v", "error", "-show_format", "-show_chapters",
-                                  "-print_format", "json", str(p)], capture_output=True, text=True)
+                                  "-print_format", "json", str(p)], capture_output=True, text=True, encoding="utf-8", errors="replace")
             data = json.loads(out.stdout or "{}")
             fmt = data.get("format", {})
             chapters = len(data.get("chapters", []))
@@ -8255,7 +8255,7 @@ def _vid_probe(args, path):
     mk = {"tracks": [], "attachments": []}
     if mkvmerge and is_mkv:
         try:
-            mk = json.loads(subprocess.run([mkvmerge, "-J", str(p)], capture_output=True, text=True).stdout or "{}")
+            mk = json.loads(subprocess.run([mkvmerge, "-J", str(p)], capture_output=True, text=True, encoding="utf-8", errors="replace").stdout or "{}")
         except Exception:
             mk = {"tracks": [], "attachments": []}
     mk_audio = [t for t in mk.get("tracks", []) if t.get("type") == "audio"]
@@ -8453,7 +8453,7 @@ def _vid_extract_audio(args, info):
             n += 1
         used.add(str(out))
         cmd = [ff, "-y", "-i", str(p), "-map", f"0:a:{t['ord']}", "-c:a", "copy", str(out)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode == 0 and out.exists():
             log_done(f"Audio A{t['ord'] + 1} ({t['codec']}) -> {out.name}")
         else:
@@ -8516,7 +8516,7 @@ def _vid_remove_tracks(args, info):
         elif keep_s and len(keep_s) < len(info["subs"]):
             cmd += ["--subtitle-tracks", ",".join(map(str, keep_s))]
         cmd += [str(p)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode >= 2 or not tmp.exists():
             log_warn("mkvmerge failed.")
             tmp.exists() and os.remove(str(tmp))
@@ -8532,7 +8532,7 @@ def _vid_remove_tracks(args, info):
             if t["ord"] not in rem_s:
                 maps += ["-map", f"0:s:{t['ord']}"]
         cmd = [ff, "-y", "-i", str(p)] + maps + ["-c", "copy", str(tmp)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0 or not tmp.exists():
             log_warn("ffmpeg failed.")
             tmp.exists() and os.remove(str(tmp))
@@ -8777,7 +8777,7 @@ def _vid_apply_track_changes(args, info, kind, t, changes):
                         edits += ["--edit", f"track:{o['sel']}", "--set", "flag-default=0"]
         if "forced" in changes:
             edits += ["--edit", f"track:{t['sel']}", "--set", f"flag-forced={1 if changes['forced'] else 0}"]
-        r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True)
+        r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode >= 2:
             log_warn(f"mkvpropedit error: {r.stderr.strip()[:200]}")
             return False
@@ -8813,7 +8813,7 @@ def _vid_apply_track_changes(args, info, kind, t, changes):
             fl.append("forced")
         disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
     cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + meta + disp + [str(tmp)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not tmp.exists():
         log_warn("ffmpeg remux failed.")
         tmp.exists() and os.remove(str(tmp))
@@ -8884,7 +8884,7 @@ def _vid_set_default(args, info):
             for t in info["subs"]:
                 val = 1 if (s != "none" and t["ord"] == s) else 0
                 edits += ["--edit", f"track:{t['sel']}", "--set", f"flag-default={val}"]
-        r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True)
+        r = subprocess.run([info["mkvpropedit"], str(p)] + edits, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode >= 2:
             log_warn("mkvpropedit error.")
             return None
@@ -8905,7 +8905,7 @@ def _vid_set_default(args, info):
                     fl.append("forced")
                 disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
         cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + disp + [str(tmp)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
         if r.returncode != 0 or not tmp.exists():
             log_warn("ffmpeg failed.")
             tmp.exists() and os.remove(str(tmp))
@@ -8938,7 +8938,7 @@ def _vid_add_audio(args, info):
         cmd += ["-disposition:a", "0", f"-disposition:a:{len(info['audio'])}", "default"]
     # convert text subs when muxing into mkv from mp4 to be safe
     cmd += ["-c:s", "copy" if info["is_mkv"] else "srt", str(tmp)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not tmp.exists():
         log_warn("ffmpeg mux failed.")
         tmp.exists() and os.remove(str(tmp))
@@ -8976,7 +8976,7 @@ def _vid_add_subs(args, info):
            "--language", f"0:{lang}", "--track-name", f"0:{name}",
            "--forced-track", "0:yes" if forced else "0:no",
            "--default-track", "0:yes" if default else "0:no", str(spath)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode >= 2 or not tmp.exists():
         log_warn("mkvmerge mux failed.")
         tmp.exists() and os.remove(str(tmp))
@@ -9070,7 +9070,7 @@ def _vid_extract_chapters(args, info):
         return None
     p = info["path"]
     out = p.with_name(p.stem + ".chapters.xml")
-    r = subprocess.run([info["mkvextract"], str(p), "chapters", str(out)], capture_output=True, text=True)
+    r = subprocess.run([info["mkvextract"], str(p), "chapters", str(out)], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode >= 2 or not out.exists():
         log_warn("Chapter extraction failed.")
         return None
@@ -9086,7 +9086,7 @@ def _vid_extract_attachments(args, info):
     outdir = p.with_name(p.stem + "_attachments")
     os.makedirs(outdir, exist_ok=True)
     spec = [f"{a['id']}:{outdir / a['name']}" for a in info["attachments"] if a.get("id") is not None]
-    r = subprocess.run([info["mkvextract"], str(p), "attachments"] + spec, capture_output=True, text=True)
+    r = subprocess.run([info["mkvextract"], str(p), "attachments"] + spec, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode >= 2:
         log_warn("Attachment extraction failed.")
         return None
@@ -9099,7 +9099,7 @@ def _vid_thumbnail(args, info):
     ts = ask_text("Timestamp for the thumbnail (HH:MM:SS or seconds)", "00:00:30").strip() or "00:00:30"
     out = p.with_name(p.stem + ".thumb.jpg")
     r = subprocess.run([info["ffmpeg"], "-y", "-ss", ts, "-i", str(p), "-frames:v", "1",
-                        "-q:v", "2", str(out)], capture_output=True, text=True)
+                        "-q:v", "2", str(out)], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not out.exists():
         log_warn("Thumbnail extraction failed (timestamp beyond the end?).")
         return None
@@ -9118,7 +9118,7 @@ def _vid_extract_stream_only(args, info):
     else:
         out = p.with_name(p.stem + ".noSubs" + p.suffix)
         cmd = [ff, "-y", "-i", str(p), "-map", "0:v", "-map", "0:a?", "-c", "copy", "-sn", str(out)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode != 0 or not out.exists():
         log_warn("Extraction failed.")
         return None
@@ -9264,7 +9264,7 @@ def _vid_advanced_info(args, info):
         return None
     try:
         out = subprocess.run([ffprobe, "-v", "error", "-show_streams", "-show_format",
-                              "-print_format", "json", str(info["path"])], capture_output=True, text=True)
+                              "-print_format", "json", str(info["path"])], capture_output=True, text=True, encoding="utf-8", errors="replace")
         data = json.loads(out.stdout or "{}")
     except Exception as e:
         log_warn(f"ffprobe failed: {e}")

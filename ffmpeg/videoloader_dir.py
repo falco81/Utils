@@ -80,7 +80,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "example.com": None,        # -> runs as: <url> --scan-browser
     # "shop.example.org": 2,      # -> runs as: <url> --scan-browser 2
 }
-SCRIPT_VERSION = "2.69.0"
+SCRIPT_VERSION = "2.71.0"
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
 
 
@@ -1164,7 +1164,8 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                     continue
                 fname = _streamable_fname(st['title'] or title, st['shortcode'])
                 strm_videos.append({'id': durl, 'title': fname, 'name': fname,
-                                    'direct_url': durl, 'headers': STREAMABLE_HEADERS})
+                                    'direct_url': durl, 'headers': STREAMABLE_HEADERS,
+                                    'streamable_shortcode': st['shortcode']})
             if strm_videos:
                 print(f"[INFO] Downloading {len(strm_videos)} Streamable video(s) ...")
                 download_folder_pooled(strm_videos, session, chunk_size, verbose,
@@ -1584,6 +1585,7 @@ def download_file(url: str, session: requests.Session, filename: str, chunk_size
         return False
 
     merge_parts(part_files, filename, verbose)
+    filename = _apply_forced_container(filename, verbose)   # --container (no-op when auto)
     _record_download(filename)
     if show_part_bars:
         print(f"\n{filename} downloaded successfully.")
@@ -2133,13 +2135,23 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         if job.locked:
             release_lock(job.lock_path)
         if ok:
+            _final = _apply_forced_container(_final, verbose)   # --container (no-op when auto)
             _record_download(_final)
         else:
-            _record_failed({'kind': 'dropbox' if job.direct_url else 'drive',
-                            'out_dir': os.getcwd(),
-                            'filename': os.path.basename(job.filename or job.title or ''),
-                            'reason': reason or 'download failed',
-                            'video': job.entry if isinstance(job.entry, dict) else None})
+            _sc = job.entry.get('streamable_shortcode') if isinstance(job.entry, dict) else None
+            if _sc:
+                # Streamable's CDN URL is a signed link that expires, so resume must re-resolve it
+                # from the shortcode rather than replay the stale URL.
+                _record_failed({'kind': 'streamable', 'out_dir': os.getcwd(),
+                                'filename': os.path.basename(job.filename or job.title or ''),
+                                'reason': reason or 'download failed', 'shortcode': _sc,
+                                'title': job.title})
+            else:
+                _record_failed({'kind': 'dropbox' if job.direct_url else 'drive',
+                                'out_dir': os.getcwd(),
+                                'filename': os.path.basename(job.filename or job.title or ''),
+                                'reason': reason or 'download failed',
+                                'video': job.entry if isinstance(job.entry, dict) else None})
         with result_lock:
             result['ok' if ok else 'fail'] += 1
             n = result['ok'] + result['fail']
@@ -5621,6 +5633,48 @@ def _container_ext(multi_track):
     return '.mkv' if multi_track else '.mp4'
 
 
+def _apply_forced_container(path, verbose):
+    """When --container forces a specific container, remux a finished DIRECT download into it
+    (stream copy, no re-encode) and return the new path. No-op when --container is auto, when the
+    file already has the target extension, when ffmpeg is unavailable, or when the copy fails
+    (incompatible codecs) — in those cases the original file is kept untouched."""
+    if FORCE_CONTAINER not in ('mp4', 'mkv') or not path or not os.path.exists(path):
+        return path
+    target = '.' + FORCE_CONTAINER
+    if os.path.splitext(path)[1].lower() == target:
+        return path
+    if not ensure_ffmpeg(verbose):
+        return path
+    is_mkv = target == '.mkv'
+    new_path = os.path.splitext(path)[0] + target
+    tmp = _temp_artifact(new_path, ".remux" + target)
+    cmd = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', path,
+           '-map', '0', '-c', 'copy']
+    cmd += (['-c:s', 'srt'] if is_mkv else ['-movflags', '+faststart'])
+    cmd += ['-y', tmp]
+    if verbose:
+        tqdm.write(f"[INFO] --container: remuxing {os.path.basename(path)} -> {FORCE_CONTAINER}")
+    proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-2:] if l.strip())
+        tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} --container: couldn't remux "
+                   f"{os.path.basename(path)} to {FORCE_CONTAINER} (kept original)."
+                   + (f" {tail}" if verbose and tail else ""))
+        return path
+    os.replace(tmp, new_path)
+    if os.path.abspath(new_path) != os.path.abspath(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    return new_path
+
+
 def _iso639_2(code):
     """Normalise a language tag (e.g. 'en', 'en-US', 'eng') to an ISO 639-2 3-letter code so
     players show the right language. Unknown codes are passed through as-is."""
@@ -7501,7 +7555,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             fname = _streamable_fname(os.path.splitext(output_file)[0] if output_file
                                      else title, target_id)
             entry = {'id': durl, 'title': fname, 'name': fname, 'direct_url': durl,
-                     'headers': STREAMABLE_HEADERS}
+                     'headers': STREAMABLE_HEADERS, 'streamable_shortcode': target_id}
             _with_out_dir(lambda: download_folder_pooled([entry], session, chunk_size, verbose,
                                                          label="Streamable",
                                                          conn_cap=max_connections))
@@ -7759,17 +7813,35 @@ def _download_failed_entries(entries, session, verbose, chunk):
     are re-recorded into _failed_jobs by the engines' finalize()."""
     pooled = defaultdict(list)      # out_dir -> [video dicts]
     native = defaultdict(list)      # (out_dir, max_height) -> [stream dicts]
+    streamable = defaultdict(list)  # out_dir -> [failed streamable entries]
     for e in entries:
         if not isinstance(e, dict):
             continue
         od = e.get('out_dir') or os.getcwd()
-        if e.get('kind') in ('drive', 'dropbox') and isinstance(e.get('video'), dict):
+        if e.get('kind') == 'streamable' and e.get('shortcode'):
+            streamable[od].append(e)
+        elif e.get('kind') in ('drive', 'dropbox') and isinstance(e.get('video'), dict):
             pooled[od].append(e['video'])
         elif e.get('kind') == 'native' and isinstance(e.get('stream'), dict):
             native[(od, e.get('max_height', 0))].append(e['stream'])
     for od, videos in pooled.items():
         _run_in_dir(od, lambda videos=videos: download_folder_pooled(
             videos, session, chunk, verbose, label="Retry"))
+    for od, entries_s in streamable.items():
+        def _retry_streamable(entries_s=entries_s):
+            vids = []
+            for e in entries_s:
+                durl, title, _h = resolve_streamable(e['shortcode'], session, verbose)
+                if not durl:
+                    print(f"[WARN] Streamable {e['shortcode']}: could not re-resolve; skipping.")
+                    continue
+                fn = e.get('filename') or _streamable_fname(title, e['shortcode'])
+                vids.append({'id': durl, 'title': fn, 'name': fn, 'direct_url': durl,
+                             'headers': STREAMABLE_HEADERS, 'streamable_shortcode': e['shortcode']})
+            if vids:
+                download_folder_pooled(vids, session, chunk, verbose, label="Retry",
+                                       conn_cap=_max_connections)
+        _run_in_dir(od, _retry_streamable)
     for (od, mh), streams in native.items():
         if not ensure_ffmpeg(verbose):
             print("[ERROR] ffmpeg is required for native videos; skipping those on retry.")
