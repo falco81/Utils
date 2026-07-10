@@ -2086,6 +2086,25 @@ def collect_srts(directory, recursive):
     return sorted(srts)
 
 
+def _collect_videos_subs(directory, recursive, sub_exts=None):
+    """Returns (videos, subtitle_files) in the directory. sub_exts limits which
+    subtitle extensions count (default: common subtitle formats)."""
+    exts = tuple(e.lower() for e in sub_exts) if sub_exts else (".srt", ".ass", ".ssa", ".vtt", ".sub")
+    videos = collect_videos(directory, recursive)
+    subs = []
+    if recursive:
+        for root, _d, files in os.walk(directory):
+            for f in files:
+                if f.lower().endswith(exts):
+                    subs.append(os.path.join(root, f))
+    else:
+        for f in os.listdir(directory):
+            full = os.path.join(directory, f)
+            if os.path.isfile(full) and f.lower().endswith(exts):
+                subs.append(full)
+    return sorted(videos), sorted(subs)
+
+
 def _srt_lang_tag(srt_path, vstem):
     """'X.S01E01.cs.srt' + vstem='X.S01E01' -> 'cs'. None if there is no tag."""
     sstem = Path(srt_path).stem
@@ -11262,94 +11281,193 @@ def _retime_apply_mapfn(events, mapf):
     return out
 
 
+def _retime_common_langs(ffprobe_bin, job):
+    """{lang: (src_track, tgt_track)} for audio languages present in BOTH videos of
+    the pair (the same content, so aligning like-for-like is reliable)."""
+    tgt = _video_audio_tracks(ffprobe_bin, job["target"])
+    src = _video_audio_tracks(ffprobe_bin, job["source_video"]) if job["source_video"] else []
+    tgt_by, src_by = {}, {}
+    for t in tgt:
+        tgt_by.setdefault(t["lang"], t)
+    for t in src:
+        src_by.setdefault(t["lang"], t)
+    return {lg: (src_by[lg], tgt_by[lg]) for lg in src_by if lg != "und" and lg in tgt_by}
+
+
+def _retime_pick_audio_langs(lang_count):
+    """Checkbox picker for the detected common audio languages (all pre-selected).
+    Returns a list of language codes, or None on cancel."""
+    items = sorted(lang_count.items(), key=lambda x: (-x[1], x[0]))
+    sel = set(lg for lg, _c in items)
+    pos = 0
+    top = 0
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                cols, rows = _fb_termsize()
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Audio tracks for the analysis ==={Style.RESET_ALL}",
+                    f"{Style.DIM}Pick which common-language tracks to analyse. More tracks = higher "
+                    f"reliability (cross-checked), but slower.{Style.RESET_ALL}", "",
+                ]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | Enter = confirm | Esc = cancel{Style.RESET_ALL}"]
+                avail = max(3, rows - len(head) - len(foot))
+                pos = max(0, min(pos, len(items) - 1))
+                if pos < top:
+                    top = pos
+                elif pos >= top + avail:
+                    top = pos - avail + 1
+                top = max(0, top)
+                body = []
+                for i, (lg, cnt) in enumerate(items[top:top + avail], start=top):
+                    box = "[x]" if lg in sel else "[ ]"
+                    label = f"{box} {_lang3_name(lg)} ({lg})   {Style.DIM}- in {cnt} pair(s){Style.RESET_ALL}"
+                    if i == pos:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {label}{Style.RESET_ALL}")
+                    else:
+                        body.append(f"  {Fore.CYAN if lg in sel else ''}{label}{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                k = _read_key()
+                if k == "esc":
+                    return None
+                elif k == "enter":
+                    return sorted(sel)
+                elif k == ("char", " "):
+                    lg = items[pos][0]
+                    sel.discard(lg) if lg in sel else sel.add(lg)
+                elif k == "up":
+                    pos = (pos - 1) % len(items)
+                elif k == "down":
+                    pos = (pos + 1) % len(items)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(items) - 1
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _retime_perline(src_events, tracks, guess, ep_label):
+    """Per-timestamp audio verification across one or MORE audio tracks. For every
+    source subtitle time, each track votes with a normalized cross-correlation match;
+    the highest-confidence hit is taken (best-of-N), which fills gaps where one track
+    is silent. Returns (anchors[(src_t,tgt_t)], confs, per_lang_offsets)."""
+    anchors, confs = [], []
+    per_lang = {t[0]: [] for t in tracks}
+    n = len(src_events)
+    multi = len(tracks) > 1
+    for i, e in enumerate(src_events):
+        best = None
+        for (lg, se, te, hz) in tracks:
+            r = _ncc_locate(se, te, hz, e["start"], guess(e["start"]), win_s=4.0, band_s=10.0)
+            if not r:
+                continue
+            if r[1] >= 0.30:
+                per_lang[lg].append(r[0] - e["start"])
+            if best is None or r[1] > best[0]:
+                best = (r[1], r[0], lg)
+        if best and best[0] >= 0.30:
+            anchors.append((e["start"], best[1]))
+            confs.append(best[0])
+        if (i % 5 == 0) or (i + 1 == n):
+            _print_progress(i + 1, n, prefix=f"{ep_label} checking timestamps "
+                            f"({len(tracks)} track{'s' if multi else ''}) ")
+    return anchors, confs, per_lang
+
+
 def _retime_one(args, ffmpeg_bin, job, vad_cache):
-    """Re-times the source srt to the target video. PRIMARY method: real per-timestamp
-    audio verification - every source subtitle time is located in the target audio by
-    normalized cross-correlation of the actual audio envelope (with a progress bar).
-    A coarse VAD alignment provides the initial guess (and handles big shifts); the
-    per-line pass then verifies and precisely places every timestamp. Falls back to a
-    global affine when the source audio isn't usable."""
+    """Re-times the source srt to the target video by REAL per-timestamp audio
+    verification across the selected common audio tracks (best-of-N per timestamp +
+    cross-check between languages). A coarse VAD alignment aims the search. Falls back
+    to a global affine when no usable audio is available."""
     import numpy as np
     src_events = parse_srt(Path(job["source_srt"]))
     if not src_events:
         return dict(ok=False, msg="empty or unreadable source .srt")
 
-    # pick matching (same-language) audio tracks in both videos
     ffprobe_bin = _find_ffprobe(ffmpeg_bin)
-    tgt_tracks = _video_audio_tracks(ffprobe_bin, job["target"])
-    src_tracks = _video_audio_tracks(ffprobe_bin, job["source_video"]) if job["source_video"] else []
-    src_a, tgt_a = _pick_common_audio(src_tracks, tgt_tracks)
-    tgt_ai = tgt_a["index"] if tgt_a else 0
-    src_ai = src_a["index"] if src_a else 0
-    audio_info = dict(src=src_a, tgt=tgt_a)
-
-    log_info(f"    analysing target audio [{_audio_desc(tgt_a)}]...")
-    tgt_an = _video_analysis(args, ffmpeg_bin, job["target"], vad_cache, tgt_ai)
-    if not tgt_an or not tgt_an.get("vad"):
-        return dict(ok=False, msg="could not analyse the target audio")
-    src_an = None
-    if job["source_video"]:
-        log_info(f"    analysing source audio [{_audio_desc(src_a)}]...")
-        src_an = _video_analysis(args, ffmpeg_bin, job["source_video"], vad_cache, src_ai)
-
-    tgt_vad = tgt_an["vad"]
-
-    # coarse guess (structure): VAD piecewise when there are mid-episode shifts, else
-    # a global affine; used only to aim the per-line search
-    guess = None
-    guess_desc = ""
-    if src_an and src_an.get("vad"):
-        src_vad = src_an["vad"]
-        anchors = _retime_local_offsets(src_vad, tgt_vad, 60.0, 25.0, args.max_shift)
-        clean, breaks = _retime_clean_and_breaks(anchors)
-        if len(clean) >= 4 and breaks:
-            guess = _segs_map(_retime_segments(clean, breaks))
-            guess_desc = f"{len(breaks) + 1} segments"
-        else:
-            sh = coarse_offset(tgt_vad, src_vad, max_shift=args.max_shift)
-            sc, off, _n = refine_affine(tgt_vad, src_vad, sh, tolerance=args.tolerance)
-            guess = (lambda t, sc=sc, off=off: sc * t + off)
-            guess_desc = "uniform"
+    langs = job.get("langs")
+    if langs:
+        pairs = [(lg, langs[lg][0], langs[lg][1]) for lg in sorted(langs)]
     else:
-        sh = coarse_offset(tgt_vad, src_events, max_shift=args.max_shift)
-        sc, off, _n = refine_affine(tgt_vad, src_events, sh, tolerance=args.tolerance)
+        tgt_tracks = _video_audio_tracks(ffprobe_bin, job["target"])
+        src_tracks = _video_audio_tracks(ffprobe_bin, job["source_video"]) if job["source_video"] else []
+        sa_t, ta_t = _pick_common_audio(src_tracks, tgt_tracks)
+        pairs = [((ta_t["lang"] if ta_t else "und"), sa_t, ta_t)] if (sa_t or ta_t) else [("und", None, None)]
+
+    # analyse each track pair once (cached)
+    analyses = []   # (lang, src_an, tgt_an, src_track, tgt_track)
+    for (lg, st, tt) in pairs:
+        log_info(f"    analysing {_lang3_name(lg)} audio: target [{_audio_desc(tt)}]"
+                 + (f" + source [{_audio_desc(st)}]" if st else "") + " ...")
+        ta_an = _video_analysis(args, ffmpeg_bin, job["target"], vad_cache, tt["index"] if tt else 0)
+        sa_an = (_video_analysis(args, ffmpeg_bin, job["source_video"], vad_cache, st["index"])
+                 if (job["source_video"] and st) else None)
+        analyses.append((lg, sa_an, ta_an, st, tt))
+
+    tgt_an0 = next((a[2] for a in analyses if a[2] and a[2].get("vad")), None)
+    if not tgt_an0:
+        return dict(ok=False, msg="could not analyse the target audio")
+
+    # coarse guess (aim only) from the first pair that has source speech
+    guess, guess_desc = None, ""
+    for (lg, sa_an, ta_an, st, tt) in analyses:
+        if sa_an and sa_an.get("vad") and ta_an and ta_an.get("vad"):
+            an = _retime_local_offsets(sa_an["vad"], ta_an["vad"], 60.0, 25.0, args.max_shift)
+            clean, breaks = _retime_clean_and_breaks(an)
+            if len(clean) >= 4 and breaks:
+                guess = _segs_map(_retime_segments(clean, breaks))
+                guess_desc = f"{len(breaks) + 1} segments"
+            else:
+                sh = coarse_offset(ta_an["vad"], sa_an["vad"], max_shift=args.max_shift)
+                sc, off, _n = refine_affine(ta_an["vad"], sa_an["vad"], sh, tolerance=args.tolerance)
+                guess = (lambda t, sc=sc, off=off: sc * t + off)
+                guess_desc = "uniform"
+            break
+    if guess is None:
+        sh = coarse_offset(tgt_an0["vad"], src_events, max_shift=args.max_shift)
+        sc, off, _n = refine_affine(tgt_an0["vad"], src_events, sh, tolerance=args.tolerance)
         guess = (lambda t, sc=sc, off=off: sc * t + off)
         guess_desc = "uniform (subs)"
 
-    # REAL per-timestamp audio verification against the full-track envelope
-    if (src_an and src_an.get("env") is not None and len(src_an["env"])
-            and tgt_an.get("env") is not None and len(tgt_an["env"])):
-        se, te, hz = src_an["env"], tgt_an["env"], tgt_an["hz"]
-        anchors = []
-        confs = []
-        n = len(src_events)
-        for i, e in enumerate(src_events):
-            res = _ncc_locate(se, te, hz, e["start"], guess(e["start"]), win_s=4.0, band_s=10.0)
-            if res and res[1] >= 0.30:
-                anchors.append((e["start"], res[0]))
-                confs.append(res[1])
-            if (i % 5 == 0) or (i + 1 == n):
-                _print_progress(i + 1, n, prefix=f"{_fmt_ep(job['ep'])} checking timestamps ")
-        if len(anchors) >= max(3, n // 8):
+    # per-line multi-track verification
+    tracks = [(lg, sa_an["env"], ta_an["env"], ta_an["hz"])
+              for (lg, sa_an, ta_an, st, tt) in analyses
+              if sa_an and ta_an and sa_an.get("env") is not None and ta_an.get("env") is not None
+              and len(sa_an["env"]) and len(ta_an["env"])]
+    if tracks:
+        anchors, confs, per_lang = _retime_perline(src_events, tracks, guess, _fmt_ep(job["ep"]))
+        if len(anchors) >= max(3, len(src_events) // 8):
             mapf = _retime_map_from_anchors(anchors, guess)
             corrected = _retime_apply_mapfn(src_events, mapf)
             Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
             write_srt(corrected, Path(job["out"]))
             offs = [b - a for a, b in anchors]
+            meds = {lg: float(np.median(o)) for lg, o in per_lang.items() if len(o) >= 3}
+            spread = (max(meds.values()) - min(meds.values())) if len(meds) > 1 else None
+            used = []
+            for (lg, sa_an, ta_an, st, tt) in analyses:
+                if lg in {t[0] for t in tracks}:
+                    used.append((lg, st, tt, len(per_lang.get(lg, []))))
             return dict(ok=True, method="audio per-line", perline=True,
-                        verified=len(anchors), total=n, count=len(corrected),
+                        verified=len(anchors), total=len(src_events), count=len(corrected),
                         conf=(float(np.median(confs)) if confs else 0.0),
                         off_lo=min(offs), off_hi=max(offs), guess=guess_desc,
-                        audio=audio_info, span=(src_events[0]["start"], src_events[-1]["end"]))
+                        used=used, spread=spread, span=(src_events[0]["start"], src_events[-1]["end"]))
         log_warn("    per-line audio match was weak - falling back to global alignment.")
 
     # fallback: VAD-based global affine (offset + speed)
+    tgt_vad = tgt_an0["vad"]
+    src_an0 = next((a[1] for a in analyses if a[1] and a[1].get("vad")), None)
     cands = []
-    if src_an and src_an.get("vad"):
-        src_vad = src_an["vad"]
-        sh = coarse_offset(tgt_vad, src_vad, max_shift=args.max_shift)
-        sc, off, nn = refine_affine(tgt_vad, src_vad, sh, tolerance=args.tolerance)
-        cands.append(("audio<->audio", sc, off, nn, len(src_vad)))
+    if src_an0 and src_an0.get("vad"):
+        sv = src_an0["vad"]
+        sh = coarse_offset(tgt_vad, sv, max_shift=args.max_shift)
+        sc, off, nn = refine_affine(tgt_vad, sv, sh, tolerance=args.tolerance)
+        cands.append(("audio<->audio", sc, off, nn, len(sv)))
     sh2 = coarse_offset(tgt_vad, src_events, max_shift=args.max_shift)
     sc2, off2, n2 = refine_affine(tgt_vad, src_events, sh2, tolerance=args.tolerance)
     cands.append(("subs<->audio", sc2, off2, n2, len(src_events)))
@@ -11363,15 +11481,9 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
     corrected = apply_transform(src_events, scale, offset)
     Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
     write_srt(corrected, Path(job["out"]))
-    agree = None
-    disagree = False
-    if aa and sa:
-        mid = (src_events[0]["start"] + src_events[-1]["end"]) / 2.0
-        agree = abs((aa[1] * mid + aa[2]) - (sa[1] * mid + sa[2]))
-        disagree = agree > 1.0
     return dict(ok=True, scale=scale, offset=offset, method=name, nmatched=nmatched,
-                count=len(corrected), agree=agree, disagree=disagree, audio=audio_info,
-                span=(src_events[0]["start"], src_events[-1]["end"]))
+                count=len(corrected), span=(src_events[0]["start"], src_events[-1]["end"]),
+                used=[(pairs[0][0], pairs[0][1], pairs[0][2], nmatched)])
 
 
 def run_retime_batch(args):
@@ -11412,6 +11524,32 @@ def run_retime_batch(args):
         log_warn("ffmpeg is required (to read audio for the analysis) and was not found.")
         return
 
+    # detect the common audio languages across all pairs, let the user choose which
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+    lang_count = {}
+    job_common = {}
+    for j in jobs:
+        cl = _retime_common_langs(ffprobe_bin, j)
+        job_common[id(j)] = cl
+        for lg in cl:
+            lang_count[lg] = lang_count.get(lg, 0) + 1
+    if lang_count:
+        log_info("Common audio languages found in source+target pairs: "
+                 + ", ".join(f"{_lang3_name(lg)} ({lg}) x{c}" for lg, c in sorted(lang_count.items(), key=lambda x: -x[1])))
+        if _tui_supported():
+            picked = _retime_pick_audio_langs(lang_count)
+            if picked is None:
+                log_info("Cancelled.")
+                return
+            selected = set(picked) or set(lang_count)
+        else:
+            selected = set(lang_count)   # non-TTY: use all
+        for j in jobs:
+            j["langs"] = {lg: tp for lg, tp in job_common[id(j)].items() if lg in selected}
+    else:
+        log_warn("No common audio language detected between source and target - will use "
+                 "the first audio track / subtitle timing as a fallback.")
+
     args.method = getattr(args, "method", None) or "auto"
     args.max_shift = getattr(args, "max_shift", None) or 240.0   # tolerate extra intro/recap at the start
     args.tolerance = getattr(args, "tolerance", None) or 1.5
@@ -11444,15 +11582,28 @@ def run_retime_batch(args):
             okc += 1
             au = r.get("audio") or {}
             atxt = ""
-            if au.get("src") or au.get("tgt"):
+            used = r.get("used")
+            if used:
+                parts = []
+                for tup in used:
+                    lg, st, tt = tup[0], tup[1], tup[2]
+                    cnt = tup[3] if len(tup) > 3 else None
+                    parts.append(f"{_lang3_name(lg)} [{_audio_desc(st)} <-> {_audio_desc(tt)}]"
+                                 + (f" ({cnt} hits)" if cnt is not None else ""))
+                atxt = "\n      audio tracks: " + "; ".join(parts)
+            elif au.get("src") or au.get("tgt"):
                 atxt = f"\n      audio: source [{_audio_desc(au.get('src'))}] <-> target [{_audio_desc(au.get('tgt'))}]"
             if r.get("perline"):
                 rng = (f"{r['off_lo']:+.1f}s" if abs(r['off_hi'] - r['off_lo']) < 0.2
                        else f"{r['off_lo']:+.1f}..{r['off_hi']:+.1f}s")
+                xcheck = ""
+                if r.get("spread") is not None:
+                    xcheck = (f" | {Fore.YELLOW}languages DISAGREE by {r['spread']:.2f}s{Style.RESET_ALL}"
+                              if r["spread"] > 1.0 else f" | languages agree within {r['spread']:.2f}s")
                 print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
                       f"method {Fore.CYAN}audio per-line{Style.RESET_ALL} ({r['guess']} guess) | "
                       f"verified {r['verified']}/{r['total']} timestamps by audio "
-                      f"(median match {r['conf']:.2f}) | offset {rng}{atxt}")
+                      f"(median match {r['conf']:.2f}) | offset {rng}{xcheck}{atxt}")
                 continue
             if r.get("piecewise"):
                 brk = ", ".join(f"{int(b[0]) // 60:02d}:{int(b[0]) % 60:02d} ({b[1]:+.1f}s)"
