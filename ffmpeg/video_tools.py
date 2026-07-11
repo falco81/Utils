@@ -12115,7 +12115,17 @@ def _video_decode_variants(ffmpeg_bin, fps, W, H):
     # all GPU-side-scaling attempts first (fast); libplacebo/Vulkan is the most reliable
     # GPU scaler, so try it before the finicky vendor scalers. Then GPU-decode+CPU-scale, CPU.
     gpu_scaled_variants.sort(key=lambda v: 0 if "libplacebo" in v[2] else 1)
-    return gpu_scaled_variants + cpu_scale_variants + [("CPU", [], cpu_vf)]
+    # BEST on AMD/Windows: decode on d3d11va (reliable) but map the frames to Vulkan and
+    # downscale with libplacebo (Vulkan decode itself is often broken for h264, while the
+    # Vulkan SCALER works). fps drops frames on the GPU first, so only 16x16 is downloaded.
+    avail = set(_hwaccel_available(ffmpeg_bin))
+    front = []
+    if "d3d11va" in avail and "vulkan" in avail and _HWACCEL_MODE.strip().lower() in ("auto", ""):
+        front.append(("d3d11va decode + Vulkan/libplacebo scale",
+                      ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"],
+                      f"fps={fps},hwmap=derive_device=vulkan,libplacebo=w={W}:h={H}:format=nv12,"
+                      f"hwdownload,format=nv12,format=gray"))
+    return front + gpu_scaled_variants + cpu_scale_variants + [("CPU", [], cpu_vf)]
 
 
 def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
