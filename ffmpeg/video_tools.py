@@ -2190,7 +2190,7 @@ def _run_ffmpeg_progress(cmd, prefix="", input_path=None, total_s=None, ffprobe_
     if total_s is None and input_path is not None:
         total_s = _media_duration(input_path, ffprobe_bin)
     cmd2 = [cmd[0], "-nostats", "-progress", "pipe:1"] + list(cmd[1:])
-    errf = tempfile.TemporaryFile(mode="w+")
+    errf = tempfile.TemporaryFile(mode="w+", dir=_temp_root())
     try:
         p = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=errf,
                              text=True, encoding="utf-8", errors="replace", bufsize=1)
@@ -2320,6 +2320,39 @@ _STORE_POINTER_NAME = "video_tools.configpath"
 def _script_dir():
     argv0 = sys.argv[0] if sys.argv and sys.argv[0] else None
     return os.path.dirname(os.path.abspath(argv0)) if argv0 else os.getcwd()
+
+
+_TEMP_ROOT = None
+
+
+def _temp_root():
+    """A '.temp' directory next to the script, used for all temporary files/dirs.
+    Falls back to the system temp dir if it can't be created. Cleaned up on exit."""
+    global _TEMP_ROOT
+    if _TEMP_ROOT is None:
+        d = os.path.join(_script_dir(), ".temp")
+        try:
+            os.makedirs(d, exist_ok=True)
+            _TEMP_ROOT = d
+        except Exception:
+            _TEMP_ROOT = tempfile.gettempdir()
+    return _TEMP_ROOT
+
+
+def _cleanup_temp_root():
+    """Remove our '.temp' dir at exit if it is empty (temp dirs/files self-clean, so
+    this just tidies the now-empty folder; only removes it when empty, so it's safe if
+    another instance is still using it)."""
+    global _TEMP_ROOT
+    if _TEMP_ROOT and os.path.basename(_TEMP_ROOT) == ".temp" and os.path.isdir(_TEMP_ROOT):
+        try:
+            os.rmdir(_TEMP_ROOT)   # succeeds only if empty
+        except OSError:
+            pass
+
+
+import atexit as _atexit
+_atexit.register(_cleanup_temp_root)
 
 
 def _is_unc(p):
@@ -5930,7 +5963,7 @@ def process_single(args):
     if not args.subtitle_to_fix.exists():
         die(f"The subtitle file to fix does not exist: {args.subtitle_to_fix}")
 
-    with tempfile.TemporaryDirectory() as tmpdir:
+    with tempfile.TemporaryDirectory(dir=_temp_root()) as tmpdir:
         ref_events_sub = []
         ref_events_audio = []
 
@@ -11447,7 +11480,7 @@ def _video_vad(args, ffmpeg_bin, video, cache, audio_index=0):
         return cache[key]
     ev = None
     try:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
             wav = Path(td) / "a.wav"
             extract_audio_wav(ffmpeg_bin, Path(video), audio_index, wav)
             samples, sr = read_wav_mono(wav)
@@ -11596,7 +11629,7 @@ def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0, progress_pref
         return cache[key]
     res = None
     try:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
             wav = Path(td) / "a.wav"
             extract_audio_wav(ffmpeg_bin, Path(video), audio_index, wav, progress_prefix=progress_prefix)
             samples, sr = read_wav_mono(wav)
@@ -11776,32 +11809,353 @@ def _retime_pick_audio_langs(lang_count):
             sys.stdout.flush()
 
 
-def _retime_perline(src_events, tracks, guess, ep_label):
-    """Per-timestamp audio verification across one or MORE audio tracks. For every
-    source subtitle time, each track votes with a normalized cross-correlation match;
-    the highest-confidence hit is taken (best-of-N), which fills gaps where one track
-    is silent. Returns (anchors[(src_t,tgt_t)], confs, per_lang_offsets)."""
+def _retime_perline(src_events, tracks, reffn, ep_label, band_s=10.0, pass_label="", min_conf=0.30):
+    """Per-timestamp audio verification. AUDIO tracks are primary (precise); the VIDEO
+    image is only consulted when audio is weak/absent (silence, music). Each timestamp
+    is located by normalized cross-correlation within band_s of reffn(t). Returns
+    (anchors, confs, per_lang_offsets)."""
+    audio_tracks = [t for t in tracks if t[0] != "video"]
+    video_tracks = [t for t in tracks if t[0] == "video"]
     anchors, confs = [], []
     per_lang = {t[0]: [] for t in tracks}
     n = len(src_events)
     multi = len(tracks) > 1
-    for i, e in enumerate(src_events):
-        best = None
-        for (lg, se, te, hz) in tracks:
-            r = _ncc_locate(se, te, hz, e["start"], guess(e["start"]), win_s=4.0, band_s=10.0)
+
+    def _vote(track_list, e, best):
+        for (lg, se, te, hz) in track_list:
+            r = _ncc_locate(se, te, hz, e["start"], reffn(e["start"]), win_s=4.0, band_s=band_s)
             if not r:
                 continue
-            if r[1] >= 0.30:
+            if r[1] >= min_conf:
                 per_lang[lg].append(r[0] - e["start"])
             if best is None or r[1] > best[0]:
                 best = (r[1], r[0], lg)
-        if best and best[0] >= 0.30:
+        return best
+
+    for i, e in enumerate(src_events):
+        best = _vote(audio_tracks, e, None)
+        if (best is None or best[0] < 0.45) and video_tracks:
+            best = _vote(video_tracks, e, best)
+        if best and best[0] >= min_conf:
             anchors.append((e["start"], best[1]))
             confs.append(best[0])
         if (i % 5 == 0) or (i + 1 == n):
-            _print_progress(i + 1, n, prefix=f"{ep_label} checking timestamps "
+            _print_progress(i + 1, n, prefix=f"{ep_label} checking timestamps{pass_label} "
                             f"({len(tracks)} track{'s' if multi else ''}) ")
     return anchors, confs, per_lang
+
+
+def _retime_reject_outliers(anchors, reffn, max_dev=3.5, local_tol=1.5):
+    """Drops per-line anchors that are almost certainly wrong (false correlation peaks):
+    far from the reference map/guess, or inconsistent with their local neighbourhood.
+    Keeps genuine small micro-lags. Prevents one bad anchor from cascading through the
+    monotonic map. Returns the kept anchors (sorted)."""
+    import numpy as np
+    if len(anchors) < 4:
+        return sorted(anchors)
+    anchors = sorted(anchors)
+    near = [(a, b) for (a, b) in anchors if abs(b - reffn(a)) <= max_dev]
+    if len(near) >= max(4, len(anchors) // 2):
+        anchors = near
+    offs = np.array([b - a for (a, b) in anchors])
+    keep = []
+    for i, (a, b) in enumerate(anchors):
+        lo, hi = max(0, i - 4), min(len(anchors), i + 5)
+        if abs((b - a) - np.median(offs[lo:hi])) <= local_tol:
+            keep.append((a, b))
+    return keep if len(keep) >= 4 else anchors
+
+
+def _fft_xcorr_valid(r, seg):
+    """Linear cross-correlation (mode='valid') of seg over r via FFT - fast enough to
+    scan a short window against a whole 60-min target envelope."""
+    import numpy as np
+    M, L = len(r), len(seg)
+    n = 1 << int(np.ceil(np.log2(M + L)))
+    conv = np.fft.irfft(np.fft.rfft(r, n) * np.fft.rfft(seg[::-1], n), n)
+    return conv[L - 1:L - 1 + (M - L + 1)]
+
+
+def _ncc_global(src_env, tgt_env, seg_lo, seg_hi):
+    """Normalized cross-correlation of a SOURCE window against the ENTIRE target
+    envelope (global search anywhere). Returns (tgt_start_index, confidence -1..1)."""
+    import numpy as np
+    seg = src_env[seg_lo:seg_hi].astype(np.float64)
+    seg = seg - seg.mean()
+    sn = float(np.linalg.norm(seg))
+    L = len(seg)
+    r = tgt_env.astype(np.float64)
+    M = len(r)
+    if sn < 1e-6 or M < L:
+        return None
+    corr = _fft_xcorr_valid(r, seg)
+    c1 = np.concatenate([[0.0], np.cumsum(r)])
+    c2 = np.concatenate([[0.0], np.cumsum(r * r)])
+    wsum = c1[L:] - c1[:-L]
+    wss = c2[L:] - c2[:-L]
+    wnorm = np.sqrt(np.maximum(wss - wsum * wsum / L, 1e-9))
+    ncc = corr / (wnorm * sn)
+    k = int(np.argmax(ncc))
+    return k, float(ncc[k])
+
+
+def _retime_global_anchors(src_env, tgt_env, hz, win_s=24.0, step_s=8.0, min_conf=0.55, progress=None):
+    """Anchors (src_t -> tgt_t, conf) found by locating each source window ANYWHERE in
+    the target. Robust to inserts (ad breaks) in the middle because every window is
+    matched independently across the whole target."""
+    w = int(win_s * hz)
+    step = max(1, int(step_s * hz))
+    anchors = []
+    if len(src_env) < w or len(tgt_env) < w:
+        return anchors
+    starts = list(range(0, len(src_env) - w, step))
+    for i, lo in enumerate(starts):
+        res = _ncc_global(src_env, tgt_env, lo, lo + w)
+        if res:
+            k, conf = res
+            if conf >= min_conf:
+                anchors.append(((lo + w / 2) / hz, (k + w / 2) / hz, conf))
+        if progress and ((i % 4 == 0) or i + 1 == len(starts)):
+            progress(i + 1, len(starts))
+    return anchors
+
+
+def _retime_global_guess(src_env, tgt_env, hz, args, ep_label=""):
+    """Builds a robust source->target time map from GLOBAL window matches, discovering
+    ad-break jumps automatically. Returns (map_fn, description) or (None, None)."""
+    def _pg(i, n):
+        _print_progress(i, n, prefix=f"{ep_label} scanning audio ")
+    anchors = _retime_global_anchors(src_env, tgt_env, hz, win_s=24.0, step_s=8.0,
+                                      min_conf=0.55, progress=_pg)
+    if len(anchors) < 4:
+        return None, None
+    clean, breaks = _retime_clean_and_breaks(anchors, jump_thresh=1.0, tol=2.5)
+    if len(clean) < 3:
+        return None, None
+    segs = _retime_segments(clean, breaks)
+    return _segs_map(segs), (f"global, {len(breaks) + 1} segment(s)" if breaks else "global uniform")
+
+
+_HWACCEL_MODE = "auto"          # from --hwaccel: auto | none | <method>
+_HWACCEL_RESOLVED = "__unset__"  # confirmed working method after a real decode (None = CPU)
+
+
+_GPU_VENDOR = "__unset__"
+_METHOD_VENDOR = {
+    "cuda": "NVIDIA", "nvdec": "NVIDIA", "vdpau": "NVIDIA/AMD",
+    "qsv": "Intel", "vaapi": "Intel/AMD", "d3d11va": "GPU", "dxva2": "GPU",
+    "videotoolbox": "Apple", "opencl": "GPU", "vulkan": "GPU",
+}
+
+
+def _gpu_vendor():
+    """Best-effort detection of the actual GPU maker (NVIDIA / AMD / Intel / Apple) from
+    the system, so acceleration can be shown as e.g. 'NVIDIA (cuda)'. Cached; returns a
+    vendor string or None. Never stalls (short timeout, silent on failure)."""
+    global _GPU_VENDOR
+    if _GPU_VENDOR != "__unset__":
+        return _GPU_VENDOR
+    blob = ""
+    try:
+        if sys.platform.startswith("win"):
+            try:
+                out = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"],
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+                blob = out.stdout or ""
+            except Exception:
+                blob = ""
+            if not blob.strip():
+                out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                      "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+                blob = out.stdout or ""
+        elif sys.platform == "darwin":
+            out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
+            blob = out.stdout or ""
+        else:
+            try:
+                out = subprocess.run(["lspci"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+                blob = "\n".join(l for l in (out.stdout or "").splitlines()
+                                 if any(t in l for t in ("VGA", "3D", "Display")))
+            except Exception:
+                blob = ""
+            if not blob:
+                for card in sorted(__import__("glob").glob("/sys/class/drm/card*/device/vendor")):
+                    try:
+                        blob += open(card).read()
+                    except Exception:
+                        pass
+                blob = blob.replace("0x10de", "nvidia").replace("0x1002", "amd").replace("0x8086", "intel")
+    except Exception:
+        blob = ""
+    b = blob.lower()
+    if "nvidia" in b or "10de" in b:
+        v = "NVIDIA"
+    elif "amd" in b or "radeon" in b or "advanced micro" in b or "1002" in b:
+        v = "AMD"
+    elif "intel" in b:
+        v = "Intel"
+    elif "apple" in b:
+        v = "Apple"
+    else:
+        v = None
+    _GPU_VENDOR = v
+    return v
+
+
+def _accel_label(method):
+    """Human label for an acceleration method, e.g. 'NVIDIA (cuda)', 'AMD (vaapi)', 'CPU'.
+    Uses the detected GPU vendor when known, else infers from the method name."""
+    if not method:
+        return "CPU"
+    vend = _gpu_vendor() or _METHOD_VENDOR.get(method, "GPU")
+    return f"{vend} ({method})"
+
+
+def _hwaccel_available(ffmpeg_bin):
+    """Raw list of hwaccel methods ffmpeg reports as compiled-in (may or may not work)."""
+    avail = []
+    try:
+        out = subprocess.run([ffmpeg_bin, "-hide_banner", "-hwaccels"],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        for ln in (out.stdout or "").splitlines():
+            ln = ln.strip()
+            if ln and "method" not in ln.lower():
+                avail.append(ln)
+    except Exception:
+        pass
+    return avail
+
+
+def _hwaccel_candidates(ffmpeg_bin):
+    """Ordered list of GPU decode methods to TRY in 'auto' mode, tailored to the DETECTED
+    GPU vendor so the best accelerator for THIS machine is tried first (and mismatched
+    ones - e.g. cuda on an AMD card - are skipped). Honours --hwaccel (none/explicit).
+    Covers NVIDIA (cuda/nvdec), Intel (qsv), AMD & generic on Windows (d3d11va/dxva2),
+    AMD/Intel on Linux (vaapi/vdpau), macOS (videotoolbox)."""
+    mode = (_HWACCEL_MODE or "auto").strip().lower()
+    if mode in ("none", "off", "cpu", "no", "0"):
+        return []
+    avail = set(_hwaccel_available(ffmpeg_bin))
+    if mode not in ("auto", ""):
+        return [mode]                     # explicit choice; CPU fallback still applies
+    vendor = _gpu_vendor()
+    by_vendor = {
+        # generic DirectX (d3d11va/dxva2) works for any GPU on Windows; vulkan+libplacebo
+        # gives GPU-side scaling on modern cards
+        "NVIDIA": ["cuda", "nvdec", "d3d11va", "vulkan", "dxva2", "vdpau"],
+        "AMD":    ["d3d11va", "vulkan", "dxva2", "vaapi", "vdpau"],
+        "Intel":  ["qsv", "d3d11va", "vulkan", "dxva2", "vaapi"],
+        "Apple":  ["videotoolbox"],
+    }
+    # unknown vendor -> try the broad generic order
+    pref = by_vendor.get(vendor, ["cuda", "nvdec", "qsv", "d3d11va", "vulkan", "dxva2", "vaapi", "vdpau", "videotoolbox"])
+    cands = [m for m in pref if m in avail]
+    if not cands and vendor:
+        # vendor known but its preferred methods aren't compiled in -> fall back to any GPU method
+        cands = [m for m in ["d3d11va", "dxva2", "vaapi", "cuda", "nvdec", "qsv", "vdpau", "videotoolbox"] if m in avail]
+    return cands
+
+
+def _hwaccel_for_decode(ffmpeg_bin):
+    """For display only: the method that WILL be tried first (or the confirmed one),
+    or None for CPU. Does not commit - the real choice happens during decoding."""
+    if _HWACCEL_RESOLVED != "__unset__":
+        return _HWACCEL_RESOLVED
+    cands = _hwaccel_candidates(ffmpeg_bin)
+    return cands[0] if cands else None
+
+
+_VIDEO_DECODE_VARIANT = "__unset__"   # cached working (label, pre_args, vf)
+
+
+def _video_decode_variants(ffmpeg_bin, fps, W, H):
+    """Ordered ffmpeg decode variants to try for the visual signal. GPU decode + GPU
+    downscale FIRST (only tiny 16x16 frames cross PCIe -> the GPU decoder runs at full
+    speed instead of stalling on full-res copy-back), then GPU decode + CPU scale, then
+    CPU. Vendor-aware order from _hwaccel_candidates. Returns (label, pre_args, vf)."""
+    cpu_vf = f"fps={fps},scale={W}x{H},format=gray"
+    gpu_scaled = {
+        "cuda":    (["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
+                    f"fps={fps},scale_cuda={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"),
+        "vaapi":   (["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"],
+                    f"fps={fps},scale_vaapi={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"),
+        "qsv":     (["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"],
+                    f"fps={fps},vpp_qsv=w={W}:h={H},hwdownload,format=nv12,format=gray"),
+        "d3d11va": (["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"],
+                    f"fps={fps},scale_d3d11={W}:{H},hwdownload,format=nv12,format=gray"),
+        "vulkan":  (["-init_hw_device", "vulkan", "-hwaccel", "vulkan", "-hwaccel_output_format", "vulkan"],
+                    f"fps={fps},libplacebo=w={W}:h={H},hwdownload,format=gray"),
+    }
+    gpu_scaled_variants = []
+    cpu_scale_variants = []
+    for hw in _hwaccel_candidates(ffmpeg_bin):
+        if hw in gpu_scaled:
+            pre, vf = gpu_scaled[hw]
+            gpu_scaled_variants.append((f"{_accel_label(hw)} GPU-scaled", pre, vf))
+        if hw != "vulkan":   # vulkan frames need libplacebo/hwdownload -> only the GPU-scaled form
+            cpu_scale_variants.append((_accel_label(hw), ["-hwaccel", hw], cpu_vf))
+    # all GPU-side-scaling attempts first (fast), then GPU-decode+CPU-scale, then CPU
+    return gpu_scaled_variants + cpu_scale_variants + [("CPU", [], cpu_vf)]
+
+
+def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
+    """Optional VIDEO modality: decodes the picture at a low fps as tiny grayscale
+    frames and builds a 1D visual signal (brightness + frame-to-frame motion), z-score
+    normalized. Same shape as an audio envelope, so it plugs into the same alignment.
+    Prefers GPU decode + GPU downscale (fast; minimal PCIe copy-back), falling back
+    through GPU+CPU-scale to CPU. Cached per video; returns (signal, hz) or None."""
+    import numpy as np
+    global _VIDEO_DECODE_VARIANT, _HWACCEL_RESOLVED
+    key = (video, "__visual__")
+    if key in cache:
+        return cache[key]
+    W = H = 16
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+    sig = None
+    try:
+        with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
+            raw_path = os.path.join(td, "frames.gray")
+            if _VIDEO_DECODE_VARIANT != "__unset__":
+                variants = [_VIDEO_DECODE_VARIANT]
+            else:
+                variants = _video_decode_variants(ffmpeg_bin, fps, W, H)
+            for (label, pre, vf) in variants:
+                cmd = [ffmpeg_bin, "-hide_banner", *pre, "-i", str(video),
+                       "-vf", vf, "-f", "rawvideo", raw_path]
+                res = _run_ffmpeg_progress(cmd, prefix=(progress_prefix or "") + f"[{label}] ",
+                                           input_path=str(video), ffprobe_bin=ffprobe_bin)
+                ok = (res.returncode == 0 and os.path.exists(raw_path)
+                      and os.path.getsize(raw_path) >= W * H * 4)
+                if ok:
+                    if _VIDEO_DECODE_VARIANT == "__unset__":
+                        _VIDEO_DECODE_VARIANT = (label, pre, vf)
+                        _HWACCEL_RESOLVED = pre[1] if pre else None
+                        log_info(f"    video decode: {label}.")
+                    break
+                if pre:
+                    log_warn(f"    video decode via {label} not available - trying the next backend...")
+                try:
+                    os.path.exists(raw_path) and os.remove(raw_path)
+                except OSError:
+                    pass
+            else:
+                raw_path = None
+            if raw_path and os.path.exists(raw_path):
+                raw = np.fromfile(raw_path, dtype=np.uint8)
+                nfr = len(raw) // (W * H)
+                if nfr >= 4:
+                    frames = raw[:nfr * W * H].reshape(nfr, W * H).astype(np.float64)
+                    lum = frames.mean(axis=1)
+                    motion = np.concatenate([[0.0], np.abs(np.diff(frames, axis=0)).mean(axis=1)])
+                    s = lum + 4.0 * motion
+                    s = ((s - s.mean()) / (s.std() or 1.0)).astype(np.float32)
+                    sig = (s, float(fps))
+    except Exception:
+        sig = None
+    cache[key] = sig
+    return sig
 
 
 def _retime_one(args, ffmpeg_bin, job, vad_cache):
@@ -11840,36 +12194,80 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
     if not tgt_an0:
         return dict(ok=False, msg="could not analyse the target audio")
 
-    # coarse guess (aim only) from the first pair that has source speech
+    # signal tracks for alignment: audio envelopes (+ optional VIDEO image signal).
+    # Each is (label, src_signal, tgt_signal, hz) and goes through the same pipeline.
+    tracks = [(lg, sa_an["env"], ta_an["env"], ta_an["hz"])
+              for (lg, sa_an, ta_an, st, tt) in analyses
+              if sa_an and ta_an and sa_an.get("env") is not None and ta_an.get("env") is not None
+              and len(sa_an["env"]) and len(ta_an["env"])]
+    if getattr(args, "retime_use_video", False) and job["source_video"]:
+        vs = _video_visual_signal(ffmpeg_bin, job["source_video"], vad_cache,
+                                  progress_prefix=f"{_fmt_ep(job['ep'])} reading source video ")
+        vt = _video_visual_signal(ffmpeg_bin, job["target"], vad_cache,
+                                  progress_prefix=f"{_fmt_ep(job['ep'])} reading target video ")
+        if vs and vt and len(vs[0]) and len(vt[0]):
+            tracks.append(("video", vs[0], vt[0], vs[1]))
+
+    # coarse guess (aim only). PRIMARY: global window matching on the first signal
+    # (audio preferred; locates every source window anywhere in the target -> robust to
+    # ad breaks in the middle). FALLBACK: windowed VAD offsets, then a subs-vs-speech affine.
     guess, guess_desc = None, ""
-    for (lg, sa_an, ta_an, st, tt) in analyses:
-        if sa_an and sa_an.get("vad") and ta_an and ta_an.get("vad"):
-            an = _retime_local_offsets(sa_an["vad"], ta_an["vad"], 60.0, 25.0, args.max_shift)
-            clean, breaks = _retime_clean_and_breaks(an)
-            if len(clean) >= 4 and breaks:
-                guess = _segs_map(_retime_segments(clean, breaks))
-                guess_desc = f"{len(breaks) + 1} segments"
-            else:
-                sh = coarse_offset(ta_an["vad"], sa_an["vad"], max_shift=args.max_shift)
-                sc, off, _n = refine_affine(ta_an["vad"], sa_an["vad"], sh, tolerance=args.tolerance)
-                guess = (lambda t, sc=sc, off=off: sc * t + off)
-                guess_desc = "uniform"
+    for (lg, se, te, hz) in tracks:
+        g, gd = _retime_global_guess(se, te, hz, args, _fmt_ep(job["ep"]))
+        if g is not None:
+            guess, guess_desc = g, (gd + (" [video]" if lg == "video" else ""))
             break
+    if guess is None:
+        for (lg, sa_an, ta_an, st, tt) in analyses:
+            if sa_an and sa_an.get("vad") and ta_an and ta_an.get("vad"):
+                an = _retime_local_offsets(sa_an["vad"], ta_an["vad"], 60.0, 25.0, args.max_shift)
+                clean, breaks = _retime_clean_and_breaks(an)
+                if len(clean) >= 4 and breaks:
+                    guess = _segs_map(_retime_segments(clean, breaks))
+                    guess_desc = f"{len(breaks) + 1} segments"
+                else:
+                    sh = coarse_offset(ta_an["vad"], sa_an["vad"], max_shift=args.max_shift)
+                    sc, off, _n = refine_affine(ta_an["vad"], sa_an["vad"], sh, tolerance=args.tolerance)
+                    guess = (lambda t, sc=sc, off=off: sc * t + off)
+                    guess_desc = "uniform"
+                break
     if guess is None:
         sh = coarse_offset(tgt_an0["vad"], src_events, max_shift=args.max_shift)
         sc, off, _n = refine_affine(tgt_an0["vad"], src_events, sh, tolerance=args.tolerance)
         guess = (lambda t, sc=sc, off=off: sc * t + off)
         guess_desc = "uniform (subs)"
 
-    # per-line multi-track verification
-    tracks = [(lg, sa_an["env"], ta_an["env"], ta_an["hz"])
-              for (lg, sa_an, ta_an, st, tt) in analyses
-              if sa_an and ta_an and sa_an.get("env") is not None and ta_an.get("env") is not None
-              and len(sa_an["env"]) and len(ta_an["env"])]
+    # per-line multi-track verification (audio + video, best-of-N per timestamp).
+    # PASS 1 (wide) -> reject false matches -> map -> PASS 2 (tight) -> reject -> map ->
+    # optional PASS 3 (very tight) if coverage is still low. Two/three passes + outlier
+    # rejection make it robust to lags, micro-lags and jitter (a false match can't cascade).
     if tracks:
-        anchors, confs, per_lang = _retime_perline(src_events, tracks, guess, _fmt_ep(job["ep"]))
-        if len(anchors) >= max(3, len(src_events) // 8):
-            mapf = _retime_map_from_anchors(anchors, guess)
+        ep = _fmt_ep(job["ep"])
+        ntot = len(src_events)
+        anchors, confs, per_lang = _retime_perline(src_events, tracks, guess, ep, band_s=10.0,
+                                                   pass_label=" [1/2]", min_conf=0.30)
+        anchors = _retime_reject_outliers(anchors, guess, max_dev=3.5, local_tol=1.5)
+        if len(anchors) >= max(3, ntot // 8):
+            passes = 1
+            map1 = _retime_map_from_anchors(anchors, guess)
+            a2, c2, pl2 = _retime_perline(src_events, tracks, map1, ep, band_s=4.0,
+                                          pass_label=" [2/2]", min_conf=0.25)
+            a2 = _retime_reject_outliers(a2, map1, max_dev=2.0, local_tol=1.0)
+            if len(a2) >= max(3, ntot // 8):
+                anchors, confs, per_lang = a2, c2, pl2
+                mapf = _retime_map_from_anchors(a2, map1)
+                passes = 2
+            else:
+                mapf = map1
+            # adaptive extra pass when coverage is still below ~94% - squeeze out more
+            if len(anchors) < int(0.94 * ntot):
+                a3, c3, pl3 = _retime_perline(src_events, tracks, mapf, ep, band_s=2.5,
+                                              pass_label=" [3/3]", min_conf=0.22)
+                a3 = _retime_reject_outliers(a3, mapf, max_dev=1.2, local_tol=0.8)
+                if len(a3) >= len(anchors):
+                    anchors, confs, per_lang = a3, c3, pl3
+                    mapf = _retime_map_from_anchors(a3, mapf)
+                    passes = 3
             corrected = _retime_apply_mapfn(src_events, mapf)
             Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
             write_srt(corrected, Path(job["out"]))
@@ -11880,8 +12278,10 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
             for (lg, sa_an, ta_an, st, tt) in analyses:
                 if lg in {t[0] for t in tracks}:
                     used.append((lg, st, tt, len(per_lang.get(lg, []))))
-            return dict(ok=True, method="audio per-line", perline=True,
-                        verified=len(anchors), total=len(src_events), count=len(corrected),
+            if any(t[0] == "video" for t in tracks):
+                used.append(("video", None, None, len(per_lang.get("video", []))))
+            return dict(ok=True, method="audio per-line", perline=True, passes=passes,
+                        verified=len(anchors), total=ntot, count=len(corrected),
                         conf=(float(np.median(confs)) if confs else 0.0),
                         off_lo=min(offs), off_hi=max(offs), guess=guess_desc,
                         used=used, spread=spread, span=(src_events[0]["start"], src_events[-1]["end"]))
@@ -11914,6 +12314,129 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
                 used=[(pairs[0][0], pairs[0][1], pairs[0][2], nmatched)])
 
 
+def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
+    """Checkbox UI over the auto-detected pairs, shown as readable multi-line blocks.
+    Header shows the video-analysis toggle and the detected GPU acceleration with a key
+    to change it. Space toggles a pair, 'a' all/none, 'v' toggles video analysis, 'g'
+    changes GPU acceleration, Enter runs, Esc cancels. Returns (selected_jobs, use_video)
+    or None on cancel. All pairs start checked."""
+    global _HWACCEL_MODE, _HWACCEL_RESOLVED
+    sel = [True] * len(jobs)
+    pos = 0
+    top = 0
+    hw_cycle = ["auto", "none"] + _hwaccel_available(ffmpeg_bin)
+
+    def _hw_text():
+        mode = _HWACCEL_MODE or "auto"
+        if mode.lower() in ("none", "off", "cpu", "no", "0"):
+            return "CPU (off)"
+        cands = _hwaccel_candidates(ffmpeg_bin)
+        if not cands:
+            return "CPU (no GPU detected)"
+        if _HWACCEL_RESOLVED not in ("__unset__", None):
+            return _accel_label(_HWACCEL_RESOLVED)
+        if mode == "auto":
+            return "auto: " + _accel_label(cands[0]) + (f" +{len(cands) - 1} fallback" if len(cands) > 1 else "")
+        return _accel_label(mode)
+
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                cols, rows = _fb_termsize()
+                nsel = sum(sel)
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Re-time: detected video+subtitle pairs ==={Style.RESET_ALL}",
+                    f"{Style.DIM}Auto-detected source subtitle + its video -> target video (by SxxExx). "
+                    f"All checked by default.{Style.RESET_ALL}",
+                    f"{Fore.CYAN}{nsel}/{len(jobs)} selected{Style.RESET_ALL}    "
+                    f"video analysis: {Fore.GREEN if use_video else Style.DIM}{'ON' if use_video else 'OFF'}"
+                    f"{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}    "
+                    f"GPU accel: {Fore.GREEN}{_hw_text()}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}",
+                    "",
+                ]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | v = video | "
+                            f"g = GPU accel | Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                avail = max(4, rows - len(head) - len(foot))
+                per = max(1, avail // 4)   # each pair is a 4-line block
+                pos = max(0, min(pos, len(jobs) - 1))
+                if pos < top:
+                    top = pos
+                elif pos >= top + per:
+                    top = pos - per + 1
+                top = max(0, top)
+                body = []
+                shown = list(range(top, min(top + per, len(jobs))))
+                for i in shown:
+                    j = jobs[i]
+                    box = "[x]" if sel[i] else "[ ]"
+                    ep = _fmt_ep(j["ep"])
+                    ex = f"  {Fore.YELLOW}[output exists]{Style.RESET_ALL}" if j["exists"] else ""
+                    srcv = Path(j["source_video"]).name if j["source_video"] else "(subtitle only)"
+                    l1 = f"{box} {ep}{ex}"
+                    l2 = "      sub:    " + _fb_trunc(Path(j["source_srt"]).name, cols - 16)
+                    l3 = "      video:  " + _fb_trunc(srcv, cols - 16)
+                    l4 = "      target: " + _fb_trunc(Path(j["target"]).name, cols - 16)
+                    cur = (i == pos)
+                    if cur:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {l1}{Style.RESET_ALL}")
+                        for ln in (l2, l3, l4):
+                            body.append(f"{Fore.GREEN}{ln}{Style.RESET_ALL}")
+                    else:
+                        col = "" if sel[i] else Style.DIM
+                        body.append(f"  {col}{l1}{Style.RESET_ALL}")
+                        for ln in (l2, l3, l4):
+                            body.append(f"{Style.DIM}{ln}{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                # right-edge scrollbar when the list doesn't fit on one screen
+                if len(jobs) > per and body:
+                    nrows = len(body)
+                    thumb = max(1, int(round(nrows * per / len(jobs))))
+                    tstart = int(round(nrows * top / len(jobs)))
+                    tstart = max(0, min(tstart, nrows - thumb))
+                    base = len(head)
+                    parts = ["\x1b[?7l"]
+                    for r in range(nrows):
+                        g = "\u2588" if tstart <= r < tstart + thumb else "\u2502"
+                        parts.append(f"\x1b[{base + r + 1};{cols}H{Style.DIM}{g}{Style.RESET_ALL}")
+                    parts.append("\x1b[?7h")
+                    sys.stdout.write("".join(parts))
+                    sys.stdout.flush()
+                k = _read_key()
+                if k == "esc":
+                    return None
+                elif k == "enter":
+                    return ([j for j, s in zip(jobs, sel) if s], use_video)
+                elif k == ("char", " "):
+                    sel[pos] = not sel[pos]
+                elif k == ("char", "a"):
+                    allon = all(sel)
+                    sel = [not allon] * len(jobs)
+                elif k == ("char", "v"):
+                    use_video = not use_video
+                elif k == ("char", "g"):
+                    cur = _HWACCEL_MODE if _HWACCEL_MODE in hw_cycle else "auto"
+                    _HWACCEL_MODE = hw_cycle[(hw_cycle.index(cur) + 1) % len(hw_cycle)]
+                    _HWACCEL_RESOLVED = "__unset__"   # re-detect with the new choice
+                    globals()["_VIDEO_DECODE_VARIANT"] = "__unset__"
+                elif k == "up":
+                    pos = (pos - 1) % len(jobs)
+                elif k == "down":
+                    pos = (pos + 1) % len(jobs)
+                elif k == "pgup":
+                    pos = max(0, pos - per)
+                elif k == "pgdn":
+                    pos = min(len(jobs) - 1, pos + per)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(jobs) - 1
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
 def run_retime_batch(args):
     """Scans a folder, auto-detects source(video+srt)/target(video) pairs of the
     same episode and re-times each subtitle file to its target video by analysing
@@ -11932,25 +12455,37 @@ def run_retime_batch(args):
         log_info("Expected: one video with a matching .srt, plus another video of the SAME episode (SxxExx).")
         return
 
-    log_info(f"Detected {len(jobs)} subtitle(s) to re-time:")
-    for j in jobs:
-        print(f"  {Fore.CYAN}{_fmt_ep(j['ep'])}{Style.RESET_ALL}  {Path(j['source_srt']).name}")
-        print(f"      source video: "
-              + (Path(j['source_video']).name if j['source_video'] else f"{Style.DIM}(none - will use the srt itself){Style.RESET_ALL}"))
-        print(f"      -> target:    {Path(j['target']).name}")
-        print(f"      => {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}"
-              + (f"   {Fore.YELLOW}[exists]{Style.RESET_ALL}" if j['exists'] else ""))
+    log_info(f"Detected {len(jobs)} video+subtitle pair(s).")
+
+    ffmpeg_bin = ensure_ffmpeg(directory, allow_download=not getattr(args, "no_ffmpeg_download", False))
+    if not ffmpeg_bin:
+        log_warn("ffmpeg is required (to read audio for the analysis) and was not found.")
+        return
+
+    if _tui_supported() and not noask:
+        # first thing: show the detected pairs in a checkbox UI (all checked by default),
+        # with the GPU acceleration and video-analysis controls right there.
+        res = _retime_pick_jobs(jobs, ffmpeg_bin, bool(getattr(args, "retime_use_video", False)))
+        if res is None:
+            raise WizardBack()      # Esc -> straight back to the menu (no pause)
+        jobs, args.retime_use_video = res
+        if not jobs:
+            raise WizardBack()      # nothing selected -> back to the menu
+        log_info(f"Selected {len(jobs)} pair(s) to process.")
+    else:
+        for j in jobs:
+            print(f"  {Fore.CYAN}{_fmt_ep(j['ep'])}{Style.RESET_ALL}  {Path(j['source_srt']).name}")
+            print(f"      source video: "
+                  + (Path(j['source_video']).name if j['source_video'] else f"{Style.DIM}(none - will use the srt itself){Style.RESET_ALL}"))
+            print(f"      -> target:    {Path(j['target']).name}")
+            print(f"      => {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}"
+                  + (f"   {Fore.YELLOW}[exists]{Style.RESET_ALL}" if j['exists'] else ""))
 
     if any(j["exists"] for j in jobs):
         if not noask and not ask_yes_no("Some outputs already exist - overwrite them?", default_no=True):
             jobs = [j for j in jobs if not j["exists"]]
     if not jobs:
         log_info("Nothing to do.")
-        return
-
-    ffmpeg_bin = ensure_ffmpeg(directory, allow_download=not getattr(args, "no_ffmpeg_download", False))
-    if not ffmpeg_bin:
-        log_warn("ffmpeg is required (to read audio for the analysis) and was not found.")
         return
 
     # detect the common audio languages across all pairs, let the user choose which
@@ -11971,8 +12506,7 @@ def run_retime_batch(args):
         elif _tui_supported():
             picked = _retime_pick_audio_langs(lang_count)
             if picked is None:
-                log_info("Cancelled.")
-                return
+                raise WizardBack()
             selected = set(picked) or set(lang_count)
         else:
             selected = set(lang_count)   # non-TTY: use all
@@ -11987,10 +12521,15 @@ def run_retime_batch(args):
     args.tolerance = getattr(args, "tolerance", None) or 1.5
     args.vad_percentile = getattr(args, "vad_percentile", None) or 55.0
 
+    if getattr(args, "retime_use_video", False):
+        _cands = _hwaccel_candidates(ffmpeg_bin)
+        _hwtxt = ("auto: " + _accel_label(_cands[0]) + " (+CPU fallback)") if _cands else "CPU"
+        log_info(f"Video image analysis is ON (frames compared in addition to audio). "
+                 f"Video decode: {_hwtxt}.")
+
     if not noask and not ask_yes_no(f"Re-time {len(jobs)} subtitle file(s) now? (reads audio from each video - can take a while)",
                                     default_no=False):
-        log_info("Cancelled.")
-        return
+        raise WizardBack()
 
     vad_cache = {}
     results = []
@@ -12020,22 +12559,42 @@ def run_retime_batch(args):
                 for tup in used:
                     lg, st, tt = tup[0], tup[1], tup[2]
                     cnt = tup[3] if len(tup) > 3 else None
-                    parts.append(f"{_lang3_name(lg)} [{_audio_desc(st)} <-> {_audio_desc(tt)}]"
-                                 + (f" ({cnt} hits)" if cnt is not None else ""))
-                atxt = "\n      audio tracks: " + "; ".join(parts)
+                    if lg == "video":
+                        parts.append(f"video image" + (f" ({cnt} hits)" if cnt is not None else ""))
+                    else:
+                        parts.append(f"{_lang3_name(lg)} [{_audio_desc(st)} <-> {_audio_desc(tt)}]"
+                                     + (f" ({cnt} hits)" if cnt is not None else ""))
+                atxt = "\n      tracks used: " + "; ".join(parts)
             elif au.get("src") or au.get("tgt"):
                 atxt = f"\n      audio: source [{_audio_desc(au.get('src'))}] <-> target [{_audio_desc(au.get('tgt'))}]"
             if r.get("perline"):
                 rng = (f"{r['off_lo']:+.1f}s" if abs(r['off_hi'] - r['off_lo']) < 0.2
                        else f"{r['off_lo']:+.1f}..{r['off_hi']:+.1f}s")
+                pct = (100.0 * r['verified'] / r['total']) if r['total'] else 0.0
+                pcol = Fore.GREEN if pct >= 97 else (Fore.YELLOW if pct >= 90 else Fore.RED)
                 xcheck = ""
                 if r.get("spread") is not None:
-                    xcheck = (f" | {Fore.YELLOW}languages DISAGREE by {r['spread']:.2f}s{Style.RESET_ALL}"
-                              if r["spread"] > 1.0 else f" | languages agree within {r['spread']:.2f}s")
-                print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
-                      f"method {Fore.CYAN}audio per-line{Style.RESET_ALL} ({r['guess']} guess) | "
-                      f"verified {r['verified']}/{r['total']} timestamps by audio "
-                      f"(median match {r['conf']:.2f}) | offset {rng}{xcheck}{atxt}")
+                    xcheck = (f"   {Fore.YELLOW}languages DISAGREE by {r['spread']:.2f}s (check this){Style.RESET_ALL}"
+                              if r["spread"] > 1.0 else f"   languages agree within {r['spread']:.2f}s")
+                trk = ""
+                if used:
+                    tp = []
+                    for tup in used:
+                        lg, st, tt = tup[0], tup[1], tup[2]
+                        cnt = tup[3] if len(tup) > 3 else 0
+                        if lg == "video":
+                            tp.append(f"{Fore.MAGENTA}video image{Style.RESET_ALL} ({cnt} hits)")
+                        else:
+                            tp.append(f"{_lang3_name(lg)} [{_audio_desc(st)}<->{_audio_desc(tt)}] ({cnt} hits)")
+                    trk = "; ".join(tp)
+                print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
+                      f"{Style.DIM}({r['count']} lines){Style.RESET_ALL}")
+                print(f"      method:   audio per-line, {r.get('passes', 1)} pass(es); guess: {r['guess']}")
+                print(f"      verified: {pcol}{r['verified']}/{r['total']} timestamps ({pct:.1f}%){Style.RESET_ALL} "
+                      f"by audio/video (median match {r['conf']:.2f})")
+                if trk:
+                    print(f"      tracks:   {trk}")
+                print(f"      offset:   {rng}{xcheck}")
                 continue
             if r.get("piecewise"):
                 brk = ", ".join(f"{int(b[0]) // 60:02d}:{int(b[0]) % 60:02d} ({b[1]:+.1f}s)"
@@ -13011,6 +13570,13 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--retime-subs", dest="retime_subs", action="store_true",
                         help="Interactive mode: re-time subtitles to a different video source (auto-detect "
                              "source/target by episode, analyse both videos' audio). Writes <target>.<lang>.srt.")
+    parser.add_argument("--retime-video", dest="retime_use_video", action="store_true",
+                        help="(with re-timing) ALSO analyse the video image (compare source/target frames) as an "
+                             "extra alignment modality - helps when the audio is unreliable (silence, music). Slower.")
+    parser.add_argument("--hwaccel", dest="hwaccel", default=None,
+                        help="GPU acceleration for video decoding during frame analysis: 'auto' (default, "
+                             "auto-detect NVIDIA cuda / Intel qsv / Windows d3d11va / Linux vaapi / macOS "
+                             "videotoolbox), 'none' to force CPU, or a specific method name. Falls back to CPU if it fails.")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -13067,6 +13633,9 @@ DIFFERENT LANGUAGES (target vs reference):
     global _STORE_PATH, _STORE_URL, _FFMPEG_URL_OVERRIDE
     _STORE_PATH = _normalize_store_path(getattr(args, "config_file", None) or getattr(args, "preset_file", None))
     _STORE_URL = (getattr(args, "config_url", None) or "").strip() or None
+    global _HWACCEL_MODE
+    if getattr(args, "hwaccel", None):
+        _HWACCEL_MODE = args.hwaccel
     if getattr(args, "ffmpeg_url", None):
         _FFMPEG_URL_OVERRIDE = args.ffmpeg_url
     migrate_legacy_store()
