@@ -207,8 +207,8 @@ MKV_PROGRAM_FILES_DIRS = [
 # ORDER; the first working one is used. Feel free to edit/add more. Can be
 # overridden at runtime via --ffmpeg-url (that one is then tried first).
 FFMPEG_DOWNLOAD_URLS = [
-    "http://nas.falco81.net/ffmpeg-release-essentials.zip",              # default (local NAS)
-    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",  # fallback
+    "http://nas.falco81.net/ffmpeg-full_build.7z",                 # default (local NAS, full build)
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z",   # fallback (gyan full build)
 ]
 FFMPEG_DOWNLOAD_URL = FFMPEG_DOWNLOAD_URLS[0]   # backwards compatibility
 
@@ -492,11 +492,16 @@ def _extract_archive(path, dest, url):
     if lower.endswith(".zip") or zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
             z.extractall(dest)
+    elif lower.endswith(".7z"):
+        # e.g. the gyan "full" ffmpeg build is distributed only as .7z
+        if not _extract_7z(path, dest):
+            raise ValueError("This is a .7z archive - install the 'py7zr' Python package "
+                             "or a 7z/7za binary (in PATH), or use a .zip build instead.")
     elif tarfile.is_tarfile(path):
         with tarfile.open(path) as t:
             t.extractall(dest)
     else:
-        raise ValueError("Unknown archive format (expected .zip/.tar.*).")
+        raise ValueError("Unknown archive format (expected .zip/.7z/.tar.*).")
 
 
 def _extract_7z(path, dest):
@@ -554,7 +559,7 @@ def _download_ffmpeg(urls):
         try:
             log_info(f"ffmpeg not found; downloading from {url}" + (f" (source {i}/{len(urls)})" if len(urls) > 1 else ""))
             _download_to_file(url, tmp, "ffmpeg")
-            log_info("Rozbaluji ffmpeg ...")
+            log_info("Unpacking ffmpeg ...")
             _extract_archive(tmp, cache, url)
             try:
                 os.remove(tmp)
@@ -642,7 +647,7 @@ def _download_mkvtoolnix(url):
     log_info(f"mkvtoolnix not found; downloading the portable version from {url}")
     tmp = os.path.join(cache, "mkvtoolnix_download.tmp")
     _download_to_file(url, tmp, "mkvtoolnix")
-    log_info("Rozbaluji mkvtoolnix (.7z) ...")
+    log_info("Unpacking mkvtoolnix (.7z) ...")
     ok = _extract_7z(tmp, cache)
     try:
         os.remove(tmp)
@@ -11833,9 +11838,17 @@ def _retime_perline(src_events, tracks, reffn, ep_label, band_s=10.0, pass_label
         return best
 
     for i, e in enumerate(src_events):
-        best = _vote(audio_tracks, e, None)
-        if (best is None or best[0] < 0.45) and video_tracks:
-            best = _vote(video_tracks, e, best)
+        # AUDIO is primary (finer time resolution)
+        best_a = _vote(audio_tracks, e, None)
+        # VIDEO is ALWAYS checked (cross-validation + fills weak audio moments)
+        best_v = _vote(video_tracks, e, None) if video_tracks else None
+        # keep the precise audio anchor when audio is confident; otherwise take video
+        if best_a and best_a[0] >= 0.45:
+            best = best_a
+        elif best_v and (best_a is None or best_v[0] > best_a[0]):
+            best = best_v
+        else:
+            best = best_a or best_v
         if best and best[0] >= min_conf:
             anchors.append((e["start"], best[1]))
             confs.append(best[0])
@@ -12078,25 +12091,30 @@ def _video_decode_variants(ffmpeg_bin, fps, W, H):
     cpu_vf = f"fps={fps},scale={W}x{H},format=gray"
     gpu_scaled = {
         "cuda":    (["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
-                    f"fps={fps},scale_cuda={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"),
+                    [f"fps={fps},scale_cuda={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"]),
         "vaapi":   (["-hwaccel", "vaapi", "-hwaccel_output_format", "vaapi"],
-                    f"fps={fps},scale_vaapi={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"),
+                    [f"fps={fps},scale_vaapi={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"]),
         "qsv":     (["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"],
-                    f"fps={fps},vpp_qsv=w={W}:h={H},hwdownload,format=nv12,format=gray"),
+                    [f"fps={fps},vpp_qsv=w={W}:h={H},hwdownload,format=nv12,format=gray"]),
         "d3d11va": (["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"],
-                    f"fps={fps},scale_d3d11={W}:{H},hwdownload,format=nv12,format=gray"),
+                    [f"fps={fps},scale_d3d11=w={W}:h={H}:format=nv12,hwdownload,format=gray",
+                     f"fps={fps},scale_d3d11={W}:{H},hwdownload,format=nv12,format=gray"]),
         "vulkan":  (["-init_hw_device", "vulkan", "-hwaccel", "vulkan", "-hwaccel_output_format", "vulkan"],
-                    f"fps={fps},libplacebo=w={W}:h={H},hwdownload,format=gray"),
+                    [f"fps={fps},libplacebo=w={W}:h={H}:format=nv12,hwdownload,format=nv12,format=gray"]),
     }
     gpu_scaled_variants = []
     cpu_scale_variants = []
     for hw in _hwaccel_candidates(ffmpeg_bin):
         if hw in gpu_scaled:
-            pre, vf = gpu_scaled[hw]
-            gpu_scaled_variants.append((f"{_accel_label(hw)} GPU-scaled", pre, vf))
+            pre, vfs = gpu_scaled[hw]
+            for idx, vf in enumerate(vfs):
+                tag = f" GPU-scaled" + (f" #{idx + 1}" if len(vfs) > 1 else "")
+                gpu_scaled_variants.append((f"{_accel_label(hw)}{tag}", pre, vf))
         if hw != "vulkan":   # vulkan frames need libplacebo/hwdownload -> only the GPU-scaled form
             cpu_scale_variants.append((_accel_label(hw), ["-hwaccel", hw], cpu_vf))
-    # all GPU-side-scaling attempts first (fast), then GPU-decode+CPU-scale, then CPU
+    # all GPU-side-scaling attempts first (fast); libplacebo/Vulkan is the most reliable
+    # GPU scaler, so try it before the finicky vendor scalers. Then GPU-decode+CPU-scale, CPU.
+    gpu_scaled_variants.sort(key=lambda v: 0 if "libplacebo" in v[2] else 1)
     return gpu_scaled_variants + cpu_scale_variants + [("CPU", [], cpu_vf)]
 
 
@@ -12135,7 +12153,16 @@ def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
                         log_info(f"    video decode: {label}.")
                     break
                 if pre:
-                    log_warn(f"    video decode via {label} not available - trying the next backend...")
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    lines = [l.strip() for l in (res.stderr or "").splitlines() if l.strip()]
+                    generic = ("Conversion failed!", "Error opening output files: Invalid argument")
+                    spec = [l for l in lines if l not in generic and any(k in l for k in (
+                        "Option", "not found", "Impossible", "Invalid", "not supported",
+                        "Unsupported", "No such", "cannot", "Unable", "not implemented",
+                        "No device", "Generic error"))]
+                    reason = (spec[-1] if spec else (lines[-1] if lines else ""))[:140]
+                    log_warn(f"    {label} unavailable{(' - ' + reason) if reason else ''}")
                 try:
                     os.path.exists(raw_path) and os.remove(raw_path)
                 except OSError:
@@ -12156,6 +12183,30 @@ def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
         sig = None
     cache[key] = sig
     return sig
+
+
+def _retime_run_passes(src_events, tracks, guess, ep):
+    """Runs the 2-3 refinement passes with outlier rejection over the given tracks.
+    Returns (anchors, confs, per_lang, mapf, passes) or None if the match is too weak."""
+    ntot = len(src_events)
+    a1, c1, pl1 = _retime_perline(src_events, tracks, guess, ep, band_s=10.0, pass_label=" [1/2]", min_conf=0.30)
+    a1 = _retime_reject_outliers(a1, guess, max_dev=3.5, local_tol=1.5)
+    if len(a1) < max(3, ntot // 8):
+        return None
+    passes = 1
+    map1 = _retime_map_from_anchors(a1, guess)
+    a2, c2, pl2 = _retime_perline(src_events, tracks, map1, ep, band_s=4.0, pass_label=" [2/2]", min_conf=0.25)
+    a2 = _retime_reject_outliers(a2, map1, max_dev=2.0, local_tol=1.0)
+    if len(a2) >= max(3, ntot // 8):
+        anchors, confs, per_lang, mapf, passes = a2, c2, pl2, _retime_map_from_anchors(a2, map1), 2
+    else:
+        anchors, confs, per_lang, mapf = a1, c1, pl1, map1
+    if len(anchors) < int(0.94 * ntot):
+        a3, c3, pl3 = _retime_perline(src_events, tracks, mapf, ep, band_s=2.5, pass_label=" [3/3]", min_conf=0.22)
+        a3 = _retime_reject_outliers(a3, mapf, max_dev=1.2, local_tol=0.8)
+        if len(a3) >= len(anchors):
+            anchors, confs, per_lang, mapf, passes = a3, c3, pl3, _retime_map_from_anchors(a3, mapf), 3
+    return anchors, confs, per_lang, mapf, passes
 
 
 def _retime_one(args, ffmpeg_bin, job, vad_cache):
@@ -12194,19 +12245,23 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
     if not tgt_an0:
         return dict(ok=False, msg="could not analyse the target audio")
 
-    # signal tracks for alignment: audio envelopes (+ optional VIDEO image signal).
-    # Each is (label, src_signal, tgt_signal, hz) and goes through the same pipeline.
+    # signal tracks for alignment: audio envelopes, plus the VIDEO image signal when the
+    # user turned video analysis ON. When ON it is ALWAYS decoded and used (every
+    # timestamp is matched against audio AND the picture) - no skipping.
     tracks = [(lg, sa_an["env"], ta_an["env"], ta_an["hz"])
               for (lg, sa_an, ta_an, st, tt) in analyses
               if sa_an and ta_an and sa_an.get("env") is not None and ta_an.get("env") is not None
               and len(sa_an["env"]) and len(ta_an["env"])]
     if getattr(args, "retime_use_video", False) and job["source_video"]:
+        ep = _fmt_ep(job["ep"])
         vs = _video_visual_signal(ffmpeg_bin, job["source_video"], vad_cache,
-                                  progress_prefix=f"{_fmt_ep(job['ep'])} reading source video ")
+                                  progress_prefix=f"{ep} reading source video ")
         vt = _video_visual_signal(ffmpeg_bin, job["target"], vad_cache,
-                                  progress_prefix=f"{_fmt_ep(job['ep'])} reading target video ")
+                                  progress_prefix=f"{ep} reading target video ")
         if vs and vt and len(vs[0]) and len(vt[0]):
             tracks.append(("video", vs[0], vt[0], vs[1]))
+        else:
+            log_warn(f"    {ep}: video image could not be decoded - continuing with audio only.")
 
     # coarse guess (aim only). PRIMARY: global window matching on the first signal
     # (audio preferred; locates every source window anywhere in the target -> robust to
@@ -12237,37 +12292,16 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
         guess = (lambda t, sc=sc, off=off: sc * t + off)
         guess_desc = "uniform (subs)"
 
-    # per-line multi-track verification (audio + video, best-of-N per timestamp).
-    # PASS 1 (wide) -> reject false matches -> map -> PASS 2 (tight) -> reject -> map ->
-    # optional PASS 3 (very tight) if coverage is still low. Two/three passes + outlier
-    # rejection make it robust to lags, micro-lags and jitter (a false match can't cascade).
+    # per-line multi-track verification over ALL tracks (audio + video when enabled).
+    # AUDIO is primary (finer time resolution); the VIDEO image cross-checks every
+    # timestamp and fills any moment where the audio is weak (silence, music). 2-3 passes
+    # + outlier rejection make it robust to lags, micro-lags and jitter.
     if tracks:
         ep = _fmt_ep(job["ep"])
         ntot = len(src_events)
-        anchors, confs, per_lang = _retime_perline(src_events, tracks, guess, ep, band_s=10.0,
-                                                   pass_label=" [1/2]", min_conf=0.30)
-        anchors = _retime_reject_outliers(anchors, guess, max_dev=3.5, local_tol=1.5)
-        if len(anchors) >= max(3, ntot // 8):
-            passes = 1
-            map1 = _retime_map_from_anchors(anchors, guess)
-            a2, c2, pl2 = _retime_perline(src_events, tracks, map1, ep, band_s=4.0,
-                                          pass_label=" [2/2]", min_conf=0.25)
-            a2 = _retime_reject_outliers(a2, map1, max_dev=2.0, local_tol=1.0)
-            if len(a2) >= max(3, ntot // 8):
-                anchors, confs, per_lang = a2, c2, pl2
-                mapf = _retime_map_from_anchors(a2, map1)
-                passes = 2
-            else:
-                mapf = map1
-            # adaptive extra pass when coverage is still below ~94% - squeeze out more
-            if len(anchors) < int(0.94 * ntot):
-                a3, c3, pl3 = _retime_perline(src_events, tracks, mapf, ep, band_s=2.5,
-                                              pass_label=" [3/3]", min_conf=0.22)
-                a3 = _retime_reject_outliers(a3, mapf, max_dev=1.2, local_tol=0.8)
-                if len(a3) >= len(anchors):
-                    anchors, confs, per_lang = a3, c3, pl3
-                    mapf = _retime_map_from_anchors(a3, mapf)
-                    passes = 3
+        res = _retime_run_passes(src_events, tracks, guess, ep)
+        if res is not None:
+            anchors, confs, per_lang, mapf, passes = res
             corrected = _retime_apply_mapfn(src_events, mapf)
             Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
             write_srt(corrected, Path(job["out"]))
@@ -12524,8 +12558,8 @@ def run_retime_batch(args):
     if getattr(args, "retime_use_video", False):
         _cands = _hwaccel_candidates(ffmpeg_bin)
         _hwtxt = ("auto: " + _accel_label(_cands[0]) + " (+CPU fallback)") if _cands else "CPU"
-        log_info(f"Video image analysis is ON (frames compared in addition to audio). "
-                 f"Video decode: {_hwtxt}.")
+        log_info(f"Video image analysis is ON - the picture of every pair will be analysed and "
+                 f"matched together with the audio. Video decode: {_hwtxt}.")
 
     if not noask and not ask_yes_no(f"Re-time {len(jobs)} subtitle file(s) now? (reads audio from each video - can take a while)",
                                     default_no=False):
