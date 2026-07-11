@@ -137,6 +137,12 @@ CONFIG_URL = "http://nas.falco81.net/plex_tools.config.json"            # e.g. "
 CONFIG_FETCH_TIMEOUT = 4   # seconds — keep short so an unreachable URL can't hang startup
 _CONFIG_URL_OVERRIDE = None  # set by --config-url
 CONFIG_SOURCE = ""         # human-readable description of where the config came from (set by load_config)
+# When a remote CONFIG_URL is used, the effective config is also cached to a local
+# file (resilience if the URL is unreachable later, and to keep a generated client_id
+# stable). Set to False (or pass --no-local-config) for a pure-remote setup that never
+# writes a local file — then put client_id (and any tokens) in the remote JSON.
+WRITE_LOCAL_CONFIG = True
+_NO_LOCAL_CONFIG = False   # set by --no-local-config
 
 
 def _script_dir():
@@ -888,6 +894,8 @@ def load_config():
 
 def save_config(cfg):
     global CONFIG_PATH
+    if _NO_LOCAL_CONFIG or not WRITE_LOCAL_CONFIG:
+        return  # pure-remote mode: never write a local config file
     if CONFIG_PATH is None:
         resolve_config_path()
     home_cfg = os.path.join(_xdg_config_dir(), "plex_tools", "config.json")
@@ -914,7 +922,11 @@ def get_client_id(cfg):
     if not cid:
         cid = uuid.uuid4().hex
         cfg["client_id"] = cid
-        save_config(cfg)
+        if _NO_LOCAL_CONFIG or not WRITE_LOCAL_CONFIG:
+            log_warn(f"No local config is written, so this client_id won't persist. "
+                     f"Add \"client_id\": \"{cid}\" to your remote config to keep it stable.")
+        else:
+            save_config(cfg)
     return cid
 
 
@@ -2396,15 +2408,19 @@ def main():
                     help="Watched/unwatched mode: mark selection as UNWATCHED")
     ap.add_argument("--config", help="Path to the config file (otherwise searched next to the script, in .config next to the script and parent folders, and in ~/.config)")
     ap.add_argument("--config-url", help="URL of a JSON config that OVERRIDES the local one (primary source; falls back to the local config if unreachable). Also settable via CONFIG_URL / PLEX_TOOLS_CONFIG_URL.")
+    ap.add_argument("--no-local-config", action="store_true",
+                    help="Pure-remote mode: never write a local config file (put client_id and tokens in the remote JSON).")
     ap.add_argument("--where-config", action="store_true",
                     help="Print the path of the config file in use and exit")
     args = ap.parse_args()
 
-    global _CONFIG_OVERRIDE, _CONFIG_URL_OVERRIDE
+    global _CONFIG_OVERRIDE, _CONFIG_URL_OVERRIDE, _NO_LOCAL_CONFIG
     if args.config:
         _CONFIG_OVERRIDE = args.config
     if args.config_url:
         _CONFIG_URL_OVERRIDE = args.config_url
+    if args.no_local_config:
+        _NO_LOCAL_CONFIG = True
     resolve_config_path()
     if args.where_config:
         exists = "exists" if (CONFIG_PATH and os.path.isfile(CONFIG_PATH)) else "does not exist yet"
