@@ -4921,7 +4921,7 @@ _LANG3_NAME = {
     "hrv": "Croatian", "srp": "Serbian", "slv": "Slovenian", "fil": "Filipino", "msa": "Malay",
     "und": "(unknown)",
 }
-_EPISODE_RE = re.compile(r"[Ss](\d{1,2})[Ee](\d{1,2})")
+_EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
 _LANG_TOKEN_RE = re.compile(r"^[A-Za-z]{2,3}$")
 _FLAG_TOKENS = {"forced", "sdh", "cc", "hi", "foreign", "full", "default"}
 
@@ -5132,6 +5132,34 @@ def run_import_subs(args):
         if not pairs:
             die("Could not pair subtitles with videos by SxxExx.")
         log_info(f"Paired {sum(len(x) for x in pairs.values())} subtitles to {len(pairs)} videos.")
+
+        def _sub_lang(s):
+            l3, _n, _f = _parse_sub_meta(os.path.basename(s), None)
+            return l3 or "und"
+
+        # a subtitle file per video becomes a SEPARATE track - if the folder has many
+        # subtitle files per episode (different languages/versions from earlier steps),
+        # every one of them is muxed in. Show the plan and offer to keep one per language.
+        multi = any(len(v) > 1 for v in pairs.values())
+        if multi:
+            log_info("Plan (each subtitle file = one muxed track):")
+            for v in sorted(pairs):
+                langs = [_sub_lang(s) for s in pairs[v]]
+                log_info(f"  {Path(v).name}: {len(pairs[v])} subtitle(s)  [{', '.join(langs)}]")
+            if ask_yes_no("Several videos have MANY subtitle files. Keep only ONE per language "
+                          "(the one whose name best matches the video)?", default_no=False):
+                for v in list(pairs):
+                    vstem = Path(v).stem.lower()
+                    best = {}
+                    for s in sorted(pairs[v]):
+                        lg = _sub_lang(s)
+                        sstem = Path(s).stem.lower()
+                        score = 2 if sstem.startswith(vstem) else (1 if vstem in sstem else 0)
+                        if lg not in best or score > best[lg][0]:
+                            best[lg] = (score, s)
+                    pairs[v] = [b[1] for b in best.values()]
+                log_info(f"After keeping one per language: {sum(len(x) for x in pairs.values())} subtitles "
+                         f"across {len(pairs)} videos.")
     else:
         pairs = {}
 
@@ -8918,7 +8946,8 @@ def _vid_apply_track_changes(args, info, kind, t, changes):
     letter = "a" if kind == "audio" else "s"
     meta = []
     if "name" in changes:
-        meta += [f"-metadata:s:{spec}", f"title={changes['name']}"]
+        meta += [f"-metadata:s:{spec}", f"title={changes['name']}",
+                 f"-metadata:s:{spec}", f"handler_name={changes['name']}"]
     if "lang" in changes:
         meta += [f"-metadata:s:{spec}", f"language={changes['lang']}"]
     disp = []
@@ -8982,6 +9011,231 @@ def _vid_edit_track(args, info):
         # loop back to the (refreshed) track list
     # leave immediately (the refreshed report will reflect any changes) - no extra pause
     raise WizardBack()
+
+
+def _vidg_list_screen(nvideos, tracks, desired, orig, start=0):
+    """Track list for the GLOBAL editor: shows the desired values and marks tracks
+    that were edited. Enter opens the form for that track; Esc = done."""
+    pos = max(0, min(start, len(tracks) - 1))
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                lines = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Edit track metadata - ALL {nvideos} videos ==={Style.RESET_ALL}",
+                         f"{Fore.CYAN}Edit on the first video as a template; changes apply to every video by track position.{Style.RESET_ALL}", ""]
+                for i, (kind, t) in enumerate(tracks):
+                    key = (kind, t["ord"])
+                    d = desired[key]
+                    tag = ("A" if kind == "audio" else "S") + str(t["ord"] + 1)
+                    flags = [x for x in ("default" if d["default"] else "", "forced" if d["forced"] else "") if x]
+                    fl = f"  [{', '.join(flags)}]" if flags else ""
+                    nm = f'  "{d["name"]}"' if d["name"] else ""
+                    ch = f"  {t['channels']}ch" if t.get("channels") else ""
+                    edited = f"  {Fore.GREEN}(edited){Style.RESET_ALL}" if d != orig[key] else ""
+                    row = f"{tag}  {_lang3_name(d['lang']):8} {t['codec']}{ch}{fl}{nm}"
+                    if i == pos:
+                        lines.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {row}{Style.RESET_ALL}{edited}")
+                    else:
+                        colr = Fore.YELLOW if kind == "audio" else Fore.CYAN
+                        lines.append(f"  {colr}{row}{Style.RESET_ALL}{edited}")
+                lines += ["", f"{Style.DIM}\u2191\u2193 move | Enter = edit this track | Esc = done (then apply to all){Style.RESET_ALL}"]
+                _fb_write_frame(lines)
+                k = _read_key()
+                if k == "up":
+                    pos = (pos - 1) % len(tracks)
+                elif k == "down":
+                    pos = (pos + 1) % len(tracks)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(tracks) - 1
+                elif k in ("enter", "right"):
+                    return pos
+                elif k == "esc" or k == ("char", "q"):
+                    return None
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _vidg_apply_all(args, info, changed):
+    """Applies ALL pending track changes to one video in a SINGLE operation (one
+    mkvpropedit for MKV, one ffmpeg remux otherwise). changed = {(kind, ord): {field: value}}."""
+    p = info["path"]
+    norm = {}
+    for key, ch in changed.items():
+        c = dict(ch)
+        if "lang" in c:
+            c["lang"] = _canon3(c["lang"]) or "und"
+        norm[key] = c
+    if not norm:
+        return False
+
+    if info["is_mkv"] and info["mkvpropedit"]:
+        edits = []
+        for (kind, ordv), c in norm.items():
+            lst = info["audio"] if kind == "audio" else info["subs"]
+            t = next((x for x in lst if x["ord"] == ordv), None)
+            if not t or not t.get("sel"):
+                continue
+            sel = t["sel"]
+            if "name" in c:
+                edits += (["--edit", f"track:{sel}", "--set", f"name={c['name']}"] if c["name"]
+                          else ["--edit", f"track:{sel}", "--delete", "name"])
+            if "lang" in c:
+                edits += ["--edit", f"track:{sel}", "--set", f"language={c['lang']}"]
+            if "default" in c:
+                edits += ["--edit", f"track:{sel}", "--set", f"flag-default={1 if c['default'] else 0}"]
+            if "forced" in c:
+                edits += ["--edit", f"track:{sel}", "--set", f"flag-forced={1 if c['forced'] else 0}"]
+        # single default per type: clear it on the non-chosen siblings
+        for kind in ("audio", "subs"):
+            newdef = [o for (k, o), c in norm.items() if k == kind and c.get("default") is True]
+            if newdef:
+                lst = info["audio"] if kind == "audio" else info["subs"]
+                for o in lst:
+                    if o["ord"] != newdef[0] and o.get("sel") and o.get("default"):
+                        edits += ["--edit", f"track:{o['sel']}", "--set", "flag-default=0"]
+        if not edits:
+            return False
+        r = subprocess.run([info["mkvpropedit"], str(p)] + edits,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode >= 2:
+            log_warn(f"{p.name}: mkvpropedit error: {(r.stderr or '').strip()[:160]}")
+            return False
+        return True
+
+    # MP4 / other -> single ffmpeg remux
+    ff = info["ffmpeg"]
+    tmp = p.with_name(p.stem + ".edittmp" + p.suffix)
+    meta = []
+    disp = []
+    for (kind, ordv), c in norm.items():
+        letter = "a" if kind == "audio" else "s"
+        spec = f"{letter}:{ordv}"
+        if "name" in c:
+            meta += [f"-metadata:s:{spec}", f"title={c['name']}",
+                     f"-metadata:s:{spec}", f"handler_name={c['name']}"]
+        if "lang" in c:
+            meta += [f"-metadata:s:{spec}", f"language={c['lang']}"]
+    for kind in ("audio", "subs"):
+        letter = "a" if kind == "audio" else "s"
+        lst = info["audio"] if kind == "audio" else info["subs"]
+        if not any(k == kind and ("default" in c or "forced" in c) for (k, _o), c in norm.items()):
+            continue
+        newdef = [o for (k, o), c in norm.items() if k == kind and c.get("default") is True]
+        for o in lst:
+            c = norm.get((kind, o["ord"]), {})
+            is_def = (o["ord"] == newdef[0]) if newdef else c.get("default", o["default"])
+            is_forced = c.get("forced", o["forced"])
+            fl = []
+            if is_def:
+                fl.append("default")
+            if is_forced:
+                fl.append("forced")
+            disp += [f"-disposition:{letter}:{o['ord']}", "+".join(fl) if fl else "0"]
+    if not meta and not disp:
+        return False
+    cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + meta + disp + [str(tmp)]
+    r = _run_ffmpeg_progress(cmd, prefix=f"{p.name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
+    if r.returncode != 0 or not tmp.exists():
+        log_warn(f"{p.name}: ffmpeg remux failed.")
+        tmp.exists() and os.remove(str(tmp))
+        return False
+    return _vid_replace(tmp, p)
+
+
+def run_edit_tracks_global(args):
+    """Edit track metadata (name / language / default / forced) across ALL videos in
+    a directory at once. You edit the tracks of the first video as a template using
+    the same form as the inspector, then the changes are applied to every video by
+    track position."""
+    print(f"{Fore.MAGENTA}=== Edit track metadata across ALL videos ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    if not _tui_supported():
+        log_warn("This editor needs a real terminal.")
+        return
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        log_warn("No videos in the directory.")
+        return
+    log_info(f"Found {len(videos)} videos. Using {Path(videos[0]).name} as the template.")
+
+    tmpl = _vid_probe(args, videos[0])
+    tracks = [("audio", t) for t in tmpl["audio"]] + [("subs", t) for t in tmpl["subs"]]
+    if not tracks:
+        log_warn("The template video has no audio/subtitle tracks.")
+        return
+
+    desired, orig = {}, {}
+    for kind, t in tracks:
+        base = {"name": t.get("name") or "", "lang": t["lang"] or "und",
+                "default": bool(t["default"]), "forced": bool(t["forced"])}
+        desired[(kind, t["ord"])] = dict(base)
+        orig[(kind, t["ord"])] = dict(base)
+
+    sel = 0
+    while True:
+        idx = _vidg_list_screen(len(videos), tracks, desired, orig, sel)
+        if idx is None:
+            break
+        sel = idx
+        kind, t = tracks[idx]
+        d = desired[(kind, t["ord"])]
+        tc = dict(t)
+        tc["name"], tc["lang"], tc["default"], tc["forced"] = d["name"], d["lang"], d["default"], d["forced"]
+        changes = _vid_track_form(kind, tc)
+        if changes:
+            for f in ("name", "lang", "default", "forced"):
+                if f in changes:
+                    d[f] = changes[f]
+
+    changed = {key: {f: v for f, v in desired[key].items() if v != orig[key][f]}
+               for key in desired}
+    changed = {k: c for k, c in changed.items() if c}
+    if not changed:
+        log_info("No changes made.")
+        return
+
+    print()
+    log_info("Pending changes (applied to every video):")
+    for (kind, ordv), c in changed.items():
+        tag = ("A" if kind == "audio" else "S") + str(ordv + 1)
+        parts = []
+        for f in ("name", "lang", "default", "forced"):
+            if f in c:
+                v = c[f]
+                parts.append(f"{f}=" + ("(cleared)" if v == "" else (str(v) if not isinstance(v, bool) else ("yes" if v else "no"))))
+        print(f"  {Fore.CYAN}{tag}{Style.RESET_ALL}: {', '.join(parts)}")
+    if not ask_yes_no(f"Apply these changes to all {len(videos)} videos?", default_no=False):
+        log_info("Cancelled.")
+        return
+
+    done = failed = 0
+    for i, v in enumerate(videos, 1):
+        log_info(f"[{i}/{len(videos)}] {Path(v).name}")
+        try:
+            info = _vid_probe(args, v)
+            present = {key: c for key, c in changed.items()
+                       if any(x["ord"] == key[1] for x in (info["audio"] if key[0] == "audio" else info["subs"]))}
+            if not present:
+                log_warn("    no matching tracks - skipped.")
+                continue
+            if _vidg_apply_all(args, info, present):
+                log_done("    updated.")
+                done += 1
+            else:
+                failed += 1
+        except Exception as e:
+            log_warn(f"    error: {e}")
+            failed += 1
+    print()
+    log_done(f"Done: {done} videos updated, {failed} failed/skipped.")
 
 
 def _vid_set_default(args, info):
@@ -9630,8 +9884,8 @@ _TMDB_LANG_MAP = {
 }
 
 # SxxExx (+ optional -Exx range), and the 1x02 style
-_MN_SE = re.compile(r"[Ss](\d{1,2})[ ._-]?[Ee](\d{1,3})(?:[ ._-]?[Ee](\d{1,3}))?")
-_MN_SE_X = re.compile(r"\b(\d{1,2})x(\d{1,3})\b")
+_MN_SE = re.compile(r"[Ss](\d+)[ ._-]?[Ee](\d+)(?:[ ._-]?[Ee](\d+))?")
+_MN_SE_X = re.compile(r"\b(\d{1,2})x(\d{1,4})\b")
 _MN_YEAR = re.compile(r"[\(\.\[\s_](19\d{2}|20\d{2})[\)\.\]\s_]")
 _MN_YEAR_END = re.compile(r"(19\d{2}|20\d{2})\s*$")
 
@@ -11747,6 +12001,7 @@ _INTERACTIVE_COMMANDS = {
     "import-subs": ("Insert subtitles into videos", "run_import_subs"),
     "remove-tracks": ("Remove tracks from MKV", "run_remove_tracks"),
     "set-default": ("Set the default track", "run_set_default"),
+    "edit-tracks-all": ("Edit track metadata across all videos", "run_edit_tracks_global"),
     "rename-subs": ("Rename subtitles", "run_rename_subs"),
     "subs-download": ("Download subtitles (OpenSubtitles)", "run_subs_download"),
     "retime-subs": ("Re-time subtitles to a different video source", "run_retime_batch"),
@@ -11766,7 +12021,7 @@ def dispatch_interactive_command(cmd, args):
         "translate-subs": run_translate_subs, "extract-subs": run_extract_subs,
         "merge-pro": run_transplant, "resync-pro": run_resync_pro,
         "import-subs": run_import_subs, "remove-tracks": run_remove_tracks,
-        "set-default": run_set_default, "rename-subs": run_rename_subs, "subs-download": run_subs_download, "retime-subs": run_retime_batch,
+        "set-default": run_set_default, "edit-tracks-all": run_edit_tracks_global, "rename-subs": run_rename_subs, "subs-download": run_subs_download, "retime-subs": run_retime_batch,
         "extract-audio": run_extract_audio, "import-audio": run_import_audio,
         "convert-audio": run_convert_audio, "rename-files": run_rename_files,
         "video-browser": run_video_browser,
@@ -11955,6 +12210,12 @@ def _wizard_action_specs():
             help="Clears old default flags and sets the default audio/subtitles by language. MKV in "
                  "place (mkvpropedit), MP4 via remux (ffmpeg).",
             kind="wizard", run=run_set_default, flag="set_default", preset="set-default"),
+        "edit-tracks-all": dict(
+            label="Edit track metadata across ALL videos (name / language / default / forced)",
+            help="Edit the tracks of the first video as a template (same form as the inspector: Name, Language, "
+                 "Default, Forced), then apply the same changes to EVERY video in the folder by track position. "
+                 "MKV in place (mkvpropedit); MP4/other by remux.",
+            kind="wizard", run=run_edit_tracks_global, flag="edit_tracks_all", preset="edit-tracks-all"),
         "rename-files": dict(
             label="Intelligent file rename (bulk, preview first)",
             help="Unifies file names by a glob pattern: zero-pads numbers, fills missing common words, "
@@ -11989,7 +12250,7 @@ _WIZARD_CATEGORIES = [
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
-     ["remove-tracks", "set-default", "video-browser"]),
+     ["remove-tracks", "set-default", "edit-tracks-all", "video-browser"]),
     ("Files", "Intelligent bulk file renaming",
      ["rename-files"]),
     ("Presets & settings", "Saved presets, API keys/config, API test",
@@ -11999,7 +12260,7 @@ _WIZARD_CATEGORIES = [
 _WIZARD_MODE_FLAGS = ("auto", "auto_all", "translate_subs", "merge_pro", "resync_pro",
                       "extract_subs", "import_subs", "remove_tracks", "set_default",
                       "rename_subs", "fix_readability", "extract_audio", "import_audio",
-                      "convert_audio", "rename_files", "subs_download", "retime_subs")
+                      "convert_audio", "rename_files", "subs_download", "retime_subs", "edit_tracks_all")
 
 
 def _run_wizard_action(key, args):
@@ -12665,6 +12926,9 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--convert-audio", action="store_true",
                         help="Interactive mode: re-encodes audio in each MKV to a chosen codec (e.g. AC-3), "
                              "copying video and subtitles.")
+    parser.add_argument("--edit-tracks-all", dest="edit_tracks_all", action="store_true",
+                        help="Interactive mode: edit track metadata (name/language/default/forced) across ALL "
+                             "videos in a directory, using the first video as a template.")
     parser.add_argument("--rename-files", action="store_true",
                         help="Interactive mode: intelligent file renamer (zero-pads numbers, fills common "
                              "words, normalizes case, strips emoji; preview then apply).")
@@ -12783,7 +13047,8 @@ DIFFERENT LANGUAGES (target vs reference):
             args.auto, args.auto_all, args.translate_subs, args.merge_pro, args.resync_pro,
             args.extract_subs, args.import_subs, args.remove_tracks, args.set_default,
             args.rename_subs, args.fix_readability, args.extract_audio, args.import_audio,
-            args.convert_audio, args.rename_files, args.video_browser, args.subs_download, args.retime_subs]):
+            args.convert_audio, args.rename_files, args.video_browser, args.subs_download, args.retime_subs,
+            args.edit_tracks_all]):
         run_master_wizard(args)
         return
 
@@ -12803,7 +13068,8 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "rename-files" if args.rename_files
                        else "video-browser" if args.video_browser
                        else "subs-download" if args.subs_download
-                       else "retime-subs" if args.retime_subs else None)
+                       else "retime-subs" if args.retime_subs
+                       else "edit-tracks-all" if args.edit_tracks_all else None)
     if args.save and args.load:
         die("--save and --load cannot be combined.")
     if args.save and not interactive_cmd:
@@ -12859,6 +13125,8 @@ DIFFERENT LANGUAGES (target vs reference):
             run_subs_download(args)
         elif interactive_cmd == "retime-subs":
             run_retime_batch(args)
+        elif interactive_cmd == "edit-tracks-all":
+            run_edit_tracks_global(args)
         preset_flush_if_save()
         return
 
@@ -12912,6 +13180,9 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if args.retime_subs:
         run_retime_batch(args)
+        return
+    if args.edit_tracks_all:
+        run_edit_tracks_global(args)
         return
 
     if args.all and args.fix_readability:
