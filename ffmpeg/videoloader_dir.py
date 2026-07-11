@@ -37,6 +37,16 @@ except Exception:
 # =============================================================================
 #  USER CONFIG — edit these defaults. The command line (-t, -w, -m, ...) wins.
 # =============================================================================
+# Optional remote config: point this at a JSON file (e.g. on your NAS) and its keys OVERRIDE the
+# defaults in this file — so you can change settings for many machines in one place. It may contain
+# any subset of the configurable names (the USER CONFIG section below, the ADVANCED CONFIG block
+# further down — timeouts, quality, ffmpeg/mp4decrypt paths+URLs — and the YouTube/Twitch API
+# constants). Keys it omits keep their local value, and the command line still overrides everything.
+# EMPTY = disabled (the script behaves exactly as if this didn't exist). A short timeout means a
+# dead/unreachable URL never hangs startup. CONFIG_URL itself can NOT be set from the JSON (prevents
+# a redirect/config loop).
+CONFIG_URL = ""                   # e.g. "https://nas.falco81.net/videoloader_dir.config.json"
+CONFIG_FETCH_TIMEOUT = 4          # seconds — keep short so an unreachable CONFIG_URL can't stall startup
 DEFAULT_THREADS = 16              # -t : download threads per file
 DEFAULT_FOLDER_WORKERS = 0        # -w : videos downloaded at once (0 = ALL at once)
 DEFAULT_MAX_CONNECTIONS = 64      # -m : hard cap on simultaneous connections
@@ -68,32 +78,137 @@ NTFY_TOKEN = ""                   # optional access token for private / self-hos
 # ---- Auto-scan hosts (optional) ------------------------------------------- #
 # If you launch the script with a URL whose host matches an entry below, the script behaves as if
 # you had also typed --scan / --scan-browser — handy for sites you always want scanned. A host
-# matches itself AND its subdomains (idnes.cz also matches www.idnes.cz, sport.idnes.cz). The
-# value is the scan index (like --scan N) or None for plain --scan. Only an explicit
-# --scan / --scan-browser on the command line disables this (your explicit scan choice wins);
-# other flags like --res / --audio / --sub / --key / -v combine with it. Empty = feature off.
+# matches itself AND its subdomains (idnes.cz also matches www.idnes.cz, sport.idnes.cz).
+# Each value can be:
+#   None                      -> plain --scan
+#   N (int)                   -> --scan N  (grab only the N-th found item)
+#   {"scan": N, "m": M}       -> --scan N  AND  -m M  (cap connections at M for this URL; either
+#                                key is optional, e.g. {"m": 8} = --scan + -m 8)
+# An explicit --scan / --scan-browser on the command line disables the auto behaviour, and an
+# explicit -m always wins over a host's "m". Empty = feature off. (Works from the JSON config too.)
 SCAN_AUTO_HOSTS = {
-    # "idnes.cz": None,            # -> runs as: <url> --scan
-    # "nas.com": 3,               # -> runs as: <url> --scan 3
+    # "idnes.cz": None,             # -> runs as: <url> --scan
+    # "nas.com": 3,                 # -> runs as: <url> --scan 3
+    # "slow.example.com": {"m": 8}, # -> runs as: <url> --scan -m 8
+    # "nas.lan.local": {"scan": 3, "m": 8},   # -> <url> --scan 3 -m 8
 }
 SCAN_BROWSER_AUTO_HOSTS = {
-    # "example.com": None,        # -> runs as: <url> --scan-browser
-    # "shop.example.org": 2,      # -> runs as: <url> --scan-browser 2
+    # "example.com": None,          # -> runs as: <url> --scan-browser
+    # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
+    # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "2.71.0"
+SCRIPT_VERSION = "2.74.0"
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
 
 
+def _auto_scan_opts(value):
+    """Normalize a host's auto-config value into {'scan': idx|None, 'm': maxconn|None}. Accepted
+    forms: None (plain --scan), an int N (--scan N), or a dict with any of {'scan': N, 'm': M} —
+    where 'm' auto-applies -m M (max connections) to every download from that URL."""
+    def _int(x):
+        if isinstance(x, bool) or x is None:
+            return None
+        if isinstance(x, int):
+            return x
+        if isinstance(x, str) and x.strip().isdigit():
+            return int(x)
+        return None
+    if isinstance(value, dict):
+        return {'scan': _int(value.get('scan')), 'm': _int(value.get('m'))}
+    return {'scan': _int(value), 'm': None}
+
+
 def _auto_scan_match(host, hostmap):
-    """Return (matched, index) if `host` (or a parent domain of it) is listed in hostmap. An entry
-    'idnes.cz' matches idnes.cz and any subdomain (www.idnes.cz, sport.idnes.cz)."""
+    """Return (matched, opts) if `host` (or a parent domain of it) is listed in hostmap, where opts
+    is {'scan': idx|None, 'm': maxconn|None}. An entry 'idnes.cz' matches idnes.cz and any subdomain
+    (www.idnes.cz, sport.idnes.cz)."""
     if not host or not hostmap:
-        return False, None
-    for entry, idx in hostmap.items():
+        return False, {'scan': None, 'm': None}
+    for entry, value in hostmap.items():
         e = str(entry).lower().strip().lstrip('*').lstrip('.')
         if e and (host == e or host.endswith('.' + e)):
-            return True, idx
-    return False, None
+            return True, _auto_scan_opts(value)
+    return False, {'scan': None, 'm': None}
+
+
+# Keys a remote CONFIG_URL JSON may override — every genuine USER CONFIG / advanced-config knob in
+# the file (they live in a few blocks: the USER CONFIG section, the network/quality/tools block
+# lower down, and the YouTube/Twitch API constants). Deliberately EXCLUDED: CONFIG_URL /
+# CONFIG_FETCH_TIMEOUT (no config loop); SCRIPT_VERSION / TEMP_SUBDIR (identity/internal); and all
+# per-run/runtime state (AUDIO_SEL, SUB_SEL, CENC_KEYS, FORCE_CONTAINER, MP4DECRYPT, ASCII_BARS,
+# BAR_FORMAT, CLR, regexes, and the derived *_HEADERS dicts — those follow USER_AGENT automatically).
+_REMOTE_CONFIG_KEYS = {
+    # -- USER CONFIG section --
+    'DEFAULT_THREADS', 'DEFAULT_FOLDER_WORKERS', 'DEFAULT_MAX_CONNECTIONS', 'DEFAULT_CHUNK_SIZE',
+    'DEFAULT_RECURSIVE', 'AUTO_COOKIES', 'USE_COLOR', 'FORCE_ASCII_BARS', 'PER_FILE_BAR_LIMIT',
+    'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES', 'BAR_NCOLS', 'BAR_DESC_WIDTH',
+    'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
+    # -- network / quality --
+    'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
+    # -- external tools (paths, download URLs, install dirs) --
+    'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
+    'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
+    # -- filenames / identity --
+    'ASCII_FILENAMES', 'USER_AGENT',
+    # -- YouTube / Twitch API constants (handy to hot-fix remotely when they rotate) --
+    'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY', 'TWITCH_CLIENT_ID',
+}
+
+
+def _coerce_config_value(current, value):
+    """Best-effort coerce a JSON value to the type of the existing default (e.g. "5" -> 5)."""
+    if isinstance(current, bool):
+        return value if isinstance(value, bool) else str(value).strip().lower() in ('1', 'true', 'yes', 'on')
+    if isinstance(current, int) and not isinstance(value, bool):
+        return int(value)
+    if isinstance(current, float):
+        return float(value)
+    return value
+
+
+def _apply_remote_config():
+    """If CONFIG_URL is set, fetch a JSON of overrides and apply them ON TOP of the USER CONFIG
+    defaults — before argparse reads them, so the command line still wins. Keys the JSON omits keep
+    their local value; CONFIG_URL can't be overridden (no loop). Any problem (empty URL, timeout,
+    network error, non-JSON, wrong shape) falls back silently to local defaults; the short timeout
+    guarantees an unreachable URL can't hang startup."""
+    url = (CONFIG_URL or "").strip()
+    if not url:
+        return
+    try:
+        r = requests.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
+                         headers={'User-Agent': USER_AGENT})
+        if r.status_code != 200:
+            print(f"[WARN] Remote config {url} -> HTTP {r.status_code}; using local USER CONFIG.")
+            return
+        data = r.json()
+    except requests.RequestException as e:
+        print(f"[WARN] Remote config unreachable ({type(e).__name__}); using local USER CONFIG.")
+        return
+    except ValueError:
+        print(f"[WARN] Remote config {url} is not valid JSON; using local USER CONFIG.")
+        return
+    if not isinstance(data, dict):
+        print(f"[WARN] Remote config {url} must be a JSON object; using local USER CONFIG.")
+        return
+    applied, skipped = [], []
+    for key, value in data.items():
+        if key in ('CONFIG_URL', 'CONFIG_FETCH_TIMEOUT') or key not in _REMOTE_CONFIG_KEYS:
+            skipped.append(key)
+            continue
+        try:
+            globals()[key] = _coerce_config_value(globals().get(key), value)
+            applied.append(key)
+        except (ValueError, TypeError):
+            print(f"[WARN] Remote config: bad value for {key}; keeping local default.")
+    # Keep the derived header dicts in sync if USER_AGENT / YT_IOS_UA were overridden.
+    for hname, uakey in (('STREAMABLE_HEADERS', 'USER_AGENT'), ('TWITCH_HEADERS', 'USER_AGENT'),
+                         ('YOUTUBE_HEADERS', 'YT_IOS_UA')):
+        h = globals().get(hname)
+        if isinstance(h, dict) and 'User-Agent' in h:
+            h['User-Agent'] = globals().get(uakey, h['User-Agent'])
+    print(f"[INFO] Applied remote config from {url}: {len(applied)} override(s)"
+          + (f", ignored {len(skipped)} unknown key(s)" if skipped else "") + ".")
 
 
 def _temp_dir_for(final_path: str) -> str:
@@ -122,6 +237,10 @@ def _cleanup_temp_dir(directory: str) -> None:
             os.rmdir(tdir)
     except OSError:
         pass
+# =============================================================================
+#  ADVANCED CONFIG — network timeouts, quality default, and external-tool paths/URLs.
+#  These are also overridable via CONFIG_URL (see the USER CONFIG section up top).
+# =============================================================================
 # Network timeouts (seconds). Without these a stalled connection (e.g. Google's videoplayback
 # CDN ignoring a HEAD request) would hang the whole run forever.
 CONNECT_TIMEOUT = 15              # max time to establish a TCP/TLS connection
@@ -2609,6 +2728,8 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
 
 
 # ---- YouTube + Twitch (pure requests; both resolve to a standard HLS master) ---------- #
+# These API version/key constants occasionally rotate on YouTube's side; they're overridable via
+# CONFIG_URL so you can hot-fix every machine at once without editing the script.
 YT_IOS_VERSION = "19.45.4"
 YT_IOS_UA = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)"
 YT_IOS_KEY = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
@@ -8100,6 +8221,10 @@ if __name__ == "__main__":
             except Exception:
                 pass
 
+    # Optional remote config (CONFIG_URL) overrides USER CONFIG here, BEFORE argparse builds its
+    # defaults from those globals — so the command line still wins over both. No-op when unset.
+    _apply_remote_config()
+
     def positive_int(v):
         iv = int(v)
         if iv < 1:
@@ -8185,19 +8310,30 @@ if __name__ == "__main__":
     # with it normally.
     if args.video_id and args.scan is None and not args.scan_browser:
         _host = (urlparse(args.video_id).hostname or '').lower()
-        _m, _idx = _auto_scan_match(_host, SCAN_AUTO_HOSTS)
+
+        def _apply_auto_m(opts):
+            # Host-provided -m behaves exactly like a real -m (applies to every download from this
+            # URL, overrides per-source caps), but an explicit command-line -m still wins.
+            if opts['m'] is not None and args.max_connections is None:
+                args.max_connections = opts['m']
+                return f" -m {opts['m']}"
+            return ""
+
+        _m, _opts = _auto_scan_match(_host, SCAN_AUTO_HOSTS)
         if _m:
-            args.scan = str(_idx) if _idx else True
+            args.scan = str(_opts['scan']) if _opts['scan'] is not None else True
+            extra = _apply_auto_m(_opts)
             print(f"[INFO] Auto-scan: {_host} matches SCAN_AUTO_HOSTS -> running with "
-                  f"--scan{(' ' + str(_idx)) if _idx else ''}")
+                  f"--scan{(' ' + str(_opts['scan'])) if _opts['scan'] is not None else ''}{extra}")
         else:
-            _m, _idx = _auto_scan_match(_host, SCAN_BROWSER_AUTO_HOSTS)
+            _m, _opts = _auto_scan_match(_host, SCAN_BROWSER_AUTO_HOSTS)
             if _m:
                 args.scan_browser = True
-                if _idx:
-                    args.scan = str(_idx)
+                if _opts['scan'] is not None:
+                    args.scan = str(_opts['scan'])
+                extra = _apply_auto_m(_opts)
                 print(f"[INFO] Auto-scan: {_host} matches SCAN_BROWSER_AUTO_HOSTS -> running with "
-                      f"--scan-browser{(' ' + str(_idx)) if _idx else ''}")
+                      f"--scan-browser{(' ' + str(_opts['scan'])) if _opts['scan'] is not None else ''}{extra}")
 
     _scan_pick = int(args.scan) if isinstance(args.scan, str) and args.scan.isdigit() else None
     common = dict(
