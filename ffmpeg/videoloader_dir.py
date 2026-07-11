@@ -45,7 +45,7 @@ except Exception:
 # EMPTY = disabled (the script behaves exactly as if this didn't exist). A short timeout means a
 # dead/unreachable URL never hangs startup. CONFIG_URL itself can NOT be set from the JSON (prevents
 # a redirect/config loop).
-CONFIG_URL = ""                   # e.g. "https://nas.falco81.net/videoloader_dir.config.json"
+CONFIG_URL = "http://nas.falco81.net/videoloader_dir.config.json"   # e.g. "http://nas.falco81.net/videoloader_dir.config.json"
 CONFIG_FETCH_TIMEOUT = 4          # seconds — keep short so an unreachable CONFIG_URL can't stall startup
 DEFAULT_THREADS = 16              # -t : download threads per file
 DEFAULT_FOLDER_WORKERS = 0        # -w : videos downloaded at once (0 = ALL at once)
@@ -97,7 +97,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "2.74.0"
+SCRIPT_VERSION = "2.74.2"
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
 
 
@@ -179,17 +179,17 @@ def _apply_remote_config():
         r = requests.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
                          headers={'User-Agent': USER_AGENT})
         if r.status_code != 200:
-            print(f"[WARN] Remote config {url} -> HTTP {r.status_code}; using local USER CONFIG.")
+            print(f"[WARN] Config: {url} -> HTTP {r.status_code}; using local USER CONFIG only.")
             return
         data = r.json()
     except requests.RequestException as e:
-        print(f"[WARN] Remote config unreachable ({type(e).__name__}); using local USER CONFIG.")
+        print(f"[WARN] Config: {url} unreachable ({type(e).__name__}); using local USER CONFIG only.")
         return
     except ValueError:
-        print(f"[WARN] Remote config {url} is not valid JSON; using local USER CONFIG.")
+        print(f"[WARN] Config: {url} is not valid JSON; using local USER CONFIG only.")
         return
     if not isinstance(data, dict):
-        print(f"[WARN] Remote config {url} must be a JSON object; using local USER CONFIG.")
+        print(f"[WARN] Config: {url} must be a JSON object; using local USER CONFIG only.")
         return
     applied, skipped = [], []
     for key, value in data.items():
@@ -200,15 +200,15 @@ def _apply_remote_config():
             globals()[key] = _coerce_config_value(globals().get(key), value)
             applied.append(key)
         except (ValueError, TypeError):
-            print(f"[WARN] Remote config: bad value for {key}; keeping local default.")
+            print(f"[WARN] Config: bad value for {key}; keeping local default.")
     # Keep the derived header dicts in sync if USER_AGENT / YT_IOS_UA were overridden.
     for hname, uakey in (('STREAMABLE_HEADERS', 'USER_AGENT'), ('TWITCH_HEADERS', 'USER_AGENT'),
                          ('YOUTUBE_HEADERS', 'YT_IOS_UA')):
         h = globals().get(hname)
         if isinstance(h, dict) and 'User-Agent' in h:
             h['User-Agent'] = globals().get(uakey, h['User-Agent'])
-    print(f"[INFO] Applied remote config from {url}: {len(applied)} override(s)"
-          + (f", ignored {len(skipped)} unknown key(s)" if skipped else "") + ".")
+    print(f"[INFO] Config: loaded from {url} — {len(applied)} override(s) applied over local "
+          f"USER CONFIG" + (f", {len(skipped)} unknown key(s) ignored" if skipped else "") + ".")
 
 
 def _temp_dir_for(final_path: str) -> str:
