@@ -2271,6 +2271,8 @@ _SECRET_HINTS = ("key", "password", "token", "secret")
 # ---- Unified store: video_tools.config.json (config + presets) -----------
 _STORE_PATH = None
 _STORE_URL = None          # runtime override from --config-url (wins over CONFIG_URL)
+_STORE_URL_CACHE = None    # cached remote store (dict) or "MISS" - fetched at most once per run
+_STORE_SOURCE = None       # human-readable description of where the config was loaded from
 
 
 def _config_url():
@@ -2280,9 +2282,14 @@ def _config_url():
 def _fetch_config_url():
     """PRIMARY config source: fetch the settings JSON from CONFIG_URL / --config-url.
     Returns the parsed dict, or None on any problem (empty/unreachable/invalid) so the
-    tool falls back to the local file. A short timeout keeps startup snappy."""
+    tool falls back to the local file. Fetched at most ONCE per run (cached); a short
+    timeout keeps startup snappy."""
+    global _STORE_URL_CACHE
+    if _STORE_URL_CACHE is not None:
+        return None if _STORE_URL_CACHE == "MISS" else _STORE_URL_CACHE
     url = _config_url()
     if not url:
+        _STORE_URL_CACHE = "MISS"
         return None
     try:
         import urllib.request
@@ -2290,13 +2297,22 @@ def _fetch_config_url():
         with urllib.request.urlopen(req, timeout=CONFIG_FETCH_TIMEOUT) as r:
             data = json.loads(r.read().decode("utf-8", "replace"))
         if isinstance(data, dict):
+            _STORE_URL_CACHE = data
             return data
         log_warn(f"Remote config at {url} is not a JSON object - ignoring it.")
     except Exception as e:
         if url not in _STORE_WARNED:
             _STORE_WARNED.add(url)
             log_warn(f"Could not load config from URL ({url}): {e} - using the local config.")
+    _STORE_URL_CACHE = "MISS"
     return None
+
+
+def config_source_desc():
+    """Short description of where the config is actually coming from this run."""
+    if _STORE_SOURCE is None:
+        load_store()   # resolves and records the source
+    return _STORE_SOURCE
 _STORE_FILENAME = "video_tools.config.json"
 _STORE_POINTER_NAME = "video_tools.configpath"
 
@@ -2384,21 +2400,30 @@ _STORE_WARNED = set()
 
 def load_store():
     """Loads the unified file {config, presets, default_preset}. Priority: a remote
-    CONFIG_URL / --config-url (primary), then the local path/pointer/default file."""
-    data = _fetch_config_url()          # PRIMARY: remote URL
-    if data is None:
+    CONFIG_URL / --config-url (primary), then the local path/pointer/default file.
+    Records where it actually came from in _STORE_SOURCE."""
+    global _STORE_SOURCE
+    url = _config_url()
+    data = _fetch_config_url()          # PRIMARY: remote URL (cached per run)
+    if data is not None:
+        _STORE_SOURCE = f"remote {url}"
+    else:
         p = current_store_path()        # SECONDARY: path/pointer/default (as before)
+        note = f" (remote URL {url} unreachable)" if url else ""
         try:
             with open(p, "r", encoding="utf-8") as f:
                 data = json.load(f)
+            _STORE_SOURCE = f"file {p}{note}"
         except FileNotFoundError:
             data = {}
+            _STORE_SOURCE = f"defaults - no config file at {p}{note}"
         except Exception as e:
             if p not in _STORE_WARNED:
                 _STORE_WARNED.add(p)
                 log_warn(f"Could not read the settings file: {p}")
                 log_warn(f"  reason: {e}")
             data = {}
+            _STORE_SOURCE = f"defaults - could not read {p}{note}"
     if not isinstance(data, dict):
         data = {}
     data.setdefault("config", {})
@@ -4348,19 +4373,15 @@ def run_test_api(args):
     import urllib.request
     import urllib.error
     # diagnostics: where are settings read from, and what got loaded?
-    _p = current_store_path()
     print(f"{Fore.MAGENTA}=== API test ==={Style.RESET_ALL}")
-    log_info(f"Settings file: {_p}")
-    if os.path.exists(_p):
-        _cfg = load_config()
-        if _cfg:
-            log_info(f"Loaded {len(_cfg)} setting(s): {', '.join(sorted(_cfg))}")
-        else:
-            log_warn("The settings file exists but contains no config values.")
+    log_info(f"Config source: {config_source_desc()}")
+    _cfg = load_config()
+    if _cfg:
+        log_info(f"Loaded {len(_cfg)} setting(s): {', '.join(sorted(_cfg))}")
     else:
-        log_warn("The settings file was NOT found at this path (using defaults/none).")
-        log_info("Tip: set the location via --config (Change WHERE settings are stored) "
-                 "or the CONFIG_STORE_PATH constant.")
+        log_warn("No config values loaded (using defaults/none).")
+        log_info("Tip: set a remote CONFIG_URL/--config-url, a path via --config "
+                 "(Change WHERE settings are stored), or the CONFIG_STORE_PATH constant.")
     tested = 0
 
     akey = getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
@@ -12364,6 +12385,7 @@ def run_master_wizard(args):
             "What do you want to work with?",
             cat_labels, default=0, allow_back=True, cursor=cat_pos,
             header=[f"{Fore.MAGENTA}=== video_tools - interactive wizard ==={Style.RESET_ALL}",
+                    f"{Style.DIM}config: {config_source_desc()}{Style.RESET_ALL}",
                     f"{Fore.CYAN}Tip:{Style.RESET_ALL} pick a category, then an action (type = search, "
                     "? = help, Esc = back). At the end you can save the choices as a preset.",
                     ""],
