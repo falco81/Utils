@@ -599,24 +599,38 @@ def _ssl_ctx(verify):
     return ctx
 
 
-def http_raw(method, url, headers=None, data=None, verify=True, timeout=30):
-    """Returns (status, text). Does NOT raise on HTTP errors (returns them); raises on network errors."""
+def _is_cert_error(exc):
+    reason = getattr(exc, "reason", exc)
+    return isinstance(reason, ssl.SSLError) or "CERTIFICATE" in str(reason).upper()
+
+
+def http_raw(method, url, headers=None, data=None, verify=True, timeout=30,
+             retries=2, backoff=0.8):
+    """Returns (status, text). Does NOT raise on HTTP status errors (returns them).
+    Retries transient network errors (timeout / reset); a certificate error is
+    raised immediately (so the insecure-HTTPS fallback can kick in)."""
     req = urllib.request.Request(url, method=method, headers=headers or {}, data=data)
     ctx = _ssl_ctx(verify) if url.lower().startswith("https") else None
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-            return r.status, r.read().decode("utf-8", "replace")
-    except urllib.error.HTTPError as ex:
+    for attempt in range(retries + 1):
         try:
-            body = ex.read().decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        return ex.code, body
-    except urllib.error.URLError as ex:
-        hint = ""
-        if isinstance(ex.reason, ssl.SSLError) or "CERTIFICATE" in str(ex.reason).upper():
-            hint = "  (try --insecure)"
-        raise RuntimeError(f"Connection failed: {ex.reason}{hint}")
+            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+                return r.status, r.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as ex:
+            try:
+                body = ex.read().decode("utf-8", "replace")
+            except Exception:
+                body = ""
+            return ex.code, body
+        except OSError as ex:
+            # OSError covers URLError, TimeoutError (socket timeout), ConnectionError,
+            # SSLError, ... A cert error is fatal (no retry) -> insecure fallback.
+            if _is_cert_error(ex):
+                raise RuntimeError(f"Connection failed: {getattr(ex, 'reason', ex)}  (try --insecure)")
+            if attempt < retries:
+                time.sleep(backoff * (attempt + 1))  # transient -> back off and retry
+                continue
+            raise RuntimeError(
+                f"Connection failed (after {retries + 1} attempts): {getattr(ex, 'reason', ex)}")
 
 
 def http_json(method, url, headers=None, data=None, verify=True, timeout=30):
@@ -759,7 +773,7 @@ class PlexAccount:
 # Plex server client
 # ---------------------------------------------------------------------------
 class PlexClient:
-    def __init__(self, base_url, token, client_id, verify=True, timeout=30):
+    def __init__(self, base_url, token, client_id, verify=True, timeout=45):
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.client_id = client_id
@@ -823,6 +837,33 @@ class PlexClient:
         j = self.get_json(f"/library/metadata/{rating_key}")
         md = j.get("MediaContainer", {}).get("Metadata", [])
         return md[0] if md else None
+
+    def get_metadata_many(self, rating_keys, chunk=40):
+        """Full metadata (incl. Media/Part/Stream) for many items in a FEW requests
+        via /library/metadata/{k1,k2,...}. Returns {ratingKey: md}. On a batch
+        failure it retries the items one by one and skips any that keep failing
+        (logs a warning) instead of crashing the whole scan."""
+        out = {}
+        keys = [str(k) for k in rating_keys if k is not None]
+        i = 0
+        while i < len(keys):
+            batch = keys[i:i + chunk]
+            i += chunk
+            try:
+                j = self.get_json("/library/metadata/" + ",".join(batch))
+                for md in j.get("MediaContainer", {}).get("Metadata", []):
+                    out[str(md.get("ratingKey"))] = md
+            except Exception:
+                for k in batch:  # fall back per item so one slow item doesn't kill the batch
+                    if k in out:
+                        continue
+                    try:
+                        md = self.get_metadata(k)
+                        if md:
+                            out[k] = md
+                    except Exception as ex:
+                        log_warn(f"Could not load item {k} - skipping ({ex}).")
+        return out
 
     def all_episodes(self, show_key):
         j = self.get_json(f"/library/metadata/{show_key}/allLeaves")
@@ -1035,34 +1076,51 @@ def streams_variants(streams, stream_type):
 
 def collect_streams(client, items, fetch_full):
     """Returns (items_data, audio_variants, sub_variants), where variants are
-    lists of concrete tracks (not just languages) merged across episodes by signature."""
+    lists of concrete tracks (not just languages) merged across episodes by signature.
+    Full metadata is fetched in a FEW batched requests (not one per episode), and
+    episodes that can't be loaded are skipped instead of crashing the scan."""
     items_data = []
     audio_reg, sub_reg = {}, {}
     total = len(items)
+
+    # prefetch full metadata (with streams) for items that don't have it yet,
+    # in a few batched requests instead of one-per-episode (robust to a slow server)
+    need = [str(it.get("ratingKey")) for it in items
+            if not it.get("_md") and it.get("ratingKey") is not None]
+    md_map = client.get_metadata_many(need) if need else {}
+
+    skipped = 0
     for i, it in enumerate(items, 1):
-        rk = it.get("ratingKey")
-        md = it.get("_md") or client.get_metadata(rk)
-        parts = list(iter_parts(md))
-        for _pid, streams in parts:
-            for stt, reg in ((ST_AUDIO, audio_reg), (ST_SUBTITLE, sub_reg)):
-                for key, v in streams_variants(streams, stt).items():
-                    if key in reg:
-                        reg[key]["count"] += 1
-                    else:
-                        reg[key] = v
-        items_data.append({
-            "ratingKey": rk,
-            "title": it.get("title") or md.get("title") or f"#{rk}",
-            "s": it.get("parentIndex"),
-            "e": it.get("index"),
-            "parts": parts,
-        })
+        rk = str(it.get("ratingKey")) if it.get("ratingKey") is not None else None
+        md = it.get("_md") or (md_map.get(rk) if rk else None)
+        if md is not None:
+            parts = list(iter_parts(md))
+            for _pid, streams in parts:
+                for stt, reg in ((ST_AUDIO, audio_reg), (ST_SUBTITLE, sub_reg)):
+                    for key, v in streams_variants(streams, stt).items():
+                        if key in reg:
+                            reg[key]["count"] += 1
+                        else:
+                            reg[key] = v
+            items_data.append({
+                "ratingKey": it.get("ratingKey"),
+                "title": it.get("title") or md.get("title") or f"#{rk}",
+                "s": it.get("parentIndex"),
+                "e": it.get("index"),
+                "parts": parts,
+            })
+        else:
+            skipped += 1  # couldn't load this episode -> skip, keep going
         if total > 1:
             pct = i * 100 // total
             print(f"\r  {Fore.CYAN}scanning streams: {pct:3d}%{Style.RESET_ALL} "
                   f"({i}/{total})   ", end="", flush=True)
     if total > 1:
         print()
+    if skipped:
+        log_warn(f"{skipped} of {total} items could not be loaded and were skipped.")
+    if not items_data:
+        die("Could not load any item metadata (the server did not respond).")
     return items_data, _finalize_variants(audio_reg), _finalize_variants(sub_reg)
 
 
