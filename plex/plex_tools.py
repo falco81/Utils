@@ -21,6 +21,10 @@ variable, then next to the script (plex_tools.config.json), then a
 network/samba drive too), finally ~/.config. A new config is created NEXT
 TO THE SCRIPT (so it travels with it to another drive/OS). Show the
 current path with --where-config, force a custom path with --config.
+A remote config can be the PRIMARY source: set CONFIG_URL (or
+PLEX_TOOLS_CONFIG_URL / --config-url) to a JSON file (e.g. on your NAS)
+whose keys OVERRIDE the local config; if it's unreachable/invalid the
+script falls back to the local file methods above (short timeout, no hang).
 Logout / reset: --logout (delete tokens), --relogin (fresh sign-in),
 --switch-user (pick the Home user again).
 
@@ -122,6 +126,17 @@ def die(msg, code=1):
 CONFIG_FILENAME = "plex_tools.config.json"
 _CONFIG_OVERRIDE = None   # set by --config
 CONFIG_PATH = None        # current path (resolved at run time)
+
+# Optional remote config: point this at a JSON file (e.g. on your NAS) whose keys
+# OVERRIDE the local config (base_url, tokens, …). It's the PRIMARY source when set;
+# if it's empty/unreachable/invalid the script falls back to the local file methods
+# below. Set via the CONFIG_URL constant, the PLEX_TOOLS_CONFIG_URL env var, or
+# --config-url. A short timeout keeps an unreachable URL from stalling startup, and
+# the remote can't set the config URL itself (no redirect loop).
+CONFIG_URL = "http://nas.falco81.net/plex_tools.config.json"            # e.g. "http://nas.falco81.net/plex_tools.config.json"
+CONFIG_FETCH_TIMEOUT = 4   # seconds — keep short so an unreachable URL can't hang startup
+_CONFIG_URL_OVERRIDE = None  # set by --config-url
+CONFIG_SOURCE = ""         # human-readable description of where the config came from (set by load_config)
 
 
 def _script_dir():
@@ -810,14 +825,65 @@ def ask_yes(prompt, default=True):
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
+def _config_url():
+    return (_CONFIG_URL_OVERRIDE or os.environ.get("PLEX_TOOLS_CONFIG_URL") or CONFIG_URL or "").strip()
+
+
+def _fetch_remote_config(url):
+    """GET a JSON config from url (short timeout). Returns a dict or None.
+    Never raises: any problem (timeout, HTTP error, bad JSON, cert) -> None so
+    the caller falls back to the local config. Retries once insecurely on a
+    certificate error (handy for a NAS with a self-signed cert)."""
+    for verify in (True, False):
+        try:
+            ctx = _ssl_ctx(verify) if url.lower().startswith("https") else None
+            req = urllib.request.Request(url, headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=CONFIG_FETCH_TIMEOUT, context=ctx) as r:
+                status, body = r.status, r.read().decode("utf-8", "replace")
+            if status >= 400:
+                log_warn(f"Remote config {url} -> HTTP {status}; using local config.")
+                return None
+            data = json.loads(body)
+            if not isinstance(data, dict):
+                log_warn(f"Remote config {url} must be a JSON object; using local config.")
+                return None
+            data.pop("config_url", None)  # never let the remote redirect the config source
+            return data
+        except Exception as ex:
+            if verify and _is_cert_error(ex):
+                log_warn("Remote config: certificate not trusted; retrying without verification.")
+                continue  # retry once with verify=False
+            log_warn(f"Remote config unreachable/invalid ({type(ex).__name__}); using local config.")
+            return None
+    return None
+
+
 def load_config():
+    global CONFIG_SOURCE
     if CONFIG_PATH is None:
         resolve_config_path()
     try:
         with open(CONFIG_PATH, encoding="utf-8") as f:
-            return json.load(f)
+            cfg = json.load(f)
     except Exception:
-        return {}
+        cfg = {}
+    local_exists = bool(cfg)
+    # remote config (if set) is primary: overlay its keys on top of the local one
+    url = _config_url()
+    if url:
+        remote = _fetch_remote_config(url)
+        if remote:
+            cfg = {**cfg, **remote}
+            base = f"overriding local {CONFIG_PATH}" if local_exists else f"local {CONFIG_PATH} (empty)"
+            CONFIG_SOURCE = f"remote {url}"
+            log_info(f"Config source: remote {url} ({len(remote)} key(s)), {base}.")
+        else:
+            CONFIG_SOURCE = f"local {CONFIG_PATH} (remote unavailable)"
+            log_info(f"Config source: local {CONFIG_PATH} (remote {url} unavailable).")
+    else:
+        CONFIG_SOURCE = f"local {CONFIG_PATH}"
+        log_info(f"Config source: local {CONFIG_PATH}.")
+    return cfg
 
 
 def save_config(cfg):
@@ -2292,6 +2358,7 @@ def top_menu(client, args):
     while True:
         header = [
             f"{Fore.MAGENTA}{Style.BRIGHT}plex_tools{Style.RESET_ALL}  ·  {client.base_url}",
+            f"{Style.DIM}config: {CONFIG_SOURCE}{Style.RESET_ALL}" if CONFIG_SOURCE else "",
             "",
         ]
         idx = interactive_menu("Main menu — choose a tool:",
@@ -2328,17 +2395,23 @@ def main():
     ap.add_argument("--unwatched", action="store_true",
                     help="Watched/unwatched mode: mark selection as UNWATCHED")
     ap.add_argument("--config", help="Path to the config file (otherwise searched next to the script, in .config next to the script and parent folders, and in ~/.config)")
+    ap.add_argument("--config-url", help="URL of a JSON config that OVERRIDES the local one (primary source; falls back to the local config if unreachable). Also settable via CONFIG_URL / PLEX_TOOLS_CONFIG_URL.")
     ap.add_argument("--where-config", action="store_true",
                     help="Print the path of the config file in use and exit")
     args = ap.parse_args()
 
-    global _CONFIG_OVERRIDE
+    global _CONFIG_OVERRIDE, _CONFIG_URL_OVERRIDE
     if args.config:
         _CONFIG_OVERRIDE = args.config
+    if args.config_url:
+        _CONFIG_URL_OVERRIDE = args.config_url
     resolve_config_path()
     if args.where_config:
         exists = "exists" if (CONFIG_PATH and os.path.isfile(CONFIG_PATH)) else "does not exist yet"
         print(f"Config: {CONFIG_PATH}  ({exists})")
+        url = _config_url()
+        if url:
+            print(f"Remote config (primary): {url}")
         return
 
     cfg = load_config()
