@@ -716,18 +716,24 @@ def ensure_mkvtoolnix(target_dir, allow_download):
     return mm, me
 
 
-def extract_audio_wav(ffmpeg_bin: str, mkv_path: Path, audio_position: int, out_wav: Path, sample_rate: int = 16000):
+def extract_audio_wav(ffmpeg_bin: str, mkv_path: Path, audio_position: int, out_wav: Path, sample_rate: int = 16000,
+                      progress_prefix=None):
     """audio_position = index of the audio track among audio tracks (0 = first audio track in the file),
-    matching the ffmpeg specifier '0:a:N'."""
+    matching the ffmpeg specifier '0:a:N'. If progress_prefix is set, a live progress bar is shown while
+    ffmpeg decodes the (often multi-GB) file."""
     cmd = [
         ffmpeg_bin, "-y", "-i", str(mkv_path),
         "-map", f"0:a:{audio_position}",
         "-ac", "1", "-ar", str(sample_rate),
         "-f", "wav", str(out_wav),
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    if progress_prefix is not None:
+        result = _run_ffmpeg_progress(cmd, prefix=progress_prefix, input_path=str(mkv_path),
+                                      ffprobe_bin=_find_ffprobe(ffmpeg_bin))
+    else:
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
     if result.returncode != 0 or not out_wav.exists() or out_wav.stat().st_size == 0:
-        die(f"ffmpeg could not extract/decode the audio track:\n{result.stderr[-2000:]}")
+        die(f"ffmpeg could not extract/decode the audio track:\n{(result.stderr or '')[-2000:]}")
 
 
 def read_wav_mono(path: Path):
@@ -2103,6 +2109,109 @@ def _collect_videos_subs(directory, recursive, sub_exts=None):
             if os.path.isfile(full) and f.lower().endswith(exts):
                 subs.append(full)
     return sorted(videos), sorted(subs)
+
+
+# ---- progress bar for long operations (mux/demux/convert/extract/remux) ----------
+class _Proc:
+    """Minimal CompletedProcess-like result so callers keep using .returncode/.stdout/.stderr."""
+    def __init__(self, returncode, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _draw_bar(frac, prefix="", done=False):
+    """White while running, fully GREEN at 100%. Redraws in place with \\r."""
+    frac = max(0.0, min(1.0, frac))
+    bw = 28
+    fill = int(round(bw * frac))
+    if done:
+        bar = f"{Fore.GREEN}{Style.BRIGHT}{'#' * bw}{Style.RESET_ALL}"
+    else:
+        bar = f"{Fore.WHITE}{'#' * fill}{Style.RESET_ALL}{Style.DIM}{'-' * (bw - fill)}{Style.RESET_ALL}"
+    sys.stdout.write(f"\r  {prefix}[{bar}] {int(frac * 100):3d}%")
+    sys.stdout.flush()
+    if done:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+
+
+def _media_duration(path, ffprobe_bin="ffprobe"):
+    try:
+        out = subprocess.run([ffprobe_bin, "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace")
+        d = json.loads(out.stdout or "{}")
+        dur = float(d.get("format", {}).get("duration") or 0)
+        return dur or None
+    except Exception:
+        return None
+
+
+def _run_mkvmerge_progress(cmd, prefix=""):
+    """Runs an mkvmerge command showing its real 'Progress: N%' as a bar."""
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                             text=True, encoding="utf-8", errors="replace", bufsize=1)
+    except Exception as e:
+        return _Proc(1, "", str(e))
+    out = []
+    rx = re.compile(r"[Pp]rogress:\s*(\d+)\s*%")
+    last = -1
+    _draw_bar(0.0, prefix)
+    for line in p.stdout:
+        out.append(line)
+        m = rx.search(line)
+        if m:
+            pct = int(m.group(1))
+            if pct != last:
+                _draw_bar(pct / 100.0, prefix)
+                last = pct
+    p.wait()
+    if p.returncode == 0:
+        _draw_bar(1.0, prefix, done=True)
+    else:
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+    return _Proc(p.returncode, "".join(out), "".join(out))
+
+
+def _run_ffmpeg_progress(cmd, prefix="", input_path=None, total_s=None, ffprobe_bin="ffprobe"):
+    """Runs an ffmpeg command with a real progress bar (parsed from -progress).
+    input_path (or total_s) is used to know the total duration."""
+    if total_s is None and input_path is not None:
+        total_s = _media_duration(input_path, ffprobe_bin)
+    cmd2 = [cmd[0], "-nostats", "-progress", "pipe:1"] + list(cmd[1:])
+    errf = tempfile.TemporaryFile(mode="w+")
+    try:
+        p = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=errf,
+                             text=True, encoding="utf-8", errors="replace", bufsize=1)
+    except Exception as e:
+        errf.close()
+        return _Proc(1, "", str(e))
+    rx = re.compile(r"out_time_us=(\d+)")
+    last = -1
+    _draw_bar(0.0, prefix)
+    have_progress = False
+    for line in p.stdout:
+        m = rx.search(line)
+        if m and total_s:
+            have_progress = True
+            frac = min(1.0, (int(m.group(1)) / 1e6) / total_s)
+            pct = int(frac * 100)
+            if pct != last:
+                _draw_bar(frac, prefix)
+                last = pct
+    p.wait()
+    errf.seek(0)
+    err = errf.read()
+    errf.close()
+    if p.returncode == 0:
+        _draw_bar(1.0, prefix, done=True)
+    else:
+        if have_progress:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+    return _Proc(p.returncode, "", err)
 
 
 def _srt_lang_tag(srt_path, vstem):
@@ -5074,7 +5183,7 @@ def run_import_subs(args):
             cmd += ["--language", f"0:{lang3}", "--track-name", f"0:{name}",
                     "--default-track", "0:yes" if (chosen is not None and i == chosen) else "0:no",
                     "--forced-track", "0:yes" if forced else "0:no", str(subfile)]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        res = _run_mkvmerge_progress(cmd, prefix=f"{Path(v).name} ")
         if res.returncode >= 2 or not os.path.exists(tmp_out):
             tail = " | ".join([l for l in (res.stdout or "").splitlines() if l.strip()][-3:])
             log_warn(f"{vp.name}: mkvmerge failed: {tail}")
@@ -5184,7 +5293,7 @@ def run_remove_tracks(args):
         elif s_keep and len(s_keep) < len(s_all):
             cmd += ["--subtitle-tracks", ",".join(str(i) for i in s_keep)]
         cmd += [str(v)]
-        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        res = _run_mkvmerge_progress(cmd, prefix=f"{Path(v).name} ")
         if res.returncode >= 2 or not os.path.exists(tmp_out):
             tail = " | ".join([l for l in (res.stdout or "").splitlines() if l.strip()][-3:])
             log_warn(f"{vp.name}: mkvmerge failed: {tail}")
@@ -5311,7 +5420,7 @@ def run_set_default(args):
                     disp += [f"-disposition:{tkey}:{rel}", "+".join(flags) if flags else "0"]
             tmp = str(v) + ".deftmp.mp4"
             cmd = [ffmpeg_bin, "-y", "-i", str(v), "-map", "0", "-c", "copy"] + disp + ["-default_mode", "passthrough", tmp]
-            res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            res = _run_ffmpeg_progress(cmd, prefix=f"{Path(v).name} ", input_path=str(v), ffprobe_bin=_find_ffprobe(ffmpeg_bin))
             if res.returncode != 0 or not os.path.exists(tmp):
                 log_warn(f"{vp.name}: ffmpeg error.")
                 failed += 1
@@ -7087,7 +7196,7 @@ def run_extract_audio(args):
                 log_info(f"{out.name}: already exists - skipping.")
                 continue
             cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", f"0:a:{ordinal}", "-c:a", "copy", str(out)]
-            r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            r = _run_ffmpeg_progress(cmd, prefix=f"{Path(vp).name} ", input_path=str(vp), ffprobe_bin=_find_ffprobe(ffmpeg_bin))
             if r.returncode != 0 or not out.exists():
                 log_warn(f"{vp.name}: extracting audio #{t['id']} failed.")
                 continue
@@ -7145,7 +7254,7 @@ def run_convert_audio(args):
         tmp = vp.with_name(vp.stem + f".__conv_{codec}__.mkv") if overwrite else out
         cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", "0", "-c:v", "copy",
                "-c:a", codec, "-b:a", bitrate, "-c:s", "copy", str(tmp)]
-        r = subprocess.run(cmd)
+        r = _run_ffmpeg_progress(cmd, prefix=f"{vp.name} ", input_path=str(vp), ffprobe_bin=_find_ffprobe(ffmpeg_bin))
         if r.returncode != 0 or not os.path.exists(tmp):
             log_warn(f"{vp.name}: conversion failed.")
             errors += 1
@@ -7340,7 +7449,7 @@ def run_import_audio(args):
         streams = _ffprobe_streams(ffprobe_bin, video_path)
         cmd = _build_import_audio_cmd(ffmpeg_bin, video_path, audio_path, out_path, streams,
                                       audio_lang3, audio_title)
-        r = subprocess.run(cmd)
+        r = _run_ffmpeg_progress(cmd, prefix=f"{Path(video_path).name} ", input_path=str(video_path), ffprobe_bin=ffprobe_bin)
         if r.returncode != 0 or not out_path.exists():
             log_warn(f"  {vp.name}: mux failed.")
             errors += 1
@@ -8472,7 +8581,7 @@ def _vid_extract_audio(args, info):
             n += 1
         used.add(str(out))
         cmd = [ff, "-y", "-i", str(p), "-map", f"0:a:{t['ord']}", "-c:a", "copy", str(out)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = _run_ffmpeg_progress(cmd, prefix=f"{Path(p).name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
         if r.returncode == 0 and out.exists():
             log_done(f"Audio A{t['ord'] + 1} ({t['codec']}) -> {out.name}")
         else:
@@ -8535,7 +8644,7 @@ def _vid_remove_tracks(args, info):
         elif keep_s and len(keep_s) < len(info["subs"]):
             cmd += ["--subtitle-tracks", ",".join(map(str, keep_s))]
         cmd += [str(p)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = _run_mkvmerge_progress(cmd, prefix=f"{Path(p).name} ")
         if r.returncode >= 2 or not tmp.exists():
             log_warn("mkvmerge failed.")
             tmp.exists() and os.remove(str(tmp))
@@ -8551,7 +8660,7 @@ def _vid_remove_tracks(args, info):
             if t["ord"] not in rem_s:
                 maps += ["-map", f"0:s:{t['ord']}"]
         cmd = [ff, "-y", "-i", str(p)] + maps + ["-c", "copy", str(tmp)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = _run_ffmpeg_progress(cmd, prefix=f"{Path(p).name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
         if r.returncode != 0 or not tmp.exists():
             log_warn("ffmpeg failed.")
             tmp.exists() and os.remove(str(tmp))
@@ -8832,7 +8941,7 @@ def _vid_apply_track_changes(args, info, kind, t, changes):
             fl.append("forced")
         disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
     cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + meta + disp + [str(tmp)]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = _run_ffmpeg_progress(cmd, prefix=f"{Path(p).name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
     if r.returncode != 0 or not tmp.exists():
         log_warn("ffmpeg remux failed.")
         tmp.exists() and os.remove(str(tmp))
@@ -8924,7 +9033,7 @@ def _vid_set_default(args, info):
                     fl.append("forced")
                 disp += [f"-disposition:{letter}:{t['ord']}", "+".join(fl) if fl else "0"]
         cmd = [ff, "-y", "-i", str(p), "-map", "0", "-c", "copy"] + disp + [str(tmp)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        r = _run_ffmpeg_progress(cmd, prefix=f"{Path(p).name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
         if r.returncode != 0 or not tmp.exists():
             log_warn("ffmpeg failed.")
             tmp.exists() and os.remove(str(tmp))
@@ -8957,7 +9066,7 @@ def _vid_add_audio(args, info):
         cmd += ["-disposition:a", "0", f"-disposition:a:{len(info['audio'])}", "default"]
     # convert text subs when muxing into mkv from mp4 to be safe
     cmd += ["-c:s", "copy" if info["is_mkv"] else "srt", str(tmp)]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = _run_ffmpeg_progress(cmd, prefix=f"{Path(p).name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
     if r.returncode != 0 or not tmp.exists():
         log_warn("ffmpeg mux failed.")
         tmp.exists() and os.remove(str(tmp))
@@ -8995,7 +9104,7 @@ def _vid_add_subs(args, info):
            "--language", f"0:{lang}", "--track-name", f"0:{name}",
            "--forced-track", "0:yes" if forced else "0:no",
            "--default-track", "0:yes" if default else "0:no", str(spath)]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = _run_mkvmerge_progress(cmd, prefix=f"{Path(p).name} ")
     if r.returncode >= 2 or not tmp.exists():
         log_warn("mkvmerge mux failed.")
         tmp.exists() and os.remove(str(tmp))
@@ -9137,7 +9246,7 @@ def _vid_extract_stream_only(args, info):
     else:
         out = p.with_name(p.stem + ".noSubs" + p.suffix)
         cmd = [ff, "-y", "-i", str(p), "-map", "0:v", "-map", "0:a?", "-c", "copy", "-sn", str(out)]
-    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+    r = _run_ffmpeg_progress(cmd, prefix=f"{Path(p).name} ", input_path=str(p), ffprobe_bin=_find_ffprobe(ff))
     if r.returncode != 0 or not out.exists():
         log_warn("Extraction failed.")
         return None
@@ -11147,23 +11256,17 @@ def _retime_apply_segments(events, segs):
 
 
 def _print_progress(i, n, prefix=""):
-    """One-line \\r progress bar (normal terminal mode)."""
+    """One-line \\r progress bar: white while running, fully green at 100%."""
     if n <= 0:
         return
-    frac = min(1.0, i / n)
-    bw = 28
-    fill = int(bw * frac)
-    sys.stdout.write(f"\r  {prefix}[{'#' * fill}{'-' * (bw - fill)}] {i}/{n} ({frac * 100:4.0f}%)")
-    sys.stdout.flush()
-    if i >= n:
-        sys.stdout.write("\n")
-        sys.stdout.flush()
+    _draw_bar(min(1.0, i / n), prefix=prefix, done=(i >= n))
 
 
-def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0):
+def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0, progress_prefix=None):
     """Extracts one audio track ONCE and returns dict(vad, env, hz, dur): VAD speech
     events (coarse structure) AND a full-track RMS energy envelope at 50 Hz (for
-    precise per-timestamp waveform correlation). Cached per (video, audio_index)."""
+    precise per-timestamp waveform correlation). Cached per (video, audio_index).
+    Shows a progress bar during the (slow) ffmpeg decode when progress_prefix is set."""
     import numpy as np
     key = (video, audio_index)
     if key in cache:
@@ -11172,7 +11275,7 @@ def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0):
     try:
         with tempfile.TemporaryDirectory() as td:
             wav = Path(td) / "a.wav"
-            extract_audio_wav(ffmpeg_bin, Path(video), audio_index, wav)
+            extract_audio_wav(ffmpeg_bin, Path(video), audio_index, wav, progress_prefix=progress_prefix)
             samples, sr = read_wav_mono(wav)
         if samples is not None and len(samples):
             try:
@@ -11398,13 +11501,15 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
         sa_t, ta_t = _pick_common_audio(src_tracks, tgt_tracks)
         pairs = [((ta_t["lang"] if ta_t else "und"), sa_t, ta_t)] if (sa_t or ta_t) else [("und", None, None)]
 
-    # analyse each track pair once (cached)
+    # analyse each track pair once (cached) - with a live bar during the slow decode
     analyses = []   # (lang, src_an, tgt_an, src_track, tgt_track)
     for (lg, st, tt) in pairs:
-        log_info(f"    analysing {_lang3_name(lg)} audio: target [{_audio_desc(tt)}]"
-                 + (f" + source [{_audio_desc(st)}]" if st else "") + " ...")
-        ta_an = _video_analysis(args, ffmpeg_bin, job["target"], vad_cache, tt["index"] if tt else 0)
-        sa_an = (_video_analysis(args, ffmpeg_bin, job["source_video"], vad_cache, st["index"])
+        log_info(f"    analysing {_lang3_name(lg)} audio (target [{_audio_desc(tt)}]"
+                 + (f" + source [{_audio_desc(st)}]" if st else "") + "):")
+        ta_an = _video_analysis(args, ffmpeg_bin, job["target"], vad_cache, tt["index"] if tt else 0,
+                                progress_prefix=f"{_fmt_ep(job['ep'])} reading {_lang3_name(lg)} target audio ")
+        sa_an = (_video_analysis(args, ffmpeg_bin, job["source_video"], vad_cache, st["index"],
+                                 progress_prefix=f"{_fmt_ep(job['ep'])} reading {_lang3_name(lg)} source audio ")
                  if (job["source_video"] and st) else None)
         analyses.append((lg, sa_an, ta_an, st, tt))
 
@@ -11495,7 +11600,8 @@ def run_retime_batch(args):
     if not os.path.isdir(directory):
         directory = os.path.dirname(directory) or "."
     log_info(f"Working directory: {os.path.abspath(directory)}")
-    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    noask = getattr(args, "retime_all_tracks", False)   # --p3 preset: no prompts at all
+    recursive = False if noask else ask_yes_no("Search subdirectories too?", default_no=True)
 
     jobs = _retime_scan(directory, recursive)
     if not jobs:
@@ -11513,7 +11619,7 @@ def run_retime_batch(args):
               + (f"   {Fore.YELLOW}[exists]{Style.RESET_ALL}" if j['exists'] else ""))
 
     if any(j["exists"] for j in jobs):
-        if not ask_yes_no("Some outputs already exist - overwrite them?", default_no=True):
+        if not noask and not ask_yes_no("Some outputs already exist - overwrite them?", default_no=True):
             jobs = [j for j in jobs if not j["exists"]]
     if not jobs:
         log_info("Nothing to do.")
@@ -11536,7 +11642,10 @@ def run_retime_batch(args):
     if lang_count:
         log_info("Common audio languages found in source+target pairs: "
                  + ", ".join(f"{_lang3_name(lg)} ({lg}) x{c}" for lg, c in sorted(lang_count.items(), key=lambda x: -x[1])))
-        if _tui_supported():
+        if getattr(args, "retime_all_tracks", False):
+            selected = set(lang_count)
+            log_info("Preset: using ALL matching audio tracks.")
+        elif _tui_supported():
             picked = _retime_pick_audio_langs(lang_count)
             if picked is None:
                 log_info("Cancelled.")
@@ -11555,8 +11664,8 @@ def run_retime_batch(args):
     args.tolerance = getattr(args, "tolerance", None) or 1.5
     args.vad_percentile = getattr(args, "vad_percentile", None) or 55.0
 
-    if not ask_yes_no(f"Re-time {len(jobs)} subtitle file(s) now? (reads audio from each video - can take a while)",
-                      default_no=False):
+    if not noask and not ask_yes_no(f"Re-time {len(jobs)} subtitle file(s) now? (reads audio from each video - can take a while)",
+                                    default_no=False):
         log_info("Cancelled.")
         return
 
@@ -11815,6 +11924,12 @@ def _wizard_action_specs():
             help="Fixed preset: extracts the English track, translates to Czech (google, free) + rules "
                  "proofreading + readability fix, saves <video>.cs.srt. Asks only if several EN tracks exist.",
             kind="direct", run=run_p2, flag=None, preset=None),
+        "p3": dict(
+            label="[preset] Re-time subtitles to a different source, ALL audio tracks (--p3)",
+            help="Fixed preset: re-times subtitles to a different video source (auto-detect source/target) "
+                 "using ALL matching common-language audio tracks automatically - skips the track picker "
+                 "and cross-checks every shared language for maximum reliability.",
+            kind="direct", run=run_p3, flag=None, preset=None),
         "extract-audio": dict(
             label="Extract an audio track from videos (stream copy)",
             help="Extracts an audio track (by language) from each video into a standalone audio file "
@@ -11870,7 +11985,7 @@ def _wizard_action_specs():
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
      ["sync-one", "sync-folder", "translate", "extract-subs", "merge-pro",
-      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "fix-readability", "p1", "p2"]),
+      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "fix-readability", "p1", "p2", "p3"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
@@ -12130,6 +12245,15 @@ def _pick_video_track(infos, video, chosen_key, kind="subs"):
     if len(matching) == 1:
         return matching[0]
     return None
+
+
+def run_p3(args):
+    """FIXED PRESET (--p3), built directly into the script: re-time subtitles to a
+    DIFFERENT video source using ALL matching (common-language) audio tracks
+    automatically - the track picker is skipped and every shared-language pair is
+    used for maximum reliability."""
+    args.retime_all_tracks = True
+    run_retime_batch(args)
 
 
 def run_p1(args):
@@ -12563,6 +12687,10 @@ DIFFERENT LANGUAGES (target vs reference):
                              "rule-based proofreading and a readability fix (9 chars/s, min 2.5s), saving <video>.cs.srt. "
                              "If several English tracks exist it asks which to use. Optionally a path to the directory "
                              "as a positional argument.")
+    parser.add_argument("--p3", action="store_true",
+                        help="FIXED PRESET built into the script: re-time subtitles to a DIFFERENT video source "
+                             "(auto-detect source/target by episode) using ALL matching common-language audio "
+                             "tracks automatically (no track picker). Optionally a path to the directory.")
     parser.add_argument("--presets", action="store_true",
                         help="Opens the Presets menu (run/create/delete saved configurations) - works even when a default preset is set.")
     parser.add_argument("--no-preset", action="store_true",
@@ -12620,6 +12748,10 @@ DIFFERENT LANGUAGES (target vs reference):
 
     if getattr(args, "p2", False):
         run_p2(args)
+        return
+
+    if getattr(args, "p3", False):
+        run_p3(args)
         return
 
     if getattr(args, "presets", False):
