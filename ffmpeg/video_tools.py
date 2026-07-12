@@ -13421,6 +13421,39 @@ def _retime_2in1_one(args, ffmpeg_bin, job, vad_cache):
                 a_end=a_end, dropped_a=dropA, dropped_b=dropB)
 
 
+def _retime_contrib_lines(r, indent="          "):
+    """Detailed report lines (contribution graph + offset + languages-agree) for one per-line
+    _retime_one result. Returns a list of printable strings; empty if not a per-line result."""
+    if not (r and r.get("ok") and r.get("perline")):
+        return []
+    lines = []
+    used = r.get("used") or []
+    total = r.get("total") or 1
+    if used:
+        rows = []
+        for tup in used:
+            lg = tup[0]
+            cnt = tup[3] if len(tup) > 3 else 0
+            name = "video image" if lg == "video" else f"{_lang3_name(lg)} audio"
+            rows.append((name, cnt, Fore.MAGENTA if lg == "video" else Fore.CYAN))
+        labw = max((len(n) for n, _, _ in rows), default=11)
+        lines.append(f"{indent}contribution (share of {total} timestamps each method matched):")
+        for name, cnt, col in rows:
+            share = (100.0 * cnt / total) if total else 0.0
+            bar = _ascii_hbar(cnt, total)
+            lines.append(f"{indent}  {col}{name:<{labw}}{Style.RESET_ALL}  {Fore.GREEN}{bar}{Style.RESET_ALL} "
+                         f"{cnt:>4} ({share:.0f}%)")
+    if r.get("off_lo") is not None:
+        rng = (f"{r['off_lo']:+.1f}s" if abs(r['off_hi'] - r['off_lo']) < 0.2
+               else f"{r['off_lo']:+.1f}..{r['off_hi']:+.1f}s")
+        xcheck = ""
+        if r.get("spread") is not None:
+            xcheck = (f"   {Fore.YELLOW}languages DISAGREE by {r['spread']:.2f}s{Style.RESET_ALL}"
+                      if r["spread"] > 1.0 else f"   languages agree within {r['spread']:.2f}s")
+        lines.append(f"{indent}offset: {rng}{xcheck}")
+    return lines
+
+
 def run_retime_2in1_batch(args):
     """2 IN 1: re-time subtitles from two 30-min source halves onto one 60-min target
     (auto-detect, batch). Target N is built from source halves 2N-1 and 2N (by episode order)."""
@@ -13545,12 +13578,17 @@ def run_retime_2in1_batch(args):
             print(f"  {Fore.RED}FAILED{Style.RESET_ALL} {Path(j['target']).name}: {r.get('msg')}")
             continue
         ae = r.get("a_end", 0.0)
+        pa, pb = r.get("partA"), r.get("partB")
         print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
               f"{Style.DIM}({r['count']} lines total){Style.RESET_ALL}")
-        print(f"      part A (front): {_vp(r.get('partA'))}  |  {r['a_lines']} lines kept"
+        print(f"      part A (front): {_vp(pa)}  |  {r['a_lines']} lines kept"
               + (f", {Fore.YELLOW}{r.get('dropped_a', 0)} seam dropped{Style.RESET_ALL}" if r.get('dropped_a') else ""))
-        print(f"      part B (back @ ~{int(ae // 60):02d}:{int(ae % 60):02d}): {_vp(r.get('partB'))}  |  {r['b_lines']} lines kept"
+        for ln in _retime_contrib_lines(pa, indent="        "):
+            print(ln)
+        print(f"      part B (back @ ~{int(ae // 60):02d}:{int(ae % 60):02d}): {_vp(pb)}  |  {r['b_lines']} lines kept"
               + (f", {Fore.YELLOW}{r.get('dropped_b', 0)} seam dropped{Style.RESET_ALL}" if r.get('dropped_b') else ""))
+        for ln in _retime_contrib_lines(pb, indent="        "):
+            print(ln)
     print()
     log_done(f"Done: {okc}/{len(results)} target(s) re-timed from 2 source halves.")
 
