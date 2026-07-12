@@ -11710,6 +11710,11 @@ def _print_progress(i, n, prefix=""):
     _draw_bar(min(1.0, i / n), prefix=prefix, done=(i >= n))
 
 
+# --- precision knobs (all default ON for maximum accuracy; toggleable in the picker/CLI) ---
+_RETIME_ENV_HZ = 200        # audio envelope sample rate (Hz): higher = finer time grid, slower
+_RETIME_SUBSAMPLE = True    # parabolic sub-sample interpolation of the NCC peak (~1-2 ms vs 20 ms)
+
+
 def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0, progress_prefix=None):
     """Extracts one audio track ONCE and returns dict(vad, env, hz, dur): VAD speech
     events (coarse structure) AND a full-track RMS energy envelope at 50 Hz (for
@@ -11730,7 +11735,7 @@ def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0, progress_pref
                 vad = detect_speech_events(samples, sr, energy_percentile=getattr(args, "vad_percentile", None) or 55.0)
             except (SystemExit, Exception):
                 vad = []
-            hz = 50
+            hz = int(_RETIME_ENV_HZ or 100)
             fl = max(1, int(sr / hz))
             n = len(samples) // fl
             s = np.asarray(samples[:n * fl], dtype=np.float64).reshape(n, fl)
@@ -11773,7 +11778,17 @@ def _ncc_locate(src_env, tgt_env, hz, t_src, t_guess, win_s=4.0, band_s=10.0):
     num = np.correlate(r, seg, mode="valid")     # seg is zero-mean -> already the covariance
     ncc = num / (wnorm * sn)
     k = int(np.argmax(ncc))
-    return (lo + k + w // 2) / hz, float(ncc[k])
+    pos = float(k)
+    if _RETIME_SUBSAMPLE and 0 < k < len(ncc) - 1:
+        # parabolic (quadratic) interpolation of the peak from its two neighbours -> sub-sample
+        # precision (~1/10 of a sample) instead of being quantized to the envelope grid.
+        ym1, y0, yp1 = float(ncc[k - 1]), float(ncc[k]), float(ncc[k + 1])
+        denom = ym1 - 2.0 * y0 + yp1
+        if denom < -1e-9:                       # concave -> a genuine peak
+            d = 0.5 * (ym1 - yp1) / denom
+            if -0.5 <= d <= 0.5:
+                pos = k + d
+    return (lo + pos + w // 2) / hz, float(ncc[k])
 
 
 def _segs_map(segs):
@@ -12528,6 +12543,7 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
     changes GPU acceleration, Enter runs, Esc cancels. Returns (selected_jobs, use_video)
     or None on cancel. All pairs start checked."""
     global _HWACCEL_MODE, _HWACCEL_RESOLVED, _HWACCEL_DEVICE, _GPURES_HW
+    global _RETIME_ENV_HZ, _RETIME_SUBSAMPLE
     sel = [True] * len(jobs)
     pos = 0
     top = 0
@@ -12572,11 +12588,16 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                     f"GPU accel: {Fore.GREEN}{_hw_text()}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
                     + (f"    GPU: {Fore.GREEN}{_dev_text()}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}"
                        if len(gpu_names) > 1 else ""),
+                    f"{Style.DIM}precision:{Style.RESET_ALL} "
+                    f"envelope {Fore.GREEN}{_RETIME_ENV_HZ} Hz{Style.RESET_ALL} {Style.DIM}(h){Style.RESET_ALL}    "
+                    f"sub-sample interp: {Fore.GREEN if _RETIME_SUBSAMPLE else Style.DIM}"
+                    f"{'ON' if _RETIME_SUBSAMPLE else 'OFF'}{Style.RESET_ALL} {Style.DIM}(p){Style.RESET_ALL}"
+                    f"    {Style.DIM}(all on = max accuracy){Style.RESET_ALL}",
                     "",
                 ]
                 foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | v = video | "
-                            f"g = GPU accel | " + ("d = GPU device | " if len(gpu_names) > 1 else "")
-                            + f"Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                            f"g = GPU | " + ("d = device | " if len(gpu_names) > 1 else "")
+                            + f"h = envelope Hz | p = interp | Enter = run | Esc = cancel{Style.RESET_ALL}"]
                 avail = max(4, rows - len(head) - len(foot))
                 per = max(1, avail // 4)   # each pair is a 4-line block
                 pos = max(0, min(pos, len(jobs) - 1))
@@ -12636,6 +12657,13 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                     _HWACCEL_RESOLVED = "__unset__"   # re-probe on the new device
                     globals()["_VIDEO_DECODE_VARIANT"] = "__unset__"
                     _GPURES_HW = None
+                elif k == ("char", "h"):
+                    # cycle audio envelope rate: 50 -> 100 -> 200 -> 50 Hz (finer = more precise)
+                    hzc = [50, 100, 200]
+                    cur = _RETIME_ENV_HZ if _RETIME_ENV_HZ in hzc else 100
+                    _RETIME_ENV_HZ = hzc[(hzc.index(cur) + 1) % len(hzc)]
+                elif k == ("char", "p"):
+                    _RETIME_SUBSAMPLE = not _RETIME_SUBSAMPLE
                 elif k == "up":
                     pos = (pos - 1) % len(jobs)
                 elif k == "down":
@@ -13920,9 +13948,13 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--retime-subs", dest="retime_subs", action="store_true",
                         help="Interactive mode: re-time subtitles to a different video source (auto-detect "
                              "source/target by episode, analyse both videos' audio). Writes <target>.<lang>.srt.")
-    parser.add_argument("--retime-video", dest="retime_use_video", action="store_true",
+    parser.add_argument("--retime-video", dest="retime_use_video", action="store_true", default=True,
                         help="(with re-timing) ALSO analyse the video image (compare source/target frames) as an "
-                             "extra alignment modality - helps when the audio is unreliable (silence, music). Slower.")
+                             "extra alignment modality - helps when the audio is unreliable (silence, music). "
+                             "ON by default for maximum accuracy; slower.")
+    parser.add_argument("--no-retime-video", dest="retime_use_video", action="store_false",
+                        help="Disable the video-image cross-check (audio only). Faster, slightly less robust in "
+                             "silent/music stretches (audio already drives the precise timing either way).")
     parser.add_argument("--hwaccel", dest="hwaccel", default=None,
                         help="GPU acceleration for video decoding during frame analysis: 'auto' (default, "
                              "auto-detect NVIDIA cuda / Intel qsv / Windows d3d11va / Linux vaapi / macOS "
@@ -13931,6 +13963,12 @@ DIFFERENT LANGUAGES (target vs reference):
                         help="Which GPU to use when several are present (GPU+iGPU or multiple cards): an "
                              "adapter INDEX (0, 1, ...) for d3d11va/d3d12va/cuda/qsv, or a /dev/dri/renderDN "
                              "path for vaapi. Default: let ffmpeg pick. Only affects speed, never subtitle timing.")
+    parser.add_argument("--env-hz", dest="env_hz", type=int, default=None,
+                        help="Audio envelope sample rate in Hz for re-timing (default 100). Higher (e.g. 200) "
+                             "= finer time grid = more precise, but slower. Lower (50) = faster.")
+    parser.add_argument("--no-subsample-interp", dest="subsample_interp", action="store_false", default=None,
+                        help="Disable parabolic sub-sample interpolation of the correlation peak (on by default; "
+                             "it gives ~2-5 ms precision instead of the envelope grid, for free).")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -13987,11 +14025,15 @@ DIFFERENT LANGUAGES (target vs reference):
     global _STORE_PATH, _STORE_URL, _FFMPEG_URL_OVERRIDE
     _STORE_PATH = _normalize_store_path(getattr(args, "config_file", None) or getattr(args, "preset_file", None))
     _STORE_URL = (getattr(args, "config_url", None) or "").strip() or None
-    global _HWACCEL_MODE, _HWACCEL_DEVICE
+    global _HWACCEL_MODE, _HWACCEL_DEVICE, _RETIME_ENV_HZ, _RETIME_SUBSAMPLE
     if getattr(args, "hwaccel", None):
         _HWACCEL_MODE = args.hwaccel
     if getattr(args, "hwaccel_device", None):
         _HWACCEL_DEVICE = args.hwaccel_device
+    if getattr(args, "env_hz", None):
+        _RETIME_ENV_HZ = max(20, int(args.env_hz))
+    if getattr(args, "subsample_interp", None) is False:
+        _RETIME_SUBSAMPLE = False
     if getattr(args, "ffmpeg_url", None):
         _FFMPEG_URL_OVERRIDE = args.ffmpeg_url
     migrate_legacy_store()
