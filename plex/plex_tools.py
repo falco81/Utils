@@ -242,6 +242,35 @@ def strip_ansi(s):
     return _ANSI_RE.sub("", s)
 
 
+def _scrollbar_range(nrows, total, visible, top):
+    """Thumb (start_row, size) for a vertical scrollbar spanning nrows body rows,
+    or None when everything fits (total <= visible). Thumb size ~ visible share,
+    position ~ scroll offset."""
+    if total <= visible or nrows <= 0:
+        return None
+    thumb = max(1, min(nrows, round(nrows * visible / total)))
+    span = nrows - thumb                       # travel room for the thumb
+    denom = max(1, total - visible)            # number of scroll positions
+    tstart = max(0, min(span, round(span * (top / denom))))
+    return (tstart, thumb)
+
+
+def _with_scrollbar(line, cols, r, sbr):
+    """Append a scrollbar cell to a body line at the last column (col `cols`).
+    r = 0-based row within the visible body; sbr = (tstart, thumb) or None.
+    The line is padded (spaces don't count color codes) so the cell lands on the
+    right edge; the trailing CRLF after each body line prevents an autowrap."""
+    if sbr is None:
+        return line
+    tstart, thumb = sbr
+    if tstart <= r < tstart + thumb:
+        cell = f"{Fore.CYAN}{Style.BRIGHT}\u2588{Style.RESET_ALL}"   # thumb (full block)
+    else:
+        cell = f"{Style.DIM}\u2502{Style.RESET_ALL}"                 # track (light vertical)
+    pad = max(1, (cols - 1) - len(strip_ansi(line)))
+    return line + (" " * pad) + cell
+
+
 def _read_key(timeout=None):
     """Read a single key. Returns an action string or ('char', char) with a
     proper Unicode character (incl. Czech diacritics). With timeout (seconds),
@@ -427,15 +456,17 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
         else:
             start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
             window = order[start:start + page_rows]
+            sbr = _scrollbar_range(len(window), len(order), len(window), start)
             if start > 0:
                 vis_lines.append(f"  {Fore.CYAN}▲ ({start} above){Style.RESET_ALL}")
             for pos, i in enumerate(window, start):
                 text = trunc(plain[i], maxw - 2)
                 if pos == sel_pos:
-                    vis_lines.append(f"{Fore.GREEN}{Style.BRIGHT}›{Style.RESET_ALL} "
-                                     f"{Fore.GREEN}{Style.BRIGHT}{text}{Style.RESET_ALL}")
+                    line = (f"{Fore.GREEN}{Style.BRIGHT}›{Style.RESET_ALL} "
+                            f"{Fore.GREEN}{Style.BRIGHT}{text}{Style.RESET_ALL}")
                 else:
-                    vis_lines.append(f"  {text}")
+                    line = f"  {text}"
+                vis_lines.append(_with_scrollbar(line, cols, pos - start, sbr))
             rest = len(order) - (start + len(window))
             if rest > 0:
                 vis_lines.append(f"  {Fore.CYAN}▼ ({rest} below){Style.RESET_ALL}")
@@ -658,6 +689,7 @@ def checkbox_menu(prompt, rows, header=None):
 
             start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
             window = order[start:start + page_rows]
+            sbr = _scrollbar_range(len(window), len(order), len(window), start)
             if start > 0:
                 vis.append(f"  {Fore.CYAN}▲ ({start} above){Style.RESET_ALL}")
             for pos, i in enumerate(window, start):
@@ -667,26 +699,27 @@ def checkbox_menu(prompt, rows, header=None):
                     eps = header_eps(r)
                     cnt = sum(1 for j in eps if rows[j].get("selected"))
                     box = "[x]" if (eps and cnt == len(eps)) else ("[~]" if cnt else "[ ]")
-                    text = trunc(plain[i], max(1, maxw - 4))
+                    text = trunc(plain[i], max(1, maxw - 4 - (2 if sbr else 0)))
                     if cursor:
-                        vis.append(f"{Fore.GREEN}{Style.BRIGHT}› {box} {text}{Style.RESET_ALL}")
+                        line = f"{Fore.GREEN}{Style.BRIGHT}› {box} {text}{Style.RESET_ALL}"
                     else:
-                        vis.append(f"  {Fore.CYAN}{Style.BRIGHT}{box} {text}{Style.RESET_ALL}")
-                    continue
-                box = "[x]" if r.get("selected") else "[ ]"
-                if "watched" in r:
-                    word = "watched" if r["watched"] else "unwatched"
-                    color = Fore.GREEN if r["watched"] else Style.DIM
-                    tag = f"{' ' * statgap}{color}{word}{Style.RESET_ALL}"
+                        line = f"  {Fore.CYAN}{Style.BRIGHT}{box} {text}{Style.RESET_ALL}"
                 else:
-                    tag = (" " * (statgap + statw)) if status_col else ""
-                textw = max(6, maxw - 8 - (statgap + statw if status_col else 0))
-                text = fit(plain[i], textw)  # pad/truncate so the status column aligns
-                if cursor:
-                    vis.append(f"{Fore.GREEN}{Style.BRIGHT}›   {box} {text}{Style.RESET_ALL}{tag}")
-                else:
-                    boxc = f"{Fore.GREEN}{box}{Style.RESET_ALL}" if r.get("selected") else box
-                    vis.append(f"    {boxc} {text}{tag}")
+                    box = "[x]" if r.get("selected") else "[ ]"
+                    if "watched" in r:
+                        word = "watched" if r["watched"] else "unwatched"
+                        color = Fore.GREEN if r["watched"] else Style.DIM
+                        tag = f"{' ' * statgap}{color}{word}{Style.RESET_ALL}"
+                    else:
+                        tag = (" " * (statgap + statw)) if status_col else ""
+                    textw = max(6, maxw - 8 - (statgap + statw if status_col else 0))
+                    text = fit(plain[i], textw)  # pad/truncate so the status column aligns
+                    if cursor:
+                        line = f"{Fore.GREEN}{Style.BRIGHT}›   {box} {text}{Style.RESET_ALL}{tag}"
+                    else:
+                        boxc = f"{Fore.GREEN}{box}{Style.RESET_ALL}" if r.get("selected") else box
+                        line = f"    {boxc} {text}{tag}"
+                vis.append(_with_scrollbar(line, cols, pos - start, sbr))
             rest = len(order) - (start + len(window))
             if rest > 0:
                 vis.append(f"  {Fore.CYAN}▼ ({rest} below){Style.RESET_ALL}")
