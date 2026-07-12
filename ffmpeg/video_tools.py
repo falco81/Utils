@@ -245,15 +245,46 @@ CONFIG_FETCH_TIMEOUT = 4          # seconds - kept short so an unreachable URL c
 # ----------------------------------------------------------------------
 
 def log_info(msg: str):
-    print(f"{Fore.CYAN}[INFO]{Style.RESET_ALL} {msg}")
+    _log_wrapped(f"{Fore.CYAN}[INFO]{Style.RESET_ALL}", "[INFO]", msg)
 
 
 def log_warn(msg: str):
-    print(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL} {msg}")
+    _log_wrapped(f"{Fore.YELLOW}[WARNING]{Style.RESET_ALL}", "[WARNING]", msg)
 
 
 def log_done(msg: str):
-    print(f"{Fore.GREEN}[DONE]{Style.RESET_ALL} {msg}")
+    _log_wrapped(f"{Fore.GREEN}[DONE]{Style.RESET_ALL}", "[DONE]", msg)
+
+
+_LOG_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _term_cols(default=100):
+    """Current terminal width in columns (falls back to a sane default when not a TTY)."""
+    try:
+        c = shutil.get_terminal_size(fallback=(default, 30)).columns
+        return c if (c and c > 20) else default
+    except Exception:
+        return default
+
+
+def _log_wrapped(tag_colored, tag_plain, msg):
+    """Prints '[TAG] msg'. If the line is too wide for the terminal, it wraps so that
+    continuation lines are indented to line up under the message (never a ragged flush-left
+    second line). Messages that carry their own colour codes are printed as-is (wrapping
+    them would mangle the ANSI), and any leading indentation the caller used is preserved."""
+    import textwrap
+    plain = _LOG_ANSI_RE.sub("", msg)
+    tag_w = len(tag_plain) + 1                     # tag + one space
+    cols = _term_cols()
+    if ("\x1b" in msg) or (tag_w + len(plain) <= cols):
+        print(f"{tag_colored} {msg}")
+        return
+    lead = len(plain) - len(plain.lstrip(" "))     # keep e.g. '    failed: ...' indentation
+    body = plain[lead:]
+    wrapped = textwrap.fill(body, width=max(20, cols - 1),
+                            initial_indent=" " * lead, subsequent_indent=" " * (tag_w + lead))
+    print(f"{tag_colored} {wrapped}")
 
 
 def die(msg: str, code: int = 1):
@@ -2134,16 +2165,29 @@ class _Proc:
         self.stderr = stderr
 
 
-def _draw_bar(frac, prefix="", done=False):
-    """White while running, fully GREEN at 100%. Redraws in place with \\r."""
+_BAR_PREFIX_W = 44   # progress-bar prefixes are padded to this width so every bar lines up
+
+
+def _draw_bar(frac, prefix="", done=False, suffix=""):
+    """White while running, fully GREEN at 100%. Redraws in place with \\r. The prefix is
+    padded (or truncated with an ellipsis) to a fixed width so EVERY bar in the app starts at
+    the same column; an optional suffix (e.g. the decode variant) is printed after the % so it
+    does not push the bar out of alignment. '\\x1b[K' clears any leftover from a longer line."""
     frac = max(0.0, min(1.0, frac))
     bw = 28
     fill = int(round(bw * frac))
+    vis = _LOG_ANSI_RE.sub("", prefix)
+    if len(vis) > _BAR_PREFIX_W:
+        prefix = vis[:_BAR_PREFIX_W - 1] + "\u2026"
+        pad = ""
+    else:
+        pad = " " * (_BAR_PREFIX_W - len(vis))
     if done:
         bar = f"{Fore.GREEN}{Style.BRIGHT}{'#' * bw}{Style.RESET_ALL}"
     else:
         bar = f"{Fore.WHITE}{'#' * fill}{Style.RESET_ALL}{Style.DIM}{'-' * (bw - fill)}{Style.RESET_ALL}"
-    sys.stdout.write(f"\r  {prefix}[{bar}] {int(frac * 100):3d}%")
+    tail = f"  {Style.DIM}{suffix}{Style.RESET_ALL}" if suffix else ""
+    sys.stdout.write(f"\r  {prefix}{pad}[{bar}] {int(frac * 100):3d}%{tail}\x1b[K")
     sys.stdout.flush()
     if done:
         sys.stdout.write("\n")
@@ -2189,9 +2233,10 @@ def _run_mkvmerge_progress(cmd, prefix=""):
     return _Proc(p.returncode, "".join(out), "".join(out))
 
 
-def _run_ffmpeg_progress(cmd, prefix="", input_path=None, total_s=None, ffprobe_bin="ffprobe"):
+def _run_ffmpeg_progress(cmd, prefix="", input_path=None, total_s=None, ffprobe_bin="ffprobe", bar_suffix=""):
     """Runs an ffmpeg command with a real progress bar (parsed from -progress).
-    input_path (or total_s) is used to know the total duration."""
+    input_path (or total_s) is used to know the total duration. bar_suffix is printed after
+    the percentage (e.g. the decode variant) without disturbing bar alignment."""
     if total_s is None and input_path is not None:
         total_s = _media_duration(input_path, ffprobe_bin)
     cmd2 = [cmd[0], "-nostats", "-progress", "pipe:1"] + list(cmd[1:])
@@ -2204,7 +2249,7 @@ def _run_ffmpeg_progress(cmd, prefix="", input_path=None, total_s=None, ffprobe_
         return _Proc(1, "", str(e))
     rx = re.compile(r"out_time_us=(\d+)")
     last = -1
-    _draw_bar(0.0, prefix)
+    _draw_bar(0.0, prefix, suffix=bar_suffix)
     have_progress = False
     for line in p.stdout:
         m = rx.search(line)
@@ -2213,14 +2258,14 @@ def _run_ffmpeg_progress(cmd, prefix="", input_path=None, total_s=None, ffprobe_
             frac = min(1.0, (int(m.group(1)) / 1e6) / total_s)
             pct = int(frac * 100)
             if pct != last:
-                _draw_bar(frac, prefix)
+                _draw_bar(frac, prefix, suffix=bar_suffix)
                 last = pct
     p.wait()
     errf.seek(0)
     err = errf.read()
     errf.close()
     if p.returncode == 0:
-        _draw_bar(1.0, prefix, done=True)
+        _draw_bar(1.0, prefix, done=True, suffix=bar_suffix)
     else:
         if have_progress:
             sys.stdout.write("\n")
@@ -8002,6 +8047,38 @@ def _fb_write_frame(lines):
     sys.stdout.flush()
 
 
+def _fb_draw_scrollbar(base_row, nrows, total, visible, top, cols):
+    """Draws a vertical ASCII scrollbar in the LAST screen column, next to a scrollable body.
+
+    Call this right AFTER _fb_write_frame(head + body + foot), for every full-screen list that
+    can scroll. It draws a proportional thumb (full block U+2588) on a light track (U+2502),
+    using ABSOLUTE cursor positioning so it never disturbs the body text and never wraps.
+
+      base_row : 1-based screen row of the FIRST body line   (usually len(head) + 1)
+      nrows    : number of body rows on screen                (len(body))
+      total    : total number of ITEMS in the full list
+      visible  : how many of those items are shown right now  (== nrows for 1-line items)
+      top      : index of the first shown item                (the scroll offset)
+      cols     : terminal width (bar goes in column `cols`)
+
+    No-op when everything fits (total <= visible) - then there is nothing to scroll."""
+    if total <= visible or nrows <= 0 or cols <= 0:
+        return
+    thumb = max(1, min(nrows, int(round(nrows * visible / float(total)))))
+    span = nrows - thumb
+    denom = max(1, total - visible)
+    tstart = int(round(span * (top / float(denom))))
+    tstart = max(0, min(span, tstart))
+    parts = ["\x1b[?7l"]                     # autowrap OFF so a bottom-right glyph can't scroll
+    for r in range(nrows):
+        g = "\u2588" if tstart <= r < tstart + thumb else "\u2502"
+        gcol = Fore.CYAN if g == "\u2588" else Style.DIM
+        parts.append(f"\x1b[{base_row + r};{cols}H{gcol}{g}{Style.RESET_ALL}")
+    parts.append("\x1b[?7h")                 # autowrap back ON
+    sys.stdout.write("".join(parts))
+    sys.stdout.flush()
+
+
 def _fb_prompt_line(label, initial=""):
     """Modal single-line input in raw mode. Enter=confirm (returns text),
     Esc=cancel (returns None). The caller redraws its own frame afterwards."""
@@ -8118,6 +8195,7 @@ def _fb_rename_preview(cwd, files):
         footer = (f"{Style.DIM}\u2191\u2193/PgUp/PgDn scroll | Enter = APPLY | Esc = cancel"
                   f"{Style.RESET_ALL}")
         _fb_write_frame(header + body + ["", summary, footer])
+        _fb_draw_scrollbar(len(header) + 1, len(body), len(view), rows_avail, top, cols)
 
         k = _read_key()
         if k in ("esc",) or k == ("char", "q"):
@@ -8269,6 +8347,7 @@ def run_rename_files(args, mode="rename"):
                         body.append(f"  {Fore.CYAN}v ({rest} more){Style.RESET_ALL}")
 
                     _fb_write_frame(head + body + foot)
+                    _fb_draw_scrollbar(len(head) + 1, len(view), n, len(view), top, cols)
                     status = ""
                     k = _read_key()
 
@@ -8852,6 +8931,7 @@ def _vid_pick_language(current):
                     else:
                         body.append(f"  {Fore.CYAN}{label}{Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(view), avail, top, cols)
                 k = _read_key()
                 if k == "esc":
                     return None
@@ -9641,6 +9721,7 @@ def _vid_scroll_view(title, lines):
                 pos = f"[{min(top + avail, len(lines))}/{len(lines)}]"
                 head[0] = head[0] + f"  {Style.DIM}{pos}{Style.RESET_ALL}"
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, avail, len(lines), avail, top, cols)
                 k = _read_key()
                 if k == "esc" or k == ("char", "q"):
                     return
@@ -9881,6 +9962,7 @@ def _video_browser_loop(state, args):
                 if rest > 0:
                     body.append(f"  {Fore.CYAN}v ({rest} more){Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(view), n, len(view), state["top"], cols)
                 k = _read_key()
 
                 if filter_editing:
@@ -10416,6 +10498,7 @@ def _online_live_match(args, g, info_fn=None):
                     body.append(f"  {Style.DIM}" + ("(type at least 2 characters to search)"
                                 if len(query.strip()) < 2 else "(no matches)") + f"{Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(results), avail, top, cols)
                 k = _read_key()
                 if k == "esc":
                     return
@@ -10611,6 +10694,7 @@ def _online_rename_preview(args, videos):
                 footer = (f"{Style.DIM}\u2191\u2193/PgUp/PgDn scroll | i/f/t toggle | l language | "
                           f"m change match | Enter = APPLY | Esc = cancel{Style.RESET_ALL}")
                 _fb_write_frame(header + body + ["", summary, footer])
+                _fb_draw_scrollbar(len(header) + 1, len(body), len(view), rows_avail, top, cols)
 
                 k = _read_key()
                 if k == "esc" or k == ("char", "q"):
@@ -10861,6 +10945,7 @@ def _pick_languages_multi(selected):
                         col = Fore.YELLOW if c in sel else Fore.CYAN
                         body.append(f"  {col}{label}{Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(view), avail, top, cols)
                 k = _read_key()
                 if k == "esc":
                     return None
@@ -11086,6 +11171,7 @@ def _subs_pick_for_file(args, client, langs, video, tmdb_id, overwrite):
                     else:
                         body.append(f"  {Fore.CYAN}{_fb_trunc(line, cols - 4)}{Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(items), avail, top, cols)
                 k = _read_key()
                 if k == "esc" or k == ("char", "q"):
                     return
@@ -11228,6 +11314,7 @@ def _subs_preview(args, videos):
                 footer = (f"{Style.DIM}\u2191\u2193 move | Enter = versions/download | Tab = info | "
                           f"a = download all | l/h/o/m | Esc = cancel{Style.RESET_ALL}")
                 _fb_write_frame(header + body + ["", summary, footer])
+                _fb_draw_scrollbar(len(header) + 1, len(body), len(plain), rows_avail, top, cols)
 
                 k = _read_key()
                 if k == "esc" or k == ("char", "q"):
@@ -11792,6 +11879,7 @@ def _retime_pick_audio_langs(lang_count):
                     else:
                         body.append(f"  {Fore.CYAN if lg in sel else ''}{label}{Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(items), avail, top, cols)
                 k = _read_key()
                 if k == "esc":
                     return None
@@ -11954,60 +12042,87 @@ _HWACCEL_RESOLVED = "__unset__"  # confirmed working method after a real decode 
 
 
 _GPU_VENDOR = "__unset__"
+_GPU_LIST = "__unset__"
+_HWACCEL_DEVICE = None          # None/'auto' = let ffmpeg pick; int index or path = forced device
 _METHOD_VENDOR = {
     "cuda": "NVIDIA", "nvdec": "NVIDIA", "vdpau": "NVIDIA/AMD",
-    "qsv": "Intel", "vaapi": "Intel/AMD", "d3d11va": "GPU", "dxva2": "GPU",
+    "qsv": "Intel", "vaapi": "Intel/AMD", "d3d11va": "GPU", "dxva2": "GPU", "d3d12va": "GPU",
     "videotoolbox": "Apple", "opencl": "GPU", "vulkan": "GPU",
 }
 
 
-def _gpu_vendor():
-    """Best-effort detection of the actual GPU maker (NVIDIA / AMD / Intel / Apple) from
-    the system, so acceleration can be shown as e.g. 'NVIDIA (cuda)'. Cached; returns a
-    vendor string or None. Never stalls (short timeout, silent on failure)."""
-    global _GPU_VENDOR
-    if _GPU_VENDOR != "__unset__":
-        return _GPU_VENDOR
-    blob = ""
+def _list_gpus():
+    """Best-effort list of GPU names present in the system (discrete + integrated), in the
+    OS enumeration order. Cached; never stalls. Used for display and device selection so the
+    tool works on any PC - single GPU, GPU+iGPU, or several discrete cards."""
+    global _GPU_LIST
+    if _GPU_LIST != "__unset__":
+        return _GPU_LIST
+    names = []
     try:
         if sys.platform.startswith("win"):
+            blob = ""
             try:
-                out = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"],
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
+                out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                      "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=6)
                 blob = out.stdout or ""
             except Exception:
                 blob = ""
             if not blob.strip():
-                out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                      "Get-CimInstance Win32_VideoController | Select-Object -ExpandProperty Name"],
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-                blob = out.stdout or ""
+                try:
+                    out = subprocess.run(["wmic", "path", "win32_VideoController", "get", "name"],
+                                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=4)
+                    blob = out.stdout or ""
+                except Exception:
+                    blob = ""
+            for ln in blob.splitlines():
+                ln = ln.strip()
+                if ln and ln.lower() != "name":
+                    names.append(ln)
         elif sys.platform == "darwin":
             out = subprocess.run(["system_profiler", "SPDisplaysDataType"],
-                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=5)
-            blob = out.stdout or ""
+                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=6)
+            for ln in (out.stdout or "").splitlines():
+                ln = ln.strip()
+                if ln.startswith("Chipset Model:"):
+                    names.append(ln.split(":", 1)[1].strip())
         else:
             try:
                 out = subprocess.run(["lspci"], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3)
-                blob = "\n".join(l for l in (out.stdout or "").splitlines()
-                                 if any(t in l for t in ("VGA", "3D", "Display")))
+                for ln in (out.stdout or "").splitlines():
+                    if any(t in ln for t in ("VGA compatible", "3D controller", "Display controller")):
+                        names.append(ln.split(":", 2)[-1].strip())
             except Exception:
-                blob = ""
-            if not blob:
-                for card in sorted(__import__("glob").glob("/sys/class/drm/card*/device/vendor")):
-                    try:
-                        blob += open(card).read()
-                    except Exception:
-                        pass
-                blob = blob.replace("0x10de", "nvidia").replace("0x1002", "amd").replace("0x8086", "intel")
+                pass
     except Exception:
-        blob = ""
-    b = blob.lower()
+        names = []
+    _GPU_LIST = names
+    return names
+
+
+def _gpu_vendor():
+    """Best-effort detection of the actual GPU maker (NVIDIA / AMD / Intel / Apple), so
+    acceleration can be shown as e.g. 'NVIDIA (cuda)' and the right decode order is chosen.
+    On mixed systems (GPU+iGPU) NVIDIA/AMD win over Intel, i.e. the discrete card is favoured.
+    Cached; returns a vendor string or None. Never stalls (short timeout, silent on failure)."""
+    global _GPU_VENDOR
+    if _GPU_VENDOR != "__unset__":
+        return _GPU_VENDOR
+    b = " ".join(_list_gpus()).lower()
+    if not b and not sys.platform.startswith("win") and sys.platform != "darwin":
+        # Linux fallback: read vendor IDs directly from sysfs
+        for card in sorted(__import__("glob").glob("/sys/class/drm/card*/device/vendor")):
+            try:
+                b += open(card).read().lower()
+            except Exception:
+                pass
+        b = b.replace("0x10de", "nvidia").replace("0x1002", "amd").replace("0x8086", "intel")
     if "nvidia" in b or "10de" in b:
         v = "NVIDIA"
     elif "amd" in b or "radeon" in b or "advanced micro" in b or "1002" in b:
         v = "AMD"
-    elif "intel" in b:
+    elif "intel" in b or "8086" in b:
         v = "Intel"
     elif "apple" in b:
         v = "Apple"
@@ -12015,6 +12130,7 @@ def _gpu_vendor():
         v = None
     _GPU_VENDOR = v
     return v
+
 
 
 def _accel_label(method):
@@ -12051,23 +12167,32 @@ def _hwaccel_candidates(ffmpeg_bin):
     if mode in ("none", "off", "cpu", "no", "0"):
         return []
     avail = set(_hwaccel_available(ffmpeg_bin))
+    # gyan's Windows build compiles in vaapi/vdpau even though no such device exists on
+    # Windows, so they'd always fail at runtime ('No device available'). Drop OS-specific
+    # methods that cannot possibly have a device on this platform, to avoid noisy attempts.
+    if sys.platform.startswith("linux"):
+        avail -= {"d3d11va", "d3d12va", "dxva2", "videotoolbox"}
+    elif sys.platform == "darwin":
+        avail -= {"d3d11va", "d3d12va", "dxva2", "vaapi", "vdpau", "cuda", "nvdec", "qsv"}
+    else:   # Windows / other
+        avail -= {"vaapi", "vdpau", "videotoolbox"}
     if mode not in ("auto", ""):
         return [mode]                     # explicit choice; CPU fallback still applies
     vendor = _gpu_vendor()
     by_vendor = {
-        # generic DirectX (d3d11va/dxva2) works for any GPU on Windows; vulkan+libplacebo
+        # generic DirectX (d3d11va/d3d12va/dxva2) works for any GPU on Windows; vulkan+libplacebo
         # gives GPU-side scaling on modern cards
-        "NVIDIA": ["cuda", "nvdec", "d3d11va", "vulkan", "dxva2", "vdpau"],
-        "AMD":    ["d3d11va", "vulkan", "dxva2", "vaapi", "vdpau"],
-        "Intel":  ["qsv", "d3d11va", "vulkan", "dxva2", "vaapi"],
+        "NVIDIA": ["cuda", "nvdec", "d3d11va", "d3d12va", "vulkan", "dxva2", "vdpau"],
+        "AMD":    ["d3d11va", "d3d12va", "vulkan", "dxva2", "vaapi", "vdpau"],
+        "Intel":  ["qsv", "d3d11va", "d3d12va", "vulkan", "dxva2", "vaapi"],
         "Apple":  ["videotoolbox"],
     }
     # unknown vendor -> try the broad generic order
-    pref = by_vendor.get(vendor, ["cuda", "nvdec", "qsv", "d3d11va", "vulkan", "dxva2", "vaapi", "vdpau", "videotoolbox"])
+    pref = by_vendor.get(vendor, ["cuda", "nvdec", "qsv", "d3d11va", "d3d12va", "vulkan", "dxva2", "vaapi", "vdpau", "videotoolbox"])
     cands = [m for m in pref if m in avail]
     if not cands and vendor:
         # vendor known but its preferred methods aren't compiled in -> fall back to any GPU method
-        cands = [m for m in ["d3d11va", "dxva2", "vaapi", "cuda", "nvdec", "qsv", "vdpau", "videotoolbox"] if m in avail]
+        cands = [m for m in ["d3d11va", "d3d12va", "dxva2", "vaapi", "cuda", "nvdec", "qsv", "vdpau", "videotoolbox"] if m in avail]
     return cands
 
 
@@ -12080,15 +12205,34 @@ def _hwaccel_for_decode(ffmpeg_bin):
     return cands[0] if cands else None
 
 
-_VIDEO_DECODE_VARIANT = "__unset__"   # cached working (label, pre_args, vf)
+_VIDEO_DECODE_VARIANT = "__unset__"   # cached working (label, pre_args, vf) OR "__gpures__"
+_GPURES_HW = None                     # hw method for the cached GPU-resident path (bit-depth-rebuilt per file)
 
 
-def _video_decode_variants(ffmpeg_bin, fps, W, H):
-    """Ordered ffmpeg decode variants to try for the visual signal. GPU decode + GPU
-    downscale FIRST (only tiny 16x16 frames cross PCIe -> the GPU decoder runs at full
-    speed instead of stalling on full-res copy-back), then GPU decode + CPU scale, then
-    CPU. Vendor-aware order from _hwaccel_candidates. Returns (label, pre_args, vf)."""
+def _gpures_variant(hw, fps, W, H, bits):
+    """GPU-RESIDENT decode path (best for d3d11va/d3d12va on AMD, where scale_d3d11 is broken):
+    decode on the GPU, drop to `fps` ON THE GPU, then hwdownload ONLY those few frames and do
+    the tiny 16x16 downscale on the CPU. The download pixel format MUST match the bit depth
+    (p010le for 10-bit, nv12 for 8-bit) - asking nv12 for a 10-bit surface fails with -22.
+    This uses only hwdownload (which works), never scale_d3d11 (which returns -22)."""
+    out_fmt = {"d3d11va": "d3d11", "d3d12va": "d3d12"}.get(hw, hw)
+    dl = "p010le" if bits >= 10 else "nv12"
+    return (f"{_accel_label(hw)} GPU-resident ({dl})",
+            ["-hwaccel", hw, "-hwaccel_output_format", out_fmt],
+            f"fps={fps},hwdownload,format={dl},scale={W}x{H},format=gray")
+
+
+def _video_decode_variants(ffmpeg_bin, fps, W, H, bits=8):
+    """Ordered ffmpeg decode variants to try for the visual signal, given the file's bit depth.
+    Order: (1) reliable GPU-side scaling (cuda/vaapi/qsv - downloads only 16x16); (2) GPU-
+    RESIDENT decode that drops to `fps` on the GPU and downloads only those frames (d3d11va/
+    d3d12va, bit-depth-correct); (3) GPU decode + CPU scale (downloads every frame); (4) CPU.
+    Returns (label, pre_args, vf)."""
     cpu_vf = f"fps={fps},scale={W}x{H},format=gray"
+    # GPU-side scaling (scale_* + hwdownload) is only listed for backends whose hwdownload is
+    # reliable (cuda/vaapi/qsv). d3d11va is deliberately NOT here: scale_d3d11 fails to configure
+    # its output pad on many AMD drivers (-22). d3d11va/d3d12va instead use the GPU-resident
+    # path below (drop-to-fps + plain hwdownload), which was verified to work.
     gpu_scaled = {
         "cuda":    (["-hwaccel", "cuda", "-hwaccel_output_format", "cuda"],
                     [f"fps={fps},scale_cuda={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"]),
@@ -12096,13 +12240,9 @@ def _video_decode_variants(ffmpeg_bin, fps, W, H):
                     [f"fps={fps},scale_vaapi={W}:{H}:format=nv12,hwdownload,format=nv12,format=gray"]),
         "qsv":     (["-hwaccel", "qsv", "-hwaccel_output_format", "qsv"],
                     [f"fps={fps},vpp_qsv=w={W}:h={H},hwdownload,format=nv12,format=gray"]),
-        "d3d11va": (["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"],
-                    [f"fps={fps},scale_d3d11=w={W}:h={H}:format=nv12,hwdownload,format=gray",
-                     f"fps={fps},scale_d3d11={W}:{H},hwdownload,format=nv12,format=gray"]),
-        "vulkan":  (["-init_hw_device", "vulkan", "-hwaccel", "vulkan", "-hwaccel_output_format", "vulkan"],
-                    [f"fps={fps},libplacebo=w={W}:h={H}:format=nv12,hwdownload,format=nv12,format=gray"]),
     }
     gpu_scaled_variants = []
+    gpures_variants = []
     cpu_scale_variants = []
     for hw in _hwaccel_candidates(ffmpeg_bin):
         if hw in gpu_scaled:
@@ -12110,22 +12250,13 @@ def _video_decode_variants(ffmpeg_bin, fps, W, H):
             for idx, vf in enumerate(vfs):
                 tag = f" GPU-scaled" + (f" #{idx + 1}" if len(vfs) > 1 else "")
                 gpu_scaled_variants.append((f"{_accel_label(hw)}{tag}", pre, vf))
+        if hw in ("d3d11va", "d3d12va"):
+            gpures_variants.append(_gpures_variant(hw, fps, W, H, bits))
         if hw != "vulkan":   # vulkan frames need libplacebo/hwdownload -> only the GPU-scaled form
-            cpu_scale_variants.append((_accel_label(hw), ["-hwaccel", hw], cpu_vf))
-    # all GPU-side-scaling attempts first (fast); libplacebo/Vulkan is the most reliable
-    # GPU scaler, so try it before the finicky vendor scalers. Then GPU-decode+CPU-scale, CPU.
-    gpu_scaled_variants.sort(key=lambda v: 0 if "libplacebo" in v[2] else 1)
-    # BEST on AMD/Windows: decode on d3d11va (reliable) but map the frames to Vulkan and
-    # downscale with libplacebo (Vulkan decode itself is often broken for h264, while the
-    # Vulkan SCALER works). fps drops frames on the GPU first, so only 16x16 is downloaded.
-    avail = set(_hwaccel_available(ffmpeg_bin))
-    front = []
-    if "d3d11va" in avail and "vulkan" in avail and _HWACCEL_MODE.strip().lower() in ("auto", ""):
-        front.append(("d3d11va decode + Vulkan/libplacebo scale",
-                      ["-hwaccel", "d3d11va", "-hwaccel_output_format", "d3d11"],
-                      f"fps={fps},hwmap=derive_device=vulkan,libplacebo=w={W}:h={H}:format=nv12,"
-                      f"hwdownload,format=nv12,format=gray"))
-    return front + gpu_scaled_variants + cpu_scale_variants + [("CPU", [], cpu_vf)]
+            # GPU DECODES but the CPU does the tiny downscale, and EVERY decoded frame is
+            # downloaded (fps drops only after download). Reliable everywhere - the last GPU step.
+            cpu_scale_variants.append((f"{_accel_label(hw)} decode + CPU scale", ["-hwaccel", hw], cpu_vf))
+    return gpu_scaled_variants + gpures_variants + cpu_scale_variants + [("CPU", [], cpu_vf)]
 
 
 def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
@@ -12135,7 +12266,7 @@ def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
     Prefers GPU decode + GPU downscale (fast; minimal PCIe copy-back), falling back
     through GPU+CPU-scale to CPU. Cached per video; returns (signal, hz) or None."""
     import numpy as np
-    global _VIDEO_DECODE_VARIANT, _HWACCEL_RESOLVED
+    global _VIDEO_DECODE_VARIANT, _HWACCEL_RESOLVED, _GPURES_HW
     key = (video, "__visual__")
     if key in cache:
         return cache[key]
@@ -12145,22 +12276,54 @@ def _video_visual_signal(ffmpeg_bin, video, cache, fps=4, progress_prefix=None):
     try:
         with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
             raw_path = os.path.join(td, "frames.gray")
-            if _VIDEO_DECODE_VARIANT != "__unset__":
+            # bit depth for THIS file (from the pre-scan) drives the GPU-resident download
+            # format (p010le for 10-bit, nv12 for 8-bit) - files in a batch can differ.
+            prof = (cache.get("__profiles__") or {}).get(str(video)) or {}
+            bits = int(prof.get("bits", 8) or 8)
+            if _VIDEO_DECODE_VARIANT == "__gpures__" and _GPURES_HW:
+                # cached GPU-resident path: rebuild for THIS file's bit depth, with reliable
+                # fallbacks in case a particular file's format still refuses.
+                cvf = f"fps={fps},scale={W}x{H},format=gray"
+                variants = [_gpures_variant(_GPURES_HW, fps, W, H, bits),
+                            (f"{_accel_label(_GPURES_HW)} decode + CPU scale", ["-hwaccel", _GPURES_HW], cvf),
+                            ("CPU", [], cvf)]
+            elif _VIDEO_DECODE_VARIANT not in ("__unset__", None):
                 variants = [_VIDEO_DECODE_VARIANT]
             else:
-                variants = _video_decode_variants(ffmpeg_bin, fps, W, H)
+                variants = _video_decode_variants(ffmpeg_bin, fps, W, H, bits)
             for (label, pre, vf) in variants:
-                cmd = [ffmpeg_bin, "-hide_banner", *pre, "-i", str(video),
+                # force a specific GPU (adapter index or path) when the user picked one; for
+                # 'auto'/None ffmpeg selects the default adapter. Works for any PC (single GPU,
+                # GPU+iGPU, multiple discrete). vaapi wants a /dev/dri path; the rest an index.
+                runpre = list(pre)
+                if _HWACCEL_DEVICE not in (None, "", "auto") and "-hwaccel" in runpre:
+                    ix = runpre.index("-hwaccel")
+                    runpre[ix + 2:ix + 2] = ["-hwaccel_device", str(_HWACCEL_DEVICE)]
+                cmd = [ffmpeg_bin, "-hide_banner", *runpre, "-i", str(video),
                        "-vf", vf, "-f", "rawvideo", raw_path]
-                res = _run_ffmpeg_progress(cmd, prefix=(progress_prefix or "") + f"[{label}] ",
+                res = _run_ffmpeg_progress(cmd, prefix=(progress_prefix or ""), bar_suffix=label,
                                            input_path=str(video), ffprobe_bin=ffprobe_bin)
                 ok = (res.returncode == 0 and os.path.exists(raw_path)
                       and os.path.getsize(raw_path) >= W * H * 4)
                 if ok:
                     if _VIDEO_DECODE_VARIANT == "__unset__":
-                        _VIDEO_DECODE_VARIANT = (label, pre, vf)
+                        if "GPU-resident" in label:
+                            _VIDEO_DECODE_VARIANT = "__gpures__"
+                            _GPURES_HW = pre[1] if len(pre) > 1 else None
+                        else:
+                            _VIDEO_DECODE_VARIANT = (label, pre, vf)
                         _HWACCEL_RESOLVED = pre[1] if pre else None
                         log_info(f"    video decode: {label}.")
+                        # make the GPU/CPU split visible: with GPU accel on, the CPU should do
+                        # nothing but read tiny frames. Warn only if it fell to a CPU-heavy path.
+                        if _hwaccel_candidates(ffmpeg_bin):
+                            if label == "CPU":
+                                log_warn("    note: no GPU decode path worked - using CPU decode "
+                                         "(rescue). Timing accuracy is unaffected (it is audio-driven), "
+                                         "only slower.")
+                            elif "CPU scale" in label:
+                                log_info("    note: the GPU decodes the video; the tiny 16x16 downscale "
+                                         "runs on the CPU (normal for this backend, negligible at 4 fps).")
                     break
                 if pre:
                     sys.stdout.write("\n")
@@ -12364,11 +12527,12 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
     to change it. Space toggles a pair, 'a' all/none, 'v' toggles video analysis, 'g'
     changes GPU acceleration, Enter runs, Esc cancels. Returns (selected_jobs, use_video)
     or None on cancel. All pairs start checked."""
-    global _HWACCEL_MODE, _HWACCEL_RESOLVED
+    global _HWACCEL_MODE, _HWACCEL_RESOLVED, _HWACCEL_DEVICE, _GPURES_HW
     sel = [True] * len(jobs)
     pos = 0
     top = 0
     hw_cycle = ["auto", "none"] + _hwaccel_available(ffmpeg_bin)
+    gpu_names = _list_gpus()
 
     def _hw_text():
         mode = _HWACCEL_MODE or "auto"
@@ -12383,6 +12547,15 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
             return "auto: " + _accel_label(cands[0]) + (f" +{len(cands) - 1} fallback" if len(cands) > 1 else "")
         return _accel_label(mode)
 
+    def _dev_text():
+        if _HWACCEL_DEVICE in (None, "", "auto"):
+            return "auto"
+        try:
+            nm = gpu_names[int(_HWACCEL_DEVICE)]
+            return f"#{_HWACCEL_DEVICE} {_fb_trunc(nm, 22)}"
+        except (ValueError, IndexError, TypeError):
+            return str(_HWACCEL_DEVICE)
+
     with _RawMode():
         _fb_enter_screen()
         try:
@@ -12396,11 +12569,14 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                     f"{Fore.CYAN}{nsel}/{len(jobs)} selected{Style.RESET_ALL}    "
                     f"video analysis: {Fore.GREEN if use_video else Style.DIM}{'ON' if use_video else 'OFF'}"
                     f"{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}    "
-                    f"GPU accel: {Fore.GREEN}{_hw_text()}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}",
+                    f"GPU accel: {Fore.GREEN}{_hw_text()}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
+                    + (f"    GPU: {Fore.GREEN}{_dev_text()}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}"
+                       if len(gpu_names) > 1 else ""),
                     "",
                 ]
                 foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | v = video | "
-                            f"g = GPU accel | Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                            f"g = GPU accel | " + ("d = GPU device | " if len(gpu_names) > 1 else "")
+                            + f"Enter = run | Esc = cancel{Style.RESET_ALL}"]
                 avail = max(4, rows - len(head) - len(foot))
                 per = max(1, avail // 4)   # each pair is a 4-line block
                 pos = max(0, min(pos, len(jobs) - 1))
@@ -12432,20 +12608,8 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                         for ln in (l2, l3, l4):
                             body.append(f"{Style.DIM}{ln}{Style.RESET_ALL}")
                 _fb_write_frame(head + body + foot)
-                # right-edge scrollbar when the list doesn't fit on one screen
-                if len(jobs) > per and body:
-                    nrows = len(body)
-                    thumb = max(1, int(round(nrows * per / len(jobs))))
-                    tstart = int(round(nrows * top / len(jobs)))
-                    tstart = max(0, min(tstart, nrows - thumb))
-                    base = len(head)
-                    parts = ["\x1b[?7l"]
-                    for r in range(nrows):
-                        g = "\u2588" if tstart <= r < tstart + thumb else "\u2502"
-                        parts.append(f"\x1b[{base + r + 1};{cols}H{Style.DIM}{g}{Style.RESET_ALL}")
-                    parts.append("\x1b[?7h")
-                    sys.stdout.write("".join(parts))
-                    sys.stdout.flush()
+                # right-edge scrollbar when the list of pairs doesn't fit on one screen
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(jobs), per, top, cols)
                 k = _read_key()
                 if k == "esc":
                     return None
@@ -12463,6 +12627,15 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                     _HWACCEL_MODE = hw_cycle[(hw_cycle.index(cur) + 1) % len(hw_cycle)]
                     _HWACCEL_RESOLVED = "__unset__"   # re-detect with the new choice
                     globals()["_VIDEO_DECODE_VARIANT"] = "__unset__"
+                    _GPURES_HW = None
+                elif k == ("char", "d") and len(gpu_names) > 1:
+                    # cycle the forced GPU: auto -> #0 -> #1 -> ... -> auto
+                    cyc = ["auto"] + list(range(len(gpu_names)))
+                    cur = _HWACCEL_DEVICE if _HWACCEL_DEVICE in cyc else "auto"
+                    _HWACCEL_DEVICE = cyc[(cyc.index(cur) + 1) % len(cyc)]
+                    _HWACCEL_RESOLVED = "__unset__"   # re-probe on the new device
+                    globals()["_VIDEO_DECODE_VARIANT"] = "__unset__"
+                    _GPURES_HW = None
                 elif k == "up":
                     pos = (pos - 1) % len(jobs)
                 elif k == "down":
@@ -12479,6 +12652,88 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
             _fb_leave_screen()
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
+
+
+def _probe_media_profile(ffprobe_bin, path):
+    """Thorough per-file probe used to report and configure the analysis for THIS file:
+    codec, bit depth, pixel format, resolution, HDR, fps and audio tracks. Files in a batch
+    can differ (different releases of the same episode), so every video is probed once up
+    front. Returns a dict; never raises (unknown fields fall back to safe defaults)."""
+    prof = {"vcodec": "?", "bits": 8, "pix_fmt": "", "width": 0, "height": 0,
+            "fps": 0.0, "hdr": False, "audio": []}
+    for s in _ffprobe_streams(ffprobe_bin, path):
+        stype = s.get("codec_type")
+        if stype == "video" and prof["vcodec"] == "?":
+            prof["vcodec"] = s.get("codec_name") or "?"
+            prof["pix_fmt"] = s.get("pix_fmt") or ""
+            prof["width"] = int(s.get("width") or 0)
+            prof["height"] = int(s.get("height") or 0)
+            bits = s.get("bits_per_raw_sample")
+            if bits and str(bits).isdigit():
+                prof["bits"] = int(bits)
+            else:
+                pf = prof["pix_fmt"]
+                prof["bits"] = 12 if "12" in pf else (10 if ("10" in pf or "p010" in pf) else 8)
+            tr = (s.get("color_transfer") or "").lower()
+            pr = (s.get("color_primaries") or "").lower()
+            prof["hdr"] = tr in ("smpte2084", "arib-std-b67") or pr == "bt2020"
+            fr = s.get("avg_frame_rate") or s.get("r_frame_rate") or "0/0"
+            try:
+                num, den = str(fr).split("/")
+                prof["fps"] = (float(num) / float(den)) if float(den) else 0.0
+            except Exception:
+                prof["fps"] = 0.0
+        elif stype == "audio":
+            lang = ((s.get("tags") or {}).get("language")) or "und"
+            prof["audio"].append((lang, s.get("codec_name") or "?", int(s.get("channels") or 0)))
+    return prof
+
+
+def _profile_summary_line(prof):
+    """Compact one-line description of a probed video profile for the pre-scan log,
+    e.g. 'hevc 10-bit 3840x2160 29.97fps  |  audio: Korean aac/2ch'."""
+    res = f"{prof['width']}x{prof['height']}" if prof["width"] else "?x?"
+    fps = (f"{prof['fps']:.2f}".rstrip("0").rstrip(".") + "fps") if prof["fps"] else "?fps"
+    hdr = " HDR" if prof["hdr"] else ""
+    seen = []
+    for lang, codec, ch in (prof.get("audio") or []):
+        tag = f"{_lang3_name(lang)} {codec}/{ch}ch"
+        if tag not in seen:
+            seen.append(tag)
+    asum = ("audio: " + ", ".join(seen)) if seen else "audio: none"
+    return f"{prof['vcodec']} {prof['bits']}-bit {res} {fps}{hdr}  |  {asum}"
+
+
+def _video_decode_plan_text(ffmpeg_bin):
+    """Human summary of the HW-accelerated decode plan the video analysis will use (for the
+    pre-scan log). Mirrors the order in _video_decode_variants without running ffmpeg."""
+    cands = _hwaccel_candidates(ffmpeg_bin)
+    if not cands:
+        return "CPU (no GPU acceleration)"
+    first = cands[0]
+    extra = f" (+{len(cands) - 1} more)" if len(cands) > 1 else ""
+    # cuda/vaapi/qsv scale on the GPU (download only 16x16); d3d11va/d3d12va decode on the GPU,
+    # drop to the sample rate on the GPU and download only those frames (tiny CPU downscale).
+    if first in ("cuda", "vaapi", "qsv"):
+        how = "GPU-side scaling"
+    elif first in ("d3d11va", "d3d12va"):
+        how = "GPU-resident decode (drops to 4 fps on the GPU, minimal download)"
+    else:
+        how = "GPU decode + CPU downscale"
+    return (f"GPU {_accel_label(first)}, {how}{extra} -> CPU fallback; "
+            f"locked to the first that works")
+
+
+def _ascii_hbar(val, maxval, width=22):
+    """Horizontal bar for the report - filled blocks proportional to val/maxval (a value of
+    0 shows an empty track; any positive value shows at least one block)."""
+    if maxval <= 0:
+        return "\u2591" * width
+    fill = int(round(width * (val / float(maxval))))
+    fill = max(0, min(width, fill))
+    if val > 0 and fill == 0:
+        fill = 1
+    return "\u2588" * fill + "\u2591" * (width - fill)
 
 
 def run_retime_batch(args):
@@ -12576,6 +12831,43 @@ def run_retime_batch(args):
         raise WizardBack()
 
     vad_cache = {}
+    # PRE-SCAN: probe every video once so the analysis is reported and configured for THIS
+    # file (codec, bit depth, pixel format, resolution, HDR, fps, audio) - files in a batch
+    # can differ. Profiles are cached for later per-file use; here they drive the summary.
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+    allvids = []
+    for j in jobs:
+        allvids.append(str(j["target"]))
+        if j.get("source_video"):
+            allvids.append(str(j["source_video"]))
+    allvids = list(dict.fromkeys(allvids))
+    profiles = {}
+    log_info(f"Probing {len(allvids)} video file(s) to auto-configure the analysis ...")
+    for i, v in enumerate(allvids, 1):
+        profiles[v] = _probe_media_profile(ffprobe_bin, v)
+        _print_progress(i, len(allvids), "probing videos ")
+    vad_cache["__profiles__"] = profiles
+    # compact summary: if every file shares one profile, say so; else list the distinct ones
+    kinds = {}
+    for v in allvids:
+        p = profiles[v]
+        kinds.setdefault((p["vcodec"], p["bits"], p["width"], p["height"], p["hdr"]), []).append(v)
+    if len(kinds) == 1:
+        log_info(f"    all files: {_profile_summary_line(profiles[allvids[0]])}")
+    else:
+        log_info(f"    {len(kinds)} different video profiles detected (each handled per-file):")
+        for _sig, vs in kinds.items():
+            log_info(f"      {len(vs)}x  {_profile_summary_line(profiles[vs[0]])}")
+    if getattr(args, "retime_use_video", False):
+        gpus = _list_gpus()
+        if gpus:
+            dev = _HWACCEL_DEVICE if _HWACCEL_DEVICE not in (None, "", "auto") else None
+            picked = f"  (using device {dev})" if dev is not None else (
+                "  (using the default GPU; pick another with --hwaccel-device or 'd' in the picker)"
+                if len(gpus) > 1 else "")
+            log_info("    GPU(s): " + "; ".join(f"#{i} {n}" for i, n in enumerate(gpus)) + picked)
+        log_info(f"    video decode: {_video_decode_plan_text(ffmpeg_bin)}.")
+
     results = []
     for i, j in enumerate(jobs, 1):
         log_info(f"[{i}/{len(jobs)}] {_fmt_ep(j['ep'])}: {Path(j['source_srt']).name} -> {Path(j['target']).name}")
@@ -12625,11 +12917,10 @@ def run_retime_batch(args):
                     tp = []
                     for tup in used:
                         lg, st, tt = tup[0], tup[1], tup[2]
-                        cnt = tup[3] if len(tup) > 3 else 0
                         if lg == "video":
-                            tp.append(f"{Fore.MAGENTA}video image{Style.RESET_ALL} ({cnt} hits)")
+                            tp.append(f"{Fore.MAGENTA}video image{Style.RESET_ALL}")
                         else:
-                            tp.append(f"{_lang3_name(lg)} [{_audio_desc(st)}<->{_audio_desc(tt)}] ({cnt} hits)")
+                            tp.append(f"{_lang3_name(lg)} [{_audio_desc(st)}<->{_audio_desc(tt)}]")
                     trk = "; ".join(tp)
                 print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
                       f"{Style.DIM}({r['count']} lines){Style.RESET_ALL}")
@@ -12638,6 +12929,21 @@ def run_retime_batch(args):
                       f"by audio/video (median match {r['conf']:.2f})")
                 if trk:
                     print(f"      tracks:   {trk}")
+                if used:
+                    total = r.get("total") or (max((tup[3] if len(tup) > 3 else 0) for tup in used) or 1)
+                    rows = []
+                    for tup in used:
+                        lg = tup[0]
+                        cnt = tup[3] if len(tup) > 3 else 0
+                        name = "video image" if lg == "video" else f"{_lang3_name(lg)} audio"
+                        rows.append((name, cnt, Fore.MAGENTA if lg == "video" else Fore.CYAN))
+                    labw = max((len(n) for n, _, _ in rows), default=11)
+                    print(f"      contribution to timing (share of {total} timestamps each method matched):")
+                    for name, cnt, col in rows:
+                        share = (100.0 * cnt / total) if total else 0.0
+                        bar = _ascii_hbar(cnt, total)
+                        print(f"        {col}{name:<{labw}}{Style.RESET_ALL}  {Fore.GREEN}{bar}{Style.RESET_ALL} "
+                              f"{cnt:>4} ({share:.0f}%)")
                 print(f"      offset:   {rng}{xcheck}")
                 continue
             if r.get("piecewise"):
@@ -13621,6 +13927,10 @@ DIFFERENT LANGUAGES (target vs reference):
                         help="GPU acceleration for video decoding during frame analysis: 'auto' (default, "
                              "auto-detect NVIDIA cuda / Intel qsv / Windows d3d11va / Linux vaapi / macOS "
                              "videotoolbox), 'none' to force CPU, or a specific method name. Falls back to CPU if it fails.")
+    parser.add_argument("--hwaccel-device", dest="hwaccel_device", default=None,
+                        help="Which GPU to use when several are present (GPU+iGPU or multiple cards): an "
+                             "adapter INDEX (0, 1, ...) for d3d11va/d3d12va/cuda/qsv, or a /dev/dri/renderDN "
+                             "path for vaapi. Default: let ffmpeg pick. Only affects speed, never subtitle timing.")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -13677,9 +13987,11 @@ DIFFERENT LANGUAGES (target vs reference):
     global _STORE_PATH, _STORE_URL, _FFMPEG_URL_OVERRIDE
     _STORE_PATH = _normalize_store_path(getattr(args, "config_file", None) or getattr(args, "preset_file", None))
     _STORE_URL = (getattr(args, "config_url", None) or "").strip() or None
-    global _HWACCEL_MODE
+    global _HWACCEL_MODE, _HWACCEL_DEVICE
     if getattr(args, "hwaccel", None):
         _HWACCEL_MODE = args.hwaccel
+    if getattr(args, "hwaccel_device", None):
+        _HWACCEL_DEVICE = args.hwaccel_device
     if getattr(args, "ffmpeg_url", None):
         _FFMPEG_URL_OVERRIDE = args.ffmpeg_url
     migrate_legacy_store()
