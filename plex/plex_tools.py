@@ -861,6 +861,44 @@ def ask_yes(prompt, default=True):
     return raw in ("y", "yes")
 
 
+def ask_yes_back(prompt, default=True):
+    """Like ask_yes, but Esc goes back: returns True (yes) / False (no) / None (Esc)."""
+    d = "Y/n" if default else "y/N"
+    msg = (f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} [{d}] "
+           f"{Style.DIM}(Esc = back){Style.RESET_ALL} ")
+    if not _tui_supported():
+        try:
+            raw = input(strip_ansi(msg)).strip().lower()
+        except EOFError:
+            return None
+        if raw == "":
+            return default
+        return raw in ("y", "yes")
+    sys.stdout.write(msg)
+    sys.stdout.flush()
+    with _RawMode():
+        while True:
+            k = _read_key()
+            if k == "esc":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return None
+            if k == "enter":
+                sys.stdout.write(("y" if default else "n") + "\r\n")
+                sys.stdout.flush()
+                return default
+            if isinstance(k, tuple) and k[0] == "char":
+                c = k[1].lower()
+                if c == "y":
+                    sys.stdout.write("y\r\n")
+                    sys.stdout.flush()
+                    return True
+                if c == "n":
+                    sys.stdout.write("n\r\n")
+                    sys.stdout.flush()
+                    return False
+
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -2162,17 +2200,18 @@ def _apply_watched(client, targets, action):
     log_info("The change shows in the client after a refresh.")
 
 
-def _watched_action(preset, n, allow_toggle=True):
-    """Return 'watched'/'unwatched'/'toggle' from preset or an interactive menu, or None."""
+def _watched_action(preset, n, default=0, allow_toggle=True):
+    """Return (action, index): action is 'watched'/'unwatched'/'toggle' (or the
+    preset), or None on Esc. index is the chosen menu position (to remember it)."""
     if preset is not None:
-        return preset
+        return preset, default
     opts = ["Mark as WATCHED", "Mark as UNWATCHED"]
     if allow_toggle:
         opts.append("Toggle each (flip watched state)")
-    idx = interactive_menu(f"{n} selected — set status:", opts, allow_cancel=True)
+    idx = interactive_menu(f"{n} selected — set status:", opts, default=default, allow_cancel=True)
     if idx is None:
-        return None
-    return ("watched", "unwatched", "toggle")[idx]
+        return None, default
+    return ("watched", "unwatched", "toggle")[idx], idx
 
 
 def _watched_for_item(client, args, item, preset):
@@ -2186,7 +2225,7 @@ def _watched_for_item(client, args, item, preset):
         status = (f"{Fore.GREEN}WATCHED{Style.RESET_ALL}" if watched
                   else f"{Style.DIM}UNWATCHED{Style.RESET_ALL}")
         log_info(f"Movie: {Fore.CYAN}{item['title']}{Style.RESET_ALL}  (currently {status})")
-        action = _watched_action(preset, 1)
+        action, _ = _watched_action(preset, 1)
         if action is None:
             return "back"  # Esc -> back to the item picker
         print()
@@ -2250,33 +2289,58 @@ def _watched_for_item(client, args, item, preset):
         _apply_watched(client, targets, preset)
         return True
 
+    # step machine: selection -> action -> confirm. Esc steps back one level and
+    # remembers the previous choice/answer/position (checkbox selection is kept in
+    # `rows`, the action menu reopens on the last choice, confirm keeps its answer).
+    action_idx = 0
+    confirm_default = True
+    picked = []
+    action = None
+    stage = "select"
     while True:
-        res = checkbox_menu("Select episodes:", rows, header=header)
-        if res is None:
-            return "back"  # Esc on the selection -> back to the item picker
-        picked = [r for r in rows if r.get("rk") and r["selected"]]
-        if not picked:
-            log_info("Nothing selected.")
-            continue  # re-open the selection (Esc there steps back)
+        if stage == "select":
+            res = checkbox_menu("Select episodes:", rows, header=header)
+            if res is None:
+                return "back"  # Esc on the selection -> back to the item picker
+            picked = [r for r in rows if r.get("rk") and r["selected"]]
+            if not picked:
+                log_info("Nothing selected.")
+                continue  # re-open the selection (Esc there steps back)
+            stage = "action"
 
-        action = _watched_action(preset, len(picked))
-        if action is None:
-            continue  # Esc on the status menu -> back to the episode selection (keeps checkboxes)
+        elif stage == "action":
+            action, action_idx = _watched_action(preset, len(picked), default=action_idx)
+            if action is None:
+                stage = "select"  # Esc on the status menu -> back to selection (keeps checkboxes)
+                continue
+            stage = "confirm"
 
-        clear_screen()
-        verb = {"watched": "mark WATCHED", "unwatched": "mark UNWATCHED",
-                "toggle": "toggle watched state of"}[action]
-        log_info(f"Will {verb} for {len(picked)} episodes:")
-        for r in picked[:40]:
-            print(f"    {r['label']}")
-        if len(picked) > 40:
-            print(f"    … (+{len(picked) - 40} more)")
-        print()
-        if not args.yes and not ask_yes("Proceed?", default=True):
-            continue  # declined -> back to the episode selection
-        print()
-        _apply_watched(client, [(r["rk"], r["label"], r["watched"]) for r in picked], action)
-        return True
+        else:  # confirm
+            prev = "select" if preset is not None else "action"
+            clear_screen()
+            verb = {"watched": "mark WATCHED", "unwatched": "mark UNWATCHED",
+                    "toggle": "toggle watched state of"}[action]
+            log_info(f"Will {verb} for {len(picked)} episodes:")
+            for r in picked[:40]:
+                print(f"    {r['label']}")
+            if len(picked) > 40:
+                print(f"    … (+{len(picked) - 40} more)")
+            print()
+            if args.yes:
+                confirmed = True
+            else:
+                ans = ask_yes_back("Proceed?", default=confirm_default)
+                if ans is None:
+                    stage = prev  # Esc -> back one step (keeps answer/position)
+                    continue
+                confirm_default = ans
+                confirmed = ans
+            if not confirmed:
+                stage = prev  # 'n' -> back one step
+                continue
+            print()
+            _apply_watched(client, [(r["rk"], r["label"], r["watched"]) for r in picked], action)
+            return True
 
 
 def mark_watched_flow(client, args):
