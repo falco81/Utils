@@ -97,7 +97,13 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "2.74.2"
+SCRIPT_VERSION = "2.80.0"
+SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
+# Paths that look like an episode/watch page — used to recognise an episode index and to visit
+# those links first. Matches e.g. /episode/12, /watch/..., s01e05, /ep-3, /epizoda/2, /dil/4.
+_EP_LINK_RE = re.compile(
+    r'(?:episode|episod|epizod|/watch|/video/|/v/\d|season|s\d{1,2}e\d{1,2}'
+    r'|[/_.\-]ep[/_.\-]?\d|[/_.\-]dil|[/_.\-]part\d|[/_.\-]e\d{1,3}(?:[/_.\-]|$))', re.I)
 TEMP_SUBDIR = ".temp"             # all scratch files (.part/.lock/.parts/.merging/.video...) go here
 
 
@@ -145,6 +151,7 @@ _REMOTE_CONFIG_KEYS = {
     'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
+    'SCAN_LINK_CAP',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
@@ -288,8 +295,10 @@ class _Palette:
         if enabled:
             self.RESET = '\033[0m'; self.RED = '\033[31m'; self.GREEN = '\033[32m'
             self.YELLOW = '\033[33m'; self.CYAN = '\033[36m'; self.DIM = '\033[2m'
+            self.MAGENTA = '\033[35m'; self.BRIGHT = '\033[1m'
         else:
             self.RESET = self.RED = self.GREEN = self.YELLOW = self.CYAN = self.DIM = ''
+            self.MAGENTA = self.BRIGHT = ''
 
 
 CLR = _Palette(False)
@@ -645,45 +654,17 @@ def _format_mtime(path: str) -> str:
 
 
 def _prompt_cookie_choice(candidates: list) -> list:
-    """Interactively ask which cookie file(s) to load. Returns a list of paths."""
-    print(f"[INFO] Found {len(candidates)} JSON cookie files in the directory:")
-    for i, p in enumerate(candidates, 1):
-        print(f"   {CLR.CYAN}{i}{CLR.RESET}) {os.path.basename(p)}   "
-              f"{CLR.DIM}({_format_mtime(p)}){CLR.RESET}")
-    print("Select: number(s) like '1,3', 'a' for ALL, or Enter for the newest (1).")
-
-    for _ in range(3):
-        try:
-            raw = input("> ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print("")
-            return [candidates[0]]
-
-        if raw == '':
-            return [candidates[0]]
-        if raw in ('a', 'all'):
-            return list(candidates)
-
-        try:
-            picks = []
-            for part in raw.replace(' ', '').split(','):
-                if not part:
-                    continue
-                idx = int(part)
-                if 1 <= idx <= len(candidates):
-                    chosen = candidates[idx - 1]
-                    if chosen not in picks:
-                        picks.append(chosen)
-                else:
-                    raise ValueError
-            if picks:
-                return picks
-        except ValueError:
-            pass
-        print(f"[WARN] Invalid choice. Enter number(s) 1-{len(candidates)}, 'a', or Enter.")
-
-    print("[WARN] No valid choice; using the newest.")
-    return [candidates[0]]
+    """Interactive multi-select of which cookie file(s) to load (arrow-key checklist with search +
+    scrollbar; numbered fallback). Defaults to the newest. Returns a list of paths."""
+    labels = [f"{os.path.basename(p)}   {CLR.DIM}({_format_mtime(p)}){CLR.RESET}"
+              for p in candidates]
+    idxs = tui_select_many(f"Select cookie file(s) to use — {len(candidates)} found",
+                           labels, preselected=[0],
+                           header=[f"{CLR.CYAN}JSON cookie files in this folder "
+                                   f"(newest first){CLR.RESET}"])
+    if not idxs:
+        return [candidates[0]]
+    return [candidates[i] for i in idxs]
 
 
 def auto_detect_cookies(verbose: bool) -> list:
@@ -1264,6 +1245,12 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
         old_cwd = os.getcwd()
         os.chdir(out_dir)
     try:
+        if SUBS_ONLY:
+            # Subtitles-only: pull only the chosen-language subtitles from the native videos and
+            # skip every actual video download (Drive/Dropbox/Streamable/HLS video+audio).
+            _download_subs_only([{'kind': 'hls', 'stream': h, 'title': h.get('title')}
+                                 for h in hls_videos], session, None, max_height, verbose)
+            return
         if drive_videos:
             print(f"[INFO] Downloading {len(drive_videos)} Google Drive video(s) ...")
             download_folder_pooled(drive_videos, session, chunk_size, verbose)
@@ -1875,24 +1862,352 @@ def _parse_index_selection(raw: str, n: int):
     return picked
 
 
-def _prompt_file_selection(videos: list) -> list:
-    """Show a numbered list and let the user choose which videos to download."""
-    print(f"[INFO] {len(videos)} file(s) found:")
-    for i, v in enumerate(videos, 1):
-        print(f"   {CLR.CYAN}{i:>3}{CLR.RESET}) {v['title']}")
-    print("Select which to download: e.g. '1,3,5-8', 'a' or Enter for ALL, 'q' to cancel.")
+# =============================================================================
+#  Interactive TUI — arrow-key menu + checklist with live search/filter and a
+#  right-hand scrollbar. Falls back to a numbered prompt without a TTY.
+# =============================================================================
+_TUI_WIN = os.name == 'nt'
+try:
+    if _TUI_WIN:
+        import msvcrt as _msvcrt
+    else:
+        import termios as _termios
+        import tty as _tty
+    _HAS_RAW = True
+except Exception:
+    _HAS_RAW = False
 
+_TUI_ANSI_RE = re.compile(r'\x1b\[[0-9;?]*[A-Za-z]')
+
+
+def _tui_strip(s):
+    return _TUI_ANSI_RE.sub('', s)
+
+
+def _tui_supported():
+    try:
+        return _HAS_RAW and sys.stdin.isatty() and sys.stdout.isatty()
+    except Exception:
+        return False
+
+
+def _tui_flush_input():
+    try:
+        if _TUI_WIN:
+            while _msvcrt.kbhit():
+                _msvcrt.getch()
+        else:
+            _termios.tcflush(sys.stdin.fileno(), _termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def _tui_read_key():
+    """Read one keypress -> 'up'/'down'/'pgup'/'pgdn'/'home'/'end'/'enter'/'esc'/
+    'backspace'/'other', or ('char', <character>)."""
+    if _TUI_WIN:
+        ch = _msvcrt.getch()
+        if ch in (b'\x00', b'\xe0'):
+            c2 = _msvcrt.getch()
+            return {b'H': 'up', b'P': 'down', b'K': 'left', b'M': 'right', b'G': 'home',
+                    b'O': 'end', b'I': 'pgup', b'Q': 'pgdn'}.get(c2, 'other')
+        if ch in (b'\r', b'\n'):
+            return 'enter'
+        if ch == b'\x08':
+            return 'backspace'
+        if ch == b'\x1b':
+            return 'esc'
+        if ch == b'\x03':
+            raise KeyboardInterrupt
+        for enc in ('utf-8', 'cp1250', 'latin-1'):
+            try:
+                return ('char', ch.decode(enc))
+            except Exception:
+                continue
+        return 'other'
+    import select
+    fd = sys.stdin.fileno()
+
+    def _avail(t=0.12):
+        try:
+            return bool(select.select([fd], [], [], t)[0])
+        except Exception:
+            return False
+
+    def _rd():
+        try:
+            return os.read(fd, 1)
+        except Exception:
+            return b''
+
+    b = _rd()
+    if not b:
+        return 'other'
+    c0 = b[0]
+    if c0 == 0x1b:
+        if not _avail():
+            return 'esc'
+        b2 = _rd()
+        if b2 not in (b'[', b'O'):
+            return 'esc'
+        seq = b''
+        while True:
+            c = _rd()
+            if not c:
+                break
+            seq += c
+            if c.isalpha() or c == b'~' or len(seq) > 6:
+                break
+            if not _avail(0.02):
+                break
+        s = seq.decode('ascii', 'ignore')
+        return {'A': 'up', 'B': 'down', 'C': 'right', 'D': 'left', 'H': 'home', 'F': 'end',
+                '1~': 'home', '4~': 'end', '5~': 'pgup', '6~': 'pgdn'}.get(s, 'esc')
+    if c0 in (0x0d, 0x0a):
+        return 'enter'
+    if c0 in (0x7f, 0x08):
+        return 'backspace'
+    if c0 == 0x03:
+        raise KeyboardInterrupt
+    n_more = 3 if c0 >= 0xF0 else 2 if c0 >= 0xE0 else 1 if c0 >= 0xC0 else 0
+    data = b
+    for _ in range(n_more):
+        if not _avail(0.05):
+            break
+        data += _rd()
+    for enc in ('utf-8', 'cp1250', 'latin-1'):
+        try:
+            return ('char', data.decode(enc))
+        except Exception:
+            continue
+    return 'other'
+
+
+class _TuiRaw:
+    def __enter__(self):
+        if not _TUI_WIN:
+            self.fd = sys.stdin.fileno()
+            self.old = _termios.tcgetattr(self.fd)
+            try:
+                _tty.setcbreak(self.fd)
+            except Exception:
+                _tty.setraw(self.fd)
+        return self
+
+    def __exit__(self, *a):
+        if not _TUI_WIN:
+            _termios.tcsetattr(self.fd, _termios.TCSADRAIN, self.old)
+
+
+def _tui_scrollbar(base_row, nrows, total, top, cols):
+    """Draw a proportional vertical scrollbar in the last screen column next to the item area."""
+    if total <= nrows or nrows <= 0 or cols <= 1:
+        return
+    thumb = max(1, min(nrows, int(round(nrows * nrows / float(total)))))
+    span = nrows - thumb
+    denom = max(1, total - nrows)
+    tstart = max(0, min(span, int(round(span * (top / float(denom))))))
+    parts = ['\x1b[?7l']
+    for r in range(nrows):
+        if tstart <= r < tstart + thumb:
+            parts.append(f"\x1b[{base_row + r};{cols}H{CLR.CYAN}\u2588{CLR.RESET}")
+        else:
+            parts.append(f"\x1b[{base_row + r};{cols}H{CLR.DIM}\u2502{CLR.RESET}")
+    parts.append('\x1b[?7h')
+    sys.stdout.write(''.join(parts))
+    sys.stdout.flush()
+
+
+def _tui_list(prompt, labels, multi=False, preselected=None, header=None):
+    """Arrow-key selector with live search and a scrollbar. multi=False -> returns an index (or
+    None on Esc). multi=True -> returns a sorted list of indices (Enter confirms; Esc cancels).
+    Returns None when a TTY/raw mode isn't available (caller uses the numbered fallback)."""
+    if not _tui_supported() or not labels:
+        return None
+    n = len(labels)
+    plain = [_tui_strip(x) for x in labels]
+    header = list(header or [])
+    checkset = set(preselected or []) if multi else set()
+    filt = ''
+    sel_pos = 0
+    prev_lines = 0
+    first = True
+
+    def order():
+        if not filt:
+            return list(range(n))
+        f = filt.lower()
+        return [i for i in range(n) if f in plain[i].lower()]
+
+    def size():
+        try:
+            sz = os.get_terminal_size()
+            return sz.columns, sz.lines
+        except Exception:
+            return 80, 24
+
+    def trunc(s, w):
+        return s[:max(1, w - 1)] + '…' if len(s) > w else s
+
+    def render(od):
+        nonlocal prev_lines, first
+        cols, rows_total = size()
+        maxw = max(10, cols - 3)                    # leave a column for the scrollbar
+        page = max(3, rows_total - (6 + len(header)))
+        vis = []
+        buf = []
+        if first:
+            buf.append('\x1b[2J\x1b[H')
+            first = False
+        elif prev_lines > 0:
+            buf.append((f"\x1b[{prev_lines - 1}F" if prev_lines > 1 else '\r') + '\x1b[J')
+        for h in header:
+            vis.append(trunc(h, maxw) if len(_tui_strip(h)) > maxw else h)
+        vis.append(f"{CLR.YELLOW}{trunc(_tui_strip(prompt), maxw)}{CLR.RESET}")
+        keys = ("space = check · Enter = confirm" if multi else "Enter = select")
+        hint = (f"↑↓ move · type = search · {keys} · "
+                + ("Esc = clear search" if filt else "Esc = cancel"))
+        vis.append(f"{CLR.CYAN}{trunc(hint, maxw)}{CLR.RESET}")
+        body_start = len(vis) + 1                    # 1-based screen row of the first item
+        window = []
+        if not od:
+            vis.append(f"  {CLR.RED}(no match){CLR.RESET}")
+        else:
+            start = max(0, min(sel_pos - page // 2, len(od) - page))
+            window = od[start:start + page]
+            for pos, i in enumerate(window, start):
+                box = (f"{CLR.GREEN}[x]{CLR.RESET} " if i in checkset else "[ ] ") if multi else ""
+                txt = trunc(plain[i], maxw - (4 if multi else 2))
+                if pos == sel_pos:
+                    vis.append(f"{CLR.GREEN}{CLR.BRIGHT}›{CLR.RESET} {box}"
+                               f"{CLR.GREEN}{CLR.BRIGHT}{txt}{CLR.RESET}")
+                else:
+                    vis.append(f"  {box}{txt}")
+        posinfo = f" [{sel_pos + 1}/{len(od)}]" if od else ""
+        if multi:
+            posinfo += f"  ✓{len(checkset)}"
+        vis.append(f"{CLR.MAGENTA}{trunc(('Search: ' + filt if filt else '(type to search)') + posinfo, maxw)}{CLR.RESET}")
+        buf.append('\n'.join(vis))
+        sys.stdout.write(''.join(buf))
+        sys.stdout.flush()
+        prev_lines = len(vis)
+        if window:
+            _tui_scrollbar(body_start, len(window), len(od), od.index(window[0]), size()[0])
+        return page
+
+    with _TuiRaw():
+        od = order()
+        page = render(od)
+        _tui_flush_input()
+        while True:
+            key = _tui_read_key()
+            if key == 'up' and od:
+                sel_pos = (sel_pos - 1) % len(od)
+            elif key == 'down' and od:
+                sel_pos = (sel_pos + 1) % len(od)
+            elif key == 'pgup' and od:
+                sel_pos = max(0, sel_pos - page)
+            elif key == 'pgdn' and od:
+                sel_pos = min(len(od) - 1, sel_pos + page)
+            elif key == 'home':
+                sel_pos = 0
+            elif key == 'end' and od:
+                sel_pos = len(od) - 1
+            elif multi and isinstance(key, tuple) and key[0] == 'char' and key[1] == ' ':
+                if od:
+                    checkset.symmetric_difference_update({od[sel_pos]})
+            elif key in ('enter', 'right'):
+                if multi:
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    return sorted(checkset)
+                if od:
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    return od[sel_pos]
+            elif key in ('esc', 'left'):
+                if filt:
+                    filt = ''
+                    od = order()
+                    sel_pos = 0
+                else:
+                    sys.stdout.write('\n')
+                    sys.stdout.flush()
+                    return None
+            elif key == 'backspace' and filt:
+                filt = filt[:-1]
+                od = order()
+                sel_pos = 0
+            elif isinstance(key, tuple) and key[0] == 'char' and key[1].isprintable():
+                filt += key[1]
+                od = order()
+                sel_pos = 0
+            page = render(od)
+
+
+def tui_select_one(prompt, labels, header=None):
+    """Single-select. Returns the chosen index, or None if cancelled. TTY -> arrow menu; else a
+    numbered prompt."""
+    idx = _tui_list(prompt, labels, multi=False, header=header)
+    if idx is not None or _tui_supported():
+        return idx
+    for h in (header or []):
+        if _tui_strip(h).strip():
+            print(h)
+    print(f"{CLR.YELLOW}{prompt}{CLR.RESET}")
+    for i, lab in enumerate(labels, 1):
+        print(f"   {CLR.CYAN}{i:>3}{CLR.RESET}) {_tui_strip(lab)}")
     for _ in range(3):
         try:
             raw = input("> ").strip()
         except (EOFError, KeyboardInterrupt):
             print("")
-            return []
-        sel = _parse_index_selection(raw, len(videos))
+            return None
+        if raw.isdigit() and 1 <= int(raw) <= len(labels):
+            return int(raw) - 1
+        print(f"[WARN] Enter a number 1-{len(labels)}.")
+    return None
+
+
+def tui_select_many(prompt, labels, preselected=None, header=None):
+    """Multi-select. Returns a list of chosen indices (possibly empty), or None if cancelled. TTY ->
+    checklist with space to toggle; else a numbered 'a,c,1-3' prompt."""
+    res = _tui_list(prompt, labels, multi=True, preselected=preselected, header=header)
+    if res is not None or _tui_supported():
+        return res
+    for h in (header or []):
+        if _tui_strip(h).strip():
+            print(h)
+    print(f"{CLR.YELLOW}{prompt}{CLR.RESET}")
+    for i, lab in enumerate(labels, 1):
+        print(f"   {CLR.CYAN}{i:>3}{CLR.RESET}) {_tui_strip(lab)}")
+    print("Pick: e.g. '1,3,5-8', 'a' or Enter for ALL, 'q' to cancel.")
+    for _ in range(3):
+        try:
+            raw = input("> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("")
+            return None
+        if raw == '' and preselected is not None:
+            return list(preselected)           # Enter keeps the default (e.g. the newest cookie)
+        sel = _parse_index_selection(raw, len(labels))
         if sel is None:
-            print(f"[WARN] Invalid input. Use numbers/ranges 1-{len(videos)}, 'a', or 'q'.")
+            print(f"[WARN] Invalid input. Use 1-{len(labels)}, 'a', or 'q'.")
             continue
-        return [videos[i - 1] for i in sel]
+        return [i - 1 for i in sel]
+    return None
+
+
+def _prompt_file_selection(videos: list) -> list:
+    """Interactive multi-select of which videos to download (arrow-key checklist with search +
+    scrollbar; numbered fallback without a TTY). Returns the chosen video dicts."""
+    labels = [v['title'] for v in videos]
+    idxs = tui_select_many(f"Select which of {len(videos)} file(s) to download",
+                           labels, preselected=list(range(len(videos))),
+                           header=[f"{CLR.CYAN}{len(videos)} file(s) found{CLR.RESET}"])
+    if idxs is None:
+        return []
+    return [videos[i] for i in idxs]
 
     print("[WARN] No valid selection; cancelling.")
     return []
@@ -4723,6 +5038,7 @@ def resolve_master(video, session, verbose):
 
 AUDIO_SEL = None                  # None/'ALL' = all audio tracks; 'SCAN' = list; [ints] = selection
 SUB_SEL = None                    # None/'ALL' = all subtitles; 'SCAN' = list; [ints] = selection
+SUBS_ONLY = False                 # True (--subs-only): download ONLY chosen-language subtitles
 CENC_KEYS = []                    # user-supplied CENC/Widevine content keys (hex), for content you
 #                                   already hold keys for (own storage). NOT key extraction/DRM bypass.
 FORCE_CONTAINER = None            # None = auto (.mkv when multi-track, else .mp4); 'mp4'/'mkv' force it
@@ -5440,6 +5756,134 @@ def _download_sub_quiet(s, headers, session, out_file):
     except (requests.RequestException, OSError):
         return False
     return False
+
+
+def _sub_key(s):
+    """A stable key for grouping/naming a subtitle track across videos (language, else name)."""
+    return (s.get('lang') or s.get('name') or '?').strip() or '?'
+
+
+def _prompt_language_selection(langs):
+    """langs = [(key, display)]. Interactive multi-select of subtitle languages (arrow-key
+    checklist with search + scrollbar; numbered fallback). Returns a set of chosen keys."""
+    labels = [f"{disp} [{key}]" if disp and disp != key else f"[{key}]" for key, disp in langs]
+    idxs = tui_select_many(f"Pick subtitle language(s) — {len(langs)} available", labels,
+                           header=[f"{CLR.CYAN}Subtitle languages across the collection"
+                                   f"{CLR.RESET}"])
+    if not idxs:
+        return set()
+    return {langs[i][0] for i in idxs}
+
+
+def _to_srt(path, verbose):
+    """Convert a downloaded .vtt / .ttml subtitle to .srt via ffmpeg (text stream copy, no video).
+    Returns the .srt path, or the original path if ffmpeg is unavailable or the convert fails."""
+    if path.lower().endswith('.srt') or not os.path.exists(path):
+        return path
+    if not ensure_ffmpeg(verbose):
+        return path
+    srt = os.path.splitext(path)[0] + '.srt'
+    tmp = _temp_artifact(srt, ".conv.srt")
+    proc = subprocess.run([FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', path,
+                           '-y', tmp], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if proc.returncode == 0 and os.path.exists(tmp) and os.path.getsize(tmp) > 0:
+        os.replace(tmp, srt)
+        if os.path.abspath(srt) != os.path.abspath(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return srt
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return path
+
+
+def _subs_of_source(src, session, max_height, verbose):
+    """Return (headers, [sub tracks]) for one subtitle source. Sources: {'kind':'hls','stream':..},
+    {'kind':'hls_url','url':..,'headers':..}, or {'kind':'mpd','url':..,'headers':..}."""
+    try:
+        if src['kind'] == 'mpd':
+            hdrs = src.get('headers') or {}
+            mpd = _parse_mpd(src['url'], session, hdrs, max_height, verbose)
+            return hdrs, (mpd or {}).get('subs') or []
+        if src['kind'] == 'hls_url':
+            hdrs = src.get('headers') or {}
+            tracks = parse_master_tracks(src['url'], session, max_height, hdrs, verbose)
+            return hdrs, (tracks or {}).get('subs') or []
+        # 'hls' — a Patreon/Vimeo/Mux stream descriptor
+        master, hdrs = resolve_master(src['stream'], session, verbose)
+        if not master:
+            return {}, []
+        tracks = parse_master_tracks(master, session, max_height, hdrs, verbose)
+        return hdrs, (tracks or {}).get('subs') or []
+    except (requests.RequestException, OSError, ValueError):
+        return {}, []
+
+
+def _download_subs_only(sources, session, out_dir, max_height, verbose):
+    """--subs-only: for each source (native HLS stream, or a scanned HLS master / DASH .mpd),
+    discover subtitle tracks WITHOUT downloading any video, let the user multi-select language(s),
+    then download just those subtitles and convert them to .srt (WebVTT/TTML -> SubRip). Falls back
+    to .vtt if ffmpeg isn't available. No-op (with a note) when nothing has subtitles."""
+    if not sources:
+        print("[INFO] --subs-only: no HLS/DASH videos here to pull subtitles from "
+              "(Drive/Dropbox/Streamable files don't carry separate subtitle tracks).")
+        return
+    per_video, lang_map = [], {}
+    bar = make_bar(total=len(sources), desc='scanning subs', unit='vid', leave=True)
+    for src in sources:
+        headers, subs = _subs_of_source(src, session, max_height, verbose)
+        per_video.append((src.get('title') or 'video', headers, subs))
+        for s in subs:
+            k = _sub_key(s)
+            lang_map.setdefault(k, s.get('name') or s.get('lang') or k)
+        bar.update(1)
+    bar.close()
+    if not lang_map:
+        print("[INFO] --subs-only: no subtitle tracks found in these videos.")
+        return
+    langs = sorted(lang_map.items(), key=lambda kv: kv[0].lower())
+    chosen = _prompt_language_selection(langs)
+    if not chosen:
+        print("[INFO] --subs-only: nothing selected; no subtitles downloaded.")
+        return
+    tasks = []                          # (srt_target, sub, headers)
+    for title, headers, subs in per_video:
+        base = re.sub(r'\.(mp4|mkv|m4v|webm)$', '', safe_filename(title, 'video'), flags=re.I)
+        for s in subs:
+            if _sub_key(s) in chosen:
+                code = safe_filename(_sub_key(s), 'sub')
+                srt = os.path.join(out_dir or '.', f"{base}.{code}.srt")
+                if not (os.path.exists(srt) or os.path.exists(srt[:-4] + '.vtt')):
+                    tasks.append((srt, s, headers))
+    if not tasks:
+        print("[INFO] --subs-only: selected subtitles are already present.")
+        return
+    got = [0]
+    lock = threading.Lock()
+    bar = make_bar(total=len(tasks), desc='subtitles', unit='sub', leave=True)
+
+    def _one(t):
+        srt, s, hdrs = t
+        vtt = srt[:-4] + '.vtt'
+        ok = _download_sub_quiet(s, hdrs, session, vtt)
+        if ok:
+            _to_srt(vtt, verbose)       # -> .srt (or keep .vtt if ffmpeg missing)
+        with lock:
+            if ok:
+                got[0] += 1
+            bar.update(1)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_one, tasks))
+    bar.close()
+    print(f"[INFO] --subs-only: downloaded {got[0]}/{len(tasks)} subtitle file(s) "
+          f"in {len(chosen)} language(s) across {len(per_video)} video(s).")
 
 
 def _grab_subs(subs, out_path, headers, session, verbose, suffix='sub'):
@@ -7303,19 +7747,24 @@ def _browser_collect_media(page_url, verbose, wait_s=6):
     return list(dict.fromkeys(data.get('urls') or [])), (data.get('title') or None)
 
 
-def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
+def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follow_links=False,
+                        _seen=None, _is_sub=False):
     """Fetch any page and discover downloadable media on it, independent of the URL's shape:
     YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.webm/.mov URLs.
-    Follows unknown player <iframe>s one level deep. Direct/HLS items carry a 'name' taken from
-    the page title so the output isn't called 'master.mp4'. Returns a de-duplicated list of
-    {'kind': 'url'|'direct'|'hls', 'url', 'label', 'name'}."""
+    Follows unknown player <iframe>s one level deep. With follow_links=True it also treats the page
+    as an index: it visits every same-site <a href> link once (episode pages) and scans each too.
+    Direct/HLS items carry a 'name' taken from the page title so the output isn't called
+    'master.mp4'. Returns a de-duplicated list of {'kind','url','label','name'}."""
+    if _seen is None:
+        _seen = set()
+    _seen.add(page_url.split('#')[0])
     try:
         r = session.get(page_url, headers={'User-Agent': USER_AGENT,
                                             'Accept-Language': 'en-US,en;q=0.9'},
                         timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
         html = r.text
     except requests.RequestException as e:
-        if _depth == 0:
+        if _depth == 0 and not _is_sub:
             print(f"[ERROR] --scan: could not fetch the page: {e}")
         return []
     title = _title or _page_title(html)     # outer page's title wins (passed down into iframes)
@@ -7374,6 +7823,59 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None):
             for s in scan_page_for_media(src, session, verbose, _depth + 1, _title=title):
                 add(s['kind'], s['url'], s['label'] + ' (iframe)', name=s.get('name'),
                     page=s.get('page'))
+
+    # Index/episode-list mode: visit same-site <a href> links and scan each page too, so a page
+    # that only LINKS to episodes (rather than embedding the videos) is fully mined. follow_links=
+    # True always follows; 'auto' follows when the page is an episode INDEX — it has no stream of
+    # its own, OR it clearly lists episodes (>=2 links whose path looks like an episode/watch page,
+    # e.g. containing "episode"). Episode-looking links are visited first (priority within the cap).
+    if follow_links and _depth == 0:
+        base_host = urlparse(page_url).netloc.lower()
+        links, lseen = [], set()
+        for m in re.finditer(r'<a\b[^>]+href=["\']([^"\']+)["\']', html):
+            href = m.group(1).replace('&amp;', '&').strip()
+            if href.lower().startswith(('mailto:', 'tel:', 'javascript:', 'data:', '#')):
+                continue
+            full = urljoin(page_url, href).split('#')[0]
+            pu = urlparse(full)
+            if pu.scheme not in ('http', 'https') or pu.netloc.lower() != base_host:
+                continue                                  # same domain, real pages only
+            if full in _seen or full in lseen:
+                continue
+            if re.search(r'\.(jpe?g|png|gif|webp|svg|css|js|ico|woff2?|ttf|zip|pdf|rss|xml)(\?|$)',
+                         full, re.I):
+                continue
+            lseen.add(full)
+            links.append(full)
+        ep_links = [u for u in links if _EP_LINK_RE.search(urlparse(u).path)]
+        _do_follow = (follow_links is True) or (follow_links == 'auto'
+                                                and (not found or len(ep_links) >= 2))
+        if _do_follow and links:
+            others = [u for u in links if u not in set(ep_links)]
+            links = (ep_links + others)[:SCAN_LINK_CAP]   # scan episode-looking links first
+            _seen.update(links)
+            note = f" ({len(ep_links)} look like episodes)" if ep_links else ""
+            print(f"[INFO] --scan: index page — scanning {len(links)} linked page(s){note} "
+                  f"for media ...")
+            bar = make_bar(total=len(links), desc='scanning pages', unit='page', leave=True)
+            lock = threading.Lock()
+
+            def _scan_one(u):
+                try:
+                    return scan_page_for_media(u, session, verbose, _depth=0, _title=None,
+                                               follow_links=False, _seen=_seen, _is_sub=True)
+                except Exception:
+                    return []
+
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                futs = [ex.submit(_scan_one, u) for u in links]
+                for fut in as_completed(futs):
+                    for s in fut.result():
+                        add(s['kind'], s['url'], s['label'], name=s.get('name'), page=s.get('page'))
+                    with lock:
+                        bar.update(1)
+            bar.close()
     return found
 
 
@@ -7385,7 +7887,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
          out_dir: str = None, max_height: int = DEFAULT_MAX_HEIGHT, list_only: bool = False,
          ffmpeg_path: str = None, ffmpeg_url: str = None, do_rename: bool = True,
          rename_mode: str = 'ask', return_summary: bool = False, res_scan: bool = False,
-         scan_mode: bool = False, browser_scan: bool = False, scan_pick: int = None):
+         scan_mode: bool = False, browser_scan: bool = False, scan_pick: int = None,
+         scan_links: bool = False):
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
     summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
@@ -7477,7 +7980,10 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     _patreon_creator = None
 
     if scan_mode:
-        found = scan_page_for_media(id_or_url, session, verbose)
+        # --follow-links forces link crawling; otherwise --subs-only auto-crawls when the given
+        # page is an episode index (no stream of its own) rather than a direct episode page.
+        _follow = True if scan_links else ('auto' if SUBS_ONLY else False)
+        found = scan_page_for_media(id_or_url, session, verbose, follow_links=_follow)
         if browser_scan:
             print("[INFO] --scan-browser: loading the page in a browser (JS) to find media...")
             burls, btitle = _browser_collect_media(id_or_url, verbose)
@@ -7551,6 +8057,30 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                    list_only=list_only, ffmpeg_path=ffmpeg_path, ffmpeg_url=ffmpeg_url,
                    do_rename=do_rename, rename_mode=rename_mode, res_scan=res_scan, scan_mode=False)
         _scan_used = set()
+        if SUBS_ONLY:
+            # Subtitles-only over a scanned page: gather every HLS/DASH stream, pull subtitle tracks
+            # directly (no video download), pick language(s), save as .srt.
+            sub_sources = []
+            for it in found:
+                if it['kind'] not in ('hls', 'mpd'):
+                    continue
+                pg = urlparse(it.get('page') or id_or_url)
+                origin = f"{pg.scheme}://{pg.netloc}" if pg.scheme and pg.netloc else None
+                h = {'User-Agent': USER_AGENT, 'Accept': '*/*'}
+                if origin:
+                    h['Referer'] = origin + '/'
+                    h['Origin'] = origin
+                ext = '.mpd' if it['kind'] == 'mpd' else '.m3u8'
+                base = it.get('name') or \
+                    os.path.basename(urlparse(it['url']).path).replace(ext, '') or 'video'
+                sub_sources.append({'kind': 'mpd' if it['kind'] == 'mpd' else 'hls_url',
+                                    'url': it['url'], 'headers': h,
+                                    'title': safe_filename(base, 'video')})
+            _with_out_dir(lambda: _download_subs_only(sub_sources, session, None, max_height,
+                                                      verbose))
+            if return_summary:
+                return summary
+            return
         for it in found:
             try:
                 if it['kind'] == 'url':
@@ -8268,6 +8798,8 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
+    parser.add_argument("--follow-links", action="store_true", help="With --scan: treat the given URL as an index/listing page — visit every same-site link (episode pages) and scan each for media too, instead of only the given page. Combines with --subs-only.")
+    parser.add_argument("--subs-only", action="store_true", help="Subtitles-only mode: for a collection or any scanned page (HLS .m3u8 or DASH .mpd), find the videos, show which subtitle languages are available, let you multi-select which to grab, then download ONLY those subtitles directly (no video/audio) and save them as .srt. If the given URL is an episode index (no stream of its own), it automatically follows the same-site episode links and scans each. Other modes are unaffected.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
 
@@ -8281,6 +8813,7 @@ if __name__ == "__main__":
         SUB_SEL = _parse_track_sel(args.sub)
     CENC_KEYS = _parse_cenc_keys(args.key, args.keys)
     FORCE_CONTAINER = args.container if args.container in ('mp4', 'mkv') else None
+    SUBS_ONLY = args.subs_only
 
     _res = _parse_res(args.res)
     if isinstance(_res, int):
@@ -8346,7 +8879,7 @@ if __name__ == "__main__":
         list_only=args.list, ffmpeg_path=args.ffmpeg, ffmpeg_url=args.ffmpeg_url,
         do_rename=(not args.no_rename), res_scan=_res_scan,
         scan_mode=(args.scan is not None or args.scan_browser), browser_scan=args.scan_browser,
-        scan_pick=_scan_pick,
+        scan_pick=_scan_pick, scan_links=args.follow_links,
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.

@@ -5212,6 +5212,12 @@ _LANG3_NAME = {
     "hrv": "Croatian", "srp": "Serbian", "slv": "Slovenian", "fil": "Filipino", "msa": "Malay",
     "und": "(unknown)",
 }
+# reverse: full English language name -> 3-letter code, so files tagged "Korean"/"english"/etc.
+# (instead of the ISO code) still canonicalise correctly and match.
+_LANG_NAME_TO3 = {name.lower(): code for code, name in _LANG3_NAME.items() if code != "und"}
+_LANG_NAME_TO3.update({"czech": "cze", "slovak": "slo", "german": "ger", "french": "fre",
+                       "dutch": "dut", "greek": "gre", "romanian": "rum", "chinese": "chi",
+                       "mandarin": "chi", "serbo-croatian": "hrv"})
 _EPISODE_RE = re.compile(r"[Ss](\d+)[Ee](\d+)")
 _LANG_TOKEN_RE = re.compile(r"^[A-Za-z]{2,3}$")
 _FLAG_TOKENS = {"forced", "sdh", "cc", "hi", "foreign", "full", "default"}
@@ -5225,6 +5231,8 @@ def _canon3(lang):
         return _LANG3_ALIAS[l]
     if len(l) == 2:
         return _LANG3_FROM2.get(l, l)
+    if len(l) > 3 and l in _LANG_NAME_TO3:      # full English name (e.g. "korean") -> code
+        return _LANG_NAME_TO3[l]
     return l
 
 
@@ -13669,8 +13677,27 @@ def run_retime_batch(args):
         for j in jobs:
             j["langs"] = {lg: tp for lg, tp in job_common[id(j)].items() if lg in selected}
     else:
-        log_warn("No common audio language detected between source and target - will use "
-                 "the first audio track / subtitle timing as a fallback.")
+        # Diagnose WHY nothing matched and say it plainly. By far the most common cause is a
+        # file-NAMING mismatch (the source .srt name doesn't match its source video, so no source
+        # video is paired) - NOT a failure to detect the audio.
+        unpaired = sum(1 for j in jobs if not j.get("source_video"))
+        for j in jobs[:4]:
+            sv = j.get("source_video")
+            stk = _video_audio_tracks(ffprobe_bin, sv) if sv else []
+            ttk = _video_audio_tracks(ffprobe_bin, j["target"])
+            log_info(f"    {_fmt_ep(j['ep'])}: source video = "
+                     f"{os.path.basename(str(sv)) if sv else Fore.YELLOW + 'NOT PAIRED (subtitle only)' + Style.RESET_ALL}"
+                     f"  |  source audio = {[t['lang'] for t in stk] or '-'}"
+                     f"  |  target audio = {[t['lang'] for t in ttk] or '-'}")
+        if unpaired >= max(1, len(jobs) // 2):
+            log_warn(f"This is a FILE-NAMING problem, not audio detection: {unpaired}/{len(jobs)} "
+                     "subtitles have no matching source video. Name each source .srt exactly like "
+                     "its source video (video 'X.mp4' -> subtitle 'X.cze.srt'), then re-scan. "
+                     "Falling back to subtitle-timing only for now.")
+        else:
+            log_warn("No common audio language between the paired source and target audio - the "
+                     "language tags may be inconsistent (e.g. 'kor' vs 'und'). Falling back to "
+                     "subtitle-timing only.")
 
     args.method = getattr(args, "method", None) or "auto"
     args.max_shift = getattr(args, "max_shift", None) or 240.0   # tolerate extra intro/recap at the start
