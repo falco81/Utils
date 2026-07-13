@@ -11880,6 +11880,55 @@ def _retime_local_offsets(src_vad, tgt_vad, win_s, step_s, max_shift):
     return anchors
 
 
+def _retime_offset_consensus(anchors, tol=12.0, iters=400, min_run=5, max_step=600.0, max_slope=0.12):
+    """Robustly drop SPURIOUS global anchors - false NCC matches somewhere in a long target that
+    survive with high confidence but are inconsistent with the real alignment (the cause of a
+    map that scatters cues to random times). Fits a slope-limited line offset(src)=slope*src+b
+    by RANSAC (covers a constant offset AND a linear framerate drift), keeps anchors within tol
+    of it, and additionally keeps CONTIGUOUS runs offset from the line by a consistent forward
+    amount (a genuine ad-break/cut). Everything else - scattered wild-offset hits - is removed.
+    On clean input (few outliers) it keeps essentially everything, so it is safe to always run."""
+    import numpy as np
+    A = sorted(anchors, key=lambda a: a[0])
+    n = len(A)
+    if n < 8:
+        return A
+    xs = np.array([a[0] for a in A], float)
+    ys = np.array([a[1] - a[0] for a in A], float)   # offset = tgt - src, vs source time
+    rng = np.random.default_rng(0)
+    best, bc = None, 0
+    for _ in range(iters):
+        i, j = int(rng.integers(0, n)), int(rng.integers(0, n))
+        if xs[i] == xs[j]:
+            continue
+        sl = (ys[j] - ys[i]) / (xs[j] - xs[i])
+        if abs(sl) > max_slope:                       # >12% speed diff is implausible
+            continue
+        b = ys[i] - sl * xs[i]
+        c = int((np.abs(ys - (sl * xs + b)) <= tol).sum())
+        if c > bc:
+            bc, best = c, (sl, b)
+    if best is None or bc < max(4, n // 5):
+        return A                                      # no clear consensus -> leave to local filter
+    sl, b = best
+    line = sl * xs + b
+    keep = np.abs(ys - line) <= tol
+    i = 0
+    while i < n:                                       # contiguous ad-break/cut plateaus (real)
+        j = i + 1
+        while j < n and abs((ys[j] - line[j]) - (ys[i] - line[i])) <= tol:
+            j += 1
+        dev = ys[i] - line[i]
+        # a real segment is a CONTIGUOUS run at a consistent offset - it may sit above OR below
+        # the dominant line (earlier segments have less accumulated ad time). Scattered spurious
+        # matches never form such runs, so they are still rejected.
+        if (j - i) >= min_run and abs(dev) <= max_step:
+            keep[i:j] = True
+        i = j
+    kept = [A[k] for k in range(n) if keep[k]]
+    return kept if len(kept) >= 4 else A
+
+
 def _retime_clean_and_breaks(anchors, jump_thresh=0.75, tol=1.0):
     """Rejects outlier anchors (robust local-median filter) and finds break points
     where the offset jumps by more than jump_thresh seconds (a mid-episode cut).
@@ -11887,6 +11936,7 @@ def _retime_clean_and_breaks(anchors, jump_thresh=0.75, tol=1.0):
     import numpy as np
     if len(anchors) < 4:
         return anchors, []
+    anchors = _retime_offset_consensus(anchors)   # global RANSAC filter first: kill spurious matches
     anchors = sorted(anchors, key=lambda a: a[0])
     offs = np.array([a[1] - a[0] for a in anchors])
     clean = []
@@ -11982,6 +12032,366 @@ def _print_progress(i, n, prefix=""):
 # --- precision knobs (all default ON for maximum accuracy; toggleable in the picker/CLI) ---
 _RETIME_ENV_HZ = 200        # audio envelope sample rate (Hz): higher = finer time grid, slower
 _RETIME_SUBSAMPLE = True    # parabolic sub-sample interpolation of the NCC peak (~1-2 ms vs 20 ms)
+_RETIME_REPORT = False      # write a per-pair diagnostic report (JSON data + interactive HTML) next to
+#                             the output srt: downsampled src/tgt audio+video signals, every cue's source
+#                             and mapped time + text, and the matched anchors. For debugging bad subtitles.
+
+
+def _dsample_env(arr, n=5000):
+    """Downsample a 1D signal to <=n points by max-pooling (keeps peaks), normalized to 0..1."""
+    a = np.asarray(arr, dtype=np.float64)
+    if a.size == 0:
+        return []
+    if a.size > n:
+        pad = (-a.size) % n
+        if pad:
+            a = np.concatenate([a, np.full(pad, a[-1] if a.size else 0.0)])
+        a = a.reshape(n, -1).max(axis=1)
+    mx = float(a.max()) or 1.0
+    return [round(float(x) / mx, 4) for x in a]
+
+
+def _retime_write_report(job, tracks, src_events, corrected, anchors, confs, extra, dropped=None, tgt_vad=None):
+    """Write a diagnostic report (compact JSON + self-contained interactive HTML) for analysing
+    bad subtitles. Includes: downsampled src/tgt audio+video signals; the target speech (VAD)
+    regions; every cue's source & mapped time + text + match confidence + reading speed; the
+    matched anchors; dropped (source-only) cues flagged in RED; and a stats block (offset
+    median/std, matched vs extrapolated, overlaps, too-fast/too-short cues, big gaps)."""
+    try:
+        import re as _re
+        base = job.get("report_base") or os.path.splitext(str(job["out"]))[0]
+        sig = []
+        for (name, se, te, hz) in tracks:
+            sig.append(dict(name=("video image" if name == "video" else _lang3_name(name)),
+                            kind=("video" if name == "video" else "audio"), hz=round(float(hz), 2),
+                            src=_dsample_env(se), src_dur=round(len(se) / hz, 2) if hz else 0,
+                            tgt=_dsample_env(te), tgt_dur=round(len(te) / hz, 2) if hz else 0))
+        a_src = np.array([a for (a, b) in anchors], float) if anchors else np.array([])
+        a_cf = np.array([float(c) for c in confs], float) if confs else np.array([])
+        if a_src.size:
+            o = np.argsort(a_src)
+            a_src, a_cf = a_src[o], a_cf[o]
+
+        def _cue_conf(ss):
+            if a_src.size == 0:
+                return 0.0, 0
+            k = int(np.searchsorted(a_src, ss))
+            best, bc = 1e9, 0.0
+            for kk in (k - 1, k, k + 1):
+                if 0 <= kk < a_src.size and abs(a_src[kk] - ss) < best:
+                    best, bc = abs(a_src[kk] - ss), a_cf[kk]
+            return (round(float(bc), 2), 1) if best <= 2.0 else (0.0, 0)
+
+        def _mk(s, c, idx, drp):
+            txt = s.get("text", "")
+            nch = len(_re.sub(r"<[^>]+>", "", txt).replace("\n", " ").strip())
+            dur = max(0.001, c["end"] - c["start"])
+            cf, mm = _cue_conf(s["start"])
+            return dict(i=idx, ss=round(s["start"], 3), se=round(s["end"], 3),
+                        ts=round(c["start"], 3), te=round(c["end"], 3), text=txt, d=drp,
+                        cf=cf, m=mm, cps=round(nch / dur, 1), dur=round(dur, 2))
+
+        cues = [_mk(s, c, i + 1, 0) for i, (s, c) in enumerate(zip(src_events, corrected))]
+        for (s, c) in (dropped or []):
+            cues.append(_mk(s, c, 0, 1))
+        anc = [dict(s=round(a, 3), t=round(b, 3), c=round(float(cf), 3))
+               for (a, b), cf in zip(anchors, confs)]
+        vad = [[round(float(v["start"]), 2), round(float(v["end"]), 2)]
+               for v in (tgt_vad or []) if isinstance(v, dict)][:4000]
+        kept = [c for c in cues if not c["d"]]
+        koff = np.array([c["ts"] - c["ss"] for c in kept]) if kept else np.array([0.0])
+        srt = sorted(kept, key=lambda x: x["ts"])
+        overlaps = sum(1 for a, b in zip(srt, srt[1:]) if b["ts"] < a["te"] - 0.05)
+        gaps = [[round(a["te"], 1), round(b["ts"] - a["te"], 1)]
+                for a, b in zip(srt, srt[1:]) if (b["ts"] - a["te"]) > 20.0]
+        stats = dict(matched=sum(c["m"] for c in kept),
+                     extrapolated=sum(1 for c in kept if not c["m"]),
+                     dropped=len(dropped or []), overlaps=overlaps,
+                     too_fast=sum(1 for c in kept if c["cps"] > 25),
+                     too_short=sum(1 for c in kept if c["dur"] < 0.5),
+                     off_med=round(float(np.median(koff)), 2), off_std=round(float(koff.std()), 2),
+                     cps_med=round(float(np.median([c["cps"] for c in kept] or [0.0])), 1),
+                     big_gaps=gaps[:30])
+        data = dict(
+            meta=dict(source=os.path.basename(str(job.get("source_video") or "")),
+                      source_srt=os.path.basename(str(job.get("source_srt") or "")),
+                      target=os.path.basename(str(job["target"])),
+                      output=os.path.basename(str(job["out"])),
+                      lang=job.get("lang", ""), episode=_fmt_ep(job.get("ep")),
+                      dropped=len(dropped or []),
+                      **{k: extra.get(k) for k in ("verified", "total", "off_lo", "off_hi",
+                                                   "spread", "passes", "guess")}),
+            signals=sig, cues=cues, anchors=anc, vad=vad, stats=stats)
+        with open(base + ".report.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        with open(base + ".report.html", "w", encoding="utf-8") as f:
+            f.write(_RETIME_REPORT_HTML.replace("/*__DATA__*/", json.dumps(data, ensure_ascii=False)))
+        log_info(f"    report: {os.path.basename(base)}.report.html (+ .json for me to analyse)")
+    except Exception as e:
+        log_warn(f"    could not write the diagnostic report: {e}")
+
+
+_RETIME_REPORT_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Re-time diagnostic report</title><style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--src:#58a6ff;--tgt:#3fb950;--vid:#bc8cff;--warn:#f85149;--acc:#d29922}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,Consolas,monospace}
+header{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel);position:sticky;top:0;z-index:5}
+h1{margin:0 0 6px;font-size:15px}.meta{color:var(--dim);font-size:12px}.meta b{color:var(--fg)}
+.wrap{padding:14px 18px;max-width:1500px;margin:0 auto}
+.lane{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:12px 0;overflow:hidden}
+.lane h2{margin:0;padding:8px 12px;font-size:12px;color:var(--dim);border-bottom:1px solid var(--line);display:flex;justify-content:space-between}
+canvas{display:block;width:100%;cursor:crosshair}
+.hint{color:var(--dim);font-size:11px;padding:6px 12px}
+.tip{position:fixed;pointer-events:none;background:#000c;border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:12px;max-width:420px;display:none;z-index:10;white-space:pre-wrap}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:4px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{position:sticky;top:0;background:var(--panel);color:var(--dim);cursor:pointer}tr:hover{background:#1f2630}
+.tt{white-space:nowrap;color:var(--dim)}.txt{max-width:640px}.bad{color:var(--warn)}
+input{background:#0d1117;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:5px 8px;font:inherit}
+.tblwrap{max-height:420px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;font-size:11px;color:var(--dim)}
+.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
+</style></head><body>
+<header><h1>Re-time diagnostic report</h1><div class="meta" id="meta"></div>
+<div class="legend">
+<span><span class="sw" style="background:var(--src)"></span>source audio</span>
+<span><span class="sw" style="background:var(--tgt)"></span>target audio</span>
+<span><span class="sw" style="background:var(--vid)"></span>video signal</span>
+<span><span class="sw" style="background:#3fb95055"></span>target speech (VAD)</span>
+<span><span class="sw" style="background:#3fb950"></span>strong match</span>
+<span><span class="sw" style="background:#d29922"></span>weak match</span>
+<span><span class="sw" style="background:#8b949e"></span>extrapolated</span>
+<span><span class="sw" style="background:var(--warn)"></span>dropped (not in target)</span>
+<span>wheel = zoom \u00b7 drag = pan \u00b7 hover a cue for text \u00b7 click a table row to jump</span></div></header>
+<div class="wrap" id="lanes"></div>
+<div class="wrap"><div class="lane"><h2><span>All cues (click a row to zoom the graphs to it)</span>
+<span id="chips"></span><span><input id="q" placeholder="filter text / #line"></span></h2>
+<div class="tblwrap"><table id="tbl"><thead><tr><th data-k="i">#</th><th data-k="ss">src start</th>
+<th data-k="ts">tgt start</th><th data-k="cps">cps</th><th data-k="text">text</th></tr></thead><tbody></tbody></table></div></div></div>
+<div class="tip" id="tip"></div>
+<script>
+const DATA=/*__DATA__*/;
+const tip=document.getElementById('tip');
+const fmt=t=>{t=Math.max(0,t);const h=Math.floor(t/3600),m=Math.floor(t%3600/60),s=(t%60);
+return (h?String(h).padStart(2,'0')+':':'')+String(m).padStart(2,'0')+':'+s.toFixed(2).padStart(5,'0');};
+const m=DATA.meta;
+document.getElementById('meta').innerHTML=
+ `<b>${m.source||m.source_srt}</b> &rarr; <b>${m.target}</b> &nbsp;|&nbsp; ${m.episode||''} ${m.lang||''} `+
+ `&nbsp;|&nbsp; verified <b>${m.verified}/${m.total}</b> &nbsp;|&nbsp; offset `+
+ `<b>${(m.off_lo||0).toFixed?m.off_lo.toFixed(1):m.off_lo}s${Math.abs((m.off_hi||0)-(m.off_lo||0))>0.2?'..'+m.off_hi.toFixed(1)+'s':''}</b>`+
+ (m.spread!=null?` &nbsp;|&nbsp; languages agree within <b>${m.spread.toFixed(2)}s</b>`:'')+
+ (m.dropped?` &nbsp;|&nbsp; <span style="color:var(--warn)">${m.dropped} cue(s) dropped (not in target)</span>`:'')+
+ ` &nbsp;|&nbsp; guess: ${m.guess||''}`;
+
+const LANES=[];                       // registry of {zoomTo} for table-click navigation
+function cueCol(c){
+ if(c.d)return '#f85149ee';           // dropped = red
+ if(!c.m)return '#8b949e88';          // extrapolated (no anchor) = grey
+ return c.cf>=0.6?'#3fb95099':'#d29922cc';   // strong match = green, weak = amber
+}
+const st=DATA.stats||{};
+document.getElementById('meta').innerHTML+=
+ `<div style="margin-top:6px">stats: `+
+ `<b style="color:var(--tgt)">${st.matched||0}</b> matched \u00b7 `+
+ `<b style="color:var(--dim)">${st.extrapolated||0}</b> extrapolated \u00b7 `+
+ `<b style="color:var(--warn)">${st.dropped||0}</b> dropped \u00b7 `+
+ `offset median <b>${st.off_med}s</b> (\u00b1${st.off_std}s) \u00b7 median <b>${st.cps_med}</b> cps`+
+ (st.overlaps?` \u00b7 <span style="color:var(--warn)">${st.overlaps} overlap(s)</span>`:'')+
+ (st.too_fast?` \u00b7 <span style="color:var(--warn)">${st.too_fast} too fast (>25 cps)</span>`:'')+
+ (st.too_short?` \u00b7 <span style="color:var(--warn)">${st.too_short} too short (<0.5s)</span>`:'')+
+ (st.big_gaps&&st.big_gaps.length?` \u00b7 <span style="color:var(--acc)">${st.big_gaps.length} gap(s) &gt;20s</span>`:'')+
+ `</div>`;
+
+function lane(title,dur,env,cues,cueKey,color,vad){
+ const box=document.createElement('div');box.className='lane';
+ box.innerHTML=`<h2><span>${title}</span><span class="tt">${fmt(dur)}</span></h2>`;
+ const cv=document.createElement('canvas');box.appendChild(cv);
+ const hint=document.createElement('div');hint.className='hint';box.appendChild(hint);
+ document.getElementById('lanes').appendChild(box);
+ let view={a:0,b:dur||1};
+ function resize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=150*devicePixelRatio;cv.style.height='150px';draw();}
+ const X=t=>(t-view.a)/(view.b-view.a)*cv.width;
+ const T=x=>view.a+x/cv.width*(view.b-view.a);
+ function draw(){const w=cv.width,h=cv.height,g=cv.getContext('2d');g.clearRect(0,0,w,h);
+  const base=h*0.72;
+  // target speech (VAD) regions as faint bands, so you can see if cues sit on speech
+  if(vad&&vad.length){g.fillStyle='#3fb95018';
+   for(const [a,b] of vad){if(b<view.a||a>view.b)continue;const x=X(a);g.fillRect(x,0,Math.max(1,X(b)-x),base);}}
+  // envelope
+  g.fillStyle=color+'55';g.strokeStyle=color;g.lineWidth=devicePixelRatio;g.beginPath();
+  const n=env.length;g.moveTo(0,base);
+  const i0=Math.max(0,Math.floor(view.a/dur*n)-1),i1=Math.min(n,Math.ceil(view.b/dur*n)+1);
+  for(let i=i0;i<i1;i++){const t=i/n*dur,x=X(t),y=base-env[i]*base*0.92;g.lineTo(x,y);}
+  g.lineTo(X(view.b),base);g.stroke();
+  g.lineTo(X(view.b),base);g.lineTo(X(view.a),base);g.closePath();g.globalAlpha=.25;g.fill();g.globalAlpha=1;
+  // cue blocks (colored by match confidence; red=dropped, grey=extrapolated)
+  const cb=h*0.80,ch=h*0.16;const isSrc=(cueKey==='ss');
+  for(const c of cues){
+   if(!isSrc&&c.d)continue;                     // dropped cues are NOT present in the target
+   const s=c[cueKey],e=c[cueKey==='ss'?'se':'te'];if(e<view.a||s>view.b)continue;
+   const x=X(s),ww=Math.max(1.2,X(e)-x);g.fillStyle=cueCol(c);g.fillRect(x,cb,ww,ch);}
+  // time ticks
+  g.fillStyle='#8b949e';g.font=(11*devicePixelRatio)+'px monospace';
+  const span=view.b-view.a,step=niceStep(span/8);
+  for(let t=Math.ceil(view.a/step)*step;t<view.b;t+=step){const x=X(t);
+   g.strokeStyle='#30363d';g.beginPath();g.moveTo(x,0);g.lineTo(x,base);g.stroke();
+   g.fillText(fmt(t),x+3,h-4);}
+ }
+ function niceStep(x){const p=Math.pow(10,Math.floor(Math.log10(x)));const f=x/p;
+  return (f<1.5?1:f<3.5?2:f<7.5?5:10)*p;}
+ cv.addEventListener('wheel',e=>{e.preventDefault();const t=T(e.offsetX*devicePixelRatio);
+  const k=e.deltaY<0?0.8:1.25;let a=t-(t-view.a)*k,b=t+(view.b-t)*k;
+  a=Math.max(0,a);b=Math.min(dur,b);if(b-a>0.5){view={a,b};draw();}},{passive:false});
+ let drag=null;cv.addEventListener('mousedown',e=>drag={x:e.offsetX,a:view.a,b:view.b});
+ addEventListener('mouseup',()=>drag=null);
+ cv.addEventListener('mousemove',e=>{
+  if(drag){const dt=(e.offsetX-drag.x)*devicePixelRatio/cv.width*(drag.b-drag.a);
+   let a=drag.a-dt,b=drag.b-dt;if(a<0){b-=a;a=0;}if(b>dur){a-=b-dur;b=dur;}view={a:Math.max(0,a),b};draw();return;}
+  const t=T(e.offsetX*devicePixelRatio);let hit=null;const isS=(cueKey==='ss');
+  for(const c of cues){if(!isS&&c.d)continue;const s=c[cueKey],e2=c[cueKey==='ss'?'se':'te'];if(t>=s&&t<=e2){hit=c;break;}}
+  if(hit){tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';
+   const info=hit.d?'\u2717 DROPPED - not in target (source-only)\n'
+     :((hit.m?`match ${hit.cf}`:'extrapolated (no direct match)')+`  \u00b7  ${hit.cps} cps  \u00b7  ${hit.dur}s\n`);
+   tip.textContent=info+`#${hit.i||'-'}  src ${fmt(hit.ss)}-${fmt(hit.se)}\n     tgt ${fmt(hit.ts)}-${fmt(hit.te)}\n${hit.text}`;}
+  else tip.style.display='none';});
+ cv.addEventListener('mouseleave',()=>tip.style.display='none');
+ hint.textContent=`${cues.length} cues`;new ResizeObserver(resize).observe(cv);resize();
+ const api={reset:()=>{view={a:0,b:dur||1};draw();},
+   zoomTo:(a,b)=>{const pad=Math.max(3,(b-a)*1.5);view={a:Math.max(0,a-pad),b:Math.min(dur,b+pad)};draw();}};
+ LANES.push(api);return api;
+}
+// audio lanes (source + target) for the primary audio track; video if present
+const audio=DATA.signals.find(s=>s.kind==='audio')||DATA.signals[0];
+if(audio){
+ lane('SOURCE audio + source-time cues',audio.src_dur,audio.src,DATA.cues,'ss','#58a6ff');
+ lane('TARGET audio + RE-TIMED cues (do the cues sit on speech?)',audio.tgt_dur,audio.tgt,DATA.cues,'ts','#3fb950',DATA.vad);
+}
+// OFFSET-over-time diagnostic: offset(src_time) for every cue + the matched anchors coloured by
+// confidence. A clean run is a near-flat line; spurious matches show as scattered dots, an
+// ad-break as a step, a framerate drift as a slope.
+(function offsetPanel(){
+ const A=DATA.anchors||[],C=DATA.cues.filter(c=>!c.d);
+ if(!A.length&&!C.length)return;
+ const dur=(audio?audio.src_dur:0)||Math.max(...C.map(c=>c.ss),1);
+ const offs=C.map(c=>c.ts-c.ss).concat(A.map(a=>a.t-a.s));
+ let lo=Math.min(...offs),hi=Math.max(...offs);if(hi-lo<2){const mid=(hi+lo)/2;lo=mid-1;hi=mid+1;}
+ const pad=(hi-lo)*0.08;lo-=pad;hi+=pad;
+ const Cs=C.slice().sort((a,b)=>a.ss-b.ss);
+ const box=document.createElement('div');box.className='lane';
+ box.innerHTML=`<h2><span>OFFSET over time (tgt\u2212src) \u2014 flat = good, scattered dots = bad matches, step = ad-break, slope = drift</span><span class="tt">${lo.toFixed(0)}..${hi.toFixed(0)}s</span></h2>`;
+ const cv=document.createElement('canvas');box.appendChild(cv);
+ const hint=document.createElement('div');hint.className='hint';hint.textContent=`${A.length} anchors, ${C.length} cues \u00b7 wheel = zoom, drag = pan`;box.appendChild(hint);
+ document.getElementById('lanes').appendChild(box);
+ let view={a:0,b:dur||1};
+ const X=t=>(t-view.a)/(view.b-view.a)*cv.width, T=x=>view.a+x/cv.width*(view.b-view.a),
+       Y=o=>cv.height-8-(o-lo)/(hi-lo)*(cv.height-24);
+ function niceStep(x){const p=Math.pow(10,Math.floor(Math.log10(x)));const f=x/p;return (f<1.5?1:f<3.5?2:f<7.5?5:10)*p;}
+ function resize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=170*devicePixelRatio;cv.style.height='170px';draw();}
+ function draw(){const w=cv.width,h=cv.height,g=cv.getContext('2d');g.clearRect(0,0,w,h);
+  g.fillStyle='#8b949e';g.font=(11*devicePixelRatio)+'px monospace';
+  for(let k=0;k<=4;k++){const o=lo+(hi-lo)*k/4,y=Y(o);g.strokeStyle='#30363d';g.beginPath();g.moveTo(0,y);g.lineTo(w,y);g.stroke();g.fillText(o.toFixed(1)+'s',3,y-2);}
+  const span=view.b-view.a,step=niceStep(span/8);
+  for(let t=Math.ceil(view.a/step)*step;t<view.b;t+=step){const x=X(t);g.strokeStyle='#21262d';g.beginPath();g.moveTo(x,0);g.lineTo(x,h);g.stroke();g.fillText(fmt(t),x+3,h-4);}
+  g.strokeStyle='#d2992288';g.lineWidth=devicePixelRatio;g.beginPath();let started=false;
+  for(const c of Cs){if(c.ss<view.a-1||c.ss>view.b+1)continue;const x=X(c.ss),y=Y(c.ts-c.ss);started?g.lineTo(x,y):g.moveTo(x,y);started=true;}g.stroke();
+  for(const a of A){if(a.s<view.a||a.s>view.b)continue;const q=Math.max(0,Math.min(1,a.c)),r=Math.round(255*(1-q)),gr=Math.round(180*q+40);
+   g.fillStyle=`rgba(${r},${gr},70,0.9)`;g.beginPath();g.arc(X(a.s),Y(a.t-a.s),2.2*devicePixelRatio,0,7);g.fill();}}
+ cv.addEventListener('wheel',e=>{e.preventDefault();const t=T(e.offsetX*devicePixelRatio);const k=e.deltaY<0?0.8:1.25;
+  let a=t-(t-view.a)*k,b=t+(view.b-t)*k;a=Math.max(0,a);b=Math.min(dur,b);if(b-a>0.5){view={a,b};draw();}},{passive:false});
+ let drag=null;cv.addEventListener('mousedown',e=>drag={x:e.offsetX,a:view.a,b:view.b});
+ addEventListener('mouseup',()=>drag=null);
+ cv.addEventListener('mousemove',e=>{if(!drag)return;const dt=(e.offsetX-drag.x)*devicePixelRatio/cv.width*(drag.b-drag.a);
+  let a=drag.a-dt,b=drag.b-dt;if(a<0){b-=a;a=0;}if(b>dur){a-=b-dur;b=dur;}view={a:Math.max(0,a),b};draw();});
+ LANES.push({reset:()=>{view={a:0,b:dur||1};draw();},
+   zoomTo:(a,b)=>{const p=Math.max(3,(b-a)*1.5);view={a:Math.max(0,a-p),b:Math.min(dur,b+p)};draw();},key:'ss'});
+ new ResizeObserver(resize).observe(cv);resize();
+})();
+const vid=DATA.signals.find(s=>s.kind==='video');
+if(vid){
+ lane('SOURCE video signal + source-time cues',vid.src_dur,vid.src,DATA.cues,'ss','#bc8cff');
+ lane('TARGET video signal + re-timed cues',vid.tgt_dur,vid.tgt,DATA.cues,'ts','#bc8cff');
+}
+
+// map source-time -> target-time from the anchors (piecewise linear + global-slope ends), so the
+// source signal can be drawn ON the target time axis for the overlay graphs below.
+function buildMap(){
+ const A=(DATA.anchors||[]).slice().sort((a,b)=>a.s-b.s);
+ if(A.length<2){const off=(DATA.stats&&DATA.stats.off_med)||0;return t=>t+off;}
+ const xs=A.map(a=>a.s),ys=A.map(a=>a.t),n=xs.length;
+ const mx=xs.reduce((a,b)=>a+b,0)/n,my=ys.reduce((a,b)=>a+b,0)/n;
+ let num=0,den=0;for(let i=0;i<n;i++){num+=(xs[i]-mx)*(ys[i]-my);den+=(xs[i]-mx)**2;}
+ let sl=den?num/den:1;sl=Math.max(0.9,Math.min(1.1,sl));
+ return t=>{if(t<=xs[0])return ys[0]+sl*(t-xs[0]);if(t>=xs[n-1])return ys[n-1]+sl*(t-xs[n-1]);
+  let lo=0,hi=n-1;while(hi-lo>1){const m=(lo+hi)>>1;if(xs[m]<=t)lo=m;else hi=m;}
+  const f=(t-xs[lo])/((xs[hi]-xs[lo])||1);return ys[lo]+f*(ys[hi]-ys[lo]);};}
+const MAP=buildMap();
+
+// OVERLAY: source (mapped onto target time) drawn on top of target - curves overlap where the
+// alignment is good and diverge where it is off. One for audio, one for the video signal.
+function overlay(title,tgtDur,srcEnv,srcDur,tgtEnv,cSrc,cTgt){
+ if(!srcEnv||!tgtEnv||!srcEnv.length||!tgtEnv.length)return;
+ const box=document.createElement('div');box.className='lane';
+ box.innerHTML=`<h2><span>${title}</span><span class="tt"><span style="color:${cSrc}">source\u2192</span> vs <span style="color:${cTgt}">target</span></span></h2>`;
+ const cv=document.createElement('canvas');box.appendChild(cv);
+ const hint=document.createElement('div');hint.className='hint';hint.textContent='source mapped onto target time \u2014 the two curves should overlap where aligned';box.appendChild(hint);
+ document.getElementById('lanes').appendChild(box);
+ let view={a:0,b:tgtDur||1};
+ const X=t=>(t-view.a)/(view.b-view.a)*cv.width,T=x=>view.a+x/cv.width*(view.b-view.a);
+ function nice(x){const p=Math.pow(10,Math.floor(Math.log10(x)));const f=x/p;return (f<1.5?1:f<3.5?2:f<7.5?5:10)*p;}
+ function env1(env,dur,tmap,col){const h=cv.height,base=h*0.94,n=env.length,g=cv.getContext('2d');
+  g.strokeStyle=col;g.lineWidth=devicePixelRatio;g.globalAlpha=0.8;g.beginPath();let st=false;
+  const t0=view.a-2,t1=view.b+2;
+  for(let i=0;i<n;i++){const tt=tmap(i/n*dur);if(tt<t0||tt>t1)continue;const x=X(tt),y=base-env[i]*base*0.9;st?g.lineTo(x,y):g.moveTo(x,y);st=true;}
+  g.stroke();g.globalAlpha=1;}
+ function draw(){const w=cv.width,h=cv.height,g=cv.getContext('2d');g.clearRect(0,0,w,h);
+  g.fillStyle='#8b949e';g.font=(11*devicePixelRatio)+'px monospace';const span=view.b-view.a,step=nice(span/8);
+  for(let t=Math.ceil(view.a/step)*step;t<view.b;t+=step){const x=X(t);g.strokeStyle='#21262d';g.beginPath();g.moveTo(x,0);g.lineTo(x,h);g.stroke();g.fillText(fmt(t),x+3,h-4);}
+  env1(tgtEnv,tgtDur,t=>t,cTgt);env1(srcEnv,srcDur,MAP,cSrc);}
+ function resize(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=150*devicePixelRatio;cv.style.height='150px';draw();}
+ cv.addEventListener('wheel',e=>{e.preventDefault();const t=T(e.offsetX*devicePixelRatio);const k=e.deltaY<0?0.8:1.25;
+  let a=t-(t-view.a)*k,b=t+(view.b-t)*k;a=Math.max(0,a);b=Math.min(tgtDur,b);if(b-a>0.5){view={a,b};draw();}},{passive:false});
+ let drag=null;cv.addEventListener('mousedown',e=>drag={x:e.offsetX,a:view.a,b:view.b});
+ addEventListener('mouseup',()=>drag=null);
+ cv.addEventListener('mousemove',e=>{if(!drag)return;const dt=(e.offsetX-drag.x)*devicePixelRatio/cv.width*(drag.b-drag.a);
+  let a=drag.a-dt,b=drag.b-dt;if(a<0){b-=a;a=0;}if(b>tgtDur){a-=b-tgtDur;b=tgtDur;}view={a:Math.max(0,a),b};draw();});
+ LANES.push({reset:()=>{view={a:0,b:tgtDur||1};draw();},
+   zoomTo:(a,b)=>{const p=Math.max(3,(b-a)*1.5);view={a:Math.max(0,a-p),b:Math.min(tgtDur,b+p)};draw();},key:'ts'});
+ new ResizeObserver(resize).observe(cv);resize();}
+if(audio)overlay('AUDIO overlay: source \u2192 target (aligned)',audio.tgt_dur,audio.src,audio.src_dur,audio.tgt,'#58a6ff','#3fb950');
+if(vid)overlay('VIDEO overlay: source \u2192 target (aligned)',vid.tgt_dur,vid.src,vid.src_dur,vid.tgt,'#58a6ff','#bc8cff');
+
+// cue table
+const tb=document.querySelector('#tbl tbody');let rows=DATA.cues.slice();let filt='all';
+const FILTS={all:()=>true,dropped:c=>c.d,extrapolated:c=>!c.d&&!c.m,'too fast':c=>!c.d&&c.cps>25,'too short':c=>!c.d&&c.dur<0.5};
+function jump(c){LANES.forEach(L=>{const a=c[L.key],b=c[L.key==='ss'?'se':'te'];if(a!=null&&b!=null)L.zoomTo(a,b);});
+ scrollTo({top:0,behavior:'smooth'});}
+function render(){tb.innerHTML='';let q=(document.getElementById('q').value||'').toLowerCase().trim();
+ let list=DATA.cues.filter(FILTS[filt]||FILTS.all);
+ if(q)list=list.filter(c=>(''+c.i)===q||(c.text||'').toLowerCase().includes(q));
+ rows=list;
+ for(const c of list.slice(0,3000)){const tr=document.createElement('tr');tr.style.cursor='pointer';
+  const cpsw=(!c.d&&c.cps>25)?' bad':'';
+  tr.innerHTML=`<td>${c.d?'<span class="bad">\u2717</span>':c.i}</td><td class="tt">${fmt(c.ss)}</td>`+
+   `<td class="tt">${c.d?'<span class="bad">dropped</span>':fmt(c.ts)}</td>`+
+   `<td class="tt${cpsw}">${c.d?'':c.cps}</td>`+
+   `<td class="txt${c.d?' bad':''}">${(c.text||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]))}</td>`;
+  tr.onclick=()=>jump(c);tb.appendChild(tr);}}
+const chips=document.getElementById('chips');
+Object.keys(FILTS).forEach(k=>{const cnt=DATA.cues.filter(FILTS[k]).length;if(k!=='all'&&!cnt)return;
+ const b=document.createElement('button');b.textContent=`${k}${k==='all'?'':' ('+cnt+')'}`;
+ b.style.cssText='margin-right:5px;padding:3px 7px;cursor:pointer';if(k==='all')b.style.borderColor='#58a6ff';
+ b.onclick=()=>{filt=k;[...chips.children].forEach(x=>x.style.borderColor='#30363d');b.style.borderColor='#58a6ff';render();};
+ chips.appendChild(b);});
+render();
+document.getElementById('q').addEventListener('input',render);
+document.querySelectorAll('th').forEach(th=>th.addEventListener('click',()=>{const k=th.dataset.k;
+ rows.sort((a,b)=>k==='text'?(''+a[k]).localeCompare(''+b[k]):(a[k]||0)-(b[k]||0));
+ tb.innerHTML='';for(const c of rows.slice(0,3000)){const tr=document.createElement('tr');tr.style.cursor='pointer';
+  tr.innerHTML=`<td>${c.d?'<span class="bad">\u2717</span>':c.i}</td><td class="tt">${fmt(c.ss)}</td>`+
+   `<td class="tt">${c.d?'<span class="bad">dropped</span>':fmt(c.ts)}</td><td class="tt">${c.d?'':c.cps}</td>`+
+   `<td class="txt${c.d?' bad':''}">${(c.text||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]))}</td>`;
+  tr.onclick=()=>jump(c);tb.appendChild(tr);}}));
+</script></body></html>"""
 
 
 def _video_analysis(args, ffmpeg_bin, video, cache, audio_index=0, progress_prefix=None):
@@ -12071,8 +12481,11 @@ def _segs_map(segs):
 
 
 def _retime_map_from_anchors(anchors, guess):
-    """Monotonic map source_time -> target_time built from confident per-line anchors,
-    with linear extrapolation at the ends."""
+    """Monotonic map source_time -> target_time built from confident per-line anchors, with
+    linear extrapolation at the ends. The end extrapolation uses a ROBUST GLOBAL slope (least
+    squares over all anchors, clamped near 1.0), NOT the noisy slope between the first/last two
+    anchors - a bad 2-point slope warps the head/tail into a ramp and can push edge cues to
+    wrong (or falsely-kept) times."""
     import numpy as np
     anchors = sorted(anchors)
     xs = [anchors[0][0]]
@@ -12083,18 +12496,19 @@ def _retime_map_from_anchors(anchors, guess):
             ys.append(max(y, ys[-1]))
     xs = np.array(xs)
     ys = np.array(ys)
+    if len(xs) >= 3:
+        gsl = float(np.polyfit(xs, ys, 1)[0])
+    elif len(xs) == 2:
+        gsl = (ys[1] - ys[0]) / (xs[1] - xs[0])
+    else:
+        gsl = 1.0
+    gsl = min(1.1, max(0.9, gsl))     # scale can't sanely be outside +-10%
 
     def f(t):
         if t <= xs[0]:
-            if len(xs) > 1:
-                sl = (ys[1] - ys[0]) / (xs[1] - xs[0])
-                return float(ys[0] + sl * (t - xs[0]))
-            return float(guess(t))
+            return float(ys[0] + gsl * (t - xs[0]))
         if t >= xs[-1]:
-            if len(xs) > 1:
-                sl = (ys[-1] - ys[-2]) / (xs[-1] - xs[-2])
-                return float(ys[-1] + sl * (t - xs[-1]))
-            return float(guess(t))
+            return float(ys[-1] + gsl * (t - xs[-1]))
         return float(np.interp(t, xs, ys))
     return f
 
@@ -12779,7 +13193,20 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
         res = _retime_run_passes(src_events, tracks, guess, ep)
         if res is not None:
             anchors, confs, per_lang, mapf, passes = res
-            corrected = _retime_apply_mapfn(src_events, mapf)
+            corrected_all = _retime_apply_mapfn(src_events, mapf)
+            # Trim cues that map OUTSIDE the target timeline. The source can carry an intro / recap /
+            # outro / next-episode preview that the TARGET does not contain; those cues land at
+            # negative times or past the end and have no place in the target - drop them (and clamp
+            # any tiny residual negative start to 0 as a safety net, so we never write bad times).
+            _tdur = float(tgt_an0.get("dur") or 0.0)
+            def _in_target(c):
+                return c["start"] >= -1.0 and (not _tdur or c["start"] <= _tdur + 1.0)
+            _keep = [(s, c) for (s, c) in zip(src_events, corrected_all) if _in_target(c)]
+            _dropped = [(s, c) for (s, c) in zip(src_events, corrected_all) if not _in_target(c)]
+            dropped_edge = len(src_events) - len(_keep)
+            src_kept = [s for s, c in _keep]
+            corrected = [dict(c, start=max(0.0, c["start"]), end=max(c["start"] + 0.05, c["end"]))
+                         for s, c in _keep] if _keep else corrected_all
             Path(job["out"]).parent.mkdir(parents=True, exist_ok=True)
             write_srt(corrected, Path(job["out"]))
             offs = [b - a for a, b in anchors]
@@ -12792,8 +13219,13 @@ def _retime_one(args, ffmpeg_bin, job, vad_cache):
             if any(t[0] == "video" for t in tracks):
                 used.append(("video", None, None, len(per_lang.get("video", []))))
             _asrc = sorted(a for a, _b in anchors)
+            if _RETIME_REPORT:
+                _retime_write_report(job, tracks, src_kept, corrected, anchors, confs,
+                                     dict(verified=len(anchors), total=ntot, off_lo=min(offs),
+                                          off_hi=max(offs), spread=spread, passes=passes, guess=guess_desc),
+                                     dropped=_dropped, tgt_vad=tgt_an0.get("vad"))
             return dict(ok=True, method="audio per-line", perline=True, passes=passes,
-                        verified=len(anchors), total=ntot, count=len(corrected),
+                        verified=len(anchors), total=ntot, count=len(corrected), dropped_edge=dropped_edge,
                         conf=(float(np.median(confs)) if confs else 0.0),
                         off_lo=min(offs), off_hi=max(offs), guess=guess_desc,
                         used=used, spread=spread, span=(src_events[0]["start"], src_events[-1]["end"]),
@@ -12834,7 +13266,7 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
     changes GPU acceleration, Enter runs, Esc cancels. Returns (selected_jobs, use_video)
     or None on cancel. All pairs start checked."""
     global _HWACCEL_MODE, _HWACCEL_RESOLVED, _HWACCEL_DEVICE, _GPURES_HW
-    global _RETIME_ENV_HZ, _RETIME_SUBSAMPLE, _VIDEO_KEYFRAME
+    global _RETIME_ENV_HZ, _RETIME_SUBSAMPLE, _VIDEO_KEYFRAME, _RETIME_REPORT
     sel = [True] * len(jobs)
     pos = 0
     top = 0
@@ -12884,12 +13316,14 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                     f"sub-sample interp: {Fore.GREEN if _RETIME_SUBSAMPLE else Style.DIM}"
                     f"{'ON' if _RETIME_SUBSAMPLE else 'OFF'}{Style.RESET_ALL} {Style.DIM}(p){Style.RESET_ALL}    "
                     f"video: {Fore.GREEN}{'keyframes (fast)' if _VIDEO_KEYFRAME else 'full (dense)'}"
-                    f"{Style.RESET_ALL} {Style.DIM}(k){Style.RESET_ALL}",
+                    f"{Style.RESET_ALL} {Style.DIM}(k){Style.RESET_ALL}    "
+                    f"report: {Fore.GREEN if _RETIME_REPORT else Style.DIM}"
+                    f"{'ON' if _RETIME_REPORT else 'off'}{Style.RESET_ALL} {Style.DIM}(r){Style.RESET_ALL}",
                     "",
                 ]
                 foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | v = video | "
                             f"g = GPU | " + ("d = device | " if len(gpu_names) > 1 else "")
-                            + f"h = envelope Hz | p = interp | k = keyframe/full | Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                            + f"h = envelope Hz | p = interp | k = keyframe/full | r = report | Enter = run | Esc = cancel{Style.RESET_ALL}"]
                 avail = max(4, rows - len(head) - len(foot))
                 blk = 6 if (jobs and jobs[0].get("parts")) else 4   # 2-in-1 blocks are taller
                 per = max(1, avail // blk)
@@ -12971,6 +13405,8 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
                 elif k == ("char", "k"):
                     _VIDEO_KEYFRAME = not _VIDEO_KEYFRAME
                     globals()["_VIDEO_DECODE_VARIANT"] = "__unset__"   # re-probe: filter chain changed
+                elif k == ("char", "r"):
+                    _RETIME_REPORT = not _RETIME_REPORT
                 elif k == "up":
                     pos = (pos - 1) % len(jobs)
                 elif k == "down":
@@ -13068,6 +13504,92 @@ def _ascii_hbar(val, maxval, width=22):
     if val > 0 and fill == 0:
         fill = 1
     return "\u2588" * fill + "\u2591" * (width - fill)
+
+
+def _print_retime_report_one(j, r):
+    """Print the detailed re-time report for ONE finished job (perline / piecewise / affine),
+    shown right after that episode is saved so each result is visible immediately."""
+    if not r.get("ok"):
+        print(f"  {Fore.RED}FAILED{Style.RESET_ALL} {Path(j['target']).name}: {r.get('msg')}")
+        return
+    au = r.get("audio") or {}
+    atxt = ""
+    used = r.get("used")
+    if used:
+        parts = []
+        for tup in used:
+            lg, st, tt = tup[0], tup[1], tup[2]
+            cnt = tup[3] if len(tup) > 3 else None
+            if lg == "video":
+                parts.append("video image" + (f" ({cnt} hits)" if cnt is not None else ""))
+            else:
+                parts.append(f"{_lang3_name(lg)} [{_audio_desc(st)} <-> {_audio_desc(tt)}]"
+                             + (f" ({cnt} hits)" if cnt is not None else ""))
+        atxt = "\n      tracks used: " + "; ".join(parts)
+    elif au.get("src") or au.get("tgt"):
+        atxt = f"\n      audio: source [{_audio_desc(au.get('src'))}] <-> target [{_audio_desc(au.get('tgt'))}]"
+    if r.get("perline"):
+        rng = (f"{r['off_lo']:+.1f}s" if abs(r['off_hi'] - r['off_lo']) < 0.2
+               else f"{r['off_lo']:+.1f}..{r['off_hi']:+.1f}s")
+        pct = (100.0 * r['verified'] / r['total']) if r['total'] else 0.0
+        pcol = Fore.GREEN if pct >= 97 else (Fore.YELLOW if pct >= 90 else Fore.RED)
+        xcheck = ""
+        if r.get("spread") is not None:
+            xcheck = (f"   {Fore.YELLOW}languages DISAGREE by {r['spread']:.2f}s (check this){Style.RESET_ALL}"
+                      if r["spread"] > 1.0 else f"   languages agree within {r['spread']:.2f}s")
+        trk = ""
+        if used:
+            tp = []
+            for tup in used:
+                lg, st, tt = tup[0], tup[1], tup[2]
+                if lg == "video":
+                    tp.append(f"{Fore.MAGENTA}video image{Style.RESET_ALL}")
+                else:
+                    tp.append(f"{_lang3_name(lg)} [{_audio_desc(st)}<->{_audio_desc(tt)}]")
+            trk = "; ".join(tp)
+        print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
+              f"{Style.DIM}({r['count']} lines){Style.RESET_ALL}"
+              + (f"  {Fore.YELLOW}{r['dropped_edge']} intro/outro cue(s) dropped (not in target){Style.RESET_ALL}"
+                 if r.get("dropped_edge") else ""))
+        print(f"      method:   audio per-line, {r.get('passes', 1)} pass(es); guess: {r['guess']}")
+        print(f"      verified: {pcol}{r['verified']}/{r['total']} timestamps ({pct:.1f}%){Style.RESET_ALL} "
+              f"by audio/video (median match {r['conf']:.2f})")
+        if trk:
+            print(f"      tracks:   {trk}")
+        if used:
+            total = r.get("total") or (max((tup[3] if len(tup) > 3 else 0) for tup in used) or 1)
+            rows = []
+            for tup in used:
+                lg = tup[0]
+                cnt = tup[3] if len(tup) > 3 else 0
+                name = "video image" if lg == "video" else f"{_lang3_name(lg)} audio"
+                rows.append((name, cnt, Fore.MAGENTA if lg == "video" else Fore.CYAN))
+            labw = max((len(n) for n, _, _ in rows), default=11)
+            print(f"      contribution to timing (share of {total} timestamps each method matched):")
+            for name, cnt, col in rows:
+                share = (100.0 * cnt / total) if total else 0.0
+                bar = _ascii_hbar(cnt, total)
+                print(f"        {col}{name:<{labw}}{Style.RESET_ALL}  {Fore.GREEN}{bar}{Style.RESET_ALL} "
+                      f"{cnt:>4} ({share:.0f}%)")
+        print(f"      offset:   {rng}{xcheck}")
+        return
+    if r.get("piecewise"):
+        brk = ", ".join(f"{int(b[0]) // 60:02d}:{int(b[0]) % 60:02d} ({b[1]:+.1f}s)"
+                        for b in r.get("breaks", []))
+        print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
+              f"method {Fore.YELLOW}PIECEWISE{Style.RESET_ALL} - {r['segments']} segments, "
+              f"shift changes at: {brk}{atxt}")
+        return
+    span = max(0.001, r["span"][1] - r["span"][0])
+    drift = (r["scale"] - 1.0) * span
+    if r.get("agree") is not None:
+        extra = (f" | {Fore.YELLOW}methods DISAGREE by {r['agree']:.2f}s - check this one{Style.RESET_ALL}"
+                 if r.get("disagree") else f" | methods agree within {r['agree']:.2f}s")
+    else:
+        extra = f" | {Style.DIM}(no source video - subtitle match only){Style.RESET_ALL}"
+    print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
+          f"offset {r['offset']:+.2f}s | speed {r['scale']:.4f}x | "
+          f"drift {drift:+.1f}s over the episode | method {r['method']} ({r['nmatched']} anchors){extra}{atxt}")
 
 
 def run_retime_batch(args):
@@ -13218,92 +13740,11 @@ def run_retime_batch(args):
             log_done(f"    saved {Path(j['out']).name}")
         else:
             log_warn(f"    failed: {r.get('msg')}")
+        # report for THIS episode, right after it is processed (not all at the end)
+        _print_retime_report_one(j, r)
+        print()
 
-    print()
-    log_info("=== Re-time report ===")
-    okc = 0
-    for j, r in results:
-        if r.get("ok"):
-            okc += 1
-            au = r.get("audio") or {}
-            atxt = ""
-            used = r.get("used")
-            if used:
-                parts = []
-                for tup in used:
-                    lg, st, tt = tup[0], tup[1], tup[2]
-                    cnt = tup[3] if len(tup) > 3 else None
-                    if lg == "video":
-                        parts.append(f"video image" + (f" ({cnt} hits)" if cnt is not None else ""))
-                    else:
-                        parts.append(f"{_lang3_name(lg)} [{_audio_desc(st)} <-> {_audio_desc(tt)}]"
-                                     + (f" ({cnt} hits)" if cnt is not None else ""))
-                atxt = "\n      tracks used: " + "; ".join(parts)
-            elif au.get("src") or au.get("tgt"):
-                atxt = f"\n      audio: source [{_audio_desc(au.get('src'))}] <-> target [{_audio_desc(au.get('tgt'))}]"
-            if r.get("perline"):
-                rng = (f"{r['off_lo']:+.1f}s" if abs(r['off_hi'] - r['off_lo']) < 0.2
-                       else f"{r['off_lo']:+.1f}..{r['off_hi']:+.1f}s")
-                pct = (100.0 * r['verified'] / r['total']) if r['total'] else 0.0
-                pcol = Fore.GREEN if pct >= 97 else (Fore.YELLOW if pct >= 90 else Fore.RED)
-                xcheck = ""
-                if r.get("spread") is not None:
-                    xcheck = (f"   {Fore.YELLOW}languages DISAGREE by {r['spread']:.2f}s (check this){Style.RESET_ALL}"
-                              if r["spread"] > 1.0 else f"   languages agree within {r['spread']:.2f}s")
-                trk = ""
-                if used:
-                    tp = []
-                    for tup in used:
-                        lg, st, tt = tup[0], tup[1], tup[2]
-                        if lg == "video":
-                            tp.append(f"{Fore.MAGENTA}video image{Style.RESET_ALL}")
-                        else:
-                            tp.append(f"{_lang3_name(lg)} [{_audio_desc(st)}<->{_audio_desc(tt)}]")
-                    trk = "; ".join(tp)
-                print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
-                      f"{Style.DIM}({r['count']} lines){Style.RESET_ALL}")
-                print(f"      method:   audio per-line, {r.get('passes', 1)} pass(es); guess: {r['guess']}")
-                print(f"      verified: {pcol}{r['verified']}/{r['total']} timestamps ({pct:.1f}%){Style.RESET_ALL} "
-                      f"by audio/video (median match {r['conf']:.2f})")
-                if trk:
-                    print(f"      tracks:   {trk}")
-                if used:
-                    total = r.get("total") or (max((tup[3] if len(tup) > 3 else 0) for tup in used) or 1)
-                    rows = []
-                    for tup in used:
-                        lg = tup[0]
-                        cnt = tup[3] if len(tup) > 3 else 0
-                        name = "video image" if lg == "video" else f"{_lang3_name(lg)} audio"
-                        rows.append((name, cnt, Fore.MAGENTA if lg == "video" else Fore.CYAN))
-                    labw = max((len(n) for n, _, _ in rows), default=11)
-                    print(f"      contribution to timing (share of {total} timestamps each method matched):")
-                    for name, cnt, col in rows:
-                        share = (100.0 * cnt / total) if total else 0.0
-                        bar = _ascii_hbar(cnt, total)
-                        print(f"        {col}{name:<{labw}}{Style.RESET_ALL}  {Fore.GREEN}{bar}{Style.RESET_ALL} "
-                              f"{cnt:>4} ({share:.0f}%)")
-                print(f"      offset:   {rng}{xcheck}")
-                continue
-            if r.get("piecewise"):
-                brk = ", ".join(f"{int(b[0]) // 60:02d}:{int(b[0]) % 60:02d} ({b[1]:+.1f}s)"
-                                for b in r.get("breaks", []))
-                print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
-                      f"method {Fore.YELLOW}PIECEWISE{Style.RESET_ALL} - {r['segments']} segments, "
-                      f"shift changes at: {brk}{atxt}")
-                continue
-            span = max(0.001, r["span"][1] - r["span"][0])
-            drift = (r["scale"] - 1.0) * span
-            if r.get("agree") is not None:
-                extra = (f" | {Fore.YELLOW}methods DISAGREE by {r['agree']:.2f}s - check this one{Style.RESET_ALL}"
-                         if r.get("disagree") else f" | methods agree within {r['agree']:.2f}s")
-            else:
-                extra = f" | {Style.DIM}(no source video - subtitle match only){Style.RESET_ALL}"
-            print(f"  {Fore.GREEN}{Path(j['out']).name}{Style.RESET_ALL}: {r['count']} lines | "
-                  f"offset {r['offset']:+.2f}s | speed {r['scale']:.4f}x | "
-                  f"drift {drift:+.1f}s over the episode | method {r['method']} ({r['nmatched']} anchors){extra}{atxt}")
-        else:
-            print(f"  {Fore.RED}FAILED{Style.RESET_ALL} {Path(j['target']).name}: {r.get('msg')}")
-    print()
+    okc = sum(1 for _j, r in results if r.get("ok"))
     log_done(f"Done: {okc}/{len(results)} subtitle file(s) re-timed to their target video.")
 
 
@@ -13380,12 +13821,13 @@ def _retime_2in1_one(args, ffmpeg_bin, job, vad_cache):
     a, b = job["parts"]
     target = job["target"]
 
-    def _align_and_trim(part, tmin, label):
+    def _align_and_trim(part, tmin, label, tag):
         log_info(label)
         with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
             outp = os.path.join(td, "p.srt")
             pjob = dict(source_srt=part["srt"], source_video=part["video"], target=target,
-                        out=outp, lang=job["lang"], ep=part["ep"], langs=None, tgt_min_t=tmin)
+                        out=outp, lang=job["lang"], ep=part["ep"], langs=None, tgt_min_t=tmin,
+                        report_base=os.path.splitext(str(job["out"]))[0] + f".{tag}")
             r = _retime_one(args, ffmpeg_bin, pjob, vad_cache)
             if not r.get("ok"):
                 return [], r, 0
@@ -13402,15 +13844,15 @@ def _retime_2in1_one(args, ffmpeg_bin, job, vad_cache):
                 dropped = 0
         return cues, r, dropped
 
-    cues_a, rA, dropA = _align_and_trim(a, 0.0, "    part A (first half) -> front of target:")
+    cues_a, rA, dropA = _align_and_trim(a, 0.0, "    part A (first half) -> front of target:", "partA")
     a_end = max((c["end"] for c in cues_a), default=0.0)
     tmin = max(0.0, a_end - 120.0)                    # allow recap/overlap margin before the back half
     cues_b, rB, dropB = _align_and_trim(
-        b, tmin, f"    part B (second half) -> back of target (after ~{int(a_end // 60):02d}:{int(a_end % 60):02d}):")
+        b, tmin, f"    part B (second half) -> back of target (after ~{int(a_end // 60):02d}:{int(a_end % 60):02d}):", "partB")
     b_start = min((c["start"] for c in cues_b), default=1e9)
     if (not rB.get("ok")) or (cues_b and a_end > 0 and b_start < a_end - 300.0):
         log_info("    part B: retrying without the back-half constraint")
-        cues_b, rB, dropB = _align_and_trim(b, 0.0, "    part B (second half), unconstrained:")
+        cues_b, rB, dropB = _align_and_trim(b, 0.0, "    part B (second half), unconstrained:", "partB")
     if not cues_a and not cues_b:
         return dict(ok=False, msg="neither half could be aligned to the target", target=target)
     merged = _retime_merge_cues(cues_a, cues_b)
@@ -13452,6 +13894,32 @@ def _retime_contrib_lines(r, indent="          "):
                       if r["spread"] > 1.0 else f"   languages agree within {r['spread']:.2f}s")
         lines.append(f"{indent}offset: {rng}{xcheck}")
     return lines
+
+
+def _print_2in1_report_one(j, r):
+    """Detailed 2-in-1 report for ONE finished target (part A + part B), printed right after it
+    is saved so each result is visible immediately."""
+    def _vp(part):
+        if part and part.get("ok") and part.get("perline"):
+            pct = 100.0 * part["verified"] / max(1, part["total"])
+            col = Fore.GREEN if pct >= 98 else (Fore.YELLOW if pct >= 90 else Fore.RED)
+            return f"{col}{part['verified']}/{part['total']} ({pct:.0f}%){Style.RESET_ALL}"
+        return f"{Fore.GREEN}ok{Style.RESET_ALL}" if (part and part.get("ok")) else f"{Fore.RED}FAILED{Style.RESET_ALL}"
+    if not r.get("ok"):
+        print(f"  {Fore.RED}FAILED{Style.RESET_ALL} {Path(j['target']).name}: {r.get('msg')}")
+        return
+    ae = r.get("a_end", 0.0)
+    pa, pb = r.get("partA"), r.get("partB")
+    print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
+          f"{Style.DIM}({r['count']} lines total){Style.RESET_ALL}")
+    print(f"      part A (front): {_vp(pa)}  |  {r['a_lines']} lines kept"
+          + (f", {Fore.YELLOW}{r.get('dropped_a', 0)} seam dropped{Style.RESET_ALL}" if r.get('dropped_a') else ""))
+    for ln in _retime_contrib_lines(pa, indent="        "):
+        print(ln)
+    print(f"      part B (back @ ~{int(ae // 60):02d}:{int(ae % 60):02d}): {_vp(pb)}  |  {r['b_lines']} lines kept"
+          + (f", {Fore.YELLOW}{r.get('dropped_b', 0)} seam dropped{Style.RESET_ALL}" if r.get('dropped_b') else ""))
+    for ln in _retime_contrib_lines(pb, indent="        "):
+        print(ln)
 
 
 def run_retime_2in1_batch(args):
@@ -13562,34 +14030,11 @@ def run_retime_2in1_batch(args):
         else:
             log_warn(f"    failed: {r.get('msg')}")
         results.append((j, r))
+        # report for THIS target, right after it is processed (not all at the end)
+        _print_2in1_report_one(j, r)
+        print()
 
     okc = sum(1 for _j, r in results if r.get("ok"))
-    log_info(f"{Fore.MAGENTA}{Style.BRIGHT}=== Re-time 2-in-1 report ==={Style.RESET_ALL}")
-
-    def _vp(part):
-        if part and part.get("ok") and part.get("perline"):
-            pct = 100.0 * part["verified"] / max(1, part["total"])
-            col = Fore.GREEN if pct >= 98 else (Fore.YELLOW if pct >= 90 else Fore.RED)
-            return f"{col}{part['verified']}/{part['total']} ({pct:.0f}%){Style.RESET_ALL}"
-        return f"{Fore.GREEN}ok{Style.RESET_ALL}" if (part and part.get("ok")) else f"{Fore.RED}FAILED{Style.RESET_ALL}"
-
-    for j, r in results:
-        if not r.get("ok"):
-            print(f"  {Fore.RED}FAILED{Style.RESET_ALL} {Path(j['target']).name}: {r.get('msg')}")
-            continue
-        ae = r.get("a_end", 0.0)
-        pa, pb = r.get("partA"), r.get("partB")
-        print(f"  {Fore.GREEN}{Style.BRIGHT}{Path(j['out']).name}{Style.RESET_ALL}  "
-              f"{Style.DIM}({r['count']} lines total){Style.RESET_ALL}")
-        print(f"      part A (front): {_vp(pa)}  |  {r['a_lines']} lines kept"
-              + (f", {Fore.YELLOW}{r.get('dropped_a', 0)} seam dropped{Style.RESET_ALL}" if r.get('dropped_a') else ""))
-        for ln in _retime_contrib_lines(pa, indent="        "):
-            print(ln)
-        print(f"      part B (back @ ~{int(ae // 60):02d}:{int(ae % 60):02d}): {_vp(pb)}  |  {r['b_lines']} lines kept"
-              + (f", {Fore.YELLOW}{r.get('dropped_b', 0)} seam dropped{Style.RESET_ALL}" if r.get('dropped_b') else ""))
-        for ln in _retime_contrib_lines(pb, indent="        "):
-            print(ln)
-    print()
     log_done(f"Done: {okc}/{len(results)} target(s) re-timed from 2 source halves.")
 
 
@@ -14618,6 +15063,11 @@ DIFFERENT LANGUAGES (target vs reference):
                         help="Decode EVERY video frame for the image cross-check (denser signal, but much slower). "
                              "By default only keyframes are decoded (~40x faster, GPU stays the decoder), which is "
                              "plenty for a secondary cross-check since audio drives the precise timing.")
+    parser.add_argument("--report", dest="retime_report", action="store_true", default=None,
+                        help="Write a diagnostic report next to each output srt: an interactive HTML (src/tgt audio "
+                             "+ video waveforms with the re-timed subtitles overlaid) and a compact JSON with the "
+                             "signals, every cue's source+mapped time+text, and the matched anchors. For debugging "
+                             "bad subtitles (small enough to share instead of the video).")
     parser.add_argument("--p1", action="store_true",
                         help="FIXED PRESET built into the script: from the videos in the directory it extracts CZECH subtitles "
                              "(aliases cze/ces/cz/cs) and immediately fixes readability (9 chars/s, min 2.5s). No prompts, "
@@ -14684,7 +15134,7 @@ DIFFERENT LANGUAGES (target vs reference):
         _debug_start(args)
     _STORE_PATH = _normalize_store_path(getattr(args, "config_file", None) or getattr(args, "preset_file", None))
     _STORE_URL = (getattr(args, "config_url", None) or "").strip() or None
-    global _HWACCEL_MODE, _HWACCEL_DEVICE, _RETIME_ENV_HZ, _RETIME_SUBSAMPLE, _VIDEO_KEYFRAME
+    global _HWACCEL_MODE, _HWACCEL_DEVICE, _RETIME_ENV_HZ, _RETIME_SUBSAMPLE, _VIDEO_KEYFRAME, _RETIME_REPORT
     if getattr(args, "hwaccel", None):
         _HWACCEL_MODE = args.hwaccel
     if getattr(args, "hwaccel_device", None):
@@ -14695,6 +15145,8 @@ DIFFERENT LANGUAGES (target vs reference):
         _RETIME_SUBSAMPLE = False
     if getattr(args, "video_keyframe", None) is False:
         _VIDEO_KEYFRAME = False
+    if getattr(args, "retime_report", None) is True:
+        _RETIME_REPORT = True
     if getattr(args, "ffmpeg_url", None):
         _FFMPEG_URL_OVERRIDE = args.ffmpeg_url
     migrate_legacy_store()
