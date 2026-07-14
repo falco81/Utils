@@ -97,8 +97,10 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "2.80.0"
+SCRIPT_VERSION = "2.91.1"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
+EP_PROBE_MAX = 0                # (deprecated / unused — episode-number probing was removed)
+SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
 # Paths that look like an episode/watch page — used to recognise an episode index and to visit
 # those links first. Matches e.g. /episode/12, /watch/..., s01e05, /ep-3, /epizoda/2, /dil/4.
 _EP_LINK_RE = re.compile(
@@ -151,7 +153,7 @@ _REMOTE_CONFIG_KEYS = {
     'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
-    'SCAN_LINK_CAP',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
@@ -405,6 +407,16 @@ def make_bar(**kwargs):
     kwargs.setdefault('ncols', _bar_ncols())
     kwargs.setdefault('bar_format', BAR_FORMAT)
     return tqdm(**kwargs)
+
+
+def _log_source(module, detail=None):
+    """Announce which downloader/source module is handling this download. Called on every download
+    path so the log always shows the engine in use (e.g. 'YouTube — DASH via InnerTube')."""
+    try:
+        tag = f"{CLR.CYAN}{module}{CLR.RESET}"
+    except Exception:
+        tag = module
+    print(f"[INFO] Downloader: {tag}" + (f" — {detail}" if detail else ""))
 
 
 # Global cap on how many network connections may be open at the same time.
@@ -1246,19 +1258,20 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
         os.chdir(out_dir)
     try:
         if SUBS_ONLY:
+            _log_source("Subtitles-only (collection)", "native HLS text tracks -> .srt")
             # Subtitles-only: pull only the chosen-language subtitles from the native videos and
             # skip every actual video download (Drive/Dropbox/Streamable/HLS video+audio).
             _download_subs_only([{'kind': 'hls', 'stream': h, 'title': h.get('title')}
                                  for h in hls_videos], session, None, max_height, verbose)
             return
         if drive_videos:
-            print(f"[INFO] Downloading {len(drive_videos)} Google Drive video(s) ...")
+            _log_source("Google Drive", f"direct download — {len(drive_videos)} file(s)")
             download_folder_pooled(drive_videos, session, chunk_size, verbose)
         if dropbox_items:
             dbx_videos = [{'id': normalize_dropbox_url(d['url']), 'title': d['filename'],
                            'name': d['filename'], 'direct_url': normalize_dropbox_url(d['url'])}
                           for d in dropbox_items]
-            print(f"[INFO] Downloading {len(dbx_videos)} Dropbox file(s) ...")
+            _log_source("Dropbox", f"direct download — {len(dbx_videos)} file(s)")
             download_folder_pooled(dbx_videos, session, chunk_size, verbose, label="Dropbox",
                                    conn_cap=DROPBOX_DEFAULT_CONNECTIONS)
         if streamable_items:
@@ -1273,7 +1286,7 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                                     'direct_url': durl, 'headers': STREAMABLE_HEADERS,
                                     'streamable_shortcode': st['shortcode']})
             if strm_videos:
-                print(f"[INFO] Downloading {len(strm_videos)} Streamable video(s) ...")
+                _log_source("Streamable", f"direct MP4 — {len(strm_videos)} file(s)")
                 download_folder_pooled(strm_videos, session, chunk_size, verbose,
                                        label="Streamable", conn_cap=max_connections)
         if hls_videos:
@@ -1281,6 +1294,7 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                 print("[ERROR] Native (Vimeo/Mux) videos need ffmpeg to mux audio+video, and it "
                       "was not available. Skipping the native videos.")
             else:
+                _log_source("Native Vimeo/Mux", f"HLS + ffmpeg mux — {len(hls_videos)} file(s)")
                 mc = max_connections or DEFAULT_MAX_CONNECTIONS
                 download_hls_pooled(hls_videos, session, None, mc, max_height, verbose)
     finally:
@@ -2882,7 +2896,7 @@ def ensure_ffmpeg(verbose):
     if cached and _try_ffmpeg(cached):
         FFMPEG = cached
         if verbose:
-            print(f"[INFO] Using cached ffmpeg: {cached}")
+            tqdm.write(f"[INFO] Using cached ffmpeg: {cached}")
         return True
     # Look in the configured install folders (+ script dir + cwd) before downloading.
     script_dir = os.path.dirname(os.path.abspath(sys.argv[0] or '.')) or os.getcwd()
@@ -2893,27 +2907,27 @@ def ensure_ffmpeg(verbose):
     found = _find_ffmpeg_in(broad, max_depth=4)
     if found:
         FFMPEG = found
-        print(f"[INFO] Found ffmpeg: {found}")
+        tqdm.write(f"[INFO] Found ffmpeg: {found}")
         return True
     if os.name == 'nt' and FFMPEG_DOWNLOAD_URL:
         try:
             path = _download_and_extract_ffmpeg(FFMPEG_DOWNLOAD_URL, verbose)
         except Exception as e:
-            print(f"[ERROR] ffmpeg download/extract failed: {e}")
+            tqdm.write(f"[ERROR] ffmpeg download/extract failed: {e}")
             return False
         if path and _try_ffmpeg(path):
             FFMPEG = path
-            print(f"[INFO] Using downloaded ffmpeg: {path}")
+            tqdm.write(f"[INFO] Using downloaded ffmpeg: {path}")
             return True
-        print("[ERROR] Downloaded archive but could not find a working ffmpeg binary inside.")
+        tqdm.write("[ERROR] Downloaded archive but could not find a working ffmpeg binary inside.")
         return False
     # Linux / macOS: don't fetch a Windows build — tell the user how to install it.
-    print("[ERROR] ffmpeg not found. Install it and/or put it on PATH:")
-    print("        Debian/Ubuntu:  sudo apt install ffmpeg")
-    print("        Fedora:         sudo dnf install ffmpeg")
-    print("        Arch:           sudo pacman -S ffmpeg")
-    print("        macOS (brew):   brew install ffmpeg")
-    print("        or pass --ffmpeg /path/to/ffmpeg (or a folder that contains it).")
+    tqdm.write("[ERROR] ffmpeg not found. Install it and/or put it on PATH:")
+    tqdm.write("        Debian/Ubuntu:  sudo apt install ffmpeg")
+    tqdm.write("        Fedora:         sudo dnf install ffmpeg")
+    tqdm.write("        Arch:           sudo pacman -S ffmpeg")
+    tqdm.write("        macOS (brew):   brew install ffmpeg")
+    tqdm.write("        or pass --ffmpeg /path/to/ffmpeg (or a folder that contains it).")
     return False
 
 
@@ -5775,14 +5789,71 @@ def _prompt_language_selection(langs):
     return {langs[i][0] for i in idxs}
 
 
+def _vtt_ts_to_srt(ts):
+    """'00:01:02.345' or '01:02.345' -> '00:01:02,345' (SubRip). Returns None if unparseable."""
+    m = re.match(r'\s*(?:(\d+):)?(\d{1,2}):(\d{2})[.,](\d{1,3})\s*$', ts)
+    if not m:
+        return None
+    h, mm, ss = int(m.group(1) or 0), int(m.group(2)), int(m.group(3))
+    ms = (m.group(4) + '000')[:3]
+    return f"{h:02d}:{mm:02d}:{ss:02d},{ms}"
+
+
+def _vtt_to_srt(vtt_text):
+    """Convert WebVTT text to SubRip (.srt) text in pure Python — no ffmpeg. Drops the WEBVTT header,
+    NOTE/STYLE/REGION blocks and cue-position settings, renumbers cues, and fixes the timestamp
+    separator ('.'->','). Keeps <i>/<b> (SRT understands them); strips <c>/<v>/karaoke tags."""
+    text = vtt_text.replace('\r\r\n', '\n').replace('\r\n', '\n').replace('\r', '\n')
+    out, n = [], 0
+    for block in re.split(r'\n\s*\n', text.strip()):
+        lines = block.split('\n')
+        ti = next((k for k, ln in enumerate(lines) if '-->' in ln), None)
+        if ti is None:
+            continue                                   # header / NOTE / STYLE / REGION
+        m = re.search(r'([\d:.,]+)\s*-->\s*([\d:.,]+)', lines[ti])
+        if not m:
+            continue
+        start, end = _vtt_ts_to_srt(m.group(1)), _vtt_ts_to_srt(m.group(2))
+        if not start or not end:
+            continue
+        payload = '\n'.join(lines[ti + 1:]).strip()
+        payload = re.sub(r'<(\d{2}:)?\d{2}:\d{2}[.,]\d{3}>', '', payload)   # inline karaoke stamps
+        payload = re.sub(r'</?c[^>]*>|</?v[^>]*>|</?ruby>|</?rt>|</?lang[^>]*>', '', payload)
+        payload = payload.strip()
+        if not payload:
+            continue
+        n += 1
+        out.append(f"{n}\n{start} --> {end}\n{payload}\n")
+    return '\n'.join(out)
+
+
 def _to_srt(path, verbose):
-    """Convert a downloaded .vtt / .ttml subtitle to .srt via ffmpeg (text stream copy, no video).
-    Returns the .srt path, or the original path if ffmpeg is unavailable or the convert fails."""
+    """Convert a downloaded .vtt / .ttml subtitle to .srt. WebVTT is converted in pure Python (no
+    ffmpeg needed — most robust); anything else falls back to ffmpeg. Returns the .srt path, or the
+    original path if conversion isn't possible."""
     if path.lower().endswith('.srt') or not os.path.exists(path):
         return path
+    srt = os.path.splitext(path)[0] + '.srt'
+    try:
+        with open(path, encoding='utf-8-sig', newline='') as f:
+            content = f.read()
+    except (OSError, UnicodeDecodeError):
+        content = ''
+    # WebVTT (Viki/HLS/DASH text tracks) -> pure-Python conversion.
+    if content and ('WEBVTT' in content[:80].upper() or '-->' in content):
+        body = _vtt_to_srt(content)
+        if body.strip():
+            try:
+                with open(srt, 'w', encoding='utf-8') as f:
+                    f.write(body)
+                if os.path.abspath(srt) != os.path.abspath(path):
+                    os.remove(path)
+                return srt
+            except OSError:
+                return path
+    # Non-VTT (e.g. TTML): let ffmpeg try.
     if not ensure_ffmpeg(verbose):
         return path
-    srt = os.path.splitext(path)[0] + '.srt'
     tmp = _temp_artifact(srt, ".conv.srt")
     proc = subprocess.run([FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error', '-i', path,
                            '-y', tmp], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
@@ -5824,6 +5895,228 @@ def _subs_of_source(src, session, max_height, verbose):
         return {}, []
 
 
+# --- Viki (rakuten viki) subtitles -----------------------------------------------------------
+# A logged-in subscriber can pull every timed-text (.vtt) track directly from Viki's API — no video
+# download. The web app embeds a session token in the page (__NEXT_DATA__); each video's per-play
+# stream_id + language list come from the Next.js data endpoint; subtitles are then a single GET.
+_VIKI_APP = "100000a"
+
+
+def _viki_url_kind(url):
+    """('container', id) for a viki.com/tv/<id>-… series, ('video', id) for a viki.com/videos/<id>-…
+    page, else None."""
+    m = re.search(r'viki\.com/tv/([0-9a-z]+)', url or '', re.I)
+    if m:
+        return ('container', m.group(1))
+    m = re.search(r'viki\.com/videos/(\d+v)', url or '', re.I)
+    if m:
+        return ('video', m.group(1))
+    return None
+
+
+def _viki_page_ctx(url, session, verbose):
+    """Fetch a Viki page and read its __NEXT_DATA__ -> (buildId, user token, container id, title)."""
+    try:
+        r = session.get(url, headers={'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        m = re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S)
+        data = json.loads(m.group(1)) if m else {}
+    except (requests.RequestException, ValueError, AttributeError):
+        return None, None, None, None
+    build = data.get('buildId')
+    pp = data.get('props', {}).get('pageProps', {})
+    token = (pp.get('userInfo') or {}).get('token')
+    cj = pp.get('containerJson') or (pp.get('videoMetadataJson') or {}).get('container') or {}
+    cid = cj.get('id')
+    titles = cj.get('titles') or {}
+    title = titles.get('en') or (list(titles.values())[0] if titles else None) or cj.get('id')
+    return build, token, cid, title
+
+
+def _viki_episodes(cid, session, verbose):
+    """Every episode of a container via the paginated episodes API (ascending by number)."""
+    eps, page = [], 1
+    while page <= 30:
+        u = (f"https://api.viki.io/v4/containers/{cid}/episodes.json?app={_VIKI_APP}"
+             f"&per_page=50&sort=number&direction=asc&with_upcoming=false&page={page}")
+        try:
+            d = session.get(u, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)).json()
+        except (requests.RequestException, ValueError):
+            break
+        for ep in d.get('response', []):
+            web = ((ep.get('url') or {}).get('web') or '')
+            slug = web.split('/videos/')[-1] if '/videos/' in web else ep.get('id', '')
+            eps.append({'id': ep.get('id'), 'number': ep.get('number'), 'slug': slug,
+                        'langs': list((ep.get('subtitle_completions') or {}).keys())})
+        if not d.get('more'):
+            break
+        page += 1
+    return eps
+
+
+def _viki_video_data(slug, build, session, verbose):
+    """Next.js data for one video -> (video_id, stream_id, [subtitle langs], token)."""
+    u = f"https://www.viki.com/_next/data/{build}/videos/{slug}.json?vid={slug}"
+    try:
+        pp = session.get(u, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)).json().get('pageProps', {})
+    except (requests.RequestException, ValueError):
+        return None, None, [], None
+    stats = (pp.get('videoPlaybackStreamJson') or {}).get('stats') or []
+    sid = stats[0].get('stream_id') if stats else None
+    meta = pp.get('videoMetadataJson') or {}
+    langs = list((meta.get('subtitle_completions') or {}).keys())
+    return meta.get('id'), sid, langs, (pp.get('userInfo') or {}).get('token')
+
+
+def _viki_sub_url(vid, lang, sid, token):
+    u = (f"https://api.viki.io/v4/videos/{vid}/auth_subtitles/{lang}.vtt"
+         f"?app={_VIKI_APP}&token={token}")
+    return u + (f"&stream_id={sid}" if sid else "")
+
+
+def _download_viki_subs(url, session, out_dir, verbose):
+    """--subs-only for Viki: list the series' episodes, gather available subtitle languages, let the
+    user pick, then download those .vtt tracks straight from Viki's API and convert to .srt. No video
+    is downloaded. Needs your logged-in Viki session (export viki.com cookies into the folder).
+
+    Kept deliberately light on the server: 1 page fetch + the episodes list + one probe, then only
+    the subtitle files themselves. A per-video stream_id (1 extra request/episode) is fetched ONLY
+    if Viki rejects the token-only request."""
+    build, token, cid, title = _viki_page_ctx(url, session, verbose)
+    kind = _viki_url_kind(url)
+    if kind and kind[0] == 'container':
+        cid = kind[1]
+    if not build or not token:
+        print(f"{CLR.YELLOW}[ERROR]{CLR.RESET} Viki: couldn't read your session from the page. "
+              "Log in on viki.com and export your viki.com cookies (JSON) into this folder, so the "
+              "script can use your subscription.")
+        return
+    if not cid:
+        print(f"{CLR.YELLOW}[ERROR]{CLR.RESET} Viki: couldn't find the series id in that URL.")
+        return
+    episodes = _viki_episodes(cid, session, verbose)
+    if not episodes:
+        print("[INFO] Viki: no episodes found for this series.")
+        return
+    total = len(episodes)
+    cov = {}
+    for ep in episodes:
+        for lang in ep['langs']:
+            cov[lang] = cov.get(lang, 0) + 1
+    if not cov:
+        print("[INFO] Viki: no subtitle languages available.")
+        return
+    print(f"[INFO] Viki: '{title}' — {total} episode(s), {len(cov)} subtitle language(s) available.")
+    # Show each language WITH its episode coverage, fullest first, so you can see at a glance which
+    # languages cover the whole series and which are partial (e.g. specials only in English).
+    def _disp(lang):
+        return f"{_VIKI_LANG_NAMES.get(lang, lang)} · {cov.get(lang, 0)}/{total}"
+    order = sorted(cov.keys(), key=lambda l: (-cov[l], _VIKI_LANG_NAMES.get(l, l).lower()))
+    chosen = _prompt_language_selection([(l, _disp(l)) for l in order])
+    if not chosen:
+        print("[INFO] Viki: nothing selected.")
+        return
+    series = safe_filename(title or 'viki', 'viki')
+    sid_cache = {}
+
+    def _sid(ep):
+        if ep['id'] not in sid_cache:
+            _v, s, _l, _t = _viki_video_data(ep['slug'], build, session, verbose)
+            sid_cache[ep['id']] = s
+        return sid_cache[ep['id']]
+
+    def _fetch(vid, lang, sid, out):
+        try:
+            r = session.get(_viki_sub_url(vid, lang, sid, token),
+                            timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT))
+            if r.status_code == 200 and r.text.lstrip().upper().startswith('WEBVTT'):
+                body = _vtt_to_srt(r.text)      # convert in memory (no file round-trip)
+                if body.strip():
+                    with open(out, 'w', encoding='utf-8') as f:   # out is the .srt path
+                        f.write(body)
+                    return True
+                vtt = out[:-4] + '.vtt'         # rare: couldn't parse -> keep .vtt, try ffmpeg
+                with open(vtt, 'w', encoding='utf-8', newline='') as f:
+                    f.write(r.text)
+                _to_srt(vtt, verbose)
+                return True
+        except (requests.RequestException, OSError):
+            pass
+        return False
+
+    # Per-language coverage for the languages you chose (so a lower count than the total is clearly
+    # explained rather than a mystery).
+    for lang in sorted(chosen, key=lambda l: (-cov.get(l, 0), l)):
+        miss = [str(ep['number']) for ep in episodes if lang not in ep['langs']]
+        note = f" — missing for E{', E'.join(miss)}" if miss else ""
+        print(f"[INFO] Viki: {_VIKI_LANG_NAMES.get(lang, lang)} [{lang}] in "
+              f"{total - len(miss)}/{total} episode(s){note}.")
+    # Episodes that have NONE of your chosen languages — tell the user what they DO have.
+    orphan = [ep for ep in episodes if not any(lang in ep['langs'] for lang in chosen)]
+    if orphan:
+        have = sorted({lang for ep in orphan for lang in ep['langs']})
+        print(f"{CLR.YELLOW}[WARN]{CLR.RESET} Viki: {len(orphan)} episode(s) have none of your "
+              f"chosen languages: E{', E'.join(str(ep['number']) for ep in orphan)}. "
+              f"Those episodes only have: {', '.join(have) or '—'}. "
+              "Re-run and add one of those to grab them too.")
+
+    want = []
+    converted = 0
+    for ep in episodes:
+        try:
+            base = f"{series} - E{int(ep['number']):02d}"
+        except (TypeError, ValueError):
+            base = f"{series} - {ep['id']}"
+        for lang in ep['langs']:
+            if lang in chosen:
+                srt = os.path.join(out_dir or '.', f"{base}.{lang}.srt")
+                vtt = srt[:-4] + '.vtt'
+                if os.path.exists(srt):
+                    continue                          # already have the .srt
+                if os.path.exists(vtt):               # leftover .vtt -> convert, no re-download
+                    if _to_srt(vtt, verbose).lower().endswith('.srt'):
+                        converted += 1
+                    continue
+                want.append((ep, lang, srt))
+    if converted:
+        print(f"[INFO] Viki: converted {converted} existing .vtt file(s) to .srt (no re-download).")
+    if not want:
+        print("[INFO] Viki: selected subtitles already present." if not converted
+              else "[INFO] Viki: done — all selected subtitles are now .srt.")
+        return
+
+    # One bar per subtitle (per episode+language), sequentially — gentlest on a rate-limited server.
+    need_sid, got = False, 0
+    for idx, (ep, lang, out) in enumerate(want):
+        bar = make_bar(total=1, desc=os.path.basename(out), unit='sub', leave=True)
+        ok = _fetch(ep['id'], lang, _sid(ep) if need_sid else None, out)
+        if not ok and idx == 0:                     # first failed token-only -> stream_id needed?
+            ok = _fetch(ep['id'], lang, _sid(ep), out)
+            if ok:
+                need_sid = True
+        bar.update(1)
+        try:
+            bar.colour = 'green' if ok else 'red'
+        except Exception:
+            pass
+        bar.close()
+        got += 1 if ok else 0
+    extra = " (token-only)" if not need_sid else ""
+    print(f"[INFO] Viki: downloaded {got}/{len(want)} subtitle file(s) in {len(chosen)} "
+          f"language(s){extra}.")
+
+
+_VIKI_LANG_NAMES = {
+    'en': 'English', 'ko': 'Korean', 'ja': 'Japanese', 'zh': 'Chinese (Simplified)',
+    'zt': 'Chinese (Traditional)', 'cs': 'Czech', 'sk': 'Slovak', 'de': 'German', 'fr': 'French',
+    'es': 'Spanish', 'pt': 'Portuguese', 'it': 'Italian', 'ru': 'Russian', 'pl': 'Polish',
+    'nl': 'Dutch', 'tr': 'Turkish', 'ar': 'Arabic', 'vi': 'Vietnamese', 'th': 'Thai', 'id': 'Indonesian',
+    'ms': 'Malay', 'hi': 'Hindi', 'ro': 'Romanian', 'hu': 'Hungarian', 'el': 'Greek', 'sv': 'Swedish',
+    'fi': 'Finnish', 'da': 'Danish', 'he': 'Hebrew', 'uk': 'Ukrainian', 'bg': 'Bulgarian',
+    'hr': 'Croatian', 'sr': 'Serbian', 'tl': 'Tagalog',
+}
+
+
 def _download_subs_only(sources, session, out_dir, max_height, verbose):
     """--subs-only: for each source (native HLS stream, or a scanned HLS master / DASH .mpd),
     discover subtitle tracks WITHOUT downloading any video, let the user multi-select language(s),
@@ -5852,17 +6145,27 @@ def _download_subs_only(sources, session, out_dir, max_height, verbose):
         print("[INFO] --subs-only: nothing selected; no subtitles downloaded.")
         return
     tasks = []                          # (srt_target, sub, headers)
+    converted = 0
     for title, headers, subs in per_video:
         base = re.sub(r'\.(mp4|mkv|m4v|webm)$', '', safe_filename(title, 'video'), flags=re.I)
         for s in subs:
             if _sub_key(s) in chosen:
                 code = safe_filename(_sub_key(s), 'sub')
                 srt = os.path.join(out_dir or '.', f"{base}.{code}.srt")
-                if not (os.path.exists(srt) or os.path.exists(srt[:-4] + '.vtt')):
-                    tasks.append((srt, s, headers))
+                vtt = srt[:-4] + '.vtt'
+                if os.path.exists(srt):
+                    continue
+                if os.path.exists(vtt):             # leftover .vtt -> convert, no re-download
+                    if _to_srt(vtt, verbose).lower().endswith('.srt'):
+                        converted += 1
+                    continue
+                tasks.append((srt, s, headers))
+    if converted:
+        print(f"[INFO] --subs-only: converted {converted} existing .vtt file(s) to .srt.")
     if not tasks:
         print("[INFO] --subs-only: selected subtitles are already present.")
         return
+    ensure_ffmpeg(verbose)              # resolve ffmpeg once, before the bar (clean output)
     got = [0]
     lock = threading.Lock()
     bar = make_bar(total=len(tasks), desc='subtitles', unit='sub', leave=True)
@@ -5879,7 +6182,7 @@ def _download_subs_only(sources, session, out_dir, max_height, verbose):
             bar.update(1)
 
     from concurrent.futures import ThreadPoolExecutor
-    with ThreadPoolExecutor(max_workers=8) as ex:
+    with ThreadPoolExecutor(max_workers=max(1, SCAN_PAGE_WORKERS)) as ex:
         list(ex.map(_one, tasks))
     bar.close()
     print(f"[INFO] --subs-only: downloaded {got[0]}/{len(tasks)} subtitle file(s) "
@@ -7832,22 +8135,39 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follo
     if follow_links and _depth == 0:
         base_host = urlparse(page_url).netloc.lower()
         links, lseen = [], set()
-        for m in re.finditer(r'<a\b[^>]+href=["\']([^"\']+)["\']', html):
-            href = m.group(1).replace('&amp;', '&').strip()
-            if href.lower().startswith(('mailto:', 'tel:', 'javascript:', 'data:', '#')):
-                continue
+
+        def _consider(href):
+            href = (href or '').replace('&amp;', '&').strip()
+            if not href or href.lower().startswith(('mailto:', 'tel:', 'javascript:', 'data:', '#')):
+                return
             full = urljoin(page_url, href).split('#')[0]
             pu = urlparse(full)
             if pu.scheme not in ('http', 'https') or pu.netloc.lower() != base_host:
-                continue                                  # same domain, real pages only
+                return
             if full in _seen or full in lseen:
-                continue
+                return
             if re.search(r'\.(jpe?g|png|gif|webp|svg|css|js|ico|woff2?|ttf|zip|pdf|rss|xml)(\?|$)',
                          full, re.I):
-                continue
+                return
             lseen.add(full)
             links.append(full)
+
+        for m in re.finditer(r'<a\b[^>]+href=["\']([^"\']+)["\']', html):
+            _consider(m.group(1))
+        # JS/lazy pages (links appear only on hover): the URL is almost always still in the source —
+        # in a data-* attribute, JSON blob, onclick or <script> array, and may be relative. Harvest
+        # any episode-looking token from anywhere in the raw HTML so those pages get scanned even
+        # without a plain <a href>.
+        for m in re.finditer(r'''["']([^"'\s<>]{3,})["']''', html):
+            cand = m.group(1)
+            if '/' in cand and _EP_LINK_RE.search(cand):
+                _consider(cand)
         ep_links = [u for u in links if _EP_LINK_RE.search(urlparse(u).path)]
+        if verbose:
+            print(f"[INFO] --scan: {len(links)} same-site link(s), {len(ep_links)} look like "
+                  f"episodes:")
+            for u in (ep_links or links)[:40]:
+                print(f"        {u}")
         _do_follow = (follow_links is True) or (follow_links == 'auto'
                                                 and (not found or len(ep_links) >= 2))
         if _do_follow and links:
@@ -7863,12 +8183,12 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follo
             def _scan_one(u):
                 try:
                     return scan_page_for_media(u, session, verbose, _depth=0, _title=None,
-                                               follow_links=False, _seen=_seen, _is_sub=True)
+                                               follow_links='auto', _seen=_seen, _is_sub=True)
                 except Exception:
                     return []
 
             from concurrent.futures import ThreadPoolExecutor, as_completed
-            with ThreadPoolExecutor(max_workers=8) as ex:
+            with ThreadPoolExecutor(max_workers=max(1, SCAN_PAGE_WORKERS)) as ex:
                 futs = [ex.submit(_scan_one, u) for u in links]
                 for fut in as_completed(futs):
                     for s in fut.result():
@@ -7979,6 +8299,12 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     _active_collection_title = None
     _patreon_creator = None
 
+    # Viki subtitles-only: pull every episode's .vtt straight from Viki's API (subscriber session).
+    if SUBS_ONLY and _viki_url_kind(id_or_url):
+        _log_source("Viki", "subtitle API (auth_subtitles) -> .srt")
+        _with_out_dir(lambda: _download_viki_subs(id_or_url, session, None, verbose))
+        return
+
     if scan_mode:
         # --follow-links forces link crawling; otherwise --subs-only auto-crawls when the given
         # page is an episode index (no stream of its own) rather than a direct episode page.
@@ -8058,6 +8384,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                    do_rename=do_rename, rename_mode=rename_mode, res_scan=res_scan, scan_mode=False)
         _scan_used = set()
         if SUBS_ONLY:
+            _log_source("Subtitles-only (page scan)", "HLS/DASH text tracks -> .srt")
             # Subtitles-only over a scanned page: gather every HLS/DASH stream, pull subtitle tracks
             # directly (no video download), pick language(s), save as .srt.
             sub_sources = []
@@ -8071,7 +8398,9 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                     h['Referer'] = origin + '/'
                     h['Origin'] = origin
                 ext = '.mpd' if it['kind'] == 'mpd' else '.m3u8'
-                base = it.get('name') or \
+                page_it = it.get('page') or ''
+                slug = os.path.basename(urlparse(page_it).path.rstrip('/')) if page_it else ''
+                base = slug or it.get('name') or \
                     os.path.basename(urlparse(it['url']).path).replace(ext, '') or 'video'
                 sub_sources.append({'kind': 'mpd' if it['kind'] == 'mpd' else 'hls_url',
                                     'url': it['url'], 'headers': h,
@@ -8106,6 +8435,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                     hdrs['Referer'] = origin + '/'
                     hdrs['Origin'] = origin
                 if it['kind'] == 'direct':
+                    _log_source("Direct file (page scan)", "direct download")
                     base = it.get('name') or os.path.basename(urlparse(it['url']).path) or 'video'
                     final = _scan_unique_name(safe_filename(base, 'video'), _scan_used)
                     entry = {'id': it['url'], 'title': final, 'name': final,
@@ -8113,6 +8443,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                     _with_out_dir(lambda e=entry: download_folder_pooled(
                         [e], session, chunk_size, verbose, label="Direct", conn_cap=16))
                 elif it['kind'] in ('hls', 'mpd'):
+                    _log_source("DASH (.mpd)" if it['kind'] == 'mpd' else "HLS (.m3u8)",
+                                "page scan" + (" + mp4decrypt" if CENC_KEYS else ""))
                     if not ensure_ffmpeg(verbose):
                         print("[WARN] --scan: skipping stream (ffmpeg needed).")
                         continue
@@ -8175,6 +8507,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
 
     try:
         if kind == 'patreon':
+            _log_source("Patreon collection", "Drive + Dropbox + Streamable + native Vimeo/Mux HLS")
             if output_file:
                 print("[WARN] -o/--output is ignored for Patreon collections; names come from the posts.")
             process_patreon_collection(target_id, session, chunk_size, num_threads, folder_workers,
@@ -8182,6 +8515,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                                        max_connections=max_connections, max_height=max_height,
                                        list_only=list_only)
         elif kind == 'patreon_post':
+            _log_source("Patreon post", "Drive + Dropbox + Streamable + native Vimeo/Mux HLS")
             if output_file:
                 print("[WARN] -o/--output is ignored for Patreon posts; names come from the post.")
             process_patreon_post(target_id, session, chunk_size, num_threads, folder_workers,
@@ -8189,6 +8523,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                                  max_connections=max_connections, max_height=max_height,
                                  list_only=list_only)
         elif kind == 'dropbox':
+            _log_source("Dropbox", "direct download")
             fname = safe_filename(output_file, 'video') if output_file else \
                 dropbox_filename(target_id, 'video')
             durl = normalize_dropbox_url(target_id)
@@ -8196,6 +8531,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             _with_out_dir(lambda: download_folder_pooled([entry], session, chunk_size, verbose,
                                                          label="Dropbox", conn_cap=DROPBOX_DEFAULT_CONNECTIONS))
         elif kind == 'streamable':
+            _log_source("Streamable", "direct MP4")
             durl, title, _h = resolve_streamable(target_id, session, verbose)
             if not durl:
                 print(f"[ERROR] Could not resolve Streamable video {target_id}.")
@@ -8211,6 +8547,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                                                          label="Streamable",
                                                          conn_cap=max_connections))
         elif kind == 'vimeo':
+            _log_source("Vimeo", "native HLS (ffmpeg mux)")
             if not ensure_ffmpeg(verbose):
                 print("[ERROR] Vimeo videos are HLS and need ffmpeg to mux audio+video into MP4.")
                 summary['error'] = "ffmpeg not available for Vimeo/HLS"
@@ -8222,25 +8559,30 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             _with_out_dir(lambda: download_hls_pooled([target_id], session, None,
                                                       max_connections, max_height, verbose))
         elif kind == 'twitch':
+            _log_source("Twitch", "native HLS")
             _with_out_dir(lambda: process_twitch(target_id, session, max_connections,
                                                  max_height, verbose, list_only, out_dir,
                                                  output_file=output_file))
         elif kind == 'youtube':
+            _log_source("YouTube", "DASH via InnerTube")
             _with_out_dir(lambda: process_youtube(target_id, session, max_connections,
                                                   max_height, verbose, list_only, out_dir,
                                                   output_file=output_file, res_scan=res_scan))
         elif kind == 'youtube_playlist':
+            _log_source("YouTube playlist", "DASH via InnerTube")
             if output_file:
                 print("[WARN] -o/--output is ignored for playlists; names come from YouTube.")
             _with_out_dir(lambda: process_youtube_playlist(target_id, session, max_connections,
                                                            max_height, verbose, list_only, out_dir,
                                                            res_scan=res_scan))
         elif kind == 'folder':
+            _log_source("Google Drive folder", "direct download")
             if output_file:
                 print("[WARN] -o/--output is ignored for folders; names come from Drive.")
             _with_out_dir(lambda: process_folder(target_id, session, chunk_size, num_threads,
                                                  folder_workers, recursive, verbose, select=select))
         else:
+            _log_source("Google Drive", "direct download")
             if select:
                 print("[WARN] --select only applies to folders/collections; ignoring.")
             ok = _with_out_dir(lambda: process_single_video(target_id, session, output_file,
@@ -8804,6 +9146,8 @@ if __name__ == "__main__":
     parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
 
     args = parser.parse_args()
+
+    print(f"[INFO] videoloader_dir v{SCRIPT_VERSION}")
 
     if args.ascii:
         ASCII_FILENAMES = True
