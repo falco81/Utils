@@ -11,6 +11,8 @@
   "META_READ_TIMEOUT": 30,
   "DOWNLOAD_READ_TIMEOUT": 120,
   "DEFAULT_MAX_HEIGHT": 0,
+  "SCAN_LINK_CAP": 300,
+  "SCAN_PAGE_WORKERS": 4,
   "FFMPEG": "ffmpeg",
   "FFMPEG_DOWNLOAD_URL": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
   "FFMPEG_PROGRAM_FILES_DIRS": [

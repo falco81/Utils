@@ -14273,10 +14273,16 @@ def _wizard_action_specs():
                  "decode onto the CPU (no GPU). Slower, avoids GPU driver quirks.",
             kind="direct", run=run_p3vc, flag=None, preset=None),
         "p3": dict(
-            label="[preset] Re-time to a different source, ALL tracks, audio only (--p3)",
+            label="[preset] Re-time to a different source, ALL tracks + video, DISCRETE GPU + report (--p3)",
+            help="Fixed preset: re-times to a different video source using ALL matching common-language audio "
+                 "tracks (no track picker), video image cross-check ON, on the DISCRETE GPU (auto-detected, iGPU "
+                 "fallback), with FULL (dense) video decode and the diagnostic REPORT written. Max accuracy + diagnostics.",
+            kind="direct", run=run_p3, flag=None, preset=None),
+        "p3aud": dict(
+            label="[preset] Re-time to a different source, ALL tracks, audio only (--p3aud)",
             help="Fixed preset: re-times to a different video source using ALL matching common-language audio "
                  "tracks automatically (no track picker), with video analysis OFF (audio only, fastest).",
-            kind="direct", run=run_p3, flag=None, preset=None),
+            kind="direct", run=run_p3aud, flag=None, preset=None),
         "extract-audio": dict(
             label="Extract an audio track from videos (stream copy)",
             help="Extracts an audio track (by language) from each video into a standalone audio file "
@@ -14338,7 +14344,7 @@ def _wizard_action_specs():
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
      ["sync-one", "sync-folder", "translate", "extract-subs", "merge-pro",
-      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p3vg", "p3vc", "p3"]),
+      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p3vg", "p3vc", "p3", "p3aud"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
@@ -14621,10 +14627,54 @@ def run_p3vc(args):
     run_retime_batch(args)
 
 
+def _discrete_gpu_index():
+    """Index (into _list_gpus order = ffmpeg device order) of the first DISCRETE GPU, or None if
+    it can't be told apart / there's only one GPU. Used by --p3 to force the powerful discrete
+    card instead of an iGPU."""
+    gpus = _list_gpus()
+    if len(gpus) < 2:
+        return None
+    igpu = ("uhd graphics", "iris", "hd graphics", "(tm) graphics", "radeon graphics",
+            "vega ", "integrated", "igpu", "microsoft basic", "raphael", "granite ridge")
+    disc = ("rtx", "gtx", "geforce", "radeon rx", "radeon pro", " rx ", "arc a", "quadro",
+            "titan", "instinct", "radeon r9", "radeon r7")
+
+    def cls(n):
+        s = n.lower()
+        if any(h in s for h in disc):
+            return True
+        if any(h in s for h in igpu):
+            return False
+        return None
+    for i, n in enumerate(gpus):        # first clearly-discrete
+        if cls(n) is True:
+            return i
+    for i, n in enumerate(gpus):        # else first not-clearly-integrated
+        if cls(n) is not False:
+            return i
+    return 0
+
+
 def run_p3(args):
     """FIXED PRESET (--p3): re-time subtitles to a DIFFERENT video source using ALL matching
+    (common-language) audio tracks automatically (no track picker), with the VIDEO image
+    cross-check ON, on the DISCRETE GPU (auto-detected; iGPU fallback), with FULL (dense) video
+    decode and the diagnostic REPORT written next to each output. Maximum accuracy + diagnostics."""
+    global _HWACCEL_DEVICE, _VIDEO_KEYFRAME, _RETIME_REPORT
+    args.retime_all_tracks = True
+    args.retime_use_video = True
+    di = _discrete_gpu_index()
+    if di is not None:
+        _HWACCEL_DEVICE = di          # force the discrete card
+    _VIDEO_KEYFRAME = False           # full (dense) video decode
+    _RETIME_REPORT = True             # write the diagnostic report
+    run_retime_batch(args)
+
+
+def run_p3aud(args):
+    """FIXED PRESET (--p3aud): re-time subtitles to a DIFFERENT video source using ALL matching
     (common-language) audio tracks automatically (no track picker), with the video image
-    analysis OFF - audio only, fastest. (For the video cross-check use --p3vg or --p3vc.)"""
+    analysis OFF - audio only, fastest. (For the video cross-check use --p3, --p3vg or --p3vc.)"""
     args.retime_all_tracks = True
     args.retime_use_video = False
     run_retime_batch(args)
@@ -15113,10 +15163,14 @@ DIFFERENT LANGUAGES (target vs reference):
                         help="FIXED PRESET: same as --p3vg (ALL audio tracks + video cross-check ON) but forces video "
                              "decode onto the CPU (no GPU). Optionally a path to the directory.")
     parser.add_argument("--p3", action="store_true",
-                        help="FIXED PRESET built into the script: re-time subtitles to a DIFFERENT video source "
-                             "(auto-detect source/target by episode) using ALL matching common-language audio "
-                             "tracks automatically (no track picker), video analysis OFF (audio only). "
-                             "Optionally a path to the directory.")
+                        help="FIXED PRESET: re-time to a DIFFERENT video source using ALL matching common-language "
+                             "audio tracks (no track picker), VIDEO image cross-check ON, on the DISCRETE GPU "
+                             "(auto-detected, iGPU fallback), with FULL (dense) video decode and the diagnostic "
+                             "REPORT written. Max accuracy + diagnostics. Optionally a path to the directory.")
+    parser.add_argument("--p3aud", action="store_true",
+                        help="FIXED PRESET: re-time to a DIFFERENT video source using ALL matching common-language "
+                             "audio tracks automatically (no track picker), video analysis OFF (audio only, fastest; "
+                             "the former --p3). Optionally a path to the directory.")
     parser.add_argument("--presets", action="store_true",
                         help="Opens the Presets menu (run/create/delete saved configurations) - works even when a default preset is set.")
     parser.add_argument("--no-preset", action="store_true",
@@ -15210,6 +15264,9 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if getattr(args, "p3", False):
         run_p3(args)
+        return
+    if getattr(args, "p3aud", False):
+        run_p3aud(args)
         return
 
     if getattr(args, "presets", False):
