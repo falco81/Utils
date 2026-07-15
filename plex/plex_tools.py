@@ -588,14 +588,16 @@ def _checkbox_classic(prompt, rows, header=None):
             r["selected"] = not r.get("selected")
 
 
-def checkbox_menu(prompt, rows, header=None):
+def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
     """Smart app-like multi-select with [x]/[ ] checkboxes.
     rows: dicts with 'label', 'selected', optional 'watched' (bool status tag) and
     optional 'season' (int, enables season filtering). Group-select actions act on
     the CURRENTLY VISIBLE rows (respecting the active season/search filter):
       Space=toggle current, a=all, n=none, w=watched, u=unwatched, i=invert,
       [ / ]=previous/next season, /=search (type, Enter/Esc exit), Enter=confirm,
-      Esc=clear filter or cancel. Returns rows (with 'selected' set) or None."""
+      Esc=clear filter or cancel. Returns rows (with 'selected' set) or None.
+    start_pos restores the highlighted row; if pos_out is a list, the final
+    highlighted row index is written to pos_out[0] (so a caller can come back to it)."""
     if not _tui_supported():
         return _checkbox_classic(prompt, rows, header)
 
@@ -606,9 +608,14 @@ def checkbox_menu(prompt, rows, header=None):
     scope_idx = 0
     filt = ""
     search_mode = False
-    sel_pos = 0
+    sel_pos = max(0, min(start_pos, len(rows) - 1)) if rows else 0
     prev_lines = 0
     first = True
+
+    def _remember():
+        if pos_out is not None:
+            pos_out[:] = [order[sel_pos] if order else 0]  # remember the ROW index
+
 
     def cur_season():
         return scopes[scope_idx] if scopes else None
@@ -802,6 +809,7 @@ def checkbox_menu(prompt, rows, header=None):
             elif key == ("char", "/"):
                 search_mode = True
             elif key == "enter":
+                _remember()
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 return rows
@@ -812,6 +820,7 @@ def checkbox_menu(prompt, rows, header=None):
                     order = visible_order()
                     sel_pos = 0
                 else:
+                    _remember()
                     sys.stdout.write("\r\n")
                     sys.stdout.flush()
                     return None
@@ -1585,7 +1594,11 @@ def item_available_variants(item, stream_type):
 # ---------------------------------------------------------------------------
 # Track selection
 # ---------------------------------------------------------------------------
-def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=False, header=None):
+def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=False,
+                   header=None, default=None):
+    """Returns (action, idx). action is ('var',v)/('off',None)/('keep',None)/('back',None);
+    idx is the highlighted menu index (to remember the position). `default` sets the
+    initial highlighted row."""
     labels = [v["label"] for v in variants]
     off_idx = keep_idx = None
     all_labels = list(labels)
@@ -1597,17 +1610,18 @@ def choose_variant(kind, variants, allow_off=False, allow_keep=True, allow_back=
         all_labels.append(f"{Fore.MAGENTA}— leave unchanged —{Style.RESET_ALL}")
     if not all_labels:
         log_warn(f"No {kind} tracks found.")
-        return ("keep", None)
-    default_idx = keep_idx if keep_idx is not None else 0
+        return ("keep", None), 0
+    default_idx = default if default is not None else (keep_idx if keep_idx is not None else 0)
+    default_idx = max(0, min(default_idx, len(all_labels) - 1))
     idx = interactive_menu(f"Select default {kind}:", all_labels,
                            default=default_idx, allow_cancel=allow_back, header=header)
     if idx is None:
-        return ("back", None)
+        return ("back", None), default_idx
     if idx < len(variants):
-        return ("var", variants[idx])
+        return ("var", variants[idx]), idx
     if off_idx is not None and idx == off_idx:
-        return ("off", None)
-    return ("keep", None)
+        return ("off", None), idx
+    return ("keep", None), idx
 
 
 def resolve_variant_arg(arg, variants, kind, allow_off):
@@ -1988,9 +2002,10 @@ def scan_target(client, target):
     return idata, audio, subs, header
 
 
-def select_and_configure(client, args):
+def select_and_configure(client, args, resume=None):
     """Wizard: library -> item -> audio -> subtitles, with step-back (Esc).
-    Returns (items_data, audio_action, sub_action) or None."""
+    Returns (items_data, audio_action, sub_action, state) or None. `state` lets the
+    caller resume at the subtitles step (e.g. after Esc on the final confirm)."""
     # --show: fixed item (skips the library/item steps)
     fixed = None
     if args.show:
@@ -2046,6 +2061,17 @@ def select_and_configure(client, args):
 
     lib_idx = 0
     item_idx = {}  # section key -> last highlighted item index
+    audio_idx = None
+    sub_idx = None
+    if resume is not None:
+        idata = resume["idata"]
+        audio_vars = resume["audio_vars"]
+        sub_vars = resume["sub_vars"]
+        header = resume["header"]
+        audio_action = resume["audio_action"]
+        audio_idx = resume.get("audio_idx")
+        sub_idx = resume.get("sub_idx")
+        step = SUBS if subs_interactive else AUDIO
     while True:
         if step == LIB:
             labels = [f"{s['title']}  [{s['type']}]" for s in secs]
@@ -2089,8 +2115,8 @@ def select_and_configure(client, args):
                 audio_action = resolve_variant_arg(args.audio, audio_vars, "audio", False)
                 step = SUBS
                 continue
-            audio_action = choose_variant("audio", audio_vars, allow_off=False,
-                                          allow_back=True, header=header)
+            audio_action, audio_idx = choose_variant("audio", audio_vars, allow_off=False,
+                                                     allow_back=True, header=header, default=audio_idx)
             if audio_action[0] == "back":
                 if have_item_step:
                     step = ITEM
@@ -2102,8 +2128,8 @@ def select_and_configure(client, args):
             if not subs_interactive:
                 sub_action = resolve_variant_arg(args.subs, sub_vars, "subtitles", True)
                 break
-            sub_action = choose_variant("subtitles", sub_vars, allow_off=True,
-                                        allow_back=True, header=header)
+            sub_action, sub_idx = choose_variant("subtitles", sub_vars, allow_off=True,
+                                                 allow_back=True, header=header, default=sub_idx)
             if sub_action[0] == "back":
                 if audio_interactive:
                     step = AUDIO
@@ -2117,7 +2143,10 @@ def select_and_configure(client, args):
     if audio_action[0] == "keep" and sub_action[0] == "keep":
         log_warn("No change selected. Exiting.")
         return None
-    return idata, audio_action, sub_action
+    state = {"idata": idata, "audio_vars": audio_vars, "sub_vars": sub_vars,
+             "header": header, "audio_action": audio_action, "audio_idx": audio_idx,
+             "sub_idx": sub_idx, "can_resume": subs_interactive or audio_interactive}
+    return idata, audio_action, sub_action, state
 
 
 # ---------------------------------------------------------------------------
@@ -2294,12 +2323,14 @@ def _watched_for_item(client, args, item, preset):
     # `rows`, the action menu reopens on the last choice, confirm keeps its answer).
     action_idx = 0
     confirm_default = True
+    sel_cursor = [0]
     picked = []
     action = None
     stage = "select"
     while True:
         if stage == "select":
-            res = checkbox_menu("Select episodes:", rows, header=header)
+            res = checkbox_menu("Select episodes:", rows, header=header,
+                                start_pos=sel_cursor[0], pos_out=sel_cursor)
             if res is None:
                 return "back"  # Esc on the selection -> back to the item picker
             picked = [r for r in rows if r.get("rk") and r["selected"]]
@@ -2395,37 +2426,64 @@ def mark_watched_flow(client, args):
 # Top-level menu (hub) + flows
 # ---------------------------------------------------------------------------
 def langsubs_flow(client, args):
-    """Set the default audio/subtitle tracks. Returns True if a change was made."""
-    result = select_and_configure(client, args)
-    if result is None:
-        log_info("Cancelled.")
-        return False
-    items_data, audio_action, sub_action = result
-
-    interactive = not args.yes
-    print()
-    audio_plan = resolve_coverage("audio", audio_action, items_data, ST_AUDIO,
-                                  allow_off=False, interactive=interactive)
-    sub_plan = resolve_coverage("subtitles", sub_action, items_data, ST_SUBTITLE,
-                                allow_off=True, interactive=interactive)
-
-    if all(p[0] == "skip" for p in audio_plan) and all(p[0] == "skip" for p in sub_plan):
-        log_warn("Nothing to change after all.")
-        return False
-
-    clear_screen()
-    log_info(f"Will set on {len(items_data)} items:")
-    print(f"    audio:   {plan_summary(audio_plan)}")
-    print(f"    subtitles: {plan_summary(sub_plan)}")
-    print()
-
+    """Set the default audio/subtitle tracks. Returns True if a change was made.
+    Esc on the final confirm goes back to the subtitle step (keeping selections)."""
+    resume = None
+    confirm_default = True
     dry = args.dry_run
-    if not dry and not args.yes:
-        if not ask_yes("Apply the changes?", default=True):
-            dry = ask_yes("At least show the plan (dry-run)?", default=True)
-            if not dry:
+    while True:  # wizard loop (re-entered on Esc from the confirm)
+        result = select_and_configure(client, args, resume=resume)
+        if result is None:
+            log_info("Cancelled.")
+            return False
+        items_data, audio_action, sub_action, state = result
+
+        interactive = not args.yes
+        print()
+        audio_plan = resolve_coverage("audio", audio_action, items_data, ST_AUDIO,
+                                      allow_off=False, interactive=interactive)
+        sub_plan = resolve_coverage("subtitles", sub_action, items_data, ST_SUBTITLE,
+                                    allow_off=True, interactive=interactive)
+
+        if all(p[0] == "skip" for p in audio_plan) and all(p[0] == "skip" for p in sub_plan):
+            log_warn("Nothing to change after all.")
+            return False
+
+        clear_screen()
+        log_info(f"Will set on {len(items_data)} items:")
+        print(f"    audio:   {plan_summary(audio_plan)}")
+        print(f"    subtitles: {plan_summary(sub_plan)}")
+        print()
+
+        if args.dry_run or args.yes:
+            break  # no confirmation needed
+
+        back_to_wizard = False
+        while True:  # confirm loop (Esc steps back one question)
+            ans = ask_yes_back("Apply the changes?", default=confirm_default)
+            if ans is None:  # Esc -> back to the subtitle step
+                back_to_wizard = True
+                break
+            confirm_default = ans
+            if ans:
+                dry = False
+                break
+            d2 = ask_yes_back("At least show the plan (dry-run)?", default=True)
+            if d2 is None:  # Esc -> back to the "Apply?" question
+                continue
+            if not d2:
                 log_info("Cancelled.")
                 return False
+            dry = True
+            break
+
+        if back_to_wizard:
+            if state.get("can_resume"):
+                resume = state
+                continue  # re-enter the wizard at the subtitle step
+            log_info("Cancelled.")
+            return False
+        break  # confirmed (real or dry-run)
 
     print()
     ok, fail, changed = apply_changes(client, items_data, audio_plan, sub_plan, dry)
