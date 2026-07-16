@@ -4807,34 +4807,51 @@ def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=No
                 log_info("    face detector on GPU (CUDA).")
             else:
                 log_warn("    GPU face-detect needs an OpenCV built with CUDA - the pip 'opencv-python' package "
-                         "has none, and its OpenCL path is broken on most drivers - so the detector runs on CPU. "
-                         "(Your CPU handles the DNN fine; the per-cue frame extraction is the real cost.)")
+                         "has none - so the DNN runs on CPU (fast enough). Frame decoding still uses the GPU.")
         except Exception:
             pass
-    out = []
     n = len(events)
+    dur = max((e["end"] for e in events), default=0.0)
+    if dur <= 0:
+        return [{"g": "?", "conf": 0.0} for _ in events]
+    # ONE ffmpeg pass extracts frames on a uniform grid (GPU decode helps here, unlike a per-cue
+    # spawn), then each unique frame is classified once - far fewer processes than one ffmpeg per cue.
+    fps = max(0.15, min(0.5, n / dur))          # ~1 frame per 2-6s; frame k -> time k/fps
     tmpd = tempfile.mkdtemp(dir=_temp_root())
     try:
-        fp = os.path.join(tmpd, "f.jpg")
+        patt = os.path.join(tmpd, "f_%06d.jpg")
+        hw = []
+        if gpu:
+            method = _hwaccel_for_decode(ffmpeg_bin)
+            if method:
+                hw = ["-hwaccel", method] + (["-hwaccel_device", str(dev)]
+                                             if dev not in (None, "", "auto") else [])
+
+        def _extract(hwargs):
+            if prefix:
+                _print_progress(1, n, prefix=prefix + "(decoding) ")
+            subprocess.run([ffmpeg_bin, "-y"] + hwargs + ["-i", str(video), "-vf", f"fps={fps}",
+                            "-q:v", "4", patt], capture_output=True,
+                           timeout=max(120, int(dur / 2) + 60))
+            return sorted(__import__("glob").glob(os.path.join(tmpd, "f_*.jpg")))
+
+        frames = _extract(hw)
+        if not frames and hw:                    # GPU decode failed -> retry on CPU
+            frames = _extract([])
+        if not frames:
+            log_warn("    could not extract frames for video gender - using audio only.")
+            return None
+        nf = len(frames)
+        cache = {}
+        out = []
         for i, e in enumerate(events):
-            if prefix and (i % 10 == 0 or i == n - 1):
+            if prefix and (i % 25 == 0 or i == n - 1):
                 _print_progress(i + 1, n, prefix=prefix)
-            mid = (e["start"] + e["end"]) / 2.0
-            try:
-                subprocess.run([ffmpeg_bin, "-y", "-ss", f"{mid:.3f}", "-i", str(video),
-                                "-frames:v", "1", "-q:v", "3", fp],
-                               capture_output=True, timeout=20)
-                g, c = "?", 0.0
-                if os.path.exists(fp):
-                    img = cv2.imread(fp)
-                    if img is not None:
-                        g, c = _gender_face(fd, gn, img, cv2)
-                    try:
-                        os.remove(fp)
-                    except OSError:
-                        pass
-            except Exception:
-                g, c = "?", 0.0
+            fi = min(nf - 1, max(0, int(round(((e["start"] + e["end"]) / 2.0) * fps))))
+            if fi not in cache:
+                img = cv2.imread(frames[fi])
+                cache[fi] = _gender_face(fd, gn, img, cv2) if img is not None else ("?", 0.0)
+            g, c = cache[fi]
             out.append({"g": g, "conf": c})
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
@@ -4870,8 +4887,11 @@ def _gender_translate(events, comb, engine, key, model, src_name):
     tag = {"M": "(M)", "F": "(F)", "?": ""}
     result = [{"start": e["start"], "end": e["end"], "text": e["text"]} for e in events]
     BATCH = 60
-    ok = True
-    for s in range(0, len(events), BATCH):
+    nok = 0
+    fatal = None
+    nbatch = (len(events) + BATCH - 1) // BATCH
+    log_info(f"    translating {len(events)} lines with gender hints ({engine} {model or ''})...")
+    for bi, s in enumerate(range(0, len(events), BATCH), 1):
         chunk = events[s:s + BATCH]
         cg = comb[s:s + BATCH]
         lines = []
@@ -4885,35 +4905,54 @@ def _gender_translate(events, comb, engine, key, model, src_name):
             f"first-person forms (e.g. 'udelal jsem' vs 'udelala jsem'); infer other genders from the "
             f"dialogue context. Keep names and titles untranslated. Return EXACTLY one line per input, "
             f"each prefixed by its number and a period, and nothing else.\n\n" + "\n".join(lines))
-        try:
-            if engine == "claude":
-                resp = anthropic_messages(prompt, key, model or "claude-sonnet-4-6", max_tokens=4000)
-            else:
-                resp = gemini_generate(prompt, key, model or "gemini-2.5-flash")
-        except Exception:
-            resp = None
-        if not resp:
-            ok = False
+        _print_progress(s, len(events), prefix="    gender translate ")   # show BEFORE the call
+        resp = None
+        for attempt in range(2):
+            try:
+                if engine == "claude":
+                    resp = anthropic_messages(prompt, key, model or "claude-sonnet-4-6", max_tokens=4000)
+                else:
+                    resp = gemini_generate(prompt, key, model or "gemini-1.5-flash", timeout=60)
+                break
+            except _FatalAPIError as e:      # bad key / no quota / bad model -> retrying is pointless
+                fatal = str(e)
+                break
+            except Exception:
+                resp = None
+                if attempt == 0:
+                    time.sleep(2.5)
+        if fatal:
             break
+        if not resp:
+            continue                         # transient miss: keep this batch as source, go on
         got = {}
         for ln in resp.splitlines():
             mm = re.match(r"\s*(\d+)[.)]\s*(.*)", ln)
             if mm:
                 got[int(mm.group(1))] = mm.group(2).strip()
         if len(got) < max(1, len(chunk) // 2):
-            ok = False
-            break
+            continue
         for j in range(len(chunk)):
             txt = got.get(j + 1)
             if txt:
-                # strip any leftover (M)/(F) tag the model may have echoed
                 txt = re.sub(r"^\(?[MF]\)?\s+", "", txt)
                 result[s + j]["text"] = txt
-    if ok:
+        nok += 1
+    _print_progress(len(events), len(events), prefix="    gender translate ")
+    print()
+    if fatal:
+        log_warn(f"    AI translation stopped: {fatal}")
+        log_warn("    Falling back to the free Google engine (no gender hints). For gender-correct "
+                 "Czech next time, pick a Gemini model WITH free quota (e.g. gemini-1.5-flash / "
+                 "gemini-2.0-flash) or use Claude.")
+        fb = translate_events_to(events, "google", "cs")
+        return fb or result
+    if nok:
+        if nok < nbatch:
+            log_warn(f"    {nbatch - nok}/{nbatch} batch(es) failed (transient) - those lines kept as source.")
         return result
-    log_warn("    AI gendered translation failed - falling back to the plain engine.")
-    fb = translate_events_to(events, ("google" if engine not in ("gemini", "claude", "deepl") else engine),
-                             "cs", api_key=key, model=model)
+    log_warn("    AI gendered translation produced nothing - falling back to the free Google engine.")
+    fb = translate_events_to(events, "google", "cs")
     return fb or result
 
 
@@ -5230,7 +5269,10 @@ def run_gender_translate(args):
     if engine == "gemini":
         key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
                or os.environ.get("GOOGLE_AI_API_KEY") or ask_text("Gemini API key (aistudio.google.com)", ""))
-        model = getattr(args, "gemini_model", None) or "gemini-2.5-flash"
+        model = getattr(args, "gemini_model", None) or ask_gemini_model(
+            "Gemini model  (2.5-flash has almost no free quota; 'gemini-1.5-flash' or "
+            "'gemini-2.0-flash' usually do - ? for the list)", "gemini-1.5-flash", args)
+        args.gemini_model = getattr(args, "gemini_model", None) or model
     else:
         key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
                or ask_text("Anthropic API key", ""))
