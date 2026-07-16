@@ -4662,6 +4662,740 @@ def run_test_api(args):
         log_warn("No AI key is set. Set it via --config, --anthropic-key or --llm-key.")
 
 
+_GENDER_MODELS = {
+    "face_proto": ("face_deploy.prototxt",
+                   "https://raw.githubusercontent.com/opencv/opencv/master/samples/dnn/face_detector/deploy.prototxt"),
+    "face_model": ("res10_ssd.caffemodel",
+                   "https://raw.githubusercontent.com/opencv/opencv_3rdparty/dnn_samples_face_detector_20170830/res10_300x300_ssd_iter_140000.caffemodel"),
+    "gender_proto": ("gender_deploy.prototxt",
+                     "https://raw.githubusercontent.com/spmallick/learnopencv/master/AgeGender/gender_deploy.prototxt"),
+    "gender_model": ("gender_net.caffemodel",
+                     "https://raw.githubusercontent.com/smahesh29/Gender-and-Age-Detection/master/gender_net.caffemodel"),
+}
+_GENDER_MEAN = (78.4263377603, 87.7689143744, 114.895847746)
+
+
+def _gender_model_dir():
+    d = Path.home() / ".video_tools" / "gender_models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _gender_fetch_models():
+    """Download (once, cached) the OpenCV face detector + Caffe gender model. Returns paths."""
+    import urllib.request
+    d = _gender_model_dir()
+    paths = {}
+    for k, (fn, url) in _GENDER_MODELS.items():
+        p = d / fn
+        if not p.exists() or p.stat().st_size < 1000:
+            log_info(f"    downloading model {fn} (first run only) ...")
+            urllib.request.urlretrieve(url, str(p))
+        paths[k] = str(p)
+    return paths
+
+
+def _gender_f0(seg, sr, fmin=75, fmax=300, vthr=0.35):
+    """Median fundamental frequency (Hz) of a voiced segment via autocorrelation; 0 if unvoiced."""
+    if len(seg) < int(0.04 * sr):
+        return 0.0
+    fl, hop = int(0.04 * sr), int(0.02 * sr)
+    f0s = []
+    for i in range(0, len(seg) - fl, hop):
+        x = seg[i:i + fl].astype(np.float64)
+        x -= x.mean()
+        e = float(np.dot(x, x))
+        if e < 1e-5:
+            continue
+        ac = np.correlate(x, x, "full")[len(x) - 1:]
+        lo, hi = int(sr / fmax), min(int(sr / fmin), len(ac) - 1)
+        if lo >= hi:
+            continue
+        k = int(np.argmax(ac[lo:hi])) + lo
+        if ac[k] / (ac[0] + 1e-9) >= vthr:
+            f0s.append(sr / float(k))
+    return float(np.median(f0s)) if len(f0s) >= 3 else 0.0
+
+
+def _gender_from_f0(f0):
+    if f0 <= 0:
+        return "?", 0.0
+    if f0 < 150:
+        return "M", min(1.0, (150 - f0) / 40 + 0.3)
+    if f0 > 180:
+        return "F", min(1.0, (f0 - 180) / 40 + 0.3)
+    return "?", 0.2
+
+
+def _gender_from_audio(samples, sr, events, prefix=None):
+    """Per-cue speaker gender from voice pitch. Returns [{g, f0, conf}] aligned with events."""
+    out = []
+    n = len(events)
+    for i, e in enumerate(events):
+        if prefix and (i % 25 == 0 or i == n - 1):
+            _print_progress(i + 1, n, prefix=prefix)
+        a = int(e["start"] * sr)
+        b = int(min(e["end"], e["start"] + 8.0) * sr)
+        f0 = _gender_f0(samples[max(0, a):max(a + 1, b)], sr)
+        g, c = _gender_from_f0(f0)
+        out.append({"g": g, "f0": round(f0, 1), "conf": round(c, 2)})
+    return out
+
+
+def _gender_face(fd, gn, img, cv2):
+    """Detect the most prominent face and classify its gender. Returns (g, conf)."""
+    h, w = img.shape[:2]
+    blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104, 177, 123))
+    fd.setInput(blob)
+    det = fd.forward()
+    best, barea = None, 0
+    for i in range(det.shape[2]):
+        if float(det[0, 0, i, 2]) < 0.6:
+            continue
+        x1, y1, x2, y2 = (det[0, 0, i, 3:7] * np.array([w, h, w, h])).astype(int)
+        area = max(0, x2 - x1) * max(0, y2 - y1)
+        if area > barea:
+            barea, best = area, (x1, y1, x2, y2)
+    if not best:
+        return "?", 0.0
+    x1, y1, x2, y2 = best
+    pad = int(0.2 * max(1, y2 - y1))
+    face = img[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
+    if face.size == 0:
+        return "?", 0.0
+    gb = cv2.dnn.blobFromImage(face, 1.0, (227, 227), _GENDER_MEAN, swapRB=False)
+    gn.setInput(gb)
+    pr = gn.forward()[0]
+    gi = int(np.argmax(pr))
+    return ("M", "F")[gi], round(float(pr[gi]), 2)
+
+
+def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=None):
+    """Per-cue speaker gender from the on-screen face (OpenCV DNN, one frame per cue midpoint).
+    Returns [{g, conf}] or None if OpenCV / models are unavailable. gpu=True runs the DNN on the
+    GPU via OpenCL (best-effort; falls back to CPU)."""
+    try:
+        import cv2
+    except Exception:
+        log_warn("    video gender needs opencv-python (pip install opencv-python) - using audio only.")
+        return None
+    if not hasattr(cv2, "dnn") or not hasattr(cv2.dnn, "readNet"):
+        log_warn("    this OpenCV build has no DNN module (try 'pip install --upgrade opencv-python') "
+                 "- using audio only.")
+        return None
+    try:
+        m = _gender_fetch_models()
+        fd = cv2.dnn.readNet(m["face_model"], m["face_proto"])
+        gn = cv2.dnn.readNet(m["gender_model"], m["gender_proto"])
+    except Exception as e:
+        msg = str(e)
+        if "Caffe" in msg:
+            log_warn("    video gender needs Caffe model support, which your OpenCV (>= 5.0) removed. "
+                     "Install OpenCV 4.x for video:  pip install \"opencv-python<5\"   "
+                     "(the audio-based gender detection works fine without it).")
+        else:
+            log_warn(f"    could not load face/gender models ({msg[:90]}) - using audio only.")
+        return None
+    if gpu:      # GPU = CUDA (NVIDIA) if this OpenCV was built with it; OpenCL DNN is unreliable so unused
+        try:
+            if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
+                if isinstance(dev, int) and dev < cv2.cuda.getCudaEnabledDeviceCount():
+                    cv2.cuda.setDevice(dev)
+                for net in (fd, gn):
+                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
+                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
+                log_info("    face detector on GPU (CUDA).")
+            else:
+                log_warn("    GPU face-detect needs an OpenCV built with CUDA - the pip 'opencv-python' package "
+                         "has none, and its OpenCL path is broken on most drivers - so the detector runs on CPU. "
+                         "(Your CPU handles the DNN fine; the per-cue frame extraction is the real cost.)")
+        except Exception:
+            pass
+    out = []
+    n = len(events)
+    tmpd = tempfile.mkdtemp(dir=_temp_root())
+    try:
+        fp = os.path.join(tmpd, "f.jpg")
+        for i, e in enumerate(events):
+            if prefix and (i % 10 == 0 or i == n - 1):
+                _print_progress(i + 1, n, prefix=prefix)
+            mid = (e["start"] + e["end"]) / 2.0
+            try:
+                subprocess.run([ffmpeg_bin, "-y", "-ss", f"{mid:.3f}", "-i", str(video),
+                                "-frames:v", "1", "-q:v", "3", fp],
+                               capture_output=True, timeout=20)
+                g, c = "?", 0.0
+                if os.path.exists(fp):
+                    img = cv2.imread(fp)
+                    if img is not None:
+                        g, c = _gender_face(fd, gn, img, cv2)
+                    try:
+                        os.remove(fp)
+                    except OSError:
+                        pass
+            except Exception:
+                g, c = "?", 0.0
+            out.append({"g": g, "conf": c})
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    return out
+
+
+def _gender_combine(aud, vid):
+    """Combine per-cue audio + (optional) video gender estimates into a final {g, conf, src}."""
+    out = []
+    for i in range(len(aud)):
+        a = aud[i]
+        v = vid[i] if vid else None
+        score = {"M": 0.0, "F": 0.0}
+        srcs = []
+        if a["g"] in ("M", "F"):
+            score[a["g"]] += a["conf"]
+            srcs.append("audio")
+        if v and v["g"] in ("M", "F"):
+            score[v["g"]] += v["conf"] * 0.9
+            srcs.append("video")
+        if score["M"] == 0 and score["F"] == 0:
+            out.append({"g": "?", "conf": 0.0, "src": ""})
+        else:
+            g = "M" if score["M"] >= score["F"] else "F"
+            conf = round(abs(score["M"] - score["F"]) / (score["M"] + score["F"] + 1e-9), 2)
+            out.append({"g": g, "conf": conf, "src": "+".join(srcs)})
+    return out
+
+
+def _gender_translate(events, comb, engine, key, model, src_name):
+    """Translate events into Czech using per-line speaker-gender hints + full scene context via an
+    AI engine (gemini/claude). Falls back to plain translate_events_to on any failure."""
+    tag = {"M": "(M)", "F": "(F)", "?": ""}
+    result = [{"start": e["start"], "end": e["end"], "text": e["text"]} for e in events]
+    BATCH = 60
+    ok = True
+    for s in range(0, len(events), BATCH):
+        chunk = events[s:s + BATCH]
+        cg = comb[s:s + BATCH]
+        lines = []
+        for j, (e, g) in enumerate(zip(chunk, cg), 1):
+            t = e["text"].replace("\n", " ").strip()
+            lines.append(f"{j}. {tag.get(g['g'], '')} {t}".strip())
+        prompt = (
+            f"Translate these {src_name} TV subtitle lines into natural Czech. Some lines are tagged "
+            f"with the speaker's gender detected from audio/video: (M)=male speaker, (F)=female "
+            f"speaker. Use the tag to choose the correct Czech grammatical gender for THAT speaker's "
+            f"first-person forms (e.g. 'udelal jsem' vs 'udelala jsem'); infer other genders from the "
+            f"dialogue context. Keep names and titles untranslated. Return EXACTLY one line per input, "
+            f"each prefixed by its number and a period, and nothing else.\n\n" + "\n".join(lines))
+        try:
+            if engine == "claude":
+                resp = anthropic_messages(prompt, key, model or "claude-sonnet-4-6", max_tokens=4000)
+            else:
+                resp = gemini_generate(prompt, key, model or "gemini-2.5-flash")
+        except Exception:
+            resp = None
+        if not resp:
+            ok = False
+            break
+        got = {}
+        for ln in resp.splitlines():
+            mm = re.match(r"\s*(\d+)[.)]\s*(.*)", ln)
+            if mm:
+                got[int(mm.group(1))] = mm.group(2).strip()
+        if len(got) < max(1, len(chunk) // 2):
+            ok = False
+            break
+        for j in range(len(chunk)):
+            txt = got.get(j + 1)
+            if txt:
+                # strip any leftover (M)/(F) tag the model may have echoed
+                txt = re.sub(r"^\(?[MF]\)?\s+", "", txt)
+                result[s + j]["text"] = txt
+    if ok:
+        return result
+    log_warn("    AI gendered translation failed - falling back to the plain engine.")
+    fb = translate_events_to(events, ("google" if engine not in ("gemini", "claude", "deepl") else engine),
+                             "cs", api_key=key, model=model)
+    return fb or result
+
+
+_GENDER_REPORT_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Speaker-gender report</title><style>
+:root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--m:#58a6ff;--f:#f778ba;--u:#8b949e}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,Consolas,monospace}
+header{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel)}h1{margin:0 0 6px;font-size:15px}
+.meta{color:var(--dim);font-size:12px}.wrap{padding:14px 18px;max-width:1500px;margin:0 auto}
+.lane{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:12px 0;overflow:hidden}
+.lane h2{margin:0;padding:8px 12px;font-size:12px;color:var(--dim);border-bottom:1px solid var(--line)}
+canvas{display:block;width:100%}.hint{color:var(--dim);font-size:11px;padding:6px 12px}
+.tip{position:fixed;pointer-events:none;background:#000d;border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:12px;max-width:520px;display:none;z-index:10;white-space:pre-wrap}
+table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:4px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
+th{position:sticky;top:0;background:var(--panel);color:var(--dim)}tr:hover{background:#1f2630}.tt{white-space:nowrap;color:var(--dim)}
+.m{color:var(--m)}.f{color:var(--f)}.u{color:var(--u)}.tblwrap{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.legend{display:flex;gap:16px;margin-top:6px;font-size:11px;color:var(--dim)}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
+</style></head><body>
+<header><h1>Speaker-gender-aware translation report</h1><div class="meta" id="meta"></div>
+<div class="legend"><span><span class="sw" style="background:var(--m)"></span>male speaker</span>
+<span><span class="sw" style="background:var(--f)"></span>female speaker</span>
+<span><span class="sw" style="background:var(--u)"></span>unknown</span>
+<span>each bar = one cue; height of dot = F0; hover for detail</span></div></header>
+<div class="wrap" id="lanes"></div>
+<div class="wrap"><div class="lane"><h2>All cues: detected gender + source text + Czech translation</h2>
+<div class="tblwrap"><table><thead><tr><th>#</th><th>time</th><th>gender</th><th>F0</th><th>source</th><th>Czech</th></tr></thead>
+<tbody id="tb"></tbody></table></div></div></div><div class="tip" id="tip"></div>
+<script>
+const DATA=/*__DATA__*/;const tip=document.getElementById('tip');
+const fmt=t=>{t=Math.max(0,t);const m=Math.floor(t/60),s=(t%60);return String(m).padStart(2,'0')+':'+s.toFixed(1).padStart(4,'0');};
+const col=g=>g==='M'?'#58a6ff':g==='F'?'#f778ba':'#8b949e';
+const C=DATA.cues,dur=DATA.dur||(C.length?C[C.length-1].te:1);
+const st=DATA.stats||{};
+document.getElementById('meta').innerHTML=`<b>${DATA.video||''}</b> &nbsp;|&nbsp; ${C.length} cues &nbsp;|&nbsp; `+
+ `<span class="m">${st.male||0} male</span> &middot; <span class="f">${st.female||0} female</span> &middot; `+
+ `<span class="u">${st.unknown||0} unknown</span> &nbsp;|&nbsp; source ${DATA.src_lang||''} &rarr; Czech &nbsp;|&nbsp; `+
+ `detection: ${DATA.detect||'audio'} &nbsp;|&nbsp; engine: ${DATA.engine||''}`;
+// timeline lane
+(function(){const box=document.createElement('div');box.className='lane';
+ box.innerHTML='<h2>Speaker gender over time (blue=male, pink=female, grey=unknown; dot height = pitch F0)</h2>';
+ const cv=document.createElement('canvas');box.appendChild(cv);document.getElementById('lanes').appendChild(box);
+ let view={a:0,b:dur||1};const X=t=>(t-view.a)/(view.b-view.a)*cv.width,T=x=>view.a+x/cv.width*(view.b-view.a);
+ function rs(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=150*devicePixelRatio;cv.style.height='150px';draw();}
+ function draw(){const w=cv.width,h=cv.height,g=cv.getContext('2d');g.clearRect(0,0,w,h);const base=h-20;
+  for(const c of C){if(c.te<view.a||c.ts>view.b)continue;const x=X(c.ts),ww=Math.max(1.5,X(c.te)-x);
+   g.fillStyle=col(c.g)+'cc';g.fillRect(x,base-4,ww,8);
+   if(c.f0>0){const y=base-8-(Math.min(280,Math.max(80,c.f0))-80)/200*(base-20);g.fillStyle=col(c.g);g.beginPath();g.arc(x+ww/2,y,2*devicePixelRatio,0,7);g.fill();}}
+  g.fillStyle='#8b949e';g.font=(11*devicePixelRatio)+'px monospace';
+  const span=view.b-view.a,step=Math.pow(10,Math.floor(Math.log10(span/8)));
+  for(let t=Math.ceil(view.a/step)*step;t<view.b;t+=step){const x=X(t);g.fillText(fmt(t),x+2,h-4);}}
+ cv.addEventListener('wheel',e=>{e.preventDefault();const t=T(e.offsetX*devicePixelRatio),k=e.deltaY<0?0.8:1.25;
+  let a=t-(t-view.a)*k,b=t+(view.b-t)*k;a=Math.max(0,a);b=Math.min(dur,b);if(b-a>0.3){view={a,b};draw();}},{passive:false});
+ let d=null;cv.addEventListener('mousedown',e=>d={x:e.offsetX,a:view.a,b:view.b});addEventListener('mouseup',()=>d=null);
+ cv.addEventListener('mousemove',e=>{if(d){const dt=(e.offsetX-d.x)*devicePixelRatio/cv.width*(d.b-d.a);let a=d.a-dt,b=d.b-dt;if(a<0){b-=a;a=0;}if(b>dur){a-=b-dur;b=dur;}view={a,b};draw();return;}
+  const t=T(e.offsetX*devicePixelRatio);let hit=null;for(const c of C){if(t>=c.ts&&t<=c.te){hit=c;break;}}
+  if(hit){tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';
+   tip.textContent=`${fmt(hit.ts)}  ${hit.g==='M'?'MALE':hit.g==='F'?'FEMALE':'unknown'} (${hit.conf}${hit.src?', '+hit.src:''})  F0=${hit.f0||'-'}Hz\n${hit.t}\n-> ${hit.cz||''}`;}
+  else tip.style.display='none';});
+ cv.addEventListener('mouseleave',()=>tip.style.display='none');new ResizeObserver(rs).observe(cv);rs();})();
+// table
+const tb=document.getElementById('tb');
+for(const c of C){const tr=document.createElement('tr');
+ tr.innerHTML=`<td>${c.i}</td><td class="tt">${fmt(c.ts)}</td>`+
+  `<td class="${c.g==='M'?'m':c.g==='F'?'f':'u'}">${c.g==='M'?'male':c.g==='F'?'female':'?'} ${c.conf?'('+c.conf+')':''}</td>`+
+  `<td class="tt">${c.f0>0?c.f0:''}</td>`+
+  `<td>${(c.t||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]))}</td>`+
+  `<td>${(c.cz||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]))}</td>`;tb.appendChild(tr);}
+</script></body></html>"""
+
+
+def _write_gender_report(base, video, src_lang, engine, detect, events, translated, aud, vid, comb):
+    try:
+        cues = []
+        for i, (e, tr, g) in enumerate(zip(events, translated, comb), 1):
+            cues.append(dict(i=i, ts=round(e["start"], 2), te=round(e["end"], 2),
+                             g=g["g"], conf=g["conf"], src=g.get("src", ""),
+                             f0=(aud[i - 1]["f0"] if aud else 0),
+                             t=e["text"].replace("\n", " "), cz=tr["text"].replace("\n", " ")))
+        stats = dict(male=sum(1 for c in comb if c["g"] == "M"),
+                     female=sum(1 for c in comb if c["g"] == "F"),
+                     unknown=sum(1 for c in comb if c["g"] == "?"))
+        data = dict(video=os.path.basename(str(video)), src_lang=src_lang, engine=engine,
+                    detect=detect, dur=(round(events[-1]["end"], 1) if events else 0),
+                    cues=cues, stats=stats)
+        with open(base + ".gender.report.json", "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
+        with open(base + ".gender.report.html", "w", encoding="utf-8") as f:
+            f.write(_GENDER_REPORT_HTML.replace("/*__DATA__*/", json.dumps(data, ensure_ascii=False)))
+        log_info(f"    report: {os.path.basename(base)}.gender.report.html (+ .json)")
+    except Exception as e:
+        log_warn(f"    could not write the gender report: {e}")
+
+
+def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
+    """Retime-style interactive picker for the gender-translate batch. The source subtitle/audio
+    LANGUAGE is chosen globally beforehand (arrows+enter); here you toggle each video, override a
+    single episode's tracks with 'o', flip video face detection (v) with its GPU accel (g) +
+    device (d), the AI engine (e) and the report (r). Returns ('run', videos) / ('over', index) /
+    None. State (selection, overrides) lives in cfg so it survives an override round-trip."""
+    sel = cfg["sel"]
+    pos = cfg.get("pos", 0)
+    top = 0
+
+    def eff(v):
+        o = cfg["over"].get(v)
+        s = (o[0] if o and o[0] else global_sub)
+        a = (o[1] if o and o[1] else global_aud)
+        return s, a, bool(o)
+
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                cols, rows = _fb_termsize()
+                eng = ["gemini", "claude"][cfg["eng_i"] % 2]
+                avail_sel = [s and (eff(v)[0] in vinfo[v][0]) for v, s in zip(videos, sel)]
+                nsel = sum(avail_sel)
+                vend = _gpu_vendor() or "GPU"
+                dev = cfg["dev"]
+                devtxt = ("auto" if dev in (None, "auto") else
+                          (f"#{dev} {_fb_trunc(gpu_names[int(dev)], 22)}"
+                           if (isinstance(dev, int) and 0 <= int(dev) < len(gpu_names)) else str(dev)))
+                if cfg["use_video"]:
+                    gpu_line = (f"    face-detect: {Fore.GREEN if cfg['gpu'] else Style.DIM}"
+                                f"{(vend + ' GPU (CUDA)') if cfg['gpu'] else 'CPU'}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
+                                + (f"    device: {Fore.GREEN}{devtxt}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}"
+                                   if len(gpu_names) > 1 else ""))
+                else:
+                    # video OFF -> keep the same options visible but greyed out (disabled)
+                    gpu_line = (f"    {Style.DIM}face-detect: {(vend + ' GPU') if cfg['gpu'] else 'CPU'} (g)"
+                                + (f"    device: {devtxt} (d)" if len(gpu_names) > 1 else "")
+                                + Style.RESET_ALL)
+                head = [
+                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Gender-aware translation: pick videos + options ==={Style.RESET_ALL}",
+                    f"{Style.DIM}Global source subs: {Fore.GREEN}{_lang3_name(global_sub)} ({global_sub}){Style.RESET_ALL}"
+                    f"{Style.DIM}   audio for gender: {Fore.GREEN}{_lang3_name(global_aud)} ({global_aud}){Style.RESET_ALL}"
+                    f"{Style.DIM}   (override one episode with 'o'){Style.RESET_ALL}",
+                    f"{Fore.CYAN}{nsel}/{len(videos)} selected{Style.RESET_ALL}    "
+                    f"video face detection: {Fore.GREEN if cfg['use_video'] else Style.DIM}"
+                    f"{'ON' if cfg['use_video'] else 'off'}{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}"
+                    f"    engine: {Fore.GREEN}{eng}{Style.RESET_ALL} {Style.DIM}(e){Style.RESET_ALL}"
+                    f"    report: {Fore.GREEN if cfg['want_report'] else Style.DIM}"
+                    f"{'ON' if cfg['want_report'] else 'off'}{Style.RESET_ALL} {Style.DIM}(r){Style.RESET_ALL}" + gpu_line,
+                    "",
+                ]
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | o = override this "
+                            f"episode | v = video" + (" | g = GPU | d = device" if gpu_names else "")
+                            + f" | e = engine | r = report | Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                avail = max(4, rows - len(head) - len(foot))
+                per = max(1, avail // 4)
+                pos = max(0, min(pos, len(videos) - 1))
+                if pos < top:
+                    top = pos
+                elif pos >= top + per:
+                    top = pos - per + 1
+                top = max(0, top)
+                body = []
+                for i in range(top, min(top + per, len(videos))):
+                    v = videos[i]
+                    subs, auds = vinfo[v]
+                    s, a, isover = eff(v)
+                    has_sub = s in subs
+                    box = "[x]" if (sel[i] and has_sub) else "[ ]"
+                    ov = f" {Fore.CYAN}[override]{Style.RESET_ALL}" if isover else ""
+                    subtxt = (f"{_lang3_name(s)} ({s})" if has_sub else f"{Fore.RED}MISSING {s}{Style.RESET_ALL}")
+                    audtxt = (f"{_lang3_name(a)} ({a})" if a in auds else f"{Fore.YELLOW}no {a} audio{Style.RESET_ALL}")
+                    header = f"{box} {_fb_trunc(Path(v).name, cols - 16)}{ov}"
+                    rows_j = [f"      source subs: {subtxt}", f"      audio:       {audtxt}"]
+                    if i == pos:
+                        body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {header}{Style.RESET_ALL}")
+                        for ln in rows_j:
+                            body.append(f"{Fore.GREEN}{ln}{Style.RESET_ALL}")
+                    else:
+                        c = "" if (sel[i] and has_sub) else Style.DIM
+                        body.append(f"  {c}{header}{Style.RESET_ALL}")
+                        for ln in rows_j:
+                            body.append(f"{Style.DIM}{ln}{Style.RESET_ALL}")
+                _fb_write_frame(head + body + foot)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(videos), per, top, cols)
+                k = _read_key()
+                cfg["pos"] = pos
+                if k == "esc":
+                    return None
+                elif k == "enter":
+                    chosen = [v for v, s in zip(videos, avail_sel) if s]
+                    if chosen:
+                        return ("run", chosen)
+                elif k == ("char", "o"):
+                    return ("over", pos)
+                elif k == ("char", " "):
+                    sel[pos] = not sel[pos]
+                elif k == ("char", "a"):
+                    allon = all(sel)
+                    for j in range(len(sel)):
+                        sel[j] = not allon
+                elif k == ("char", "v"):
+                    cfg["use_video"] = not cfg["use_video"]
+                elif k == ("char", "e"):
+                    cfg["eng_i"] = (cfg["eng_i"] + 1) % 2
+                elif k == ("char", "r"):
+                    cfg["want_report"] = not cfg["want_report"]
+                elif k == ("char", "g") and cfg["use_video"]:
+                    cfg["gpu"] = not cfg["gpu"]
+                elif k == ("char", "d") and cfg["use_video"] and len(gpu_names) > 1:
+                    cyc = ["auto"] + list(range(len(gpu_names)))
+                    cur = cfg["dev"] if cfg["dev"] in cyc else "auto"
+                    cfg["dev"] = cyc[(cyc.index(cur) + 1) % len(cyc)]
+                elif k == "up":
+                    pos = (pos - 1) % len(videos)
+                elif k == "down":
+                    pos = (pos + 1) % len(videos)
+                elif k == "pgup":
+                    pos = max(0, pos - per)
+                elif k == "pgdn":
+                    pos = min(len(videos) - 1, pos + per)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(videos) - 1
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def run_gender_translate(args):
+    """Scan videos, pick a SOURCE subtitle language, then translate that track into Czech with
+    SPEAKER-GENDER awareness: detect each line's speaker gender from the AUDIO (voice pitch) and
+    optionally the VIDEO (on-screen face, OpenCV), feed it as a hint to an AI translator (so Czech
+    gender agreement 'udelal/udelala' is correct), and optionally write an HTML diagnostic report."""
+    directory = str(args.mkv) if (args.mkv and args.mkv.is_dir()) else (
+        os.path.dirname(str(args.mkv)) if (args.mkv and args.mkv.exists()) else ".")
+    print(f"{Fore.MAGENTA}=== Speaker-gender-aware translation -> Czech .srt ==={Style.RESET_ALL}")
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("No videos found in the directory.")
+    mkvmerge_bin, _mkvx, _ff, _ismkv = _resolve_tools_for_extract(args, Path(videos[0]))
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    if not ffmpeg_bin:
+        die("ffmpeg is required to read the audio for gender detection, but it was not found. "
+            "Install ffmpeg or allow the auto-download.")
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+
+    # survey each video: which subtitle languages, and audio language -> track position
+    vinfo = {}
+    sub_count, aud_count = {}, {}
+    for i, v in enumerate(videos):
+        _print_progress(i + 1, len(videos), prefix="  scanning tracks ")
+        try:
+            subs = mkvmerge_tracks(mkvmerge_bin, Path(v), "subtitles") if mkvmerge_bin else []
+        except (Exception, SystemExit):
+            subs = []
+        subset = {_canon3(t.get("lang")) for t in subs}
+        audpos = {}
+        for t in (_video_audio_tracks(ffprobe_bin, v) if ffprobe_bin else []):
+            audpos.setdefault(t["lang"], t["index"])
+        vinfo[v] = (subset, audpos)
+        for lg in subset:
+            sub_count[lg] = sub_count.get(lg, 0) + 1
+        for lg in audpos:
+            aud_count[lg] = aud_count.get(lg, 0) + 1
+    if not sub_count:
+        die("No subtitle tracks found in any video.")
+    sub_langs = sorted(sub_count, key=lambda l: (-sub_count[l], l))
+    aud_langs = sorted(aud_count, key=lambda l: (-aud_count[l], l)) or ["und"]
+
+    # global source subtitle + audio language via arrows+enter (override per-episode in the picker)
+    gi = ask_pick("Source SUBTITLE language to translate FROM (global; override per-episode next):",
+                  [f"{_lang3_name(l)} ({l}) - {sub_count[l]} video(s)" for l in sub_langs], default=0)
+    if gi is None:
+        return
+    global_sub = sub_langs[gi]
+    ga = ask_pick("AUDIO language used for speaker-gender detection (global):",
+                  [f"{_lang3_name(l)} ({l}) - {aud_count.get(l, 0)} video(s)" for l in aud_langs], default=0)
+    if ga is None:
+        return
+    global_aud = aud_langs[ga]
+
+    gpu_names = _list_gpus()
+    di = _discrete_gpu_index()
+    cfg = {"use_video": True, "gpu": True, "dev": (di if di is not None else "auto"),
+           "eng_i": 0, "want_report": True, "sel": [True] * len(videos), "over": {}, "pos": 0}
+    while True:
+        res = _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names)
+        if res is None:
+            log_info("Cancelled.")
+            return
+        if res[0] == "over":                                   # per-episode track override
+            v = videos[res[1]]
+            vs, va = sorted(vinfo[v][0]), sorted(vinfo[v][1])
+            sub_o = aud_o = None
+            if vs:
+                si = ask_pick(f"SUBTITLE language for {Path(v).name}:",
+                              [f"{_lang3_name(l)} ({l})" for l in vs] + ["(use global default)"], default=len(vs))
+                if si is not None and si < len(vs):
+                    sub_o = vs[si]
+            if va:
+                aj = ask_pick(f"AUDIO language for {Path(v).name}:",
+                              [f"{_lang3_name(l)} ({l})" for l in va] + ["(use global default)"], default=len(va))
+                if aj is not None and aj < len(va):
+                    aud_o = va[aj]
+            if sub_o or aud_o:
+                cfg["over"][v] = (sub_o, aud_o)
+            elif v in cfg["over"]:
+                del cfg["over"][v]
+            continue
+        chosen = res[1]
+        break
+
+    engine = ["gemini", "claude"][cfg["eng_i"] % 2]
+    use_video, want_report = cfg["use_video"], cfg["want_report"]
+    if engine == "gemini":
+        key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
+               or os.environ.get("GOOGLE_AI_API_KEY") or ask_text("Gemini API key (aistudio.google.com)", ""))
+        model = getattr(args, "gemini_model", None) or "gemini-2.5-flash"
+    else:
+        key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+               or ask_text("Anthropic API key", ""))
+        model = getattr(args, "anthropic_model", None) or "claude-sonnet-4-6"
+    if not key:
+        die("No API key - the gender hints need an AI engine (gemini/claude).")
+
+    detect = "audio+video" if use_video else "audio"
+    done = 0
+    for i, v in enumerate(chosen, 1):
+        o = cfg["over"].get(v)
+        src_lang = (o[0] if o and o[0] else global_sub)
+        aud_lang = (o[1] if o and o[1] else global_aud)
+        src_name = _lang3_name(src_lang)
+        log_info(f"[{i}/{len(chosen)}] {Path(v).name}  {Style.DIM}(subs {src_lang}, audio {aud_lang}){Style.RESET_ALL}")
+        try:
+            events, _tr = extract_subtitle_events(args, v, ref_lang=src_lang)
+        except Exception as e:
+            log_warn(f"    extract failed ({e}) - skipping.")
+            continue
+        if not events:
+            log_warn("    no subtitle events - skipping.")
+            continue
+        apos = vinfo[v][1].get(aud_lang, 0)
+        with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
+            wav = Path(td) / "a.wav"
+            try:
+                extract_audio_wav(ffmpeg_bin, Path(v), apos, wav, sample_rate=16000,
+                                  progress_prefix=f"  {Path(v).stem[:22]} reading {aud_lang} audio ")
+                samples, sr = read_wav_mono(wav)
+            except Exception as e:
+                log_warn(f"    could not read audio ({e}) - skipping.")
+                continue
+        aud = _gender_from_audio(samples, sr, events, prefix=f"  {Path(v).stem[:22]} audio gender ")
+        vid = (_gender_from_video(ffmpeg_bin, v, events, prefix=f"  {Path(v).stem[:22]} video gender ",
+                                  gpu=cfg["gpu"], dev=cfg["dev"]) if use_video else None)
+        comb = _gender_combine(aud, vid)
+        log_info(f"    detected: {sum(1 for c in comb if c['g']=='M')} male, "
+                 f"{sum(1 for c in comb if c['g']=='F')} female, {sum(1 for c in comb if c['g']=='?')} unknown")
+        with _dbg_timer(f"gender-translate {Path(v).name}"):
+            translated = _gender_translate(events, comb, engine, key, model, src_name)
+        outp = Path(v).with_name(Path(v).stem + ".cze.srt")
+        write_srt(translated, outp)
+        log_done(f"    saved {outp.name} ({len(translated)} lines)")
+        if want_report:
+            _write_gender_report(os.path.splitext(str(outp))[0], v, src_name, engine, detect,
+                                 events, translated, aud, vid, comb)
+        done += 1
+    print()
+    log_done(f"Done: {done}/{len(chosen)} subtitle track(s) translated into Czech (gender-aware).")
+
+
+def run_scan_translate(args):
+    """Scan every video in the directory, survey their SUBTITLE + AUDIO tracks, let the user pick
+    the SOURCE subtitle language (showing how many videos carry it and whether a same-language
+    audio track exists too), then machine-translate that track into Czech (or another target) for
+    every matching video, saving <video>.<lang>.srt with the original timing. For Czech an AI
+    engine (gemini/claude) with scene context is recommended - it handles gender/pronouns far
+    better than word-by-word engines."""
+    if args.mkv and args.mkv.is_dir():
+        directory = str(args.mkv)
+    elif args.mkv and args.mkv.exists():
+        directory = os.path.dirname(str(args.mkv)) or "."
+    else:
+        directory = "."
+    print(f"{Fore.MAGENTA}=== Scan videos and translate a subtitle track -> .srt ==={Style.RESET_ALL}")
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    recursive = ask_yes_no("Search subdirectories too?", default_no=True)
+    videos = collect_videos(directory, recursive)
+    if not videos:
+        die("No videos found in the directory.")
+    mkvmerge_bin, _mkvx, ffmpeg_bin, _ismkv = _resolve_tools_for_extract(args, Path(videos[0]))
+    ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+
+    # --- survey every video's subtitle + audio tracks ---
+    sub_by_lang, aud_by_lang = {}, {}
+    n = len(videos)
+    for i, v in enumerate(videos):
+        _print_progress(i + 1, n, prefix="  scanning tracks ")
+        try:
+            subs = mkvmerge_tracks(mkvmerge_bin, Path(v), "subtitles") if mkvmerge_bin else []
+        except (Exception, SystemExit):
+            subs = []
+        auds = _video_audio_tracks(ffprobe_bin, v) if ffprobe_bin else []
+        for lg in {_canon3(t.get("lang")) for t in subs}:
+            sub_by_lang.setdefault(lg, []).append(v)
+        for lg in {t["lang"] for t in auds}:
+            aud_by_lang.setdefault(lg, []).append(v)
+    if not sub_by_lang or (len(sub_by_lang) == 1 and "und" in sub_by_lang):
+        if "und" not in sub_by_lang:
+            die("No subtitle tracks found in any video.")
+
+    # --- pick the SOURCE subtitle language ---
+    langs = sorted(sub_by_lang, key=lambda l: (-len(sub_by_lang[l]), l))
+    opts = []
+    for l in langs:
+        na = len(aud_by_lang.get(l, []))
+        audtxt = (f"  {Fore.GREEN}+ audio in {na}{Style.RESET_ALL}" if na else f"  {Style.DIM}(no matching audio){Style.RESET_ALL}")
+        name = _lang3_name(l) if l != "und" else "undetermined"
+        opts.append(f"{name} ({l}) - {len(sub_by_lang[l])} video(s){audtxt}")
+    audio_langs = ", ".join(f"{_lang3_name(l)} x{len(vs)}" for l, vs in sorted(aud_by_lang.items(), key=lambda kv: -len(kv[1]))) or "none"
+    pick = ask_pick("Which SUBTITLE language to translate FROM?", opts, default=0,
+                    header=[f"{Style.DIM}Scanned {n} video(s). Audio tracks present: {audio_langs}.{Style.RESET_ALL}",
+                            f"{Style.DIM}Tip: for Czech, subtitle gender (on/ona, jeho/jeji) is best handled by an AI "
+                            f"engine with context - see the note after you pick.{Style.RESET_ALL}", ""])
+    src_lang = langs[pick]
+    tvids = sub_by_lang[src_lang]
+
+    out_lang = (ask_language("Into which language to translate (code, e.g. cs/en/de)",
+                             getattr(args, "out_lang", None) or "cs") or "cs").lower()
+
+    # --- machine translator (AI recommended for Czech gender/context) ---
+    if _canon3(out_lang) == "cze":
+        log_info("Note on Czech gender (on/ona, jeho/jeji): the source language rarely marks it "
+                 "(English & Korean don't), so word-by-word engines guess. An AI engine (gemini/claude) "
+                 "translates whole scenes WITH context and gets gender right far more often. Prefer gemini/claude.")
+    ei = ask_pick("Machine translator:",
+                  ["gemini - FREE AI quality (Google AI Studio key) - best for Czech gender/context",
+                   "claude - AI via the Anthropic API (paid) - best context",
+                   "deepl  - excellent (API key, free tier)",
+                   "google - free, no key (word-by-word - weaker on Czech gender)",
+                   "argos  - offline, free (lower quality)"], default=0)
+    engine = ["gemini", "claude", "deepl", "google", "argos"][ei]
+    mt_key = mt_model = None
+    if engine == "gemini":
+        mt_key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
+                  or os.environ.get("GOOGLE_AI_API_KEY") or ask_text("Gemini API key (free at aistudio.google.com)", ""))
+        mt_model = getattr(args, "gemini_model", None) or "gemini-2.5-flash"
+    elif engine == "claude":
+        mt_key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
+                  or ask_text("Anthropic API key", ""))
+        mt_model = getattr(args, "anthropic_model", None) or "claude-sonnet-4-6"
+    elif engine == "deepl":
+        mt_key = (getattr(args, "deepl_key", None) or os.environ.get("DEEPL_API_KEY")
+                  or ask_text("DeepL API key", ""))
+
+    tgt_name = _lang3_name(_canon3(out_lang))
+    if not ask_yes_no(f"Translate the {_lang3_name(src_lang)} subtitle track of {len(tvids)} video(s) "
+                      f"into {tgt_name} with {engine} now?", default_no=False):
+        return
+
+    done = 0
+    for i, v in enumerate(tvids, 1):
+        log_info(f"[{i}/{len(tvids)}] {Path(v).name}")
+        try:
+            events, track = extract_subtitle_events(args, v, ref_lang=src_lang)
+        except Exception as e:
+            log_warn(f"    could not extract the {src_lang} track ({e}) - skipping.")
+            continue
+        if not events:
+            log_warn("    no subtitle events extracted - skipping.")
+            continue
+        with _dbg_timer(f"translate {Path(v).name}"):
+            translated = translate_events_to(events, engine, out_lang, api_key=mt_key, model=mt_model)
+        if not translated:
+            log_warn("    translator unavailable - skipping.")
+            continue
+        outp = Path(v).with_name(Path(v).stem + f".{out_lang}.srt")
+        write_srt(translated, outp)
+        log_done(f"    saved {outp.name} ({len(translated)} lines)")
+        done += 1
+    print()
+    log_done(f"Done: {done}/{len(tvids)} subtitle track(s) translated into {tgt_name}.")
+
+
 def run_translate_subs(args):
     """Interactive wizard: the source is either a subtitle track from VIDEOS
     (extracted), or directly EXISTING subtitle files in the directory
@@ -14202,6 +14936,20 @@ def _wizard_action_specs():
             help="Extracts a track from a video or takes an existing .srt, translates into the target "
                  "language (Gemini/Google/DeepL/Claude/Argos) + proofreading, saves <name>.<lang>.srt.",
             kind="wizard", run=run_translate_subs, flag="translate_subs", preset="translate-subs"),
+        "scan-translate": dict(
+            label="Scan all videos, pick a subtitle language, translate that track -> .srt",
+            help="Surveys every video's SUBTITLE + AUDIO tracks, you pick the SOURCE subtitle language "
+                 "(shows how many videos have it and whether a same-language audio track exists), then "
+                 "machine-translates that track into Czech (or another target) for all matching videos. "
+                 "Recommends an AI engine (gemini/claude) for correct Czech gender.",
+            kind="direct", run=run_scan_translate, flag=None, preset=None),
+        "gender-translate": dict(
+            label="Translate a subtitle track -> Czech with SPEAKER-GENDER detection (audio+video)",
+            help="Scans videos, you pick the source subtitle language, then translates to Czech while "
+                 "detecting each line's speaker gender from the AUDIO (voice pitch) and optionally the "
+                 "VIDEO (on-screen face, OpenCV) - the gender is fed to an AI translator so Czech gender "
+                 "agreement (udelal/udelala) is right. Optional HTML report.",
+            kind="direct", run=run_gender_translate, flag=None, preset=None),
         "extract-subs": dict(
             label="Extract subtitles from videos into .srt - pick which tracks",
             help="From each video it extracts subtitle tracks into .srt. You pick which (by language, "
@@ -14343,7 +15091,7 @@ def _wizard_action_specs():
 
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
-     ["sync-one", "sync-folder", "translate", "extract-subs", "merge-pro",
+     ["sync-one", "sync-folder", "translate", "scan-translate", "gender-translate", "extract-subs", "merge-pro",
       "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p3vg", "p3vc", "p3", "p3aud"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
@@ -15061,6 +15809,15 @@ DIFFERENT LANGUAGES (target vs reference):
                          help="Interactive wizard for a BATCH (like --all, but asks about the settings first): method, reference source, language, overwrite, readability - then processes the whole directory.")
     parser.add_argument("--translate-subs", action="store_true",
                          help="Interactive mode: for all videos in the directory it extracts the chosen subtitle track, obtains subtitles in the target language (OpenSubtitles and/or machine translation + proofreading) and saves them as <video>.<lang>.srt.")
+    parser.add_argument("--scan-translate", action="store_true",
+                        help="Interactive: scans every video's SUBTITLE + AUDIO tracks, you pick the SOURCE subtitle "
+                             "language (shows which have a matching audio track), then machine-translates that track "
+                             "into Czech (or --out-lang) for all matching videos, saving <video>.<lang>.srt.")
+    parser.add_argument("--gender-translate", action="store_true",
+                        help="Interactive: translate a subtitle track into Czech with SPEAKER-GENDER detection - "
+                             "per line it detects the speaker's gender from the audio (voice pitch) and optionally "
+                             "the video (on-screen face, needs opencv-python), and feeds it to an AI translator so "
+                             "Czech gender agreement (udelal/udelala) is correct. Optional HTML report.")
     parser.add_argument("--out-lang", default=None, help="(--translate-subs) target translation language, e.g. cs")
     parser.add_argument("--merge-pro", action="store_true",
                         help="Interactive mode: replaces the machine translation of your subtitles with a PROFESSIONAL "
@@ -15267,6 +16024,12 @@ DIFFERENT LANGUAGES (target vs reference):
         return
     if getattr(args, "p3aud", False):
         run_p3aud(args)
+        return
+    if getattr(args, "scan_translate", False):
+        run_scan_translate(args)
+        return
+    if getattr(args, "gender_translate", False):
+        run_gender_translate(args)
         return
 
     if getattr(args, "presets", False):
