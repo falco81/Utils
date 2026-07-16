@@ -408,7 +408,9 @@ def _log_wrapped(tag_colored, tag_plain, msg):
         return
     lead = len(plain) - len(plain.lstrip(" "))     # keep e.g. '    failed: ...' indentation
     body = plain[lead:]
-    wrapped = textwrap.fill(body, width=max(20, cols - 1),
+    # the first printed line is "[TAG] " + body, so the wrap width must leave room for the tag,
+    # otherwise the first line overflows by tag_w and the terminal hard-wraps it mid-word.
+    wrapped = textwrap.fill(body, width=max(20, cols - 1 - tag_w),
                             initial_indent=" " * lead, subsequent_indent=" " * (tag_w + lead))
     print(f"{tag_colored} {wrapped}")
 
@@ -4008,7 +4010,7 @@ def gemini_generate(prompt, api_key, model="gemini-2.5-flash", timeout=120):
         if e.code == 429 and ("limit: 0" in detail or "free_tier" in detail.lower() or "quota" in detail.lower()):
             raise _FatalAPIError(msg + "  → This model has no free quota for your account/region. "
                                  "Try another model ('?' at the model, or --gemini-model, e.g. "
-                                 "gemini-1.5-flash), or use the 'google' engine (completely free without a key).")
+                                 "gemini-2.0-flash), or use the 'google' engine (completely free without a key).")
         raise RuntimeError(msg)
     cands = data.get("candidates", [])
     if not cands:
@@ -4034,11 +4036,11 @@ def gemini_translate_batch(batch, target_lang, api_key, model):
 
 
 _GEMINI_STATIC_MODELS = [
-    ("gemini-2.5-flash", "fast, good quality"),
-    ("gemini-2.0-flash-lite", "cheapest/fastest"),
-    ("gemini-1.5-flash", "older flash - often has a free quota"),
-    ("gemini-1.5-flash-8b", "small, cheap"),
-    ("gemini-2.5-flash", "newer flash"),
+    ("gemini-2.0-flash", "current, usually has free quota - recommended"),
+    ("gemini-2.5-flash-lite", "cheapest/fastest"),
+    ("gemini-2.0-flash-lite", "small, cheap"),
+    ("gemini-2.5-flash", "newer, but often NO free quota"),
+    ("gemini-2.5-pro", "best quality, paid"),
 ]
 
 
@@ -4695,6 +4697,146 @@ def _gender_fetch_models():
     return paths
 
 
+_GENDER_ONNX = {
+    "yunet": ("face_detection_yunet_2023mar.onnx",
+              "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"),
+    "gender": ("gender_googlenet.onnx",
+               "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/age_gender/models/gender_googlenet.onnx"),
+}
+
+
+def _has_directml():
+    """Cached: is onnxruntime's DirectML provider available (so the DNN can run on any DX12 GPU)?"""
+    if not hasattr(_has_directml, "_v"):
+        try:
+            import onnxruntime as ort
+            _has_directml._v = "DmlExecutionProvider" in ort.get_available_providers()
+        except Exception:
+            _has_directml._v = False
+    return _has_directml._v
+
+
+def _gender_onnx_fetch():
+    """Download (once, cached) the YuNet face ONNX + gender ONNX. These make the GPU path work AND
+    remove the Caffe dependency, so video gender also runs on OpenCV 5.x."""
+    import urllib.request
+    d = _gender_model_dir()
+    paths = {}
+    for k, (fn, url) in _GENDER_ONNX.items():
+        p = d / fn
+        if not p.exists() or p.stat().st_size < 50000:
+            log_info(f"    downloading ONNX model {fn} (first run only) ...")
+            urllib.request.urlretrieve(url, str(p))
+        paths[k] = str(p)
+    return paths
+
+
+def _gender_pick_dml_device(ort, gender_model):
+    """Micro-benchmark each DirectML device and return (providers, device_id, ms) for the FASTEST -
+    this auto-selects the discrete GPU over a slow iGPU. None if no DirectML device works.
+    Probes without a CPU fallback and with the logger silenced, so a non-existent device_id raises
+    cleanly (caught here) instead of printing onnxruntime's scary 'EP Error ... falling back' noise."""
+    import numpy as np
+    try:
+        ort.set_default_logger_severity(4)                # fatal only - hush per-probe warnings
+    except Exception:
+        pass
+    so = ort.SessionOptions()
+    so.log_severity_level = 4
+    best, x = None, None
+    for did in range(2):                                   # device 0 (discrete) + 1 (iGPU) covers ~all PCs
+        try:
+            sess = ort.InferenceSession(gender_model, sess_options=so,
+                                        providers=[("DmlExecutionProvider", {"device_id": did})])
+            if sess.get_providers()[0] != "DmlExecutionProvider":
+                continue
+            inp = sess.get_inputs()[0]
+            if x is None:
+                shape = [d if isinstance(d, int) and d > 0 else 1 for d in inp.shape]
+                x = np.random.rand(*shape).astype("float32")
+            sess.run(None, {inp.name: x})                 # warmup
+            t = time.time()
+            for _ in range(8):
+                sess.run(None, {inp.name: x})
+            ms = (time.time() - t) / 8 * 1000
+            dbg(f"video gender: DirectML device {did} -> {ms:.2f} ms/infer")
+            if best is None or ms < best[2]:
+                best = ([("DmlExecutionProvider", {"device_id": did}), "CPUExecutionProvider"], did, ms)
+        except Exception as e:
+            dbg(f"video gender: DirectML device {did} not usable ({str(e)[:60]})")
+    return best
+
+
+def _gender_onnx_setup(cv2):
+    """Build a GPU (DirectML) face+gender pipeline: YuNet face detector (ONNX; works on any OpenCV
+    >= 4.5.4 incl. 5.x) + gender_googlenet on onnxruntime-DirectML (auto-picked discrete GPU).
+    Returns a dict, or None so the caller falls back to the OpenCV Caffe CPU path."""
+    try:
+        import onnxruntime as ort
+    except Exception:
+        dbg("video gender: onnxruntime not installed -> CPU path (pip install onnxruntime-directml)")
+        return None
+    if not hasattr(cv2, "FaceDetectorYN"):
+        dbg("video gender: cv2.FaceDetectorYN missing (OpenCV < 4.5.4) -> CPU path")
+        return None
+    provs = ort.get_available_providers()
+    if "DmlExecutionProvider" not in provs:
+        dbg(f"video gender: onnxruntime has no DirectML provider ({provs}) -> CPU path "
+            f"(pip install onnxruntime-directml)")
+        return None
+    try:
+        m = _gender_onnx_fetch()
+    except Exception as e:
+        dbg(f"video gender: could not fetch ONNX models ({e}) -> CPU path")
+        return None
+    pick = _gender_pick_dml_device(ort, m["gender"])
+    if not pick:
+        dbg("video gender: DirectML present but no usable device -> CPU path")
+        return None
+    providers, did, ms = pick
+    try:
+        _so = ort.SessionOptions()
+        _so.log_severity_level = 4
+        gsess = ort.InferenceSession(m["gender"], sess_options=_so, providers=providers)
+        fd = cv2.FaceDetectorYN.create(m["yunet"], "", (320, 320), 0.6, 0.3, 5000)
+    except Exception as e:
+        dbg(f"video gender: ONNX setup failed ({e}) -> CPU path")
+        return None
+    log_info(f"    face+gender DNN on GPU via onnxruntime-DirectML (device {did}, {ms:.1f} ms/infer).")
+    return {"fd": fd, "gsess": gsess, "gin": gsess.get_inputs()[0].name,
+            "label": f"DirectML dev{did}"}
+
+
+def _gender_face_onnx(backend, img, cv2):
+    """Largest face via YuNet + gender via the DirectML gender net. Returns (g, conf). The face
+    detection is downscaled to <=640px (YuNet on a full 1080p frame is slow on the CPU); the box is
+    scaled back and the gender crop is taken from the full-resolution frame."""
+    import numpy as np
+    try:
+        h, w = img.shape[:2]
+        scale = 640.0 / max(w, h) if max(w, h) > 640 else 1.0
+        det = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale)))) if scale < 1.0 else img
+        dh, dw = det.shape[:2]
+        fd = backend["fd"]
+        fd.setInputSize((dw, dh))
+        _, faces = fd.detect(det)
+        if faces is None or len(faces) == 0:
+            return "?", 0.0
+        f = max(faces, key=lambda a: a[2] * a[3])
+        x, y, fw, fh = (int(max(0, v) / scale) for v in f[:4])   # box back to full resolution
+        crop = img[y:min(h, y + fh), x:min(w, x + fw)]
+        if crop.size == 0:
+            return "?", 0.0
+        blob = cv2.resize(crop, (224, 224)).astype(np.float32)
+        blob -= np.array([104.0, 117.0, 123.0], np.float32)      # BGR mean (googlenet)
+        blob = blob.transpose(2, 0, 1)[None]
+        out = backend["gsess"].run(None, {backend["gin"]: blob})[0].ravel()
+        idx = int(np.argmax(out))
+        return ("M" if idx == 0 else "F"), round(float(np.max(out)), 2)   # 0=Male, 1=Female
+    except Exception:
+        return "?", 0.0
+
+
 def _gender_f0(seg, sr, fmin=75, fmax=300, vthr=0.35):
     """Median fundamental frequency (Hz) of a voiced segment via autocorrelation; 0 if unvoiced."""
     if len(seg) < int(0.04 * sr):
@@ -4718,6 +4860,7 @@ def _gender_f0(seg, sr, fmin=75, fmax=300, vthr=0.35):
 
 
 def _gender_from_f0(f0):
+    """Fixed-threshold fallback (used only when the adaptive fit is degenerate)."""
     if f0 <= 0:
         return "?", 0.0
     if f0 < 150:
@@ -4727,18 +4870,79 @@ def _gender_from_f0(f0):
     return "?", 0.2
 
 
+def _gender_adaptive_thresholds(f0s):
+    """Fit two clusters (1D k-means, k=2) to this track's voiced F0 so the male/female split is
+    calibrated to THESE speakers instead of a fixed 150/180 Hz. Returns (male_hz, female_hz, thr).
+    Falls back to fixed values if the data is degenerate (e.g. a single-gender scene)."""
+    v = [f for f in f0s if f > 0]
+    if len(v) < 30:
+        return 130.0, 200.0, 165.0
+    cm, cf = 120.0, 210.0
+    for _ in range(60):
+        a = [x for x in v if abs(x - cm) <= abs(x - cf)]
+        b = [x for x in v if abs(x - cm) > abs(x - cf)]
+        if not a or not b:
+            break
+        ncm, ncf = sum(a) / len(a), sum(b) / len(b)
+        if abs(ncm - cm) < 0.1 and abs(ncf - cf) < 0.1:
+            cm, cf = ncm, ncf
+            break
+        cm, cf = ncm, ncf
+    if cf - cm < 25:                     # clusters collapsed -> not two genders; use fixed
+        return 130.0, 200.0, 165.0
+    return cm, cf, (cm + cf) / 2.0
+
+
+def _gender_from_f0_adaptive(f0, cm, cf, thr, gap):
+    if f0 <= 0:
+        return "?", 0.0
+    margin = max(6.0, gap * 0.08)        # narrow unknown band right at the valley
+    if abs(f0 - thr) <= margin:
+        return "?", 0.15
+    g = "M" if f0 < thr else "F"
+    return g, round(min(1.0, abs(f0 - thr) / (gap / 2.0)), 2)
+
+
+def _gender_smooth(out, win=6):
+    """Resolve leftover '?' cues from the majority gender of nearby CONFIDENT cues - in a dialogue
+    turn the same speaker holds several consecutive lines, so a borderline-pitch line usually shares
+    its neighbours' gender. Uses a snapshot so it can't cascade."""
+    base = [o["g"] for o in out]
+    for i, o in enumerate(out):
+        if o["g"] != "?":
+            continue
+        neigh = [base[j] for j in range(max(0, i - win), min(len(out), i + win + 1)) if base[j] in ("M", "F")]
+        if neigh:
+            m, f = neigh.count("M"), neigh.count("F")
+            if m != f:
+                o["g"] = "M" if m > f else "F"
+                o["conf"] = 0.3
+
+
 def _gender_from_audio(samples, sr, events, prefix=None):
-    """Per-cue speaker gender from voice pitch. Returns [{g, f0, conf}] aligned with events."""
-    out = []
+    """Per-cue speaker gender from voice pitch, with a per-track adaptive threshold + temporal
+    smoothing. Returns [{g, f0, conf}] aligned with events."""
     n = len(events)
+    f0s = []
     for i, e in enumerate(events):
         if prefix and (i % 25 == 0 or i == n - 1):
             _print_progress(i + 1, n, prefix=prefix)
         a = int(e["start"] * sr)
         b = int(min(e["end"], e["start"] + 8.0) * sr)
-        f0 = _gender_f0(samples[max(0, a):max(a + 1, b)], sr)
-        g, c = _gender_from_f0(f0)
-        out.append({"g": g, "f0": round(f0, 1), "conf": round(c, 2)})
+        f0s.append(_gender_f0(samples[max(0, a):max(a + 1, b)], sr))
+    cm, cf, thr = _gender_adaptive_thresholds(f0s)
+    gap = max(1.0, cf - cm)
+    out = [dict(zip(("g", "conf"), _gender_from_f0_adaptive(f, cm, cf, thr, gap))) | {"f0": round(f, 1)}
+           for f in f0s]
+    unknown_before = sum(1 for o in out if o["g"] == "?")
+    _gender_smooth(out)
+    if _DEBUG:
+        vf = [f for f in f0s if f > 0]
+        dbg(f"audio gender: {n} cues, voiced {len(vf)} ({round(len(vf)/max(1,n)*100)}%), "
+            f"clusters M~{cm:.0f} F~{cf:.0f} thr~{thr:.0f}Hz -> "
+            f"M={sum(1 for o in out if o['g']=='M')} F={sum(1 for o in out if o['g']=='F')} "
+            f"?={sum(1 for o in out if o['g']=='?')} (adaptive left {unknown_before} '?', "
+            f"smoothing resolved {unknown_before - sum(1 for o in out if o['g']=='?')})")
     return out
 
 
@@ -4770,7 +4974,105 @@ def _gender_face(fd, gn, img, cv2):
     return ("M", "F")[gi], round(float(pr[gi]), 2)
 
 
-def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=None):
+def _gender_gpu_diag(cv2):
+    """Log exactly WHY the face/gender DNN runs on GPU or CPU: the OpenCV build flags (CUDA/OpenCL),
+    the CUDA device count, OpenCL availability + device, and the DNN backends/targets this OpenCV
+    exposes. --debug/--debug-gui only. Never raises."""
+    if not _DEBUG:
+        return
+    try:
+        dbg(f"gpu-diag: cv2 {cv2.__version__}")
+    except Exception:
+        pass
+    try:                                           # CUDA (NVIDIA only, and needs a CUDA-built OpenCV)
+        nc = cv2.cuda.getCudaEnabledDeviceCount() if hasattr(cv2, "cuda") else 0
+        dbg(f"gpu-diag: cuda_enabled_devices={nc}"
+            + ("" if nc else "  => this OpenCV was NOT built with CUDA (pip 'opencv-python' never is), "
+                             "so DNN_TARGET_CUDA is unavailable"))
+    except Exception as e:
+        dbg(f"gpu-diag: cuda check error: {e}")
+    try:                                           # OpenCL (AMD/Intel/NVIDIA) - available but its DNN path is unreliable
+        if hasattr(cv2, "ocl"):
+            have, use = cv2.ocl.haveOpenCL(), cv2.ocl.useOpenCL()
+            dbg(f"gpu-diag: opencl have={have} use={use} (DNN OpenCL target is intentionally NOT used - "
+                f"the kernel build is broken on many AMD/Intel drivers: '-cl-no-subgroup-ifp')")
+            if have:
+                try:
+                    d = cv2.ocl.Device_getDefault()
+                    dbg(f"gpu-diag: opencl device name='{d.name()}' vendor='{d.vendorName()}' "
+                        f"type={d.type()} driver='{d.driverVersion()}' compute_units={d.maxComputeUnits()}")
+                except Exception as e:
+                    dbg(f"gpu-diag: opencl device query error: {e}")
+    except Exception as e:
+        dbg(f"gpu-diag: opencl check error: {e}")
+    try:                                           # which DNN targets OpenCV actually offers per backend
+        if hasattr(cv2.dnn, "getAvailableTargets"):
+            names = {getattr(cv2.dnn, n): n for n in dir(cv2.dnn) if n.startswith("DNN_TARGET_")}
+            for bn in ("DNN_BACKEND_OPENCV", "DNN_BACKEND_CUDA"):
+                b = getattr(cv2.dnn, bn, None)
+                if b is None:
+                    continue
+                try:
+                    ts = [names.get(t, str(t)) for t in cv2.dnn.getAvailableTargets(b)]
+                    dbg(f"gpu-diag: dnn {bn} targets={ts}")
+                except Exception:
+                    pass
+    except Exception as e:
+        dbg(f"gpu-diag: dnn targets error: {e}")
+    try:                                           # the CUDA/OpenCL lines straight from the build config
+        for ln in cv2.getBuildInformation().splitlines():
+            l = ln.strip()
+            if l and any(k in l for k in ("CUDA", "cuDNN", "OpenCL", "Use OpenCL", "Parallel framework", "OpenCV modules")):
+                dbg(f"gpu-diag: build: {l}")
+    except Exception as e:
+        dbg(f"gpu-diag: build info error: {e}")
+
+
+def _gender_keyframes(ffmpeg_bin, ffprobe_bin, video, tmpd, hw, dur):
+    """Decode ONLY keyframes (-skip_frame nokey) - far fewer frames than a full decode and the GPU
+    finishes fast - and pair them with their timestamps from ffprobe. Returns (times, frame_paths)
+    in time order, or (None, None) if it can't be done reliably (caller falls back to full decode)."""
+    if not ffprobe_bin:
+        return None, None
+    to = max(120, int(dur / 3) + 60)
+    try:
+        r = subprocess.run([ffprobe_bin, "-v", "error", "-select_streams", "v", "-skip_frame", "nokey",
+                            "-show_entries", "frame=pts_time", "-of", "csv=p=0", str(video)],
+                           capture_output=True, text=True, timeout=to)
+        times = sorted(float(x) for x in r.stdout.replace(",", " ").split() if x.strip())
+    except Exception:
+        return None, None
+    if len(times) < 2:
+        return None, None
+    patt = os.path.join(tmpd, "k_%08d.jpg")
+    g = __import__("glob")
+    # ffmpeg option names changed across versions: newer builds REMOVED -vsync (use -fps_mode), and
+    # some don't accept -frame_pts. Try the modern flag first, then the legacy one; frames are named
+    # sequentially and paired with the (sorted) ffprobe timestamps BY INDEX - no -frame_pts needed.
+    for extra in (["-fps_mode", "passthrough"], ["-vsync", "0"]):
+        for f in g.glob(os.path.join(tmpd, "k_*.jpg")):
+            try:
+                os.remove(f)
+            except OSError:
+                pass
+        try:
+            r = subprocess.run([ffmpeg_bin, "-y"] + hw + ["-skip_frame", "nokey", "-i", str(video)] + extra
+                               + ["-q:v", "4", patt], capture_output=True, text=True, timeout=to)
+        except Exception as e:
+            dbg(f"video gender keyframe: ffmpeg raised {e}")
+            continue
+        frames = sorted(g.glob(os.path.join(tmpd, "k_*.jpg")))
+        if len(frames) == len(times):
+            dbg(f"video gender keyframe: {len(frames)} frames via '{' '.join(extra)}' "
+                f"hw={hw[1] if hw else 'cpu'}")
+            return times, frames
+        tail = " | ".join((r.stderr or "").strip().splitlines()[-2:])[:220]
+        dbg(f"video gender keyframe: '{' '.join(extra)}' rc={r.returncode} frames={len(frames)} vs "
+            f"times={len(times)} hw={hw[1] if hw else 'cpu'}; ffmpeg: {tail}")
+    return None, None
+
+
+def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=None, keyframe=False):
     """Per-cue speaker gender from the on-screen face (OpenCV DNN, one frame per cue midpoint).
     Returns [{g, conf}] or None if OpenCV / models are unavailable. gpu=True runs the DNN on the
     GPU via OpenCL (best-effort; falls back to CPU)."""
@@ -4783,101 +5085,342 @@ def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=No
         log_warn("    this OpenCV build has no DNN module (try 'pip install --upgrade opencv-python') "
                  "- using audio only.")
         return None
-    try:
-        m = _gender_fetch_models()
-        fd = cv2.dnn.readNet(m["face_model"], m["face_proto"])
-        gn = cv2.dnn.readNet(m["gender_model"], m["gender_proto"])
-    except Exception as e:
-        msg = str(e)
-        if "Caffe" in msg:
-            log_warn("    video gender needs Caffe model support, which your OpenCV (>= 5.0) removed. "
-                     "Install OpenCV 4.x for video:  pip install \"opencv-python<5\"   "
-                     "(the audio-based gender detection works fine without it).")
-        else:
-            log_warn(f"    could not load face/gender models ({msg[:90]}) - using audio only.")
-        return None
-    if gpu:      # GPU = CUDA (NVIDIA) if this OpenCV was built with it; OpenCL DNN is unreliable so unused
+    _gender_gpu_diag(cv2)                          # log GPU/CPU situation (--debug)
+    # DNN backend: GPU via onnxruntime-DirectML (YuNet face + gender ONNX) if requested AND available
+    # - this also works on OpenCV 5.x (no Caffe) - else the OpenCV Caffe models on CPU.
+    onnx = _gender_onnx_setup(cv2) if gpu else None
+    if onnx:
+        def classify(img):
+            return _gender_face_onnx(onnx, img, cv2)
+        dbg(f"video gender: DNN backend = {onnx['label']} (YuNet + gender ONNX)")
+    else:
+        if not hasattr(cv2, "dnn") or not hasattr(cv2.dnn, "readNet"):
+            log_warn("    this OpenCV build has no DNN module (try 'pip install --upgrade opencv-python') "
+                     "- using audio only.")
+            return None
         try:
-            if hasattr(cv2, "cuda") and cv2.cuda.getCudaEnabledDeviceCount() > 0:
-                if isinstance(dev, int) and dev < cv2.cuda.getCudaEnabledDeviceCount():
-                    cv2.cuda.setDevice(dev)
-                for net in (fd, gn):
-                    net.setPreferableBackend(cv2.dnn.DNN_BACKEND_CUDA)
-                    net.setPreferableTarget(cv2.dnn.DNN_TARGET_CUDA)
-                log_info("    face detector on GPU (CUDA).")
+            m = _gender_fetch_models()
+            fd = cv2.dnn.readNet(m["face_model"], m["face_proto"])
+            gn = cv2.dnn.readNet(m["gender_model"], m["gender_proto"])
+        except Exception as e:
+            msg = str(e)
+            if "Caffe" in msg:
+                log_warn("    video gender needs Caffe, which your OpenCV (>= 5.0) removed. Either install "
+                         "OpenCV 4.x (pip install \"opencv-python<5\"), OR the GPU path "
+                         "(pip install onnxruntime-directml) which also works on OpenCV 5. Using audio only.")
             else:
-                log_warn("    GPU face-detect needs an OpenCV built with CUDA - the pip 'opencv-python' package "
-                         "has none - so the DNN runs on CPU (fast enough). Frame decoding still uses the GPU.")
-        except Exception:
-            pass
+                log_warn(f"    could not load face/gender models ({msg[:90]}) - using audio only.")
+            return None
+
+        def classify(img):
+            return _gender_face(fd, gn, img, cv2)
+        if gpu:      # GPU requested but no DirectML/onnxruntime -> honest CPU note
+            _vend = _gpu_vendor() or "your"
+            if _vend == "NVIDIA":
+                log_warn("    GPU DNN needs onnxruntime-directml (or a CUDA OpenCV build), which isn't "
+                         "installed - so the DNN runs on CPU. Frame decoding still uses the GPU. "
+                         "Run 'pip install onnxruntime-directml' to use the GPU.")
+            else:
+                log_warn(f"    OpenCV can't run the DNN on a {_vend} GPU - install onnxruntime-directml "
+                         f"('pip install onnxruntime-directml') to run it on your {_vend} GPU. Using CPU "
+                         f"for now; frame decoding still uses the GPU.")
+            dbg("video gender: DNN on CPU (no DirectML/CUDA)")
     n = len(events)
     dur = max((e["end"] for e in events), default=0.0)
     if dur <= 0:
         return [{"g": "?", "conf": 0.0} for _ in events]
-    # ONE ffmpeg pass extracts frames on a uniform grid (GPU decode helps here, unlike a per-cue
-    # spawn), then each unique frame is classified once - far fewer processes than one ffmpeg per cue.
-    fps = max(0.15, min(0.5, n / dur))          # ~1 frame per 2-6s; frame k -> time k/fps
     tmpd = tempfile.mkdtemp(dir=_temp_root())
     try:
-        patt = os.path.join(tmpd, "f_%06d.jpg")
         hw = []
         if gpu:
             method = _hwaccel_for_decode(ffmpeg_bin)
             if method:
                 hw = ["-hwaccel", method] + (["-hwaccel_device", str(dev)]
                                              if dev not in (None, "", "auto") else [])
+        ffprobe_bin = _find_ffprobe(ffmpeg_bin)
+        if prefix:
+            _print_progress(1, n, prefix=prefix + "(decoding) ")
+        # FULL decode by default (robust). Keyframe mode (opt-in) decodes only I-frames - much
+        # faster - and maps each cue to its nearest keyframe by time; it falls back to full decode
+        # if the keyframe extraction can't be paired reliably.
+        ktimes = kframes = None
+        if keyframe:
+            ktimes, kframes = _gender_keyframes(ffmpeg_bin, ffprobe_bin, video, tmpd, hw, dur)
+            if ktimes is None and hw:
+                dbg("video gender: GPU keyframe decode failed -> retrying keyframes on CPU")
+                ktimes, kframes = _gender_keyframes(ffmpeg_bin, ffprobe_bin, video, tmpd, [], dur)
+            if ktimes is None:
+                dbg("video gender: keyframe mode failed -> falling back to full decode")
+        if ktimes:
+            import bisect
 
-        def _extract(hwargs):
-            if prefix:
-                _print_progress(1, n, prefix=prefix + "(decoding) ")
-            subprocess.run([ffmpeg_bin, "-y"] + hwargs + ["-i", str(video), "-vf", f"fps={fps}",
-                            "-q:v", "4", patt], capture_output=True,
-                           timeout=max(120, int(dur / 2) + 60))
-            return sorted(__import__("glob").glob(os.path.join(tmpd, "f_*.jpg")))
+            def _get(mid):
+                j = bisect.bisect_left(ktimes, mid)
+                if j <= 0:
+                    return kframes[0]
+                if j >= len(ktimes):
+                    return kframes[-1]
+                return kframes[j if (ktimes[j] - mid) < (mid - ktimes[j - 1]) else j - 1]
+            nf = len(kframes)
+            dbg(f"video gender: keyframe mode, {nf} keyframes, hwaccel={hw[1] if hw else 'cpu'}, "
+                f"mapping {n} cues")
+        else:
+            fps = max(0.15, min(0.5, n / dur))       # fallback: uniform low-fps full decode
 
-        frames = _extract(hw)
-        if not frames and hw:                    # GPU decode failed -> retry on CPU
-            frames = _extract([])
-        if not frames:
-            log_warn("    could not extract frames for video gender - using audio only.")
-            return None
-        nf = len(frames)
+            def _extract(hwargs):
+                r = subprocess.run([ffmpeg_bin, "-y"] + hwargs + ["-i", str(video), "-vf", f"fps={fps}",
+                                    "-q:v", "4", os.path.join(tmpd, "f_%06d.jpg")], capture_output=True,
+                                   text=True, timeout=max(120, int(dur / 2) + 60))
+                frames = sorted(__import__("glob").glob(os.path.join(tmpd, "f_*.jpg")))
+                if not frames:
+                    tail = " | ".join((r.stderr or "").strip().splitlines()[-2:])[:220]
+                    dbg(f"video gender full-decode: rc={r.returncode} 0 frames "
+                        f"hw={hwargs[1] if hwargs else 'cpu'}; ffmpeg: {tail}")
+                return frames
+            frames = _extract(hw)
+            if not frames and hw:
+                frames = _extract([])
+            if not frames:
+                log_warn("    could not extract frames for video gender - using audio only.")
+                return None
+            nf = len(frames)
+
+            def _get(mid):
+                return frames[min(nf - 1, max(0, int(round(mid * fps))))]
+            dbg(f"video gender: full-decode fallback, fps={fps:.3f}, {nf} frames for {n} cues")
         cache = {}
         out = []
+        faces = 0
         for i, e in enumerate(events):
             if prefix and (i % 25 == 0 or i == n - 1):
                 _print_progress(i + 1, n, prefix=prefix)
-            fi = min(nf - 1, max(0, int(round(((e["start"] + e["end"]) / 2.0) * fps))))
-            if fi not in cache:
-                img = cv2.imread(frames[fi])
-                cache[fi] = _gender_face(fd, gn, img, cv2) if img is not None else ("?", 0.0)
-            g, c = cache[fi]
+            fp = _get((e["start"] + e["end"]) / 2.0)
+            if fp not in cache:
+                img = cv2.imread(fp)
+                cache[fp] = classify(img) if img is not None else ("?", 0.0)
+            g, c = cache[fp]
+            if g in ("M", "F"):
+                faces += 1
             out.append({"g": g, "conf": c})
+        dbg(f"video gender: {len(cache)} unique frames classified, face+gender in {faces}/{n} cues -> "
+            f"M={sum(1 for x in out if x['g']=='M')} F={sum(1 for x in out if x['g']=='F')} "
+            f"?={sum(1 for x in out if x['g']=='?')}")
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
     return out
 
 
+def _gender_debug_block(aud_list, want, aud, vid, comb, timings, cfg, engine, model, detect):
+    """Detailed per-stage stats for analysis/debugging, embedded in the report JSON and written to
+    the --debug log. Covers each audio track's F0 distribution, the merged audio, the video pass,
+    how audio vs video combined (agreements/tie-breaks/who won), stage timings and the config."""
+    import numpy as _np
+
+    def _cnt(arr):
+        return dict(M=sum(1 for x in arr if x["g"] == "M"),
+                    F=sum(1 for x in arr if x["g"] == "F"),
+                    U=sum(1 for x in arr if x["g"] == "?"))
+
+    def _f0stats(arr):
+        f = [x["f0"] for x in arr if x.get("f0", 0) > 0]
+        if not f:
+            return dict(voiced=0)
+        a = _np.array(f, float)
+        return dict(voiced=len(f), voiced_pct=round(len(f) / max(1, len(arr)) * 100, 1),
+                    f0_min=round(float(a.min()), 1), f0_med=round(float(_np.median(a)), 1),
+                    f0_max=round(float(a.max()), 1), f0_std=round(float(a.std()), 1))
+    tracks = []
+    for lang, est in zip(want, aud_list):
+        tracks.append(dict(lang=lang, counts=_cnt(est), **_f0stats(est)))
+    # audio vs video interaction
+    av = dict(agree=0, disagree=0, audio_only=0, video_only=0, both_conf=0, neither=0)
+    if vid:
+        for a, v in zip(aud, vid):
+            ac, vc = a["g"] in ("M", "F"), v["g"] in ("M", "F")
+            if ac and vc:
+                av["both_conf"] += 1
+                av["agree" if a["g"] == v["g"] else "disagree"] += 1
+            elif ac:
+                av["audio_only"] += 1
+            elif vc:
+                av["video_only"] += 1
+            else:
+                av["neither"] += 1
+    conf = [c["conf"] for c in comb if c["g"] in ("M", "F")]
+    return dict(
+        config=dict(engine=engine, model=model, detect=detect, video=bool(vid),
+                    gpu=cfg.get("gpu"), device=cfg.get("dev"),
+                    decode=("keyframe" if cfg.get("kf") else "full"), opencv=_opencv_version()),
+        timings_s={k: round(v, 2) for k, v in (timings or {}).items()},
+        audio_tracks=tracks,
+        audio_merged=_cnt(aud), video=(_cnt(vid) if vid else None),
+        combined=_cnt(comb),
+        audio_vs_video=(av if vid else None),
+        combined_confidence=dict(mean=round(float(_np.mean(conf)), 3) if conf else 0,
+                                 median=round(float(_np.median(conf)), 3) if conf else 0,
+                                 low_lt_0_3=sum(1 for c in conf if c < 0.3)))
+
+
+def _opencv_version():
+    try:
+        import cv2
+        return cv2.__version__
+    except Exception:
+        return None
+
+
+def _gender_summary_lines(aud, vid, comb):
+    """Retime-style ASCII bars comparing the AUDIO vs VIDEO gender detection (and the combined
+    result), printed after each video. Fixed-width columns so it lines up cleanly."""
+    def cnt(arr):
+        return (sum(1 for x in arr if x["g"] == "M"),
+                sum(1 for x in arr if x["g"] == "F"),
+                sum(1 for x in arr if x["g"] == "?"))
+    rows = [("audio (F0)", aud)]
+    if vid:
+        rows.append(("video (face)", vid))
+    rows.append(("combined", comb))
+    mx = max((max(cnt(a)) for _, a in rows), default=1) or 1
+    BLK = "\u2588"
+    W, COL = 14, 21                               # bar width, full column width (bar + space + count)
+
+    def cell(n, color):
+        k = max(0, min(W, round(n / mx * W)))
+        return color + BLK * k + " " * (W - k) + Style.RESET_ALL + " " + str(n).ljust(6)
+    out = ["",
+           "      " + " " * 15
+           + f"{Fore.BLUE}male{Style.RESET_ALL}" + " " * (COL - 4)
+           + f"{Fore.MAGENTA}female{Style.RESET_ALL}" + " " * (COL - 6)
+           + f"{Style.DIM}unknown{Style.RESET_ALL}"]
+    for name, arr in rows:
+        m, f, u = cnt(arr)
+        out.append("      " + name.ljust(15) + cell(m, Fore.BLUE) + cell(f, Fore.MAGENTA) + cell(u, Style.DIM))
+    if vid:
+        both = [(a["g"], v["g"]) for a, v in zip(aud, vid) if a["g"] in ("M", "F") and v["g"] in ("M", "F")]
+        if both:
+            agree = sum(1 for a, v in both if a == v)
+            out.append(f"      {Style.DIM}audio & video agree on {agree}/{len(both)} confident lines "
+                       f"({round(agree / len(both) * 100)}%){Style.RESET_ALL}")
+    out.append("")
+    return out
+
+
+def _ask_checkbox(title, options, preselect=None, single=False):
+    """Fullscreen multi-select: Space toggles, 'a' = all/none, Enter confirms, Esc cancels.
+    With single=True it behaves like a radio list (selecting one clears the others). Returns the
+    list of selected indices (possibly empty), or None on cancel."""
+    if not options:
+        return []
+    sel = [False] * len(options)
+    for i in (preselect or []):
+        if 0 <= i < len(options):
+            sel[i] = True
+    pos = top = 0
+    if single and any(sel):
+        pos = sel.index(True)
+    with _RawMode():
+        _fb_enter_screen()
+        try:
+            while True:
+                cols, rows = _fb_termsize()
+                keys = ("\u2191\u2193 move | Space = select | Enter = confirm | Esc = cancel" if single
+                        else "\u2191\u2193 move | Space = toggle | a = all/none | Enter = confirm | Esc = cancel")
+                head = [f"{Fore.CYAN}{Style.BRIGHT}{title}{Style.RESET_ALL}", f"{Style.DIM}{keys}{Style.RESET_ALL}", ""]
+                per = max(3, rows - len(head) - 1)
+                pos = max(0, min(pos, len(options) - 1))
+                if pos < top:
+                    top = pos
+                elif pos >= top + per:
+                    top = pos - per + 1
+                top = max(0, top)
+                body = []
+                for i in range(top, min(top + per, len(options))):
+                    mark = ("(o)" if single and sel[i] else "( )") if single else (f"[{'x' if sel[i] else ' '}]")
+                    line = f"{mark} {_fb_trunc(options[i], cols - 6)}"
+                    body.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {line}{Style.RESET_ALL}" if i == pos else f"  {line}")
+                _fb_write_frame(head + body)
+                _fb_draw_scrollbar(len(head) + 1, len(body), len(options), per, top, cols)
+                k = _read_key()
+                if k == "esc":
+                    return None
+                elif k == "enter":
+                    if single and not any(sel):
+                        return [pos]
+                    return [i for i, s in enumerate(sel) if s]
+                elif k == ("char", " "):
+                    if single:
+                        sel = [j == pos for j in range(len(options))]
+                    else:
+                        sel[pos] = not sel[pos]
+                elif k == ("char", "a") and not single:
+                    allon = all(sel)
+                    sel = [not allon] * len(options)
+                elif k == "up":
+                    pos = (pos - 1) % len(options)
+                elif k == "down":
+                    pos = (pos + 1) % len(options)
+                elif k == "pgup":
+                    pos = max(0, pos - per)
+                elif k == "pgdn":
+                    pos = min(len(options) - 1, pos + per)
+                elif k == "home":
+                    pos = 0
+                elif k == "end":
+                    pos = len(options) - 1
+        finally:
+            _fb_leave_screen()
+            sys.stdout.write("\x1b[2J\x1b[H")
+            sys.stdout.flush()
+
+
+def _gender_audio_merge(aud_list):
+    """Merge N per-track audio gender estimates (one list per audio track) into ONE per-cue audio
+    estimate by confidence-weighted vote across the tracks. More tracks agreeing => more confident."""
+    aud_list = [a for a in aud_list if a]
+    if not aud_list:
+        return []
+    if len(aud_list) == 1:
+        return aud_list[0]
+    n = min(len(a) for a in aud_list)
+    out = []
+    for i in range(n):
+        score = {"M": 0.0, "F": 0.0}
+        f0s = []
+        for track in aud_list:
+            e = track[i]
+            if e["g"] in ("M", "F"):
+                score[e["g"]] += e["conf"]
+                if e.get("f0"):
+                    f0s.append(e["f0"])
+        if score["M"] == 0 and score["F"] == 0:
+            out.append({"g": "?", "f0": 0, "conf": 0.0})
+        else:
+            g = "M" if score["M"] >= score["F"] else "F"
+            conf = round(abs(score["M"] - score["F"]) / (score["M"] + score["F"] + 1e-9), 2)
+            out.append({"g": g, "f0": (round(sum(f0s) / len(f0s), 1) if f0s else 0), "conf": conf})
+    return out
+
+
 def _gender_combine(aud, vid):
-    """Combine per-cue audio + (optional) video gender estimates into a final {g, conf, src}."""
+    """Combine per-cue audio + (optional) video gender into a final {g, conf, src}. The data shows
+    video (the on-screen face) is wrong ~38% of the time even when audio is unambiguous - the face
+    often isn't the speaker - so AUDIO always wins. Video only REINFORCES a matching audio call or
+    FILLS a cue where audio is still unknown; it never overrides a confident audio gender."""
     out = []
     for i in range(len(aud)):
         a = aud[i]
         v = vid[i] if vid else None
-        score = {"M": 0.0, "F": 0.0}
-        srcs = []
+        vok = bool(v) and v["g"] in ("M", "F")
         if a["g"] in ("M", "F"):
-            score[a["g"]] += a["conf"]
-            srcs.append("audio")
-        if v and v["g"] in ("M", "F"):
-            score[v["g"]] += v["conf"] * 0.9
-            srcs.append("video")
-        if score["M"] == 0 and score["F"] == 0:
-            out.append({"g": "?", "conf": 0.0, "src": ""})
+            if vok and v["g"] == a["g"]:
+                out.append({"g": a["g"], "conf": round(min(1.0, a["conf"] + v["conf"] * 0.2), 2),
+                            "src": "audio+video"})
+            else:
+                out.append({"g": a["g"], "conf": a["conf"], "src": "audio"})
+        elif vok:                                      # audio unknown -> fall back to video
+            out.append({"g": v["g"], "conf": round(v["conf"] * 0.6, 2), "src": "video"})
         else:
-            g = "M" if score["M"] >= score["F"] else "F"
-            conf = round(abs(score["M"] - score["F"]) / (score["M"] + score["F"] + 1e-9), 2)
-            out.append({"g": g, "conf": conf, "src": "+".join(srcs)})
+            out.append({"g": "?", "conf": 0.0, "src": ""})
     return out
 
 
@@ -4906,13 +5449,15 @@ def _gender_translate(events, comb, engine, key, model, src_name):
             f"dialogue context. Keep names and titles untranslated. Return EXACTLY one line per input, "
             f"each prefixed by its number and a period, and nothing else.\n\n" + "\n".join(lines))
         _print_progress(s, len(events), prefix="    gender translate ")   # show BEFORE the call
+        if bi > 1 and engine == "gemini":
+            time.sleep(0.7)                  # pace requests to stay under the free-tier per-minute limit
         resp = None
         for attempt in range(2):
             try:
                 if engine == "claude":
                     resp = anthropic_messages(prompt, key, model or "claude-sonnet-4-6", max_tokens=4000)
                 else:
-                    resp = gemini_generate(prompt, key, model or "gemini-1.5-flash", timeout=60)
+                    resp = gemini_generate(prompt, key, model or "gemini-2.0-flash", timeout=60)
                 break
             except _FatalAPIError as e:      # bad key / no quota / bad model -> retrying is pointless
                 fatal = str(e)
@@ -4922,14 +5467,18 @@ def _gender_translate(events, comb, engine, key, model, src_name):
                 if attempt == 0:
                     time.sleep(2.5)
         if fatal:
+            dbg(f"gender translate: batch {bi}/{nbatch} FATAL: {fatal[:120]}")
             break
         if not resp:
+            dbg(f"gender translate: batch {bi}/{nbatch} no response (transient) - kept as source")
             continue                         # transient miss: keep this batch as source, go on
         got = {}
         for ln in resp.splitlines():
             mm = re.match(r"\s*(\d+)[.)]\s*(.*)", ln)
             if mm:
                 got[int(mm.group(1))] = mm.group(2).strip()
+        dbg(f"gender translate: batch {bi}/{nbatch} lines={len(chunk)} parsed={len(got)} "
+            f"resp_chars={len(resp)}")
         if len(got) < max(1, len(chunk) // 2):
             continue
         for j in range(len(chunk)):
@@ -4942,9 +5491,9 @@ def _gender_translate(events, comb, engine, key, model, src_name):
     print()
     if fatal:
         log_warn(f"    AI translation stopped: {fatal}")
-        log_warn("    Falling back to the free Google engine (no gender hints). For gender-correct "
-                 "Czech next time, pick a Gemini model WITH free quota (e.g. gemini-1.5-flash / "
-                 "gemini-2.0-flash) or use Claude.")
+        log_warn("    Falling back to the free Google engine (no gender hints). If you saw 'limit: 0', "
+                 "your account has NO free Gemini tier at all - for gender-correct Czech use Claude, or "
+                 "enable Gemini billing; otherwise a free-quota Gemini model (e.g. gemini-2.5-flash-lite).")
         fb = translate_events_to(events, "google", "cs")
         return fb or result
     if nok:
@@ -4961,105 +5510,134 @@ _GENDER_REPORT_HTML = r"""<!DOCTYPE html><html lang="en"><head><meta charset="ut
 :root{--bg:#0d1117;--panel:#161b22;--line:#30363d;--fg:#e6edf3;--dim:#8b949e;--m:#58a6ff;--f:#f778ba;--u:#8b949e}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:13px/1.5 ui-monospace,Consolas,monospace}
 header{padding:14px 18px;border-bottom:1px solid var(--line);background:var(--panel)}h1{margin:0 0 6px;font-size:15px}
-.meta{color:var(--dim);font-size:12px}.wrap{padding:14px 18px;max-width:1500px;margin:0 auto}
-.lane{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:12px 0;overflow:hidden}
+.meta{color:var(--dim);font-size:12px}.wrap{padding:8px 18px;max-width:1500px;margin:0 auto}
+.lane{background:var(--panel);border:1px solid var(--line);border-radius:8px;margin:10px 0;overflow:hidden}
 .lane h2{margin:0;padding:8px 12px;font-size:12px;color:var(--dim);border-bottom:1px solid var(--line)}
-canvas{display:block;width:100%}.hint{color:var(--dim);font-size:11px;padding:6px 12px}
-.tip{position:fixed;pointer-events:none;background:#000d;border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:12px;max-width:520px;display:none;z-index:10;white-space:pre-wrap}
+canvas{display:block;width:100%}
+.tip{position:fixed;pointer-events:none;background:#000d;border:1px solid var(--line);border-radius:6px;padding:6px 9px;font-size:12px;max-width:560px;display:none;z-index:10;white-space:pre-wrap}
 table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:4px 8px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top}
 th{position:sticky;top:0;background:var(--panel);color:var(--dim)}tr:hover{background:#1f2630}.tt{white-space:nowrap;color:var(--dim)}
-.m{color:var(--m)}.f{color:var(--f)}.u{color:var(--u)}.tblwrap{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:8px}
-.legend{display:flex;gap:16px;margin-top:6px;font-size:11px;color:var(--dim)}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
+.m{color:var(--m)}.f{color:var(--f)}.u{color:var(--u)}.bad{color:#f85149}.tblwrap{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:8px}
+.legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;font-size:11px;color:var(--dim)}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
 </style></head><body>
 <header><h1>Speaker-gender-aware translation report</h1><div class="meta" id="meta"></div>
-<div class="legend"><span><span class="sw" style="background:var(--m)"></span>male speaker</span>
-<span><span class="sw" style="background:var(--f)"></span>female speaker</span>
+<div class="legend"><span><span class="sw" style="background:var(--m)"></span>male</span>
+<span><span class="sw" style="background:var(--f)"></span>female</span>
 <span><span class="sw" style="background:var(--u)"></span>unknown</span>
-<span>each bar = one cue; height of dot = F0; hover for detail</span></div></header>
+<span><span class="sw" style="background:#f85149"></span>audio/video disagree</span>
+<span>wheel = zoom, drag = pan, hover a cue for detail</span></div></header>
 <div class="wrap" id="lanes"></div>
-<div class="wrap"><div class="lane"><h2>All cues: detected gender + source text + Czech translation</h2>
-<div class="tblwrap"><table><thead><tr><th>#</th><th>time</th><th>gender</th><th>F0</th><th>source</th><th>Czech</th></tr></thead>
+<div class="wrap"><div class="lane"><h2>All cues: audio + video gender, source text and Czech translation</h2>
+<div class="tblwrap"><table><thead><tr><th>#</th><th>time</th><th>audio</th><th>F0</th><th>video</th><th>used</th><th>source</th><th>Czech</th></tr></thead>
 <tbody id="tb"></tbody></table></div></div></div><div class="tip" id="tip"></div>
 <script>
 const DATA=/*__DATA__*/;const tip=document.getElementById('tip');
 const fmt=t=>{t=Math.max(0,t);const m=Math.floor(t/60),s=(t%60);return String(m).padStart(2,'0')+':'+s.toFixed(1).padStart(4,'0');};
 const col=g=>g==='M'?'#58a6ff':g==='F'?'#f778ba':'#8b949e';
-const C=DATA.cues,dur=DATA.dur||(C.length?C[C.length-1].te:1);
-const st=DATA.stats||{};
+const nm=g=>g==='M'?'male':g==='F'?'female':'?';
+const C=DATA.cues,dur=DATA.dur||(C.length?C[C.length-1].te:1),st=DATA.stats||{};
+const gl=s=>`<span class="m">${(s||{}).male||0}M</span> <span class="f">${(s||{}).female||0}F</span> <span class="u">${(s||{}).unknown||0}?</span>`;
 document.getElementById('meta').innerHTML=`<b>${DATA.video||''}</b> &nbsp;|&nbsp; ${C.length} cues &nbsp;|&nbsp; `+
- `<span class="m">${st.male||0} male</span> &middot; <span class="f">${st.female||0} female</span> &middot; `+
- `<span class="u">${st.unknown||0} unknown</span> &nbsp;|&nbsp; source ${DATA.src_lang||''} &rarr; Czech &nbsp;|&nbsp; `+
- `detection: ${DATA.detect||'audio'} &nbsp;|&nbsp; engine: ${DATA.engine||''}`;
-// timeline lane
-(function(){const box=document.createElement('div');box.className='lane';
- box.innerHTML='<h2>Speaker gender over time (blue=male, pink=female, grey=unknown; dot height = pitch F0)</h2>';
+ `combined ${gl(st.combined)} &nbsp;|&nbsp; audio ${gl(st.audio)}`+
+ (DATA.has_video?` &nbsp;|&nbsp; video ${gl(st.video)} &nbsp;|&nbsp; audio&video agree ${st.agree}%`:'')+
+ ` &nbsp;|&nbsp; ${DATA.src_lang||''} &rarr; Czech (${DATA.engine||''})`;
+
+function lane(title,mode){
+ const box=document.createElement('div');box.className='lane';box.innerHTML='<h2>'+title+'</h2>';
  const cv=document.createElement('canvas');box.appendChild(cv);document.getElementById('lanes').appendChild(box);
- let view={a:0,b:dur||1};const X=t=>(t-view.a)/(view.b-view.a)*cv.width,T=x=>view.a+x/cv.width*(view.b-view.a);
- function rs(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=150*devicePixelRatio;cv.style.height='150px';draw();}
+ let view={a:0,b:dur||1};const H=mode==='overlay'?170:140;
+ const X=t=>(t-view.a)/(view.b-view.a)*cv.width,T=x=>view.a+x/cv.width*(view.b-view.a);
+ function rs(){cv.width=cv.clientWidth*devicePixelRatio;cv.height=H*devicePixelRatio;cv.style.height=H+'px';draw();}
  function draw(){const w=cv.width,h=cv.height,g=cv.getContext('2d');g.clearRect(0,0,w,h);const base=h-20;
   for(const c of C){if(c.te<view.a||c.ts>view.b)continue;const x=X(c.ts),ww=Math.max(1.5,X(c.te)-x);
-   g.fillStyle=col(c.g)+'cc';g.fillRect(x,base-4,ww,8);
-   if(c.f0>0){const y=base-8-(Math.min(280,Math.max(80,c.f0))-80)/200*(base-20);g.fillStyle=col(c.g);g.beginPath();g.arc(x+ww/2,y,2*devicePixelRatio,0,7);g.fill();}}
+   if(mode==='audio'){g.fillStyle=col(c.ag)+'cc';g.fillRect(x,base-6,ww,12);
+     if(c.af0>0){const y=base-14-(Math.min(280,Math.max(80,c.af0))-80)/200*(base-24);g.fillStyle=col(c.ag);g.beginPath();g.arc(x+ww/2,y,2*devicePixelRatio,0,7);g.fill();}}
+   else if(mode==='video'){g.fillStyle=col(c.vg)+'cc';g.fillRect(x,base-6,ww,12);}
+   else{g.fillStyle=col(c.ag)+'cc';g.fillRect(x,base-17,ww,7);
+        g.fillStyle=col(c.vg)+'cc';g.fillRect(x,base-1,ww,7);
+        if(c.ag!=='?'&&c.vg!=='?'&&c.ag!==c.vg){g.fillStyle='#f85149';g.fillRect(x,base-10,Math.max(1.5,ww),3);}}}
   g.fillStyle='#8b949e';g.font=(11*devicePixelRatio)+'px monospace';
-  const span=view.b-view.a,step=Math.pow(10,Math.floor(Math.log10(span/8)));
-  for(let t=Math.ceil(view.a/step)*step;t<view.b;t+=step){const x=X(t);g.fillText(fmt(t),x+2,h-4);}}
+  const span=view.b-view.a,step=Math.pow(10,Math.floor(Math.log10(span/8)))||1;
+  for(let t=Math.ceil(view.a/step)*step;t<view.b;t+=step){const x=X(t);g.fillText(fmt(t),x+2,h-4);}
+  if(mode==='overlay'){g.fillStyle='#8b949e';g.fillText('audio',3,base-11);g.fillText('video',3,base+13);}}
  cv.addEventListener('wheel',e=>{e.preventDefault();const t=T(e.offsetX*devicePixelRatio),k=e.deltaY<0?0.8:1.25;
   let a=t-(t-view.a)*k,b=t+(view.b-t)*k;a=Math.max(0,a);b=Math.min(dur,b);if(b-a>0.3){view={a,b};draw();}},{passive:false});
  let d=null;cv.addEventListener('mousedown',e=>d={x:e.offsetX,a:view.a,b:view.b});addEventListener('mouseup',()=>d=null);
  cv.addEventListener('mousemove',e=>{if(d){const dt=(e.offsetX-d.x)*devicePixelRatio/cv.width*(d.b-d.a);let a=d.a-dt,b=d.b-dt;if(a<0){b-=a;a=0;}if(b>dur){a-=b-dur;b=dur;}view={a,b};draw();return;}
   const t=T(e.offsetX*devicePixelRatio);let hit=null;for(const c of C){if(t>=c.ts&&t<=c.te){hit=c;break;}}
   if(hit){tip.style.display='block';tip.style.left=(e.clientX+12)+'px';tip.style.top=(e.clientY+12)+'px';
-   tip.textContent=`${fmt(hit.ts)}  ${hit.g==='M'?'MALE':hit.g==='F'?'FEMALE':'unknown'} (${hit.conf}${hit.src?', '+hit.src:''})  F0=${hit.f0||'-'}Hz\n${hit.t}\n-> ${hit.cz||''}`;}
+   tip.textContent=`${fmt(hit.ts)}\naudio: ${nm(hit.ag)}${hit.af0>0?' (F0 '+hit.af0+'Hz)':''}`+
+    (DATA.has_video?`\nvideo: ${nm(hit.vg)}`:'')+`\nused:  ${nm(hit.g)} (${hit.conf}${hit.src?', '+hit.src:''})\n${hit.t}\n-> ${hit.cz||''}`;}
   else tip.style.display='none';});
- cv.addEventListener('mouseleave',()=>tip.style.display='none');new ResizeObserver(rs).observe(cv);rs();})();
-// table
+ cv.addEventListener('mouseleave',()=>tip.style.display='none');new ResizeObserver(rs).observe(cv);rs();}
+
+lane('1) AUDIO gender - from voice pitch F0 (dot height = pitch)','audio');
+if(DATA.has_video){
+ lane('2) VIDEO gender - from the on-screen face','video');
+ lane('3) COMPARISON - audio (top) vs video (bottom); red bar = they disagree','overlay');
+}
 const tb=document.getElementById('tb');
-for(const c of C){const tr=document.createElement('tr');
+for(const c of C){const tr=document.createElement('tr');const dis=(c.ag!=='?'&&c.vg!=='?'&&c.ag!==c.vg);
+ const esc=s=>(s||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]));
  tr.innerHTML=`<td>${c.i}</td><td class="tt">${fmt(c.ts)}</td>`+
-  `<td class="${c.g==='M'?'m':c.g==='F'?'f':'u'}">${c.g==='M'?'male':c.g==='F'?'female':'?'} ${c.conf?'('+c.conf+')':''}</td>`+
-  `<td class="tt">${c.f0>0?c.f0:''}</td>`+
-  `<td>${(c.t||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]))}</td>`+
-  `<td>${(c.cz||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]))}</td>`;tb.appendChild(tr);}
+  `<td class="${c.ag==='M'?'m':c.ag==='F'?'f':'u'}">${nm(c.ag)}</td><td class="tt">${c.af0>0?c.af0:''}</td>`+
+  `<td class="${dis?'bad':(c.vg==='M'?'m':c.vg==='F'?'f':'u')}">${DATA.has_video?nm(c.vg):'-'}</td>`+
+  `<td class="${c.g==='M'?'m':c.g==='F'?'f':'u'}">${nm(c.g)}</td>`+
+  `<td>${esc(c.t)}</td><td>${esc(c.cz)}</td>`;tb.appendChild(tr);}
 </script></body></html>"""
 
 
-def _write_gender_report(base, video, src_lang, engine, detect, events, translated, aud, vid, comb):
+def _write_gender_report(base, video, src_lang, engine, detect, events, translated, aud, vid, comb, debug=None):
     try:
+        has_video = bool(vid)
         cues = []
-        for i, (e, tr, g) in enumerate(zip(events, translated, comb), 1):
-            cues.append(dict(i=i, ts=round(e["start"], 2), te=round(e["end"], 2),
+        for i, (e, tr, g) in enumerate(zip(events, translated, comb)):
+            a = aud[i] if aud else {"g": "?", "f0": 0, "conf": 0}
+            v = vid[i] if vid else None
+            cues.append(dict(i=i + 1, ts=round(e["start"], 2), te=round(e["end"], 2),
                              g=g["g"], conf=g["conf"], src=g.get("src", ""),
-                             f0=(aud[i - 1]["f0"] if aud else 0),
+                             ag=a["g"], af0=a.get("f0", 0), aconf=a.get("conf", 0),
+                             vg=(v["g"] if v else "?"), vconf=(v["conf"] if v else 0),
                              t=e["text"].replace("\n", " "), cz=tr["text"].replace("\n", " ")))
-        stats = dict(male=sum(1 for c in comb if c["g"] == "M"),
-                     female=sum(1 for c in comb if c["g"] == "F"),
-                     unknown=sum(1 for c in comb if c["g"] == "?"))
+
+        def _cnt(key):
+            return dict(male=sum(1 for c in cues if c[key] == "M"),
+                        female=sum(1 for c in cues if c[key] == "F"),
+                        unknown=sum(1 for c in cues if c[key] == "?"))
+        agree = None
+        if has_video:
+            both = [(c["ag"], c["vg"]) for c in cues if c["ag"] in ("M", "F") and c["vg"] in ("M", "F")]
+            agree = (round(sum(1 for a, b in both if a == b) / len(both) * 100) if both else 0)
+        stats = dict(combined=_cnt("g"), audio=_cnt("ag"), video=_cnt("vg"), agree=agree)
         data = dict(video=os.path.basename(str(video)), src_lang=src_lang, engine=engine,
-                    detect=detect, dur=(round(events[-1]["end"], 1) if events else 0),
-                    cues=cues, stats=stats)
+                    detect=detect, has_video=has_video,
+                    dur=(round(events[-1]["end"], 1) if events else 0),
+                    cues=cues, stats=stats, debug=(debug or {}))
         with open(base + ".gender.report.json", "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, separators=(",", ":"))
         with open(base + ".gender.report.html", "w", encoding="utf-8") as f:
             f.write(_GENDER_REPORT_HTML.replace("/*__DATA__*/", json.dumps(data, ensure_ascii=False)))
         log_info(f"    report: {os.path.basename(base)}.gender.report.html (+ .json)")
+        if debug:
+            dbg("gender report debug block: " + json.dumps(debug, ensure_ascii=False))
     except Exception as e:
         log_warn(f"    could not write the gender report: {e}")
 
 
-def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
-    """Retime-style interactive picker for the gender-translate batch. The source subtitle/audio
-    LANGUAGE is chosen globally beforehand (arrows+enter); here you toggle each video, override a
-    single episode's tracks with 'o', flip video face detection (v) with its GPU accel (g) +
-    device (d), the AI engine (e) and the report (r). Returns ('run', videos) / ('over', index) /
-    None. State (selection, overrides) lives in cfg so it survives an override round-trip."""
+def _gender_picker(videos, vinfo, cfg, gpu_names):
+    """Retime-style interactive picker for the gender-translate batch. Global source subtitle (s)
+    and audio track(s) (u) are shown at the top and can be changed from here; each video can be
+    toggled, a single episode's tracks overridden ('o'), and video face detection (v) + its GPU
+    (g) + device (d), the AI engine (e) and the report (r) flipped. Returns ('run', videos) /
+    ('over', index) / ('subs',) / ('audio',) / None. State lives in cfg (survives a round-trip)."""
     sel = cfg["sel"]
     pos = cfg.get("pos", 0)
     top = 0
 
     def eff(v):
         o = cfg["over"].get(v)
-        s = (o[0] if o and o[0] else global_sub)
-        a = (o[1] if o and o[1] else global_aud)
+        s = (o[0] if o and o[0] else cfg["global_sub"])
+        a = (o[1] if o and o[1] else cfg["global_auds"])   # list of audio languages
         return s, a, bool(o)
 
     with _RawMode():
@@ -5075,21 +5653,27 @@ def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
                 devtxt = ("auto" if dev in (None, "auto") else
                           (f"#{dev} {_fb_trunc(gpu_names[int(dev)], 22)}"
                            if (isinstance(dev, int) and 0 <= int(dev) < len(gpu_names)) else str(dev)))
+                _dml = _has_directml()
+                gpu_tag = (vend + " GPU" + (" (DirectML)" if _dml else
+                                            (" (CUDA)" if vend == "NVIDIA" else " decode-only")))
+                dec = f"    decode: {Fore.GREEN}{'keyframe' if cfg.get('kf') else 'full'}{Style.RESET_ALL} {Style.DIM}(k){Style.RESET_ALL}"
                 if cfg["use_video"]:
                     gpu_line = (f"    face-detect: {Fore.GREEN if cfg['gpu'] else Style.DIM}"
-                                f"{(vend + ' GPU (CUDA)') if cfg['gpu'] else 'CPU'}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
+                                f"{gpu_tag if cfg['gpu'] else 'CPU'}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
                                 + (f"    device: {Fore.GREEN}{devtxt}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}"
-                                   if len(gpu_names) > 1 else ""))
+                                   if len(gpu_names) > 1 else "") + dec)
                 else:
                     # video OFF -> keep the same options visible but greyed out (disabled)
-                    gpu_line = (f"    {Style.DIM}face-detect: {(vend + ' GPU') if cfg['gpu'] else 'CPU'} (g)"
+                    gpu_line = (f"    {Style.DIM}face-detect: {gpu_tag if cfg['gpu'] else 'CPU'} (g)"
                                 + (f"    device: {devtxt} (d)" if len(gpu_names) > 1 else "")
+                                + f"    decode: {'keyframe' if cfg.get('kf') else 'full'} (k)"
                                 + Style.RESET_ALL)
                 head = [
                     f"{Fore.MAGENTA}{Style.BRIGHT}=== Gender-aware translation: pick videos + options ==={Style.RESET_ALL}",
-                    f"{Style.DIM}Global source subs: {Fore.GREEN}{_lang3_name(global_sub)} ({global_sub}){Style.RESET_ALL}"
-                    f"{Style.DIM}   audio for gender: {Fore.GREEN}{_lang3_name(global_aud)} ({global_aud}){Style.RESET_ALL}"
-                    f"{Style.DIM}   (override one episode with 'o'){Style.RESET_ALL}",
+                    f"{Style.DIM}source subs: {Fore.GREEN}{_lang3_name(cfg['global_sub'])} ({cfg['global_sub']}){Style.RESET_ALL}"
+                    f" {Style.DIM}(s){Style.RESET_ALL}    "
+                    f"{Style.DIM}audio for gender: {Fore.GREEN}{'+'.join(cfg['global_auds'])}{Style.RESET_ALL}"
+                    f" {Style.DIM}(u)   \u00b7 override one episode with 'o'{Style.RESET_ALL}",
                     f"{Fore.CYAN}{nsel}/{len(videos)} selected{Style.RESET_ALL}    "
                     f"video face detection: {Fore.GREEN if cfg['use_video'] else Style.DIM}"
                     f"{'ON' if cfg['use_video'] else 'off'}{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}"
@@ -5098,8 +5682,9 @@ def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
                     f"{'ON' if cfg['want_report'] else 'off'}{Style.RESET_ALL} {Style.DIM}(r){Style.RESET_ALL}" + gpu_line,
                     "",
                 ]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | o = override this "
-                            f"episode | v = video" + (" | g = GPU | d = device" if gpu_names else "")
+                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | s = source subs | "
+                            f"u = audio | o = override | v = video" + (" | g = GPU | d = device" if gpu_names else "")
+                            + " | k = decode"
                             + f" | e = engine | r = report | Enter = run | Esc = cancel{Style.RESET_ALL}"]
                 avail = max(4, rows - len(head) - len(foot))
                 per = max(1, avail // 4)
@@ -5118,7 +5703,12 @@ def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
                     box = "[x]" if (sel[i] and has_sub) else "[ ]"
                     ov = f" {Fore.CYAN}[override]{Style.RESET_ALL}" if isover else ""
                     subtxt = (f"{_lang3_name(s)} ({s})" if has_sub else f"{Fore.RED}MISSING {s}{Style.RESET_ALL}")
-                    audtxt = (f"{_lang3_name(a)} ({a})" if a in auds else f"{Fore.YELLOW}no {a} audio{Style.RESET_ALL}")
+                    have = [al for al in a if al in auds]
+                    miss = [al for al in a if al not in auds]
+                    audtxt = ((", ".join(have) if have else "") +
+                              (f" {Fore.YELLOW}(no {'/'.join(miss)}){Style.RESET_ALL}" if miss else ""))
+                    if not have:
+                        audtxt = f"{Fore.YELLOW}none of {'/'.join(a)} present{Style.RESET_ALL}"
                     header = f"{box} {_fb_trunc(Path(v).name, cols - 16)}{ov}"
                     rows_j = [f"      source subs: {subtxt}", f"      audio:       {audtxt}"]
                     if i == pos:
@@ -5142,6 +5732,10 @@ def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
                         return ("run", chosen)
                 elif k == ("char", "o"):
                     return ("over", pos)
+                elif k == ("char", "s"):
+                    return ("subs",)
+                elif k == ("char", "u"):
+                    return ("audio",)
                 elif k == ("char", " "):
                     sel[pos] = not sel[pos]
                 elif k == ("char", "a"):
@@ -5150,6 +5744,8 @@ def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
                         sel[j] = not allon
                 elif k == ("char", "v"):
                     cfg["use_video"] = not cfg["use_video"]
+                elif k == ("char", "k"):
+                    cfg["kf"] = not cfg.get("kf")
                 elif k == ("char", "e"):
                     cfg["eng_i"] = (cfg["eng_i"] + 1) % 2
                 elif k == ("char", "r"):
@@ -5176,6 +5772,57 @@ def _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names):
             _fb_leave_screen()
             sys.stdout.write("\x1b[2J\x1b[H")
             sys.stdout.flush()
+
+
+def _ask_gemini_model_menu(key, default="gemini-2.0-flash"):
+    """Fullscreen arrow-select menu of Gemini models fetched ONLINE from the API (only those that
+    support text generation), with a built-in fallback. Returns the chosen model id."""
+    models = []
+    if key:
+        try:
+            print(f"{Fore.CYAN}Loading available Gemini models...{Style.RESET_ALL}")
+            for m in gemini_list_models(key):
+                if "generateContent" in m.get("supportedGenerationMethods", []):
+                    mid = (m.get("name", "").split("/")[-1])
+                    if mid and "embedding" not in mid and "aqa" not in mid:
+                        models.append((mid, (m.get("displayName", "") or "")))
+        except Exception as e:
+            log_warn(f"Could not load the online model list ({e}) - using the built-in list.")
+    if not models:
+        models = list(_GEMINI_STATIC_MODELS)
+    seen, uniq = set(), []
+    for mid, desc in models:
+        if mid not in seen:
+            seen.add(mid)
+            uniq.append((mid, desc))
+    # flash/current first (they usually carry the free quota), then the rest
+    uniq.sort(key=lambda md: (0 if "flash" in md[0] else 1, md[0]))
+
+    def _hint(mid):
+        m = mid.lower()
+        if "2.0-flash-lite" in m or "flash-8b" in m:
+            return "FREE", "~30 req/min, no daily cap on free tier"
+        if "2.5-flash-lite" in m:
+            return "FREE", "~15 req/min free tier"
+        if "2.0-flash" in m:
+            return "FREE", "~15 req/min, ~1500 req/day free tier"
+        if "2.5-flash" in m:
+            return "LIMITED", "tiny/none free tier (you hit this)"
+        if "pro" in m:
+            return "PAID", "little or no free tier"
+        if "1.5" in m:
+            return "GONE", "removed from the API"
+        return "?", "quota unknown - check on 429"
+    tagcol = {"FREE": Fore.GREEN, "LIMITED": Fore.YELLOW, "PAID": Fore.RED, "GONE": Style.DIM, "?": Style.DIM}
+    labels = []
+    for mid, desc in uniq:
+        tag, note = _hint(mid)
+        labels.append(f"{mid:<24} {tagcol[tag]}{tag:<8}{Style.RESET_ALL} {Style.DIM}{note}{Style.RESET_ALL}")
+    pre = next((i for i, (mid, _) in enumerate(uniq) if mid == default), 0)
+    r = _ask_checkbox("Gemini model - this feature makes MANY calls, so prefer FREE. Quota labels are "
+                      "approximate and vary by account/region; the real limit shows in a 429 error:", labels,
+                      preselect=[pre], single=True)
+    return (uniq[r[0]][0] if r else default)
 
 
 def run_gender_translate(args):
@@ -5221,41 +5868,62 @@ def run_gender_translate(args):
     sub_langs = sorted(sub_count, key=lambda l: (-sub_count[l], l))
     aud_langs = sorted(aud_count, key=lambda l: (-aud_count[l], l)) or ["und"]
 
-    # global source subtitle + audio language via arrows+enter (override per-episode in the picker)
-    gi = ask_pick("Source SUBTITLE language to translate FROM (global; override per-episode next):",
-                  [f"{_lang3_name(l)} ({l}) - {sub_count[l]} video(s)" for l in sub_langs], default=0)
-    if gi is None:
+    def _pick_sub():
+        r = _ask_checkbox("Source SUBTITLE language to translate FROM (global; override per-episode later):",
+                          [f"{_lang3_name(l)} ({l}) - {sub_count[l]} video(s)" for l in sub_langs],
+                          preselect=[0], single=True)
+        return (sub_langs[r[0]] if r else None)
+
+    def _pick_auds(pre=(0,)):
+        r = _ask_checkbox("AUDIO track(s) for gender detection - pick 1 or more (more tracks that agree "
+                          "= higher confidence):",
+                          [f"{_lang3_name(l)} ({l}) - {aud_count.get(l, 0)} video(s)" for l in aud_langs],
+                          preselect=list(pre))
+        return ([aud_langs[i] for i in r] if r else None)
+
+    global_sub = _pick_sub()
+    if global_sub is None:
         return
-    global_sub = sub_langs[gi]
-    ga = ask_pick("AUDIO language used for speaker-gender detection (global):",
-                  [f"{_lang3_name(l)} ({l}) - {aud_count.get(l, 0)} video(s)" for l in aud_langs], default=0)
-    if ga is None:
+    global_auds = _pick_auds()
+    if global_auds is None:
         return
-    global_aud = aud_langs[ga]
 
     gpu_names = _list_gpus()
     di = _discrete_gpu_index()
     cfg = {"use_video": True, "gpu": True, "dev": (di if di is not None else "auto"),
-           "eng_i": 0, "want_report": True, "sel": [True] * len(videos), "over": {}, "pos": 0}
+           "eng_i": 0, "want_report": True, "sel": [True] * len(videos), "over": {}, "pos": 0,
+           "global_sub": global_sub, "global_auds": global_auds, "kf": False}
     while True:
-        res = _gender_picker(videos, vinfo, global_sub, global_aud, cfg, gpu_names)
+        res = _gender_picker(videos, vinfo, cfg, gpu_names)
         if res is None:
             log_info("Cancelled.")
             return
+        if res[0] == "subs":                                   # change global source subtitle
+            ns = _pick_sub()
+            if ns:
+                cfg["global_sub"] = ns
+            continue
+        if res[0] == "audio":                                  # change global audio track(s)
+            pre = tuple(aud_langs.index(x) for x in cfg["global_auds"] if x in aud_langs)
+            na = _pick_auds(pre or (0,))
+            if na:
+                cfg["global_auds"] = na
+            continue
         if res[0] == "over":                                   # per-episode track override
             v = videos[res[1]]
             vs, va = sorted(vinfo[v][0]), sorted(vinfo[v][1])
-            sub_o = aud_o = None
+            sub_o, aud_o = None, None
             if vs:
-                si = ask_pick(f"SUBTITLE language for {Path(v).name}:",
-                              [f"{_lang3_name(l)} ({l})" for l in vs] + ["(use global default)"], default=len(vs))
-                if si is not None and si < len(vs):
-                    sub_o = vs[si]
+                si = _ask_checkbox(f"SUBTITLE language for {Path(v).name} (Esc = keep global):",
+                                   [f"{_lang3_name(l)} ({l})" for l in vs], single=True)
+                if si:
+                    sub_o = vs[si[0]]
             if va:
-                aj = ask_pick(f"AUDIO language for {Path(v).name}:",
-                              [f"{_lang3_name(l)} ({l})" for l in va] + ["(use global default)"], default=len(va))
-                if aj is not None and aj < len(va):
-                    aud_o = va[aj]
+                pre = [va.index(x) for x in cfg["global_auds"] if x in va]
+                aj = _ask_checkbox(f"AUDIO track(s) for {Path(v).name} (empty = use global):",
+                                   [f"{_lang3_name(l)} ({l})" for l in va], preselect=pre)
+                if aj:
+                    aud_o = [va[k] for k in aj]
             if sub_o or aud_o:
                 cfg["over"][v] = (sub_o, aud_o)
             elif v in cfg["over"]:
@@ -5263,16 +5931,20 @@ def run_gender_translate(args):
             continue
         chosen = res[1]
         break
+    global_sub, global_auds = cfg["global_sub"], cfg["global_auds"]
 
     engine = ["gemini", "claude"][cfg["eng_i"] % 2]
     use_video, want_report = cfg["use_video"], cfg["want_report"]
     if engine == "gemini":
         key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
                or os.environ.get("GOOGLE_AI_API_KEY") or ask_text("Gemini API key (aistudio.google.com)", ""))
-        model = getattr(args, "gemini_model", None) or ask_gemini_model(
-            "Gemini model  (2.5-flash has almost no free quota; 'gemini-1.5-flash' or "
-            "'gemini-2.0-flash' usually do - ? for the list)", "gemini-1.5-flash", args)
-        args.gemini_model = getattr(args, "gemini_model", None) or model
+        cfgmodel = getattr(args, "gemini_model", None)
+        # this feature makes MANY calls, so a model with real free quota matters. gemini-2.5-flash
+        # usually has none, and gemini-1.5-* was removed from the API -> default to gemini-2.0-flash.
+        stale = (not cfgmodel or cfgmodel in ("gemini-2.5-flash", "gemini-1.5-flash", "gemini-1.5-flash-8b"))
+        default_model = "gemini-2.0-flash" if stale else cfgmodel
+        model = _ask_gemini_model_menu(key, default_model)
+        args.gemini_model = model
     else:
         key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
                or ask_text("Anthropic API key", ""))
@@ -5281,13 +5953,22 @@ def run_gender_translate(args):
         die("No API key - the gender hints need an AI engine (gemini/claude).")
 
     detect = "audio+video" if use_video else "audio"
+    dbg(f"gender-translate: {len(chosen)} video(s) | engine={engine} model={model} | detect={detect} | "
+        f"global_sub={global_sub} global_auds={'+'.join(global_auds)} | video={use_video} "
+        f"gpu={cfg['gpu']} dev={cfg['dev']} decode={'keyframe' if cfg.get('kf') else 'full'} "
+        f"report={want_report} | opencv={_opencv_version()}", "INIT")
     done = 0
     for i, v in enumerate(chosen, 1):
         o = cfg["over"].get(v)
         src_lang = (o[0] if o and o[0] else global_sub)
-        aud_lang = (o[1] if o and o[1] else global_aud)
+        auds_wanted = (o[1] if o and o[1] else global_auds)
         src_name = _lang3_name(src_lang)
-        log_info(f"[{i}/{len(chosen)}] {Path(v).name}  {Style.DIM}(subs {src_lang}, audio {aud_lang}){Style.RESET_ALL}")
+        stem = Path(v).stem[:22]
+        # keep only requested audio langs present in this video (fallback to the first track)
+        want = [al for al in auds_wanted if al in vinfo[v][1]]
+        if not want and vinfo[v][1]:
+            want = [next(iter(vinfo[v][1]))]
+        log_info(f"[{i}/{len(chosen)}] {Path(v).name}  {Style.DIM}(subs {src_lang}, audio {'+'.join(want) or '-'}){Style.RESET_ALL}")
         try:
             events, _tr = extract_subtitle_events(args, v, ref_lang=src_lang)
         except Exception as e:
@@ -5296,30 +5977,69 @@ def run_gender_translate(args):
         if not events:
             log_warn("    no subtitle events - skipping.")
             continue
-        apos = vinfo[v][1].get(aud_lang, 0)
+        dbg(f"[{i}/{len(chosen)}] {Path(v).name}: subs={src_lang} audio={'+'.join(want)} "
+            f"cues={len(events)} video={'on' if use_video else 'off'}")
+        aud_list = []
+        _t0 = time.perf_counter()
         with tempfile.TemporaryDirectory(dir=_temp_root()) as td:
-            wav = Path(td) / "a.wav"
-            try:
-                extract_audio_wav(ffmpeg_bin, Path(v), apos, wav, sample_rate=16000,
-                                  progress_prefix=f"  {Path(v).stem[:22]} reading {aud_lang} audio ")
-                samples, sr = read_wav_mono(wav)
-            except Exception as e:
-                log_warn(f"    could not read audio ({e}) - skipping.")
-                continue
-        aud = _gender_from_audio(samples, sr, events, prefix=f"  {Path(v).stem[:22]} audio gender ")
-        vid = (_gender_from_video(ffmpeg_bin, v, events, prefix=f"  {Path(v).stem[:22]} video gender ",
-                                  gpu=cfg["gpu"], dev=cfg["dev"]) if use_video else None)
+            for al in want:
+                apos = vinfo[v][1].get(al, 0)
+                wav = Path(td) / f"a_{al}.wav"
+                try:
+                    extract_audio_wav(ffmpeg_bin, Path(v), apos, wav, sample_rate=16000,
+                                      progress_prefix=f"  {stem} reading {al} audio ")
+                    samples, sr = read_wav_mono(wav)
+                except Exception as e:
+                    log_warn(f"    could not read {al} audio ({e})")
+                    dbg(f"    audio track {al} (pos {apos}) read failed: {e}")
+                    continue
+                lab = f"  {stem} {al} gender " if len(want) > 1 else f"  {stem} audio gender "
+                aud_list.append(_gender_from_audio(samples, sr, events, prefix=lab))
+        if not aud_list:
+            log_warn("    no usable audio track - skipping.")
+            continue
+        aud = _gender_audio_merge(aud_list)
+        _t_audio = time.perf_counter() - _t0
+        _t0 = time.perf_counter()
+        vid = (_gender_from_video(ffmpeg_bin, v, events, prefix=f"  {stem} video gender ",
+                                  gpu=cfg["gpu"], dev=cfg["dev"], keyframe=cfg.get("kf", False)) if use_video else None)
+        _t_video = time.perf_counter() - _t0
         comb = _gender_combine(aud, vid)
-        log_info(f"    detected: {sum(1 for c in comb if c['g']=='M')} male, "
-                 f"{sum(1 for c in comb if c['g']=='F')} female, {sum(1 for c in comb if c['g']=='?')} unknown")
+        if len(aud_list) > 1:
+            log_info(f"    merged {len(aud_list)} audio track(s): {'+'.join(want)}")
+        for _ln in _gender_summary_lines(aud, vid, comb):
+            print(_ln)
+        _t0 = time.perf_counter()
         with _dbg_timer(f"gender-translate {Path(v).name}"):
             translated = _gender_translate(events, comb, engine, key, model, src_name)
+        _t_tr = time.perf_counter() - _t0
+        n_changed = sum(1 for e, t in zip(events, translated) if t["text"] != e["text"])
+        timings = {"audio": _t_audio, "video": _t_video, "translate": _t_tr}
+        dbg_block = _gender_debug_block(aud_list, want, aud, vid, comb, timings, cfg, engine, model, detect)
+        dbg_block["translation"] = dict(lines=len(events), changed=n_changed)
+        dbg(f"    stats: audio {_t_audio:.1f}s video {_t_video:.1f}s translate {_t_tr:.1f}s | "
+            f"combined M={dbg_block['combined']['M']} F={dbg_block['combined']['F']} "
+            f"?={dbg_block['combined']['U']} | translated {n_changed}/{len(events)}"
+            + (f" | audio-vs-video agree={dbg_block['audio_vs_video']['agree']} "
+               f"disagree={dbg_block['audio_vs_video']['disagree']}" if vid else ""))
         outp = Path(v).with_name(Path(v).stem + ".cze.srt")
         write_srt(translated, outp)
         log_done(f"    saved {outp.name} ({len(translated)} lines)")
+        # full machine-readable debug block: always to the --debug / --debug-gui log, and to the
+        # report JSON when the report is on, or a standalone .gender.debug.json when it isn't.
+        if _DEBUG:
+            dbg("gender debug block: " + json.dumps(dbg_block, ensure_ascii=False))
         if want_report:
             _write_gender_report(os.path.splitext(str(outp))[0], v, src_name, engine, detect,
-                                 events, translated, aud, vid, comb)
+                                 events, translated, aud, vid, comb, debug=dbg_block)
+        elif _DEBUG:
+            try:
+                with open(os.path.splitext(str(outp))[0] + ".gender.debug.json", "w", encoding="utf-8") as f:
+                    json.dump(dict(video=os.path.basename(str(v)), src_lang=src_name, engine=engine,
+                                   model=model, detect=detect, debug=dbg_block), f, ensure_ascii=False, indent=1)
+                dbg(f"    wrote {os.path.basename(os.path.splitext(str(outp))[0])}.gender.debug.json")
+            except Exception as _e:
+                dbg(f"    could not write standalone gender.debug.json: {_e}")
         done += 1
     print()
     log_done(f"Done: {done}/{len(chosen)} subtitle track(s) translated into Czech (gender-aware).")
