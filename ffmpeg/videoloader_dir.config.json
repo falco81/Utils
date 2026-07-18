@@ -13,6 +13,8 @@
   "DEFAULT_MAX_HEIGHT": 0,
   "SCAN_LINK_CAP": 300,
   "SCAN_PAGE_WORKERS": 4,
+  "PREVIEW_MAX_SECONDS": 120,
+  "PREVIEW_MAX_MB": 60,
   "FFMPEG": "ffmpeg",
   "FFMPEG_DOWNLOAD_URL": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
   "FFMPEG_PROGRAM_FILES_DIRS": [
