@@ -145,6 +145,7 @@ Usage
 """
 
 import argparse
+import base64
 import datetime
 import fnmatch
 import json
@@ -312,6 +313,8 @@ def _debug_start(args=None):
     if _DEBUG_FH is None:
         return
     _DEBUG = True
+    global _RETIME_REPORT
+    _RETIME_REPORT = True          # debug run -> always produce the diagnostic reports as well
     dbg("=== video_tools debug log ===", "INIT")
     dbg(f"started: {datetime.datetime.now().isoformat(timespec='seconds')}", "INIT")
     dbg(f"python: {sys.version.split()[0]}  platform: {sys.platform}  os: {os.name}", "INIT")
@@ -4054,6 +4057,141 @@ def gemini_list_models(api_key, timeout=30):
     return data.get("models", [])
 
 
+def _ollama_base():
+    return os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434").rstrip("/")
+
+
+_OLLAMA_LOADED = set()          # models this run loaded into Ollama, to free on exit
+
+
+def _ollama_unload(model):
+    """Tell Ollama to drop a model from memory now (keep_alive=0), freeing VRAM/RAM."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(_ollama_base() + "/api/generate",
+                                     data=json.dumps({"model": model, "keep_alive": 0}).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        urllib.request.urlopen(req, timeout=15).read()
+        return True
+    except Exception:
+        return False
+
+
+def _ollama_unload_all():
+    """Free every Ollama model this run touched. Registered with atexit so it always runs on exit."""
+    if not _OLLAMA_LOADED:
+        return
+    for m in list(_OLLAMA_LOADED):
+        if _ollama_unload(m):
+            dbg(f"ollama: unloaded {m} (freed VRAM)")
+    _OLLAMA_LOADED.clear()
+
+
+_atexit.register(_ollama_unload_all)
+
+
+def _ollama_ps_lines():
+    """Query Ollama /api/ps -> lines showing each currently loaded model and its GPU/CPU split
+    (from size_vram vs size). Returns None if Ollama isn't reachable."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(_ollama_base() + "/api/ps", timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return None
+    models = data.get("models", []) or []
+    if not models:
+        return ["(no models loaded right now)"]
+    out = []
+    for m in models:
+        size = m.get("size", 0) or 0
+        vram = m.get("size_vram", 0) or 0
+        pct = round(vram / size * 100) if size > 0 else 0
+        where = ("100% GPU" if pct >= 99 else (f"{pct}% GPU / {100 - pct}% CPU" if pct > 0 else "100% CPU"))
+        out.append(f"{m.get('name', '?')}  {size / (1024 ** 3):.1f} GB  ->  {where}")
+    return out
+
+
+def _ollama_models():
+    """Locally installed Ollama models (list of names), or None if Ollama isn't reachable."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(_ollama_base() + "/api/tags", timeout=5) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return [m["name"] for m in data.get("models", []) if m.get("name")]
+    except Exception:
+        return None
+
+
+_VISION_MODEL_HINTS = ("vl", "vision", "llava", "minicpm-v", "moondream", "bakllava")
+
+
+def _is_vision_model(name):
+    """True for image-input models. They must not be picked for TEXT work (grammar/gender correction):
+    'qwen2.5vl:7b' is a vision model and is much weaker at Czech than a same-size text model."""
+    fam = str(name or "").split(":")[0].lower()
+    return any(fam.endswith(t) or t in fam.split("-") or fam.endswith("-" + t)
+               for t in _VISION_MODEL_HINTS) or "vision" in fam or "llava" in fam
+
+
+def _ollama_best_default(models, text_only=True):
+    """Pick a sensible default: strong multilingual instruct models, larger first. Vision models are
+    skipped for text tasks (matching is family-exact, so 'qwen2.5' never selects 'qwen2.5vl')."""
+    cand = [m for m in models if not (text_only and _is_vision_model(m))] or list(models)
+    pref = ["qwen3:32b", "gemma3:27b", "qwen3:30b-a3b", "aya-expanse:32b", "qwen2.5:32b", "gemma2:27b",
+            "qwen3:14b", "gemma3:12b", "qwen2.5:14b", "aya-expanse:8b", "qwen3:8b", "qwen2.5:7b",
+            "gemma2:9b", "llama3.1:8b"]
+    for p in pref:
+        fam = p.split(":")[0]
+        for m in cand:
+            if m == p or m.split(":")[0] == fam:
+                return m
+
+    def size(m):
+        mm = re.search(r"(\d+)b", m.lower())
+        return int(mm.group(1)) if mm else 0
+    return max(cand, key=size) if cand else None
+
+
+def _ollama_generate(prompt, model, system=None, timeout=1200, temperature=0.2, num_ctx=8192):
+    """Generate from a local Ollama model. Raises on transport error, _FatalAPIError on a clear
+    'model not found' so the caller can stop retrying."""
+    import urllib.request
+    import urllib.error
+    body = {"model": model, "prompt": prompt, "stream": False,
+            "options": {"temperature": temperature, "num_ctx": num_ctx}}
+    if system:
+        body["system"] = system
+    # 'thinking' models (qwen3, deepseek-r1, ...) waste lots of time/tokens reasoning before answering,
+    # which doesn't help subtitle translation - disable it for a big speedup. Safe name-gated so we
+    # don't send 'think' to models that would reject it.
+    if model and any(t in model.lower() for t in ("qwen3", "deepseek-r1", "magistral", "-r1", "qwq")):
+        body["think"] = False
+    _OLLAMA_LOADED.add(model)                 # free it on exit
+    req = urllib.request.Request(_ollama_base() + "/api/generate",
+                                 data=json.dumps(body).encode("utf-8"),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode("utf-8")).get("response", "").strip()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            pass
+        if "think" in detail.lower() and body.get("think") is False:   # older Ollama/model: retry plain
+            body.pop("think", None)
+            req2 = urllib.request.Request(_ollama_base() + "/api/generate",
+                                          data=json.dumps(body).encode("utf-8"),
+                                          headers={"Content-Type": "application/json"}, method="POST")
+            with urllib.request.urlopen(req2, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8")).get("response", "").strip()
+        if e.code == 404 or "not found" in detail.lower():
+            raise _FatalAPIError(f"Ollama model '{model}' not found - run: ollama pull {model}")
+        raise RuntimeError(f"Ollama HTTP {e.code}: {detail}")
+
+
 def _print_gemini_models(args=None):
     key = ((getattr(args, "gemini_key", None) if args else None)
            or os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY"))
@@ -4703,6 +4841,9 @@ _GENDER_ONNX = {
     "gender": ("gender_googlenet.onnx",
                "https://github.com/onnx/models/raw/main/validated/vision/body_analysis/age_gender/models/gender_googlenet.onnx"),
 }
+# InsightFace 'genderage' (inside buffalo_l) - trained on diverse data incl. Asian faces, so it is
+# noticeably better for Korean/Japanese actors than the 2015 gender_googlenet.
+_BUFFALO_URL = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
 
 
 def _has_directml():
@@ -4717,18 +4858,44 @@ def _has_directml():
 
 
 def _gender_onnx_fetch():
-    """Download (once, cached) the YuNet face ONNX + gender ONNX. These make the GPU path work AND
-    remove the Caffe dependency, so video gender also runs on OpenCV 5.x."""
+    """Download (once, cached) YuNet + the gender model. Prefers InsightFace 'genderage' (robust on
+    Asian faces); falls back to gender_googlenet if the InsightFace pack can't be fetched. Returns
+    {yunet, gender, kind} where kind is 'insightface' or 'googlenet'."""
     import urllib.request
     d = _gender_model_dir()
-    paths = {}
-    for k, (fn, url) in _GENDER_ONNX.items():
-        p = d / fn
-        if not p.exists() or p.stat().st_size < 50000:
-            log_info(f"    downloading ONNX model {fn} (first run only) ...")
-            urllib.request.urlretrieve(url, str(p))
-        paths[k] = str(p)
-    return paths
+    # YuNet face detector
+    yp = d / _GENDER_ONNX["yunet"][0]
+    if not yp.exists() or yp.stat().st_size < 50000:
+        log_info(f"    downloading model {yp.name} (first run only) ...")
+        urllib.request.urlretrieve(_GENDER_ONNX["yunet"][1], str(yp))
+    # InsightFace genderage: reuse one already in the working dir (e.g. from the test), else pull it
+    # out of buffalo_l.zip
+    ga = d / "genderage.onnx"
+    if not ga.exists() or ga.stat().st_size < 100000:
+        local = Path.cwd() / "genderage.onnx"
+        try:
+            if local.exists() and local.stat().st_size > 100000:
+                shutil.copy(str(local), str(ga))
+            else:
+                import zipfile
+                import io as _io
+                log_info("    downloading InsightFace genderage model (~280 MB pack, first run only) ...")
+                data = urllib.request.urlopen(_BUFFALO_URL, timeout=900).read()
+                with zipfile.ZipFile(_io.BytesIO(data)) as z:
+                    for n in z.namelist():
+                        if n.endswith("genderage.onnx"):
+                            ga.write_bytes(z.read(n))
+                            break
+        except Exception as e:
+            dbg(f"video gender: genderage fetch failed ({str(e)[:70]}) -> gender_googlenet")
+    if ga.exists() and ga.stat().st_size > 100000:
+        return {"yunet": str(yp), "gender": str(ga), "kind": "insightface"}
+    # fallback: gender_googlenet
+    gg = d / _GENDER_ONNX["gender"][0]
+    if not gg.exists() or gg.stat().st_size < 50000:
+        log_info(f"    downloading model {gg.name} (first run only) ...")
+        urllib.request.urlretrieve(_GENDER_ONNX["gender"][1], str(gg))
+    return {"yunet": str(yp), "gender": str(gg), "kind": "googlenet"}
 
 
 def _gender_pick_dml_device(ort, gender_model):
@@ -4767,7 +4934,7 @@ def _gender_pick_dml_device(ort, gender_model):
     return best
 
 
-def _gender_onnx_setup(cv2):
+def _gender_onnx_setup(cv2, vlm_model=None):
     """Build a GPU (DirectML) face+gender pipeline: YuNet face detector (ONNX; works on any OpenCV
     >= 4.5.4 incl. 5.x) + gender_googlenet on onnxruntime-DirectML (auto-picked discrete GPU).
     Returns a dict, or None so the caller falls back to the OpenCV Caffe CPU path."""
@@ -4802,39 +4969,35 @@ def _gender_onnx_setup(cv2):
     except Exception as e:
         dbg(f"video gender: ONNX setup failed ({e}) -> CPU path")
         return None
-    log_info(f"    face+gender DNN on GPU via onnxruntime-DirectML (device {did}, {ms:.1f} ms/infer).")
+    log_info(f"    face+gender DNN on GPU via onnxruntime-DirectML (device {did}, {ms:.1f} ms/infer, "
+             f"{'InsightFace' if m['kind'] == 'insightface' else 'googlenet'} gender model).")
     return {"fd": fd, "gsess": gsess, "gin": gsess.get_inputs()[0].name,
-            "label": f"DirectML dev{did}"}
+            "kind": m["kind"], "vlm": vlm_model, "label": f"DirectML dev{did} {m['kind']}"}
 
 
 def _gender_face_onnx(backend, img, cv2):
-    """Largest face via YuNet + gender via the DirectML gender net. Returns (g, conf). The face
-    detection is downscaled to <=640px (YuNet on a full 1080p frame is slow on the CPU); the box is
-    scaled back and the gender crop is taken from the full-resolution frame."""
+    """Largest face via YuNet + gender via the DirectML gender net. Returns (g, conf, box) where box
+    is (x1,y1,x2,y2) in full-res coords (or None). Detection runs at up to 1920px (full res for 1080p)
+    so small/distant faces are found accurately; the gender crop is taken from the full-res frame."""
     import numpy as np
     try:
         h, w = img.shape[:2]
-        scale = 640.0 / max(w, h) if max(w, h) > 640 else 1.0
+        scale = 1920.0 / max(w, h) if max(w, h) > 1920 else 1.0
         det = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale)))) if scale < 1.0 else img
         dh, dw = det.shape[:2]
         fd = backend["fd"]
         fd.setInputSize((dw, dh))
         _, faces = fd.detect(det)
         if faces is None or len(faces) == 0:
-            return "?", 0.0
+            return "?", 0.0, None
         f = max(faces, key=lambda a: a[2] * a[3])
         x, y, fw, fh = (int(max(0, v) / scale) for v in f[:4])   # box back to full resolution
-        crop = img[y:min(h, y + fh), x:min(w, x + fw)]
-        if crop.size == 0:
-            return "?", 0.0
-        blob = cv2.resize(crop, (224, 224)).astype(np.float32)
-        blob -= np.array([104.0, 117.0, 123.0], np.float32)      # BGR mean (googlenet)
-        blob = blob.transpose(2, 0, 1)[None]
-        out = backend["gsess"].run(None, {backend["gin"]: blob})[0].ravel()
-        idx = int(np.argmax(out))
-        return ("M" if idx == 0 else "F"), round(float(np.max(out)), 2)   # 0=Male, 1=Female
+        box = (x, y, min(w, x + fw), min(h, y + fh))
+        if max(fw, fh) < 40:            # face too small/low-res to classify reliably -> unknown
+            return "?", 0.0, box
+        return _gender_of_box(backend, img, box, cv2)
     except Exception:
-        return "?", 0.0
+        return "?", 0.0, None
 
 
 def _gender_f0(seg, sr, fmin=75, fmax=300, vthr=0.35):
@@ -4919,6 +5082,144 @@ def _gender_smooth(out, win=6):
                 o["conf"] = 0.3
 
 
+def _whisper_available():
+    try:
+        import faster_whisper  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _add_nvidia_dll_dirs():
+    """Windows: pip's nvidia-cublas-cu12 / nvidia-cudnn-cu12 install their DLLs under
+    site-packages\\nvidia\\*\\bin but NOT on PATH, so CTranslate2 (faster-whisper) fails with
+    'cublas64_12.dll is not found'. Add those bin dirs to the DLL search path + PATH."""
+    if os.name != "nt":
+        return
+    import site
+    bases = []
+    try:
+        import nvidia
+        for p in (nvidia.__path__ if hasattr(nvidia, "__path__") else []):
+            bases.append(p)
+    except Exception:
+        pass
+    try:
+        sps = list(site.getsitepackages()) if hasattr(site, "getsitepackages") else []
+    except Exception:
+        sps = []
+    try:
+        sps.append(site.getusersitepackages())
+    except Exception:
+        pass
+    for sp in sps:
+        bases.append(os.path.join(sp, "nvidia"))
+    seen = set()
+    for base in bases:
+        if not base or not os.path.isdir(base):
+            continue
+        for root, _dn, _fn in os.walk(base):
+            if os.path.basename(root).lower() == "bin" and root not in seen:
+                seen.add(root)
+                try:
+                    if hasattr(os, "add_dll_directory"):
+                        os.add_dll_directory(root)
+                    os.environ["PATH"] = root + os.pathsep + os.environ.get("PATH", "")
+                    dbg(f"whisper: added CUDA DLL dir {root}")
+                except Exception:
+                    pass
+
+
+def _whisper_transcribe(wav_path, model_size="large-v3", prefix=None):
+    """Transcribe Korean speech with faster-whisper -> [{start,end,text}] (Korean). Uses the CUDA GPU
+    if available (fast on NVIDIA), else CPU int8. None if faster-whisper isn't installed / fails."""
+    _add_nvidia_dll_dirs()
+    try:
+        from faster_whisper import WhisperModel
+    except Exception:
+        return None
+    # Try each device with a FULL transcribe: on NVIDIA the model may CREATE on cuda but only FAIL
+    # at inference (e.g. missing cuDNN), so we must fall back to CPU around the whole run, not just
+    # around model creation.
+    for device, ctype in (("cuda", "float16"), ("cpu", "int8")):
+        try:
+            model = WhisperModel(model_size, device=device, compute_type=ctype)
+            segs, info = model.transcribe(wav_path, language="ko", beam_size=5, vad_filter=True,
+                                          condition_on_previous_text=True)
+            total = float(getattr(info, "duration", 0) or 0)
+            out = []
+            for s in segs:                      # iterating drives the actual inference
+                out.append({"start": float(s.start), "end": float(s.end), "text": (s.text or "").strip()})
+                if prefix:
+                    if total > 0:
+                        _print_progress(min(int(s.end), int(total)), int(total), prefix=prefix, unit="x rt")
+                    elif len(out) % 20 == 0:
+                        sys.stdout.write(f"\r{prefix}{len(out)} segments...")
+                        sys.stdout.flush()
+            if prefix and total > 0:
+                _print_progress(int(total), int(total), prefix=prefix, unit="x rt")
+            if prefix:
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+            dbg(f"whisper: {model_size} on {device} ({ctype}), {len(out)} segments")
+            return out
+        except Exception as e:
+            dbg(f"whisper: {device} failed ({str(e)[:90]}) - trying next device")
+    dbg("whisper: no usable device (install nvidia-cudnn-cu12 for GPU, or check faster-whisper)")
+    return None
+
+
+def _ko_transcribe_cached(ffmpeg_bin, video, audio_pos, model_size, prefix=None):
+    """Korean transcription of the video's audio, cached to <video>.ko.json so re-runs are instant."""
+    cache = Path(str(video)).with_suffix(".ko.json")
+    if cache.exists():
+        try:
+            data = json.loads(cache.read_text(encoding="utf-8"))
+            if data:
+                dbg(f"ko transcribe: loaded cache {cache.name} ({len(data)} segments)")
+                return data
+        except Exception:
+            pass
+    td = tempfile.mkdtemp(prefix="kowav_", dir=_temp_root())
+    try:
+        wav = Path(td) / "ko.wav"
+        try:
+            extract_audio_wav(ffmpeg_bin, Path(video), audio_pos, wav, sample_rate=16000,
+                              progress_prefix=(prefix + "extract audio ") if prefix else None)
+        except Exception as e:
+            dbg(f"ko transcribe: audio extract failed {e}")
+            return None
+        segs = _whisper_transcribe(str(wav), model_size, prefix=prefix)
+    finally:
+        shutil.rmtree(td, ignore_errors=True)       # Windows: avoid WinError 32 on locked temp
+    if segs:
+        try:
+            cache.write_text(json.dumps(segs, ensure_ascii=False), encoding="utf-8")
+            dbg(f"ko transcribe: {len(segs)} segments, cached to {cache.name}")
+        except Exception:
+            pass
+    return segs
+
+
+def _align_ko_to_cues(events, segs):
+    """For each cue's time window, the overlapping Korean transcription text (source-of-truth)."""
+    if not segs:
+        return None
+    out = []
+    i0, n = 0, len(segs)
+    for e in events:
+        cs, ce = e["start"] - 0.5, e["end"] + 0.5
+        while i0 < n and segs[i0]["end"] < cs:
+            i0 += 1
+        parts, k = [], i0
+        while k < n and segs[k]["start"] <= ce:
+            if segs[k]["end"] >= cs and segs[k]["text"]:
+                parts.append(segs[k]["text"])
+            k += 1
+        out.append(" ".join(parts).strip())
+    return out
+
+
 def _gender_from_audio(samples, sr, events, prefix=None):
     """Per-cue speaker gender from voice pitch, with a per-track adaptive threshold + temporal
     smoothing. Returns [{g, f0, conf}] aligned with events."""
@@ -4926,7 +5227,7 @@ def _gender_from_audio(samples, sr, events, prefix=None):
     f0s = []
     for i, e in enumerate(events):
         if prefix and (i % 25 == 0 or i == n - 1):
-            _print_progress(i + 1, n, prefix=prefix)
+            _print_progress(i + 1, n, prefix=prefix, unit=" cues/s")
         a = int(e["start"] * sr)
         b = int(min(e["end"], e["start"] + 8.0) * sr)
         f0s.append(_gender_f0(samples[max(0, a):max(a + 1, b)], sr))
@@ -4947,7 +5248,7 @@ def _gender_from_audio(samples, sr, events, prefix=None):
 
 
 def _gender_face(fd, gn, img, cv2):
-    """Detect the most prominent face and classify its gender. Returns (g, conf)."""
+    """Detect the most prominent face and classify its gender. Returns (g, conf, box)."""
     h, w = img.shape[:2]
     blob = cv2.dnn.blobFromImage(cv2.resize(img, (300, 300)), 1.0, (300, 300), (104, 177, 123))
     fd.setInput(blob)
@@ -4961,17 +5262,18 @@ def _gender_face(fd, gn, img, cv2):
         if area > barea:
             barea, best = area, (x1, y1, x2, y2)
     if not best:
-        return "?", 0.0
+        return "?", 0.0, None
     x1, y1, x2, y2 = best
+    box = (int(max(0, x1)), int(max(0, y1)), int(min(w, x2)), int(min(h, y2)))
     pad = int(0.2 * max(1, y2 - y1))
     face = img[max(0, y1 - pad):min(h, y2 + pad), max(0, x1 - pad):min(w, x2 + pad)]
     if face.size == 0:
-        return "?", 0.0
+        return "?", 0.0, box
     gb = cv2.dnn.blobFromImage(face, 1.0, (227, 227), _GENDER_MEAN, swapRB=False)
     gn.setInput(gb)
     pr = gn.forward()[0]
     gi = int(np.argmax(pr))
-    return ("M", "F")[gi], round(float(pr[gi]), 2)
+    return ("M", "F")[gi], round(float(pr[gi]), 2), box
 
 
 def _gender_gpu_diag(cv2):
@@ -5072,7 +5374,8 @@ def _gender_keyframes(ffmpeg_bin, ffprobe_bin, video, tmpd, hw, dur):
     return None, None
 
 
-def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=None, keyframe=False):
+def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=None, keyframe=False,
+                       debug_faces=None, vlm_model=None):
     """Per-cue speaker gender from the on-screen face (OpenCV DNN, one frame per cue midpoint).
     Returns [{g, conf}] or None if OpenCV / models are unavailable. gpu=True runs the DNN on the
     GPU via OpenCL (best-effort; falls back to CPU)."""
@@ -5088,7 +5391,7 @@ def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=No
     _gender_gpu_diag(cv2)                          # log GPU/CPU situation (--debug)
     # DNN backend: GPU via onnxruntime-DirectML (YuNet face + gender ONNX) if requested AND available
     # - this also works on OpenCV 5.x (no Caffe) - else the OpenCV Caffe models on CPU.
-    onnx = _gender_onnx_setup(cv2) if gpu else None
+    onnx = _gender_onnx_setup(cv2, vlm_model=vlm_model) if gpu else None
     if onnx:
         def classify(img):
             return _gender_face_onnx(onnx, img, cv2)
@@ -5193,21 +5496,325 @@ def _gender_from_video(ffmpeg_bin, video, events, prefix=None, gpu=False, dev=No
         faces = 0
         for i, e in enumerate(events):
             if prefix and (i % 25 == 0 or i == n - 1):
-                _print_progress(i + 1, n, prefix=prefix)
+                _print_progress(i + 1, n, prefix=prefix, unit=" cues/s")
             fp = _get((e["start"] + e["end"]) / 2.0)
             if fp not in cache:
                 img = cv2.imread(fp)
-                cache[fp] = classify(img) if img is not None else ("?", 0.0)
-            g, c = cache[fp]
+                if img is not None:
+                    g, c, box = classify(img)
+                else:
+                    g, c, box = "?", 0.0, None
+                thumb = None
+                if debug_faces is not None and box and img is not None:
+                    try:
+                        x1, y1, x2, y2 = box
+                        crop = img[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
+                        if crop.size:
+                            th = cv2.resize(crop, (72, 72))
+                            ok, buf = cv2.imencode(".jpg", th, [int(cv2.IMWRITE_JPEG_QUALITY), 55])
+                            if ok:
+                                thumb = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+                    except Exception:
+                        thumb = None
+                cache[fp] = (g, c, thumb)
+            g, c, thumb = cache[fp]
             if g in ("M", "F"):
                 faces += 1
             out.append({"g": g, "conf": c})
+            if debug_faces is not None:
+                debug_faces.append(thumb)
         dbg(f"video gender: {len(cache)} unique frames classified, face+gender in {faces}/{n} cues -> "
             f"M={sum(1 for x in out if x['g']=='M')} F={sum(1 for x in out if x['g']=='F')} "
             f"?={sum(1 for x in out if x['g']=='?')}")
     finally:
         shutil.rmtree(tmpd, ignore_errors=True)
     return out
+
+
+def _asd_speech_env(seg, sr, nf, fdur):
+    """Per-frame speech-band (300-3400 Hz) energy for a mono 16k window - isolates speech from music."""
+    import numpy as np
+    env = []
+    for k in range(nf):
+        s = seg[int(k * fdur * sr):int((k + 1) * fdur * sr)]
+        if len(s) < 32:
+            env.append(0.0)
+            continue
+        sp = np.abs(np.fft.rfft(s * np.hanning(len(s))))
+        fr = np.fft.rfftfreq(len(s), 1.0 / sr)
+        band = (fr >= 300) & (fr <= 3400)
+        env.append(float(np.sqrt(np.mean(sp[band] ** 2))) if band.any() else 0.0)
+    return env
+
+
+def _asd_iou(a, b):
+    ix1, iy1, ix2, iy2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    ua = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / ua if ua > 0 else 0.0
+
+
+def _asd_pearson(x, y):
+    import numpy as np
+    x, y = np.asarray(x, float), np.asarray(y, float)
+    m = min(len(x), len(y))
+    if m < 5:
+        return 0.0
+    x, y = x[:m], y[:m]
+    if x.std() < 1e-6 or y.std() < 1e-6:
+        return 0.0
+    return float(np.corrcoef(x, y)[0, 1])
+
+
+def _gender_video_asd(ffmpeg_bin, video, events, audio_pos, gpu, dev, backend, cv2,
+                      prefix=None, debug_faces=None, corr_gate=0.25):
+    """Active-speaker video gender: per cue, take a short burst of frames + the audio window, track
+    faces, and pick the one whose mouth motion CORRELATES with the speech envelope (the real speaker);
+    gender runs on that face. If no face correlates confidently (speaker off-screen / very short line)
+    it returns '?' so audio decides. Requires the ONNX/YuNet backend. Slow (per-cue) but accurate."""
+    import numpy as np
+    n = len(events)
+    out = []
+    if not backend or "fd" not in backend:
+        return None                       # ASD needs the YuNet detector; caller falls back
+    fd = backend["fd"]
+    # extract the primary (Korean) audio once for lip-sync correlation
+    samples, sr = None, 16000
+    _td = tempfile.mkdtemp(prefix="asdwav_", dir=_temp_root())
+    try:
+        _wav = Path(_td) / "asd.wav"
+        extract_audio_wav(ffmpeg_bin, Path(video), audio_pos, _wav, sample_rate=16000)
+        samples, sr = read_wav_mono(_wav)
+    except Exception as e:
+        dbg(f"video gender (ASD): audio extract failed ({e})")
+    finally:
+        shutil.rmtree(_td, ignore_errors=True)      # Windows: avoid WinError 32 on locked temp
+    if samples is None or len(samples) == 0:
+        dbg("video gender (ASD): no audio for lip-sync -> falling back to standard video detection")
+        return None
+    FPS = 25
+    g = __import__("glob")
+    tmpd = tempfile.mkdtemp(prefix="asd_", dir=_temp_root())
+    _method = _hwaccel_for_decode(ffmpeg_bin) if gpu else None
+    hw = ["-hwaccel", _method] if _method else []
+    # PHASE 1: decode the WHOLE video ONCE at 25fps/480p - one sustained GPU pass instead of 1147
+    # spiky per-cue passes. Frame at 0-based index q corresponds to time q/FPS.
+    framedir = os.path.join(tmpd, "fr")
+    os.makedirs(framedir, exist_ok=True)
+
+    def _decode_all(hwargs):
+        subprocess.run([ffmpeg_bin, "-y"] + hwargs + ["-i", str(video), "-vf", "scale=-2:480",
+                       "-r", str(FPS), "-q:v", "3", os.path.join(framedir, "f_%07d.jpg")],
+                       capture_output=True)
+        return sorted(g.glob(os.path.join(framedir, "f_*.jpg")))
+
+    if prefix:
+        sys.stdout.write(f"\r{prefix}decoding video (one GPU pass)...")
+        sys.stdout.flush()
+    allframes = _decode_all(hw)
+    if not allframes and hw:               # GPU decode gave nothing -> CPU
+        dbg("video gender (ASD): GPU full decode empty -> CPU decode")
+        hw = []
+        allframes = _decode_all([])
+    if len(allframes) < 8:
+        dbg("video gender (ASD): decode produced no frames -> falling back to standard video detection")
+        shutil.rmtree(tmpd, ignore_errors=True)
+        return None
+    dbg(f"video gender (ASD): decoded {len(allframes)} frames @ {FPS}fps/480p in one pass "
+        f"({'GPU ' + _method if hw else 'CPU'})")
+
+    # PHASE 2: process each cue from the pre-decoded frames (no more per-cue ffmpeg)
+    picked = offscreen = 0
+    frames_ok = faces_ok = 0
+    nfr = len(allframes)
+    try:
+        for i, e in enumerate(events):
+            if prefix and (i % 8 == 0 or i == n - 1):
+                _print_progress(i + 1, n, prefix=prefix, unit=" cues/s")
+            cs, ce = e["start"], e["end"]
+            t0 = max(0.0, cs - 0.15)
+            q0 = max(0, int(t0 * FPS))
+            q1 = min(nfr, int((ce + 0.3) * FPS) + 1)
+            imgs = [cv2.imread(allframes[q]) for q in range(q0, q1)]
+            imgs = [im for im in imgs if im is not None]
+            thumb = None
+            if len(imgs) < 8:
+                out.append({"g": "?", "conf": 0.0, "src": ""})
+                if debug_faces is not None:
+                    debug_faces.append(None)
+                continue
+            frames_ok += 1
+            nf = len(imgs)
+            win = nf / float(FPS)
+            grays = [cv2.cvtColor(im, cv2.COLOR_BGR2GRAY) for im in imgs]
+            a0 = int(t0 * sr)
+            seg = samples[a0:a0 + int(win * sr)] if samples is not None and len(samples) else np.zeros(int(win * sr), np.float32)
+            aeng = _asd_speech_env(seg, sr, nf, 1.0 / FPS)
+            # detect faces per frame + IoU-track
+            tracks = []
+            for fi, im in enumerate(imgs):
+                h, w = im.shape[:2]
+                fd.setInputSize((w, h))
+                _, faces = fd.detect(im)
+                if faces is None:
+                    continue
+                for f in faces:
+                    x, y, fw, fh = (int(max(0, v)) for v in f[:4])
+                    if fw < 24 or fh < 24:
+                        continue
+                    box = (x, y, x + fw, y + fh)
+                    best, bj = 0.3, -1
+                    for tj, tr in enumerate(tracks):
+                        if tr[-1][0] == fi:
+                            continue
+                        v = _asd_iou(tr[-1][1], box)
+                        if v > best:
+                            best, bj = v, tj
+                    if bj >= 0:
+                        tracks[bj].append((fi, box))
+                    else:
+                        tracks.append([(fi, box)])
+            tracks = [t for t in tracks if len(t) >= max(5, nf // 2)]
+            res = []
+            for tr in tracks:
+                bo = {fi: b for fi, b in tr}
+                keys = sorted(bo)
+                motion, prev = [], None
+                for fi in range(nf):
+                    b = bo.get(fi) or bo[min(keys, key=lambda k: abs(k - fi))]
+                    fw, fh = b[2] - b[0], b[3] - b[1]
+                    mx1, mx2 = b[0] + int(fw * 0.2), b[0] + int(fw * 0.8)
+                    my1, my2 = b[1] + int(fh * 0.55), min(grays[fi].shape[0], b[3])
+                    if mx2 <= mx1 or my2 <= my1:
+                        continue
+                    mc = cv2.resize(grays[fi][my1:my2, mx1:mx2], (48, 32)).astype("float32")
+                    if prev is not None:
+                        motion.append(float(np.mean(np.abs(prev - mc))))
+                    prev = mc
+                if len(motion) >= 5:
+                    res.append((_asd_pearson(motion, aeng[1:len(motion) + 1]), tr[len(tr) // 2][1]))
+            gender, conf, box = "?", 0.0, None
+            if res:
+                faces_ok += 1
+                res.sort(reverse=True)
+                topc, topbox = res[0]
+                second = res[1][0] if len(res) > 1 else -1.0
+                if topc >= corr_gate and (len(res) == 1 or topc - second >= 0.12):
+                    # confident active speaker -> gender on a FULL-RES frame (vision-LLM if on), HIGH conf
+                    mid = (cs + ce) / 2.0
+                    hi = os.path.join(tmpd, "hi.jpg")
+                    subprocess.run([ffmpeg_bin, "-y"] + hw + ["-ss", f"{mid:.2f}", "-i", str(video),
+                                    "-frames:v", "1", "-q:v", "2", hi], capture_output=True)
+                    him = cv2.imread(hi) if os.path.exists(hi) else None
+                    if him is not None and him.shape[0] > imgs[nf // 2].shape[0]:
+                        s2 = him.shape[0] / float(imgs[nf // 2].shape[0])
+                        hbox = tuple(int(v * s2) for v in topbox)
+                        gg, cc, _b = _gender_of_box(backend, him, hbox, cv2)
+                    else:
+                        gg, cc, _b = _gender_of_box(backend, imgs[nf // 2], topbox, cv2)
+                    gender, box = gg, topbox
+                    conf = round(min(1.0, cc) * 0.9 + 0.1, 2) if gg in ("M", "F") else 0.0  # speaker=high conf
+                    vsrc = "asd"
+                    picked += 1
+                else:
+                    # no clear on-screen speaker: fall back to the LARGEST face (full coverage) using the
+                    # fast InsightFace path (not the slow vision-LLM), tagged LOW confidence
+                    lb = max((r[1] for r in res), key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+                    gg, cc, _b = _gender_of_box(backend, imgs[nf // 2], lb, cv2, use_vlm=False)
+                    gender, box = gg, lb
+                    conf = round(cc * 0.4, 2) if gg in ("M", "F") else 0.0   # largest-face = low conf
+                    vsrc = "face"
+                    offscreen += 1
+            else:
+                vsrc = ""
+            out.append({"g": gender, "conf": round(conf, 2), "src": vsrc})
+            if debug_faces is not None:
+                if box is not None:
+                    x1, y1, x2, y2 = box
+                    crop = imgs[nf // 2][max(0, y1):y2, max(0, x1):x2]
+                    if crop.size:
+                        ok, buf = cv2.imencode(".jpg", cv2.resize(crop, (72, 72)),
+                                               [int(cv2.IMWRITE_JPEG_QUALITY), 55])
+                        if ok:
+                            thumb = "data:image/jpeg;base64," + base64.b64encode(buf).decode("ascii")
+                debug_faces.append(thumb)
+        dbg(f"video gender (ASD): frames ok in {frames_ok}/{n} cues, faces found in {faces_ok}, "
+            f"speaker picked in {picked} (conf-gated), {offscreen} left to audio (off-screen/short)")
+        if frames_ok == 0:
+            dbg("video gender (ASD): 0 cues produced frames -> falling back to standard video detection")
+            return None
+    finally:
+        shutil.rmtree(tmpd, ignore_errors=True)
+    return out
+
+
+def _ollama_vision_gender(crop_bgr, cv2, model, timeout=90):
+    """Ask an Ollama vision model (e.g. qwen2.5vl) the gender of a face crop. Returns (g, conf).
+    Slower than InsightFace but often better on Asian faces. '?' on failure/uncertainty."""
+    import urllib.request
+    import urllib.error
+    try:
+        ok, buf = cv2.imencode(".jpg", crop_bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+        if not ok:
+            return "?", 0.0
+        b64 = base64.b64encode(buf).decode("ascii")
+        _OLLAMA_LOADED.add(model)             # free it on exit
+        body = {"model": model,
+                "prompt": "This is a cropped face from a Korean/Japanese TV drama. Is this person a "
+                          "man or a woman? Answer with exactly one word: male, female, or unknown.",
+                "images": [b64], "stream": False, "options": {"temperature": 0}}
+        req = urllib.request.Request(_ollama_base() + "/api/generate", data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            resp = (json.loads(r.read().decode("utf-8")).get("response", "") or "").lower()
+    except Exception as e:
+        dbg(f"vlm gender failed: {str(e)[:70]}")
+        return "?", 0.0
+    if "female" in resp or "woman" in resp or "girl" in resp:
+        return "F", 0.9
+    if "male" in resp or "man" in resp or "boy" in resp:
+        return "M", 0.9
+    return "?", 0.0
+
+
+def _gender_of_box(backend, img, box, cv2, use_vlm=True):
+    """Gender of a specific face box. Uses the Ollama vision model if backend['vlm'] is set and
+    use_vlm is True (slower, better on Asian faces), else InsightFace / googlenet. (g, conf, box)."""
+    import numpy as np
+    try:
+        h, w = img.shape[:2]
+        x1, y1, x2, y2 = box
+        fw, fh = x2 - x1, y2 - y1
+        if use_vlm and backend.get("vlm"):
+            m = int(max(fw, fh) * 0.3)          # a little context helps the vision model
+            crop = img[max(0, y1 - m):min(h, y2 + m), max(0, x1 - m):min(w, x2 + m)]
+            if crop.size:
+                gg, cc = _ollama_vision_gender(crop, cv2, backend["vlm"])
+                if gg in ("M", "F"):
+                    return gg, cc, box
+            # fall through to InsightFace if the vision model was unsure/failed
+        if backend.get("kind") == "insightface":
+            cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            side = max(fw, fh) * 1.5
+            crop = img[max(0, int(cy - side / 2)):min(h, int(cy + side / 2)),
+                       max(0, int(cx - side / 2)):min(w, int(cx + side / 2))]
+            if crop.size == 0:
+                return "?", 0.0, box
+            blob = cv2.dnn.blobFromImage(cv2.resize(crop, (96, 96)), 1.0, (96, 96), (0, 0, 0), swapRB=True)
+            pred = backend["gsess"].run(None, {backend["gin"]: blob})[0].ravel()
+            p = np.exp(pred[:2] - pred[:2].max())
+            p = p / p.sum()
+            idx = int(np.argmax(p))
+            return ("M" if idx == 1 else "F"), float(p[idx]), box
+        crop = img[max(0, y1):y2, max(0, x1):x2]
+        if crop.size == 0:
+            return "?", 0.0, box
+        blob = cv2.resize(crop, (224, 224)).astype(np.float32) - np.array([104.0, 117.0, 123.0], np.float32)
+        out = backend["gsess"].run(None, {backend["gin"]: blob.transpose(2, 0, 1)[None]})[0].ravel()
+        idx = int(np.argmax(out))
+        return ("M" if idx == 0 else "F"), float(np.max(out)), box
+    except Exception:
+        return "?", 0.0, box
 
 
 def _gender_debug_block(aud_list, want, aud, vid, comb, timings, cfg, engine, model, detect):
@@ -5256,6 +5863,15 @@ def _gender_debug_block(aud_list, want, aud, vid, comb, timings, cfg, engine, mo
         audio_merged=_cnt(aud), video=(_cnt(vid) if vid else None),
         combined=_cnt(comb),
         audio_vs_video=(av if vid else None),
+        # how many video calls were a confident active-speaker vs a largest-face fallback
+        video_source=(dict(asd_speaker=sum(1 for v in vid if v.get("src") == "asd"),
+                           largest_face=sum(1 for v in vid if v.get("src") == "face"),
+                           none=sum(1 for v in vid if not v.get("src"))) if vid else None),
+        # where the FINAL (combined) gender came from - esp. how often video broke a borderline-audio tie
+        combined_source=dict(audio=sum(1 for c in comb if c.get("src") == "audio"),
+                             audio_plus_video=sum(1 for c in comb if c.get("src") == "audio+video"),
+                             video_over_audio=sum(1 for c in comb if c.get("src") == "video>audio"),
+                             video=sum(1 for c in comb if c.get("src") == "video")),
         combined_confidence=dict(mean=round(float(_np.mean(conf)), 3) if conf else 0,
                                  median=round(float(_np.median(conf)), 3) if conf else 0,
                                  low_lt_0_3=sum(1 for c in conf if c < 0.3)))
@@ -5325,7 +5941,7 @@ def _ask_checkbox(title, options, preselect=None, single=False):
                 cols, rows = _fb_termsize()
                 keys = ("\u2191\u2193 move | Space = select | Enter = confirm | Esc = cancel" if single
                         else "\u2191\u2193 move | Space = toggle | a = all/none | Enter = confirm | Esc = cancel")
-                head = [f"{Fore.CYAN}{Style.BRIGHT}{title}{Style.RESET_ALL}", f"{Style.DIM}{keys}{Style.RESET_ALL}", ""]
+                head = _wrap_title(title, cols) + _menu_lines(keys, cols) + [""]
                 per = max(3, rows - len(head) - 1)
                 pos = max(0, min(pos, len(options) - 1))
                 if pos < top:
@@ -5402,64 +6018,825 @@ def _gender_audio_merge(aud_list):
 
 
 def _gender_combine(aud, vid):
-    """Combine per-cue audio + (optional) video gender into a final {g, conf, src}. The data shows
-    video (the on-screen face) is wrong ~38% of the time even when audio is unambiguous - the face
-    often isn't the speaker - so AUDIO always wins. Video only REINFORCES a matching audio call or
-    FILLS a cue where audio is still unknown; it never overrides a confident audio gender."""
+    """Combine per-cue audio + (optional) video gender into a final {g, conf, src}, weighted by
+    CONFIDENCE. Audio (voice pitch) is the primary signal and wins when its F0 is clear. But when the
+    audio is BORDERLINE (F0 near the male/female threshold -> low audio confidence) AND the video has
+    a HIGH-confidence active speaker (lip-synced to the audio), the video breaks the tie - that's where
+    combining the two raises accuracy. A low-confidence video (largest-face fallback) only fills cues
+    where audio is unknown."""
     out = []
     for i in range(len(aud)):
         a = aud[i]
         v = vid[i] if vid else None
-        vok = bool(v) and v["g"] in ("M", "F")
-        if a["g"] in ("M", "F"):
-            if vok and v["g"] == a["g"]:
-                out.append({"g": a["g"], "conf": round(min(1.0, a["conf"] + v["conf"] * 0.2), 2),
-                            "src": "audio+video"})
-            else:
-                out.append({"g": a["g"], "conf": a["conf"], "src": "audio"})
-        elif vok:                                      # audio unknown -> fall back to video
-            out.append({"g": v["g"], "conf": round(v["conf"] * 0.6, 2), "src": "video"})
+        ag, ac = a["g"], a.get("conf", 0.0)
+        vg, vc = (v["g"], v.get("conf", 0.0)) if v else ("?", 0.0)
+        if ag in ("M", "F") and vg in ("M", "F"):
+            if ag == vg:                                        # agree -> reinforce
+                out.append({"g": ag, "conf": round(min(1.0, ac + vc * 0.2), 2), "src": "audio+video"})
+            elif ac < 0.35 and vc >= 0.7:                       # audio borderline + confident speaker -> video
+                out.append({"g": vg, "conf": round(vc * 0.7, 2), "src": "video>audio"})
+            else:                                               # clear audio -> audio wins
+                out.append({"g": ag, "conf": ac, "src": "audio"})
+        elif ag in ("M", "F"):
+            out.append({"g": ag, "conf": ac, "src": "audio"})
+        elif vg in ("M", "F"):                                  # audio unknown -> use video
+            out.append({"g": vg, "conf": round(vc * 0.6, 2), "src": "video"})
         else:
             out.append({"g": "?", "conf": 0.0, "src": ""})
     return out
 
 
-def _gender_translate(events, comb, engine, key, model, src_name):
-    """Translate events into Czech using per-line speaker-gender hints + full scene context via an
-    AI engine (gemini/claude). Falls back to plain translate_events_to on any failure."""
+_GENDER_TR_SYSTEM = (
+    "You are a professional subtitle translator localizing a Korean/Japanese TV drama into natural, "
+    "idiomatic Czech - the quality a skilled human subtitler delivers. Rules:\n"
+    "- Natural spoken Czech, never word-for-word; keep each line short like a real subtitle.\n"
+    "- A (M)/(F) tag marks the SPEAKER's gender: use it for that speaker's FIRST-PERSON forms only "
+    "(past tense, adjectives: 'udelal jsem' vs 'udelala jsem'; 'byla jsem' vs 'byl jsem').\n"
+    "- THIRD-PERSON gender (Czech on/ona, jeho/jeji, ten/ta, and past-tense verbs about someone else): "
+    "use the provided 'Character genders' list for named characters, and infer from context otherwise. "
+    "Getting he/she and his/her right for the person being TALKED ABOUT is as important as the speaker's "
+    "own forms - e.g. a woman saying 'he did it' -> 'udelal to' (male referent), not 'udelala'.\n"
+    "- REGISTER: pick Czech tykani vs vykani from the relationship and keep it CONSISTENT - strangers, "
+    "workplace superiors and elders take vykani; family, close friends, lovers and children take tykani.\n"
+    "- Keep character names and forms of address consistent across the whole episode.\n"
+    "- Localize idioms and honorific-based address into natural Czech; never leave English words in.\n"
+    "- Preserve tone (formal, angry, teasing, tender).\n"
+    "Return EXACTLY one Czech line per input line, each prefixed by its number and a period, nothing else."
+)
+
+
+_GENDER_PROOF_SYSTEM = (
+    "You are a meticulous Czech proofreader and editor for TV-drama subtitles. You receive Czech "
+    "subtitle lines that were machine-translated FROM the [SRC] source subtitle (that source line is "
+    "the meaning to keep - it may be in any language), each with the speaker's gender and sometimes a "
+    "[KO] Korean original. Do NOT re-translate from the Korean and do NOT change the meaning to match "
+    "it - the Korean is only a hint for gender and politeness register. Correct every error while "
+    "preserving the [SRC] meaning and subtitle brevity:\n"
+    "- grammatical GENDER AGREEMENT: adjectives, participles and past-tense verbs must agree with the "
+    "noun's gender ('moje zalozena znacka', not 'muj zalozeny znacka'; 'byla jsem' for a female "
+    "speaker);\n"
+    "- THIRD-PERSON gender against the source: he/she -> on/ona, his/her -> jeho/jeji, and past-tense "
+    "verbs about someone else must match THAT person's gender, not the speaker's (source 'he did it' by "
+    "a female speaker -> 'udelal to', never 'udelala'). Check every on/ona/jeho/jeji against the source;\n"
+    "- correct case, number, prepositions, word order; natural spoken Czech, not word-for-word;\n"
+    "- fix MISTRANSLATIONS against the source meaning ('Jsi zpet?' not 'Jsem zpet?');\n"
+    "- keep names/terms consistent and keep the tykani/vykani register already used;\n"
+    "- keep each line short like a subtitle; do NOT add notes, quotes, or explanations.\n"
+    "Return EXACTLY the same number of lines, numbered with a period, corrected Czech only. If a line "
+    "is already correct, return it unchanged."
+)
+
+
+_PART_VOWEL = "aeiouy\u00e1\u00e9\u00ed\u00f3\u00fa\u016f\u00fd\u011b"
+
+
+def _part_to_f(w):
+    """Masculine past participle -> feminine, respecting the Czech 'sel/sla' alternation
+    (prisel -> prisla, odesel -> odesla), otherwise just add -a (myslel -> myslela)."""
+    if re.search("[\u0161\u0160]el$", w):
+        return re.sub("el$", "la", w)
+    return w + "a"
+
+
+def _part_to_m(w):
+    """Feminine past participle -> masculine (prisla -> prisel, myslela -> myslel)."""
+    if re.search("[\u0161\u0160]la$", w):
+        return re.sub("la$", "el", w)
+    return re.sub("a$", "", w)
+
+
+def _fix_first_person(text, g):
+    """Fix the speaker's OWN past-tense form from the detected voice gender, e.g. (F) 'Myslel jsem'
+    -> 'Myslela jsem', (M) 'Myslela bych' -> 'Myslel bych'. Only the safe pattern is touched: a
+    participle IMMEDIATELY followed by 'jsem'/'bych' (a noun almost never sits there), so ordinary
+    sentences like 'jsem ucitel' are left alone. When that matched, the rest of the SAME clause is
+    completed too - a coordinated participle ('Chytila bych je a zabil' -> '... a zabila') and
+    'sam/sama' - otherwise the line would stay half-corrected."""
+    if g not in ("M", "F") or not text:
+        return text
+    conv = _part_to_f if g == "F" else _part_to_m
+    ending = r"l" if g == "F" else r"la"
+    main = re.compile(r"\b(\w*[" + _PART_VOWEL + r"]" + ending + r")(\s+(?:jsem|bych)\b)", re.I)
+    new = main.sub(lambda m: conv(m.group(1)) + m.group(2), text)
+    if new == text:
+        return text
+    # Complete the clause, but only for endings that are clearly VERBAL (-al/-il/-el after 's'/-yl,
+    # plus the sel/sla forms). Plain '-el' is left alone on purpose: 'a kabel', 'a hotel', 'a andel'
+    # are nouns and must not become 'a kabela'.
+    vend = (r"(?:\w*(?:al|il|\u011bl|yl)|\w*\u0161el)" if g == "F"
+            else r"(?:\w*(?:ala|ila|\u011bla|yla)|\w*\u0161la)")
+    conj = re.compile(r"\b(a|i|ale|nebo)\s+(" + vend + r")\b", re.I)
+    new = conj.sub(lambda m: m.group(1) + " " + conv(m.group(2)), new)
+    if g == "F":
+        new = re.sub(r"\bs\u00e1m\b", "sama", new)
+    else:
+        new = re.sub(r"\bsama\b", "s\u00e1m", new)
+    return new
+
+
+def _resolve_slash_forms(text, g):
+    """Resolve translator artefacts like 'nechal/a', 'nadseny/a', 'vdecny/a' using the known speaker
+    gender - purely mechanical, so it does not depend on the AI getting it right:
+      M -> the left form ('nechal', 'nadseny')
+      F -> left + suffix, replacing a final vowel when the suffix is one ('nechala', 'nadsena').
+    Only touches word/suffix pairs (suffix up to 2 letters); leaves things like 'and/or' alone."""
+    if g not in ("M", "F") or "/" not in text:
+        return text
+
+    def rep(m):
+        left, right = m.group(1), m.group(2)
+        if g == "M":
+            return left
+        if len(right) == 1 and left[-1:].lower() in "y\u00fdi\u00ed" and right.lower() in "a\u00e1e\u00e9":
+            return left[:-1] + right
+        return left + right
+
+    # the right side must look like a Czech gender ending ('nechal/a', 'nadseny/a', 'byl/la') -
+    # this leaves ordinary slashes such as 'and/or' or 'km/h' untouched
+    return re.sub("\\b([^\\W\\d_]{2,})/([a\u00e1e\u00e9i\u00edy\u00fd]|l[a\u00e1]|[o\u00f3]v[a\u00e1])\\b",
+                  rep, text, flags=re.I)
+
+
+def _accept_correction(orig, new, fix_only=False, min_sim=0.65):
+    """Guard for the AI corrector: accept a 'corrected' line only if it is recognisably the SAME line.
+    Weak models sometimes merge two short cues into one answer, which shifts all following numbers and
+    silently replaces subtitles with a neighbour's text. Comparing letter-only skeletons catches that
+    (a gender fix stays ~0.9 similar, a shifted line drops below 0.3). Returns the text or None."""
+    import difflib
+    if not new or not orig:
+        return None
+    a = re.sub(r"\W+", "", orig.lower())
+    b = re.sub(r"\W+", "", new.lower())
+    if not a or not b:
+        return None
+    if difflib.SequenceMatcher(None, a, b).ratio() < min_sim:
+        return None
+    if fix_only and orig[:1].islower() and new[:1].isupper():
+        new = new[:1].lower() + new[1:]     # subtitles often continue a sentence - keep the lower case
+    return new
+
+
+def _gender_proofread(events, translated, comb, engine, key, model, src_name, ko_lines=None, charmap=None,
+                      fix_only=False):
+    """Second pass: a Czech proofreader/editor reviews the first-pass translation line by line (with
+    the source + speaker gender for reference) and fixes grammar, gender agreement, mistranslations
+    and consistency - the single biggest quality lever for weaker local models. With fix_only=True the
+    lines are EXISTING Czech subtitles (no translation happened): only gender/grammar is corrected and
+    the wording is otherwise left alone. Returns a corrected copy; on total failure returns the input."""
     tag = {"M": "(M)", "F": "(F)", "?": ""}
-    result = [{"start": e["start"], "end": e["end"], "text": e["text"]} for e in events]
-    BATCH = 60
+    result = [dict(t) for t in translated]
+    # Deterministic pre-pass: resolve 'nechal/a' style dual forms from the known speaker gender. This
+    # is mechanical and always right, so the AI does not have to (and cannot get it wrong).
+    n_slash = n_fp = 0
+    for i, (tr, gs) in enumerate(zip(result, comb)):
+        txt = tr.get("text", "")
+        fixed = _resolve_slash_forms(txt, gs.get("g"))
+        if fixed != txt:
+            n_slash += 1
+        if gs.get("conf", 0) >= 0.8:            # only when the voice is unambiguous
+            f2 = _fix_first_person(fixed, gs.get("g"))
+            if f2 != fixed:
+                n_fp += 1
+                fixed = f2
+        if fixed != txt:
+            result[i]["text"] = fixed
+    if n_slash or n_fp:
+        log_info(f"    voice-based fixes: {n_slash} dual form(s) (nechal/a), "
+                 f"{n_fp} first-person ending(s)")
+    translated = result
+    BATCH = 30
+    use_ko = bool(ko_lines) and any(ko_lines)
+    nbatch = (len(events) + BATCH - 1) // BATCH
     nok = 0
     fatal = None
-    nbatch = (len(events) + BATCH - 1) // BATCH
-    log_info(f"    translating {len(events)} lines with gender hints ({engine} {model or ''})...")
+    log_info(f"    proofreading {len(events)} Czech lines (2nd pass - grammar/gender/consistency, "
+             f"{engine} {model or ''})...")
     for bi, s in enumerate(range(0, len(events), BATCH), 1):
         chunk = events[s:s + BATCH]
         cg = comb[s:s + BATCH]
+        ctr = translated[s:s + BATCH]
         lines = []
-        for j, (e, g) in enumerate(zip(chunk, cg), 1):
-            t = e["text"].replace("\n", " ").strip()
-            lines.append(f"{j}. {tag.get(g['g'], '')} {t}".strip())
-        prompt = (
-            f"Translate these {src_name} TV subtitle lines into natural Czech. Some lines are tagged "
-            f"with the speaker's gender detected from audio/video: (M)=male speaker, (F)=female "
-            f"speaker. Use the tag to choose the correct Czech grammatical gender for THAT speaker's "
-            f"first-person forms (e.g. 'udelal jsem' vs 'udelala jsem'); infer other genders from the "
-            f"dialogue context. Keep names and titles untranslated. Return EXACTLY one line per input, "
-            f"each prefixed by its number and a period, and nothing else.\n\n" + "\n".join(lines))
-        _print_progress(s, len(events), prefix="    gender translate ")   # show BEFORE the call
+        for j, (e, gsrc, tr) in enumerate(zip(chunk, cg, ctr), 1):
+            cz = (tr["text"] or "").replace(chr(10), " ").strip()
+            gt = tag.get(gsrc["g"], "")
+            src = e["text"].replace(chr(10), " ").strip()         # the CHOSEN subtitle track = the meaning
+            if fix_only:
+                lines.append(f"{j}. {gt} {cz}".strip())
+            elif use_ko:
+                ko = (ko_lines[s + j - 1] or "").replace(chr(10), " ").strip()
+                lines.append(f"{j}. {gt} [SRC] {src or '(no speech)'} [KO] {ko} [CZ] {cz}".strip())
+            else:
+                lines.append(f"{j}. {gt} [SRC] {src or '(no speech)'} [CZ] {cz}".strip())
+        if fix_only:
+            prompt = ("Below are EXISTING Czech subtitle lines. Fix ONLY grammatical gender and "
+                      "grammar errors - keep the wording, style and meaning as they are, do not "
+                      "re-translate or rephrase.\n"
+                      "(M)/(F) marks the gender of the person SPEAKING the line. Use it for:\n"
+                      "  - their own first-person forms: (F) 'byl jsem' -> 'byla jsem', "
+                      "(M) 'udelala jsem' -> 'udelal jsem';\n"
+                      "  - unresolved dual forms with a slash - ALWAYS pick one and delete the slash: "
+                      "(F) 'nechal/a' -> 'nechala', (F) 'Jsem tak nadseny/a!' -> 'Jsem tak nadsena!', "
+                      "(M) 'Znamy/a?' -> 'Znamy?';\n"
+                      "  - a line the speaker says ABOUT the person they are talking to takes THAT "
+                      "person's gender, not the speaker's ('Dnes jsi mrtvy' said to a woman -> "
+                      "'Dnes jsi mrtva').\n"
+                      "Third-person forms (on/ona, jeho/jeji, past tense about someone else) must match "
+                      "THAT person's gender - see the character list below.\n"
+                      "RULES: return EXACTLY one output line per input line, with the SAME number - "
+                      "never merge, split, reorder or skip lines, even when a line is very short like "
+                      "'Ano.' or a name. Keep the original capitalisation (a line often continues the "
+                      "previous subtitle, so a lower-case start must stay lower-case) and keep the "
+                      "punctuation as it is. If a line is already correct, repeat it unchanged.\n"
+                      + (("Character genders (for on/ona, jeho/jeji): "
+                          + ", ".join(f"{n}={'zena/F' if g == 'F' else 'muz/M'}" for n, g in charmap.items())
+                          + "\n") if charmap else "")
+                      + "\n".join(lines))
+        else:
+            prompt = (f"Proofread and correct the Czech [CZ] lines below. The [SRC] line is the source "
+                      f"subtitle ({src_name}) and its meaning must be KEPT (that is the subtitle we "
+                      f"translated). " +
+                      ("The [KO] Korean is ONLY a hint for correct GENDER (on/ona, verb/adjective endings) and "
+                       "POLITENESS register (banmal->tykani, jondaetmal->vykani) - do NOT re-translate from the "
+                       "Korean and do NOT change the meaning to match it. " if use_ko else "") +
+                      "(M)/(F) is the speaker's gender. Return the corrected Czech only, numbered:\n"
+                      + (("Character genders (for on/ona, jeho/jeji): "
+                          + ", ".join(f"{n}={'zena/F' if g == 'F' else 'muz/M'}" for n, g in charmap.items())
+                          + "\n") if charmap else "")
+                      + "\n".join(lines))
+        _print_progress(s, len(events), prefix="    proofread ", unit=" cues/s")
         if bi > 1 and engine == "gemini":
-            time.sleep(0.7)                  # pace requests to stay under the free-tier per-minute limit
+            time.sleep(0.7)
         resp = None
         for attempt in range(2):
             try:
-                if engine == "claude":
-                    resp = anthropic_messages(prompt, key, model or "claude-sonnet-4-6", max_tokens=4000)
+                if engine == "local":
+                    resp = _ollama_generate(prompt, model, system=_GENDER_PROOF_SYSTEM, timeout=1800)
+                elif engine == "claude":
+                    resp = anthropic_messages(_GENDER_PROOF_SYSTEM + "\n\n" + prompt, key,
+                                              model or "claude-sonnet-4-6", max_tokens=4000)
                 else:
-                    resp = gemini_generate(prompt, key, model or "gemini-2.0-flash", timeout=60)
+                    resp = gemini_generate(_GENDER_PROOF_SYSTEM + "\n\n" + prompt, key,
+                                           model or "gemini-2.0-flash", timeout=120)
                 break
-            except _FatalAPIError as e:      # bad key / no quota / bad model -> retrying is pointless
+            except _FatalAPIError as e:
+                fatal = str(e)
+                break
+            except Exception:
+                resp = None
+                if attempt == 0:
+                    time.sleep(2.5)
+        if fatal:
+            dbg(f"proofread: batch {bi}/{nbatch} FATAL: {fatal[:120]} - keeping first pass for the rest")
+            break
+        if not resp:
+            dbg(f"proofread: batch {bi}/{nbatch} no response - kept first-pass lines")
+            continue
+        got = {}
+        for ln in resp.splitlines():
+            mm = re.match(r"\s*(\d+)[.)]\s*(.*)", ln)
+            if mm:
+                got[int(mm.group(1))] = mm.group(2).strip()
+        dbg(f"proofread: batch {bi}/{nbatch} lines={len(chunk)} parsed={len(got)}")
+        if len(got) < max(1, len(chunk) // 2):
+            continue
+        # Validate every proposed line against the line it should be correcting. If a lot of them fail,
+        # the model merged/split cues and the numbering is shifted - drop the WHOLE batch rather than
+        # scattering neighbouring subtitles across the file.
+        proposed, rejected = {}, 0
+        for j in range(len(chunk)):
+            raw = _clean_tr_line(got.get(j + 1))
+            if not raw:
+                continue
+            ok = _accept_correction(ctr[j]["text"], raw, fix_only=fix_only)
+            if ok is None:
+                rejected += 1
+            elif ok != ctr[j]["text"]:
+                proposed[j] = ok
+        if rejected > max(2, int(len(chunk) * 0.35)):
+            dbg(f"proofread: batch {bi}/{nbatch} REJECTED - {rejected}/{len(chunk)} lines did not match "
+                f"their source line (numbering shift); keeping the originals")
+            continue
+        if rejected:
+            dbg(f"proofread: batch {bi}/{nbatch} skipped {rejected} suspicious line(s)")
+        for j, txt in proposed.items():
+            result[s + j]["text"] = txt
+        nok += 1
+    _print_progress(len(events), len(events), prefix="    proofread ", unit=" cues/s")
+    print()
+    if nok == 0:
+        dbg("proofread: no batch succeeded - keeping first-pass translation")
+        return translated
+    log_done(f"    proofread {nok}/{nbatch} batches")
+    return result
+
+
+def _clean_tr_line(txt):
+    """Strip echoed source markers ([KO]/[EN]/[CZ]), leaked Korean/CJK, and a leading (M)/(F) tag from
+    a model's output line, keeping ONLY the Czech. Fixes models that echo the dual-source prompt format
+    like 'korean [CZ] czech'."""
+    if not txt:
+        return txt
+    if re.search(r'\[cz\]', txt, re.I):                         # keep only what follows [CZ]
+        txt = re.split(r'\[cz\]', txt, flags=re.I)[-1]
+        txt = re.split(r'\[(?:ko|en|src)\]', txt, flags=re.I)[0]    # cut any trailing other-lang echo
+    txt = re.sub(r'\[(?:ko|en|src|cz)\]', ' ', txt, flags=re.I)     # any stray markers
+    txt = re.sub(r'[\uac00-\ud7a3\u3130-\u318f\u1100-\u11ff\u3040-\u30ff\u4e00-\u9fff]+', ' ', txt)  # Hangul/Kana/Han
+    txt = re.sub(r'^\s*\(?[MFmf]\)?[\s:]+', '', txt)            # leading (M)/(F)
+    return re.sub(r'\s{2,}', ' ', txt).strip()
+
+
+def _gender_glossary(events, top=40):
+    """Recurring CHARACTER names from the source, kept WHOLE (multi-word) so the character-gender map
+    genders 'Yang Hyun Bin' as one male person instead of wrongly gendering the split token 'Bin'.
+    Strips leading titles (Director Yang -> Yang), drops generic role words and org/place names."""
+    import collections
+    stop = {"I", "You", "He", "She", "We", "They", "The", "This", "That", "And", "But", "Oh", "Yeah",
+            "Hey", "No", "Yes", "What", "Why", "How", "When", "Where", "Who", "OK", "Okay", "Well", "So",
+            "Just", "Now", "Please", "Sorry", "Thank", "God", "Mr", "Mrs", "Ms", "Dr", "Sir", "Miss"}
+    roles = {"Father", "Mother", "Mom", "Mum", "Dad", "Grandfather", "Grandmother", "Grandpa", "Grandma",
+             "Son", "Daughter", "Brother", "Sister", "Uncle", "Aunt", "Director", "Councillor", "Councilor",
+             "President", "Chairman", "Chairwoman", "Manager", "Doctor", "Nurse", "Teacher", "Boss", "Chief",
+             "Officer", "Detective", "Stylist", "Chef", "Attorney", "Secretary", "Reporter", "Ma", "Pa"}
+    org = {"Fashion", "Office", "Association", "Hospital", "Group", "Company", "Team", "Hotel", "Restaurant",
+           "Design", "Department", "University", "School", "Corp", "Corporation", "Inc", "City", "Street",
+           "Store", "Building", "Center", "Centre", "Agency", "Studio", "Bank", "Airport", "Station"}
+    seqs = collections.Counter()
+    for e in events:
+        txt = e["text"]
+        for m in re.finditer(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", txt):
+            toks = m.group(1).split()
+            while len(toks) > 1 and toks[0] in roles:       # 'Director Yang' -> 'Yang'
+                toks = toks[1:]
+            if not toks or any(t in org for t in toks):     # drop org/place names
+                continue
+            if toks[0] in stop:
+                continue
+            if len(toks) == 1 and (toks[0] in stop or toks[0] in roles):
+                continue                                     # bare role/stopword is not a name
+            # a SINGLE capitalized word at sentence start is almost always a common word, not a name;
+            # real names also appear capitalized mid-sentence. Multi-word sequences are kept regardless.
+            pre = txt[:m.start()].rstrip()
+            if len(toks) == 1 and (pre == "" or pre[-1] in ".!?\u2026\"'\u2019-\u2014"):
+                continue
+            seqs[" ".join(toks)] += 1
+    kept = [n for n, ct in seqs.most_common(top * 2) if ct >= 3]
+    parts = set()                                            # tokens that belong to a multi-word name
+    for n in kept:
+        if " " in n:
+            parts.update(n.split())
+    final = [n for n in kept if " " in n or n not in parts]  # drop bare 'Bin' when 'Hyun Bin' is kept
+    return final[:top]
+
+
+def _name_key(s):
+    """Normalise a person name for matching across romanisations/Czech declension:
+    strip diacritics, lowercase, drop separators, and cut common Czech case endings."""
+    import unicodedata
+    s = unicodedata.normalize("NFKD", str(s or ""))
+    s = "".join(c for c in s if not unicodedata.combining(c)).lower()
+    s = re.sub(r"[^a-z]+", "", s)
+    # Czech declension tails on foreign names: Jun-pyoa/-ovi/-em/-ovy...
+    s = re.sub(r"(ovi|ovy|ova|ove|em|um|ami|ach|a|u|e|y|i)$", "", s)
+    return s
+
+
+def _name_variants(name):
+    """Matchable keys for a character name: the whole name plus its individual parts (subtitles often
+    use only the given name), so 'Gu Jun-pyo' also matches a subtitle saying 'Jun-pyo'."""
+    parts = [p for p in re.split(r"[\s\-_.]+", str(name or "")) if len(p) > 1]
+    out = {_name_key(name)}
+    out.update(_name_key(p) for p in parts)
+    if len(parts) > 1:                                  # 'Jun pyo' written as one word
+        out.add(_name_key("".join(parts[-2:])))
+    return {k for k in out if len(k) >= 3}
+
+
+def _tmdb_character_genders(args, show_name, year=None):
+    """Look the series up on TMDB and return {character_name: 'M'|'F'} from the credited cast.
+    TMDB stores the ACTOR's gender (1=female, 2=male), which matches the character in practice.
+    Returns {} when there is no API key, no match, or the request fails - never fatal."""
+    key, bearer = _tmdb_auth(args)
+    if not (key or bearer):
+        return {}
+    try:
+        hits = _tmdb_search_tv(args, show_name, year)
+        if not hits:
+            dbg(f"tmdb: no series found for '{show_name}'")
+            return {}
+        best = hits[0]
+        data = _tmdb_cached(args, f"/tv/{best['id']}/aggregate_credits")
+        out = {}
+        for c in (data.get("cast") or []):
+            g = c.get("gender")
+            if g not in (1, 2):
+                continue
+            roles = c.get("roles") or [{"character": c.get("character")}]
+            for r in roles:
+                ch = (r.get("character") or "").strip()
+                ch = re.sub(r"\s*\(.*?\)\s*", " ", ch).strip()      # drop '(voice)', '(young)'
+                if 2 <= len(ch) <= 40 and not ch.lower().startswith("self"):
+                    out[ch] = "F" if g == 1 else "M"
+        dbg(f"tmdb: '{best['title']}' ({best.get('year', '?')}) -> {len(out)} credited characters")
+        return out
+    except Exception as e:
+        dbg(f"tmdb character lookup failed: {str(e)[:80]}")
+        return {}
+
+
+def _match_tmdb_genders(names, tmdb_map):
+    """Map subtitle names onto TMDB characters via normalised name keys. Returns {subtitle_name: g}
+    only for unambiguous matches (a key that resolves to a single gender)."""
+    idx = {}
+    for ch, g in tmdb_map.items():
+        for k in _name_variants(ch):
+            idx.setdefault(k, set()).add(g)
+    out = {}
+    for n in names:
+        gs = set()
+        for k in _name_variants(n):
+            gs |= idx.get(k, set())
+        if len(gs) == 1:
+            out[n] = gs.pop()
+    return out
+
+
+def _video_show_hint(video, mkvmerge_bin=None):
+    """Identify the SERIES from the video itself: prefer the container/global title tag written by the
+    ripper (usually the clean show name), fall back to the filename. Returns (show, season, episode,
+    year) - any of them may be None. Used to look the cast up on TMDB before anything else runs."""
+    title = None
+    season = episode = year = None
+    if mkvmerge_bin and str(video).lower().endswith((".mkv", ".mka", ".webm")):
+        try:
+            r = subprocess.run([mkvmerge_bin, "-J", str(video)], capture_output=True, text=True,
+                               encoding="utf-8", errors="replace", timeout=60)
+            j = json.loads(r.stdout or "{}")
+            title = ((j.get("container") or {}).get("properties") or {}).get("title") or None
+            for tg in (j.get("global_tags") or []):
+                for sm in (tg.get("simple") or []):
+                    nm = (sm.get("name") or "").upper()
+                    val = (sm.get("value") or "").strip()
+                    if not val:
+                        continue
+                    if nm in ("TITLE", "SHOW", "COLLECTION", "SERIES") and not title:
+                        title = val
+                    elif nm in ("PART_NUMBER", "EPISODE") and val.isdigit():
+                        episode = int(val)
+                    elif nm in ("SEASON", "SEASON_NUMBER") and val.isdigit():
+                        season = int(val)
+                    elif nm in ("DATE_RELEASED", "DATE_RELEASE_DATE", "YEAR") and val[:4].isdigit():
+                        year = val[:4]
+        except Exception as e:
+            dbg(f"show hint: mkvmerge probe failed ({str(e)[:60]})")
+    stem = Path(str(video)).stem
+    m = re.search(r"\bS(\d{1,2})\s*E(\d{1,3})\b", re.sub(r"[._\-]+", " ", stem), re.I)
+    if m:
+        season = season or int(m.group(1))
+        episode = episode or int(m.group(2))
+    my = re.search(r"\b((?:19|20)\d\d)\b", stem)
+    if my and not year:
+        year = my.group(1)
+    # a container title that still carries the episode tag is no better than the filename
+    show = _show_key(title) if title and len(title) > 2 else None
+    if not show or re.fullmatch(r"(episode|epizoda)?\s*\d*", show):
+        show = _show_key(video)
+    return show, season, episode, year
+
+
+def _tmdb_seed_characters(args, show, events, year=None):
+    """Fetch the credited cast for the series from TMDB and keep the characters that are actually
+    mentioned in these subtitles. This runs BEFORE the AI pass, so authoritative data is the base and
+    the AI only has to fill in whatever TMDB does not cover."""
+    tm = _tmdb_character_genders(args, show, year)
+    if not tm:
+        return {}
+    text = " ".join(e["text"] for e in events)
+    text_keys = set()
+    for w in re.findall(r"[^\W\d_][\w'\-]+(?:\s+[^\W\d_][\w'\-]+)?", text):
+        if w[:1].isupper():
+            text_keys |= _name_variants(w)
+    seed = {}
+    for ch, g in tm.items():
+        if _name_variants(ch) & text_keys:
+            seed[ch] = g
+    dbg(f"tmdb seed: {len(seed)}/{len(tm)} credited characters appear in these subtitles")
+    return seed
+
+
+def _memory_path():
+    """Persistent learning DB (NOT in .temp - survives between runs). Holds per-show character genders
+    so on/ona, jeho/jeji stay consistent across every episode of a series."""
+    d = Path.home() / ".video_tools"
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    return d / "memory.json"
+
+
+def _show_key(video_path):
+    """Series name derived from a filename (drops SxxExx, year, quality/release tags, brackets), used
+    to look up remembered character genders for the whole show."""
+    name = Path(str(video_path)).stem
+    name = re.sub(r"[\[(].*?[\])]", " ", name)
+    # normalise separators FIRST: '_' is a word char, so \b never matches before the S in
+    # 'Show_S01E21' and the episode tag would survive -> every episode became its own 'show'
+    name = re.sub(r"[._\-]+", " ", name)
+    name = re.split(r"\bS\d{1,2}\s*E\d{1,3}\b", name, flags=re.I)[0]
+    name = re.split(r"\b(?:E|EP|Episode)\s*\d{1,3}\b", name, flags=re.I)[0]
+    name = re.sub(r"\b((19|20)\d\d|\d{3,4}p|x26[45]|h\.?26[45]|hevc|VIU|WEB[- ]?DL|WEBRip|HDTV|NF|"
+                  r"AMZN|BluRay|DDP?\d|AAC|10bit)\b", " ", name, flags=re.I)
+    return re.sub(r"\s+", " ", name).strip().lower() or "unknown show"
+
+
+def _memory_load():
+    try:
+        return json.loads(_memory_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {"shows": {}}
+
+
+def _memory_get_characters(show):
+    """Resolved {name: 'M'|'F'} for a show. Entries verified against TMDB always win; AI-detected
+    entries are decided by majority vote across the episodes seen so far."""
+    db = _memory_load()
+    raw = ((db.get("shows", {}) or {}).get(show, {}) or {}).get("characters", {})
+    out = {}
+    for n, v in raw.items():
+        if isinstance(v, str):                       # legacy format: plain 'M'/'F'
+            out[n] = v
+            continue
+        if v.get("src") == "tmdb" and v.get("g") in ("M", "F"):
+            out[n] = v["g"]
+            continue
+        votes = v.get("votes") or {}
+        if votes:
+            out[n] = max(votes, key=lambda g: votes[g])
+        elif v.get("g") in ("M", "F"):
+            out[n] = v["g"]
+    return out
+
+
+def _memory_update_characters(show, charmap, src="ai"):
+    """Record character genders. src='tmdb' is authoritative and overwrites; src='ai' adds one vote so
+    a single bad episode cannot poison the show permanently (the majority across episodes decides)."""
+    if not charmap:
+        return
+    db = _memory_load()
+    sh = db.setdefault("shows", {}).setdefault(show, {})
+    chars = sh.setdefault("characters", {})
+    for n, g in charmap.items():
+        if g not in ("M", "F"):
+            continue
+        cur = chars.get(n)
+        if isinstance(cur, str):                     # migrate legacy entry to the new structure
+            cur = {"g": cur, "src": "ai", "votes": {cur: 1}}
+        if cur is None:
+            cur = {"g": g, "src": src, "votes": {}}
+        if src == "tmdb":
+            cur["g"], cur["src"] = g, "tmdb"
+        elif cur.get("src") != "tmdb":               # never let a guess override a verified entry
+            votes = cur.setdefault("votes", {})
+            votes[g] = votes.get(g, 0) + 1
+            cur["g"] = max(votes, key=lambda x: votes[x])
+        chars[n] = cur
+    sh["updated"] = datetime.datetime.now().isoformat(timespec="seconds")
+    try:
+        _memory_path().write_text(json.dumps(db, ensure_ascii=False, indent=1), encoding="utf-8")
+    except Exception as e:
+        dbg(f"memory save failed: {e}")
+
+
+def _resolve_character_genders(args, video, events, ko_lines, ai_engine, ai_key, ai_model,
+                               mkvmerge_bin=None):
+    """Character genders, authoritative source first:
+      1. identify the SERIES from the video (container title / filename),
+      2. look the credited cast up on TMDB and keep whoever appears in these subtitles -> facts,
+      3. let the AI find only the REMAINING names from the dialogue (it is told what is already known),
+      4. merge with what previous episodes learned (TMDB wins, AI entries decided by majority vote).
+    Returns {name: 'M'|'F'}."""
+    show, _season, _ep, year = _video_show_hint(video, mkvmerge_bin)
+    known = _memory_get_characters(show)
+    seed = _tmdb_seed_characters(args, show, events, year)
+    if seed:
+        _memory_update_characters(show, seed, src="tmdb")
+        known = _memory_get_characters(show)
+        log_info(f"    TMDB: {len(seed)} character genders for '{show}' (authoritative)")
+    # The AI pass costs minutes per episode. When TMDB already delivered the cast (it lists the whole
+    # series, and we keep whoever appears in THIS episode), it adds nothing - skip it.
+    detected = {}
+    if ai_engine and len(seed) < 3:
+        detected = _gender_character_map(events, ko_lines, ai_engine, ai_key, ai_model, known=known)
+    elif seed:
+        dbg(f"character map: AI pass skipped - TMDB already covers {len(seed)} characters")
+    new_ai = {n: g for n, g in detected.items() if n not in known}
+    if new_ai:
+        _memory_update_characters(show, new_ai, src="ai")        # one vote per episode
+    charmap = _memory_get_characters(show) or {**detected, **known}
+    if len(charmap) > 45:            # keep prompts focused: verified entries first, then the rest
+        db = _memory_load()
+        raw = ((db.get("shows", {}) or {}).get(show, {}) or {}).get("characters", {})
+
+        def _rank(n):
+            v = raw.get(n)
+            return 0 if (isinstance(v, dict) and v.get("src") == "tmdb") else 1
+        charmap = {n: charmap[n] for n in sorted(charmap, key=lambda n: (_rank(n), n))[:45]}
+    if charmap:
+        log_info(f"    character genders: {len(charmap)} for '{show}' "
+                 f"({len(seed)} from TMDB, {len(new_ai)} new from dialogue, "
+                 f"{len(known)} remembered) -> {_memory_path()}")
+    return charmap
+
+
+def _resolve_character_genders_quiet(args, video, events, ai_model, mkvmerge_bin=None):
+    """Convenience wrapper for the presets (local Ollama as the intelligence engine)."""
+    return _resolve_character_genders(args, video, events, None, "local", None, ai_model,
+                                      mkvmerge_bin=mkvmerge_bin)
+
+
+def _memory_clear(show=None):
+    """Clear the whole learning DB, or just one show. Returns a human message."""
+    p = _memory_path()
+    if not p.exists():
+        return f"Nothing to clear - no learning DB at {p}"
+    if show is None:
+        try:
+            p.unlink()
+            return f"Cleared the entire learning DB ({p})"
+        except Exception as e:
+            return f"Could not delete {p}: {e}"
+    db = _memory_load()
+    if (db.get("shows", {}) or {}).pop(show, None) is not None:
+        p.write_text(json.dumps(db, ensure_ascii=False, indent=1), encoding="utf-8")
+        return f"Cleared remembered characters for '{show}' in {p}"
+    return f"No remembered data for '{show}' (DB: {p})"
+
+
+def _gender_character_map(events, ko_lines, engine, key, model, names=None, known=None):
+    """Ask the AI to find the named characters AND their gender straight from the dialogue - fully
+    universal (any show, any language), no hard-coded name/role lists. Uses honorifics, pronouns, how
+    people are addressed and relationships. Returns {name: 'M'|'F'}. This is an 'intelligence' task,
+    so it runs on the AI engine even when the base translation is done by Google/DeepL."""
+    use_ko = bool(ko_lines) and any(ko_lines)
+    sample = []
+    seen = 0
+    for i, e in enumerate(events):
+        en = e["text"].replace(chr(10), " ").strip()
+        if not en or en.startswith("("):
+            continue
+        if use_ko and i < len(ko_lines) and ko_lines[i]:
+            sample.append(f"[KO] {ko_lines[i].strip()} [SRC] {en}")
+        else:
+            sample.append(en)
+        seen += 1
+        if seen >= 140:
+            break
+    if len(sample) < 5:
+        return {}
+    sys_p = ("You analyse TV-drama dialogue and list the named characters with their gender, so a "
+             "translator can use correct gendered pronouns/verbs. Judge gender from honorifics, "
+             "pronouns, forms of address and relationships - work for any language.")
+    kn = ("Already known (do NOT repeat these): "
+          + ", ".join(f"{n}={'female' if g == 'F' else 'male'}" for n, g in list(known.items())[:60])
+          + "\n\n") if known else ""
+    prompt = (kn + "From the dialogue below, list every NAMED person who is a character (use their full name "
+              "as written, e.g. 'Yang Hyun Bin', not split parts). SKIP anything that is not a personal "
+              "name: company/place names, and words people are merely ADDRESSED by - family roles "
+              "(mother, dad, grandpa), titles (director, president, doctor) and honorifics (sunbae, "
+              "noona, oppa, hyung, unnie) in any language. For each, give their gender.\n\nDialogue:\n"
+              + "\n".join(sample) + "\n\nReturn ONLY lines of 'Full Name: male' or 'Full Name: female' "
+              "(or 'Full Name: unknown'). Nothing else.")
+    resp = None
+    try:
+        if engine == "local":
+            resp = _ollama_generate(prompt, model, system=sys_p, timeout=600)
+        elif engine == "claude":
+            resp = anthropic_messages(sys_p + "\n\n" + prompt, key, model or "claude-sonnet-4-6", max_tokens=1500)
+        else:
+            resp = gemini_generate(sys_p + "\n\n" + prompt, key, model or "gemini-2.0-flash", timeout=120)
+    except Exception as e:
+        dbg(f"character-gender map failed ({str(e)[:60]}) - third-person gender left to context")
+        return {}
+    alltext = " ".join(sample)
+    # Universal junk filter (no language-specific word lists): a real character NAME is essentially
+    # never written in lower case, while family roles, titles and honorifics are ('tata', 'maminka',
+    # 'sunbae', 'noona', 'pani prezidentka'). Compare WHOLE space-separated tokens (so hyphenated
+    # names like 'Seo-hyun' stay intact) and ignore diacritics.
+    def _fold(w):
+        import unicodedata
+        w = unicodedata.normalize("NFKD", w)
+        return "".join(c for c in w if not unicodedata.combining(c)).lower()
+
+    lower_words = {_fold(w) for w in re.findall(r"(?<![\w'-])([^\W\d_][\w'-]{2,})", alltext) if w.islower()}
+    # A real name also turns up in the MIDDLE of a sentence ('Rekni to Jan-di'). A single capitalised
+    # word that only ever starts a sentence is just an ordinary word ('Ano', 'Proc', 'Sakra', 'Dekuji').
+    mid_names = set()
+    for ln in sample:
+        ln = re.sub(r"\[(?:KO|SRC|EN|CZ)\]", " ", ln)
+        for sent in re.split(r"(?<=[.!?\u2026])\s+|\s+[-\u2013\u2014]\s+", ln):
+            for w in sent.split()[1:]:
+                w = w.strip(".,!?;:\"'()[]\u201e\u201c")
+                if w[:1].isupper():
+                    mid_names.add(_fold(w))
+    out = {}
+    for ln in (resp or "").splitlines():
+        mm = re.match(r"\s*[-*\d.)]*\s*(.+?)\s*[:=]\s*(male|female|muz|zena|man|woman|m|f)\b", ln, re.I)
+        if not mm:
+            continue
+        nm = mm.group(1).strip().strip("\"'*").strip()
+        g = mm.group(2).lower()
+        # keep only plausible names that actually occur in the dialogue (guards against hallucination)
+        if not (2 <= len(nm) <= 40 and nm[:1].isupper() and nm in alltext):
+            continue
+        toks = [t.strip(".,!?;:") for t in nm.split() if len(t.strip(".,!?;:")) >= 3]
+
+        def _is_common(t):
+            f = _fold(t)
+            if f in lower_words:
+                return True
+            # declined forms: 'dedecek' vs 'dedecka' - compare stems for longer words
+            return len(f) >= 5 and any(w[:5] == f[:5] for w in lower_words if len(w) >= 5)
+
+        if any(_is_common(t) for t in toks):
+            dbg(f"character map: ignoring '{nm}' (looks like a role/common word, not a name)")
+            continue
+        if len(nm.split()) == 1 and _fold(nm.strip(".,!?;:")) not in mid_names:
+            dbg(f"character map: ignoring '{nm}' (only ever starts a sentence - not a name)")
+            continue
+        out[nm] = "F" if g[0] in ("f", "z", "w") else "M"
+    if out:
+        dbg("character-gender map (AI): " + ", ".join(f"{n}={g}" for n, g in out.items()))
+    return out
+
+
+def _gender_translate(events, comb, engine, key, model, src_name, ko_lines=None, charmap=None):
+    if engine == "google":
+        # Base translation by Google (universal, no local-AI translation); the Ollama 2-pass corrector
+        # afterwards fixes gender agreement + naturalness. Google is called via the shared translator.
+        fb = translate_events_to(events, "google", "cs")
+        return fb or [dict(e) for e in events]
+    """Translate events into Czech with per-line speaker-gender hints, a professional-translator
+    system prompt (register/tykani-vykani, consistency), a running glossary of names, and a rolling
+    context of the last few translated lines. If ko_lines is given (Korean transcription per cue),
+    translate from the KOREAN original using the English as reference - the accurate, human way, and
+    it lets the model read the Korean politeness level to pick Czech tykani/vykani. Engines: gemini /
+    claude / local (Ollama). Falls back to the free Google engine on hard failure."""
+    tag = {"M": "(M)", "F": "(F)", "?": ""}
+    result = [{"start": e["start"], "end": e["end"], "text": e["text"]} for e in events]
+    BATCH = 40                                   # smaller batches -> more context per line, better quality
+    nok = 0
+    fatal = None
+    use_ko = bool(ko_lines) and any(ko_lines)
+    nbatch = (len(events) + BATCH - 1) // BATCH
+    glossary = _gender_glossary(events)
+    gtxt = ("Recurring names/terms (translate CONSISTENTLY): " + ", ".join(glossary) + "\n\n") if glossary else ""
+    if charmap is None:                          # standalone use: detect the character genders here
+        charmap = _gender_character_map(events, ko_lines, engine, key, model, glossary)
+    cmtxt = ("Character genders for THIRD-PERSON references (Czech on/ona, jeho/jeji when talking ABOUT "
+             "them): " + ", ".join(f"{n}={'zena/F' if g == 'F' else 'muz/M'}" for n, g in charmap.items())
+             + "\n\n") if charmap else ""
+    system = _GENDER_TR_SYSTEM + (
+        "\n- The [KO] text is the ORIGINAL Korean (source of truth); [EN] is a rough reference. "
+        "Translate the MEANING of the Korean, using EN only to disambiguate. Read the Korean "
+        "politeness level (banmal vs jondaetmal) to choose Czech tykani vs vykani." if use_ko else "")
+    log_info(f"    translating {len(events)} lines with gender hints + context"
+             f"{' + Korean source' if use_ko else ''} ({engine} {model or ''})...")
+    for bi, s in enumerate(range(0, len(events), BATCH), 1):
+        chunk = events[s:s + BATCH]
+        cg = comb[s:s + BATCH]
+        prev = [result[k]["text"] for k in range(max(0, s - 6), s) if result[k]["text"] != events[k]["text"]]
+        ctx = ("Preceding Czech lines (for flow & consistent register - do NOT re-translate):\n"
+               + "\n".join(prev) + "\n\n") if prev else ""
+        lines = []
+        for j, (e, g) in enumerate(zip(chunk, cg), 1):
+            en = e["text"].replace(chr(10), " ").strip()
+            gt = tag.get(g["g"], "")
+            if use_ko:
+                ko = (ko_lines[s + j - 1] or "").replace(chr(10), " ").strip()
+                lines.append(f"{j}. {gt} [KO] {ko or '(no speech)'} [EN] {en}".strip())
+            else:
+                lines.append(f"{j}. {gt} {en}".strip())
+        prompt = (gtxt + cmtxt + ctx
+                  + (f"Translate these Korean drama lines into Czech from the [KO] original "
+                     f"((M)=male speaker, (F)=female speaker):\n" if use_ko else
+                     f"Translate these {src_name} subtitle lines into Czech ((M)=male speaker, "
+                     f"(F)=female speaker):\n") + "\n".join(lines))
+        _print_progress(s, len(events), prefix="    gender translate ", unit=" cues/s")
+        if bi > 1 and engine == "gemini":
+            time.sleep(0.7)                      # pace under the free-tier per-minute limit
+        resp = None
+        for attempt in range(2):
+            try:
+                if engine == "local":
+                    resp = _ollama_generate(prompt, model, system=system, timeout=1800)
+                elif engine == "claude":
+                    resp = anthropic_messages(system + "\n\n" + prompt, key,
+                                              model or "claude-sonnet-4-6", max_tokens=4000)
+                else:
+                    resp = gemini_generate(system + "\n\n" + prompt, key,
+                                           model or "gemini-2.0-flash", timeout=120)
+                break
+            except _FatalAPIError as e:          # bad key / no quota / model not pulled -> stop retrying
                 fatal = str(e)
                 break
             except Exception:
@@ -5471,34 +6848,53 @@ def _gender_translate(events, comb, engine, key, model, src_name):
             break
         if not resp:
             dbg(f"gender translate: batch {bi}/{nbatch} no response (transient) - kept as source")
-            continue                         # transient miss: keep this batch as source, go on
+            continue
         got = {}
         for ln in resp.splitlines():
             mm = re.match(r"\s*(\d+)[.)]\s*(.*)", ln)
             if mm:
                 got[int(mm.group(1))] = mm.group(2).strip()
-        dbg(f"gender translate: batch {bi}/{nbatch} lines={len(chunk)} parsed={len(got)} "
-            f"resp_chars={len(resp)}")
+        dbg(f"gender translate: batch {bi}/{nbatch} lines={len(chunk)} parsed={len(got)} resp_chars={len(resp)}")
         if len(got) < max(1, len(chunk) // 2):
             continue
         for j in range(len(chunk)):
-            txt = got.get(j + 1)
+            txt = _clean_tr_line(got.get(j + 1))
             if txt:
-                txt = re.sub(r"^\(?[MF]\)?\s+", "", txt)
                 result[s + j]["text"] = txt
         nok += 1
-    _print_progress(len(events), len(events), prefix="    gender translate ")
+    _print_progress(len(events), len(events), prefix="    gender translate ", unit=" cues/s")
     print()
     if fatal:
         log_warn(f"    AI translation stopped: {fatal}")
-        log_warn("    Falling back to the free Google engine (no gender hints). If you saw 'limit: 0', "
-                 "your account has NO free Gemini tier at all - for gender-correct Czech use Claude, or "
-                 "enable Gemini billing; otherwise a free-quota Gemini model (e.g. gemini-2.5-flash-lite).")
+        # A cloud engine that hit a quota/key error should retry with a LOCAL model (keeps full gender
+        # awareness) BEFORE dropping to plain Google (which has no gender hints at all).
+        if engine != "local":
+            local_models = _ollama_models() or []
+            if local_models:
+                best = _ollama_best_default(local_models)
+                log_warn(f"    Retrying with the local model '{best}' (keeps gender hints + character "
+                         f"map) instead of plain Google...")
+                return _gender_translate(events, comb, "local", None, best, src_name,
+                                         ko_lines=ko_lines, charmap=charmap)
+            log_warn("    Falling back to the free Google engine (NO gender hints). Tip: install Ollama + "
+                     "'ollama pull qwen3:14b' so gender-aware translation keeps working without a key.")
+        else:
+            log_warn("    Falling back to the free Google engine (no gender hints). Make sure Ollama is "
+                     "running and the model is pulled (ollama pull <model>).")
         fb = translate_events_to(events, "google", "cs")
         return fb or result
     if nok:
+        # backfill any lines a failed batch left as English source, so no untranslated lines leak
+        missing = [k for k in range(len(events)) if result[k]["text"] == events[k]["text"]]
+        if missing:
+            log_warn(f"    {len(missing)} line(s) were not AI-translated (failed batches) - "
+                     f"filling them via the free Google engine.")
+            fb = translate_events_to([events[k] for k in missing], "google", "cs")
+            if fb:
+                for k, tr in zip(missing, fb):
+                    result[k]["text"] = tr["text"]
         if nok < nbatch:
-            log_warn(f"    {nbatch - nok}/{nbatch} batch(es) failed (transient) - those lines kept as source.")
+            log_warn(f"    {nbatch - nok}/{nbatch} batch(es) had to fall back for some lines.")
         return result
     log_warn("    AI gendered translation produced nothing - falling back to the free Google engine.")
     fb = translate_events_to(events, "google", "cs")
@@ -5519,6 +6915,13 @@ table{width:100%;border-collapse:collapse;font-size:12px}th,td{padding:4px 8px;b
 th{position:sticky;top:0;background:var(--panel);color:var(--dim)}tr:hover{background:#1f2630}.tt{white-space:nowrap;color:var(--dim)}
 .m{color:var(--m)}.f{color:var(--f)}.u{color:var(--u)}.bad{color:#f85149}.tblwrap{max-height:520px;overflow:auto;border:1px solid var(--line);border-radius:8px}
 .legend{display:flex;gap:16px;flex-wrap:wrap;margin-top:6px;font-size:11px;color:var(--dim)}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
+.faces{display:grid;grid-template-columns:repeat(auto-fill,minmax(148px,1fr));gap:8px}
+.fcard{border:2px solid var(--line);border-radius:8px;padding:6px;background:#0d1117;font-size:11px}
+.fcard img{width:72px;height:72px;border-radius:6px;display:block;margin:0 auto 4px;object-fit:cover}
+.fcard.M{border-color:var(--m)}.fcard.F{border-color:var(--f)}.fcard.dis{border-color:#f85149}
+.fcard .r{color:var(--dim)}.fcard .cz{color:var(--fg);margin-top:3px}
+.ctrl{margin:6px 0;font-size:12px}.ctrl label{margin-right:14px;color:var(--dim);cursor:pointer}
+button{background:var(--panel);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:4px 12px;cursor:pointer;font:inherit}
 </style></head><body>
 <header><h1>Speaker-gender-aware translation report</h1><div class="meta" id="meta"></div>
 <div class="legend"><span><span class="sw" style="background:var(--m)"></span>male</span>
@@ -5527,6 +6930,14 @@ th{position:sticky;top:0;background:var(--panel);color:var(--dim)}tr:hover{backg
 <span><span class="sw" style="background:#f85149"></span>audio/video disagree</span>
 <span>wheel = zoom, drag = pan, hover a cue for detail</span></div></header>
 <div class="wrap" id="lanes"></div>
+<div class="wrap" id="facewrap" style="display:none"><div class="lane">
+<h2>Face verification (debug): the detected speaker face per cue + gender + Czech. Border = final gender; RED = audio &amp; video disagree.</h2>
+<div class="ctrl"><label><input type="checkbox" id="fdis"> only where audio/video disagree</label>
+<label><input type="checkbox" id="fvid"> only where video decided</label>
+<span id="fcount"></span></div>
+<div class="faces" id="faces"></div>
+<div style="text-align:center;margin-top:10px"><button id="fmore">show more</button></div>
+</div></div>
 <div class="wrap"><div class="lane"><h2>All cues: audio + video gender, source text and Czech translation</h2>
 <div class="tblwrap"><table><thead><tr><th>#</th><th>time</th><th>audio</th><th>F0</th><th>video</th><th>used</th><th>source</th><th>Czech</th></tr></thead>
 <tbody id="tb"></tbody></table></div></div></div><div class="tip" id="tip"></div>
@@ -5584,21 +6995,55 @@ for(const c of C){const tr=document.createElement('tr');const dis=(c.ag!=='?'&&c
   `<td class="${dis?'bad':(c.vg==='M'?'m':c.vg==='F'?'f':'u')}">${DATA.has_video?nm(c.vg):'-'}</td>`+
   `<td class="${c.g==='M'?'m':c.g==='F'?'f':'u'}">${nm(c.g)}</td>`+
   `<td>${esc(c.t)}</td><td>${esc(c.cz)}</td>`;tb.appendChild(tr);}
+
+if(DATA.has_faces){
+ document.getElementById('facewrap').style.display='';
+ const facesEl=document.getElementById('faces'),fcount=document.getElementById('fcount'),more=document.getElementById('fmore');
+ const withFace=C.filter(c=>c.face);const STEP=120;let shown=0;
+ const dis=c=>(c.ag!=='?'&&c.vg!=='?'&&c.ag!==c.vg);
+ const esc=s=>(s||'').replace(/[<&]/g,x=>({'<':'&lt;','&':'&amp;'}[x]));
+ function filtered(){let a=withFace;
+  if(document.getElementById('fdis').checked)a=a.filter(dis);
+  if(document.getElementById('fvid').checked)a=a.filter(c=>(c.src||'').indexOf('video')>=0);
+  return a;}
+ function render(reset){if(reset){facesEl.innerHTML='';shown=0;}
+  const a=filtered(),slice=a.slice(shown,shown+STEP);
+  for(const c of slice){const cls=dis(c)?'dis':(c.g==='M'?'M':c.g==='F'?'F':'');
+   const d=document.createElement('div');d.className='fcard '+cls;
+   d.innerHTML=`<img src="${c.face}" loading="lazy">`+
+    `<div>${fmt(c.ts)} <b class="${c.g==='M'?'m':c.g==='F'?'f':'u'}">${nm(c.g)}</b></div>`+
+    `<div class="r">aud ${nm(c.ag)}${c.af0?' '+c.af0+'Hz':''} &middot; vid ${nm(c.vg)}</div>`+
+    `<div class="cz">${esc(c.cz)}</div>`;facesEl.appendChild(d);}
+  shown+=slice.length;fcount.textContent=`showing ${shown} / ${a.length} faces`;
+  more.style.display=shown<a.length?'':'none';}
+ more.onclick=()=>render(false);
+ document.getElementById('fdis').onchange=()=>render(true);
+ document.getElementById('fvid').onchange=()=>render(true);
+ render(true);
+}
 </script></body></html>"""
 
 
-def _write_gender_report(base, video, src_lang, engine, detect, events, translated, aud, vid, comb, debug=None):
+def _write_gender_report(base, video, src_lang, engine, detect, events, translated, aud, vid, comb,
+                         debug=None, faces=None, ko_lines=None):
     try:
         has_video = bool(vid)
         cues = []
         for i, (e, tr, g) in enumerate(zip(events, translated, comb)):
             a = aud[i] if aud else {"g": "?", "f0": 0, "conf": 0}
             v = vid[i] if vid else None
-            cues.append(dict(i=i + 1, ts=round(e["start"], 2), te=round(e["end"], 2),
-                             g=g["g"], conf=g["conf"], src=g.get("src", ""),
-                             ag=a["g"], af0=a.get("f0", 0), aconf=a.get("conf", 0),
-                             vg=(v["g"] if v else "?"), vconf=(v["conf"] if v else 0),
-                             t=e["text"].replace("\n", " "), cz=tr["text"].replace("\n", " ")))
+            c = dict(i=i + 1, ts=round(e["start"], 2), te=round(e["end"], 2),
+                     g=g["g"], conf=g["conf"], src=g.get("src", ""),
+                     ag=a["g"], af0=a.get("f0", 0), aconf=a.get("conf", 0),
+                     vg=(v["g"] if v else "?"), vconf=(v["conf"] if v else 0),
+                     vsrc=(v.get("src", "") if v else ""),      # 'asd'=active speaker, 'face'=largest-face
+                     t=e["text"].replace("\n", " "), cz=tr["text"].replace("\n", " "))
+            if ko_lines and i < len(ko_lines) and ko_lines[i]:
+                c["ko"] = ko_lines[i].replace("\n", " ")        # Korean source the LLM translated from
+            if faces and i < len(faces) and faces[i]:
+                c["face"] = faces[i]        # base64 JPEG thumbnail of the detected face (debug only)
+            cues.append(c)
+        has_faces = bool(faces) and any("face" in c for c in cues)
 
         def _cnt(key):
             return dict(male=sum(1 for c in cues if c[key] == "M"),
@@ -5610,7 +7055,7 @@ def _write_gender_report(base, video, src_lang, engine, detect, events, translat
             agree = (round(sum(1 for a, b in both if a == b) / len(both) * 100) if both else 0)
         stats = dict(combined=_cnt("g"), audio=_cnt("ag"), video=_cnt("vg"), agree=agree)
         data = dict(video=os.path.basename(str(video)), src_lang=src_lang, engine=engine,
-                    detect=detect, has_video=has_video,
+                    detect=detect, has_video=has_video, has_faces=has_faces,
                     dur=(round(events[-1]["end"], 1) if events else 0),
                     cues=cues, stats=stats, debug=(debug or {}))
         with open(base + ".gender.report.json", "w", encoding="utf-8") as f:
@@ -5645,47 +7090,59 @@ def _gender_picker(videos, vinfo, cfg, gpu_names):
         try:
             while True:
                 cols, rows = _fb_termsize()
-                eng = ["gemini", "claude"][cfg["eng_i"] % 2]
+                eng = ["google", "gemini", "claude"][cfg["eng_i"] % 3]
                 avail_sel = [s and (eff(v)[0] in vinfo[v][0]) for v, s in zip(videos, sel)]
                 nsel = sum(avail_sel)
                 vend = _gpu_vendor() or "GPU"
                 dev = cfg["dev"]
                 devtxt = ("auto" if dev in (None, "auto") else
-                          (f"#{dev} {_fb_trunc(gpu_names[int(dev)], 22)}"
+                          (f"#{dev} {_fb_trunc(gpu_names[int(dev)], max(20, cols - 26))}"
                            if (isinstance(dev, int) and 0 <= int(dev) < len(gpu_names)) else str(dev)))
                 _dml = _has_directml()
                 gpu_tag = (vend + " GPU" + (" (DirectML)" if _dml else
                                             (" (CUDA)" if vend == "NVIDIA" else " decode-only")))
-                dec = f"    decode: {Fore.GREEN}{'keyframe' if cfg.get('kf') else 'full'}{Style.RESET_ALL} {Style.DIM}(k){Style.RESET_ALL}"
-                if cfg["use_video"]:
-                    gpu_line = (f"    face-detect: {Fore.GREEN if cfg['gpu'] else Style.DIM}"
-                                f"{gpu_tag if cfg['gpu'] else 'CPU'}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
-                                + (f"    device: {Fore.GREEN}{devtxt}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}"
-                                   if len(gpu_names) > 1 else "") + dec)
-                else:
-                    # video OFF -> keep the same options visible but greyed out (disabled)
-                    gpu_line = (f"    {Style.DIM}face-detect: {gpu_tag if cfg['gpu'] else 'CPU'} (g)"
-                                + (f"    device: {devtxt} (d)" if len(gpu_names) > 1 else "")
-                                + f"    decode: {'keyframe' if cfg.get('kf') else 'full'} (k)"
-                                + Style.RESET_ALL)
-                head = [
-                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Gender-aware translation: pick videos + options ==={Style.RESET_ALL}",
-                    f"{Style.DIM}source subs: {Fore.GREEN}{_lang3_name(cfg['global_sub'])} ({cfg['global_sub']}){Style.RESET_ALL}"
-                    f" {Style.DIM}(s){Style.RESET_ALL}    "
-                    f"{Style.DIM}audio for gender: {Fore.GREEN}{'+'.join(cfg['global_auds'])}{Style.RESET_ALL}"
-                    f" {Style.DIM}(u)   \u00b7 override one episode with 'o'{Style.RESET_ALL}",
-                    f"{Fore.CYAN}{nsel}/{len(videos)} selected{Style.RESET_ALL}    "
-                    f"video face detection: {Fore.GREEN if cfg['use_video'] else Style.DIM}"
-                    f"{'ON' if cfg['use_video'] else 'off'}{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}"
-                    f"    engine: {Fore.GREEN}{eng}{Style.RESET_ALL} {Style.DIM}(e){Style.RESET_ALL}"
-                    f"    report: {Fore.GREEN if cfg['want_report'] else Style.DIM}"
-                    f"{'ON' if cfg['want_report'] else 'off'}{Style.RESET_ALL} {Style.DIM}(r){Style.RESET_ALL}" + gpu_line,
-                    "",
+                def _onchip(label, on, key):
+                    st = (Fore.GREEN + "ON") if on else (Style.DIM + "off")
+                    return f"{label}: {st}{Style.RESET_ALL} {Style.DIM}({key}){Style.RESET_ALL}"
+
+                def _valchip(label, val, key, dim=False):
+                    lead = Style.DIM if dim else ""
+                    return f"{lead}{label}: {Fore.GREEN}{val}{Style.RESET_ALL} {Style.DIM}({key}){Style.RESET_ALL}"
+
+                vid_on = cfg["use_video"]
+                gtag = (gpu_tag if cfg["gpu"] else "CPU")
+                chips = [
+                    _valchip("source subs", f"{_lang3_name(cfg['global_sub'])} ({cfg['global_sub']})", "s"),
+                    _valchip("audio for gender", "+".join(cfg["global_auds"]), "u"),
+                    _onchip("video faces", vid_on, "v"),
+                    _valchip("engine", eng, "e"),
+                    _onchip("korean-source", cfg.get("kosrc"), "w"),
+                    _onchip("active-speaker", cfg.get("asd"), "p"),
+                    _onchip("report", cfg["want_report"], "r"),
+                    _onchip("2-pass edit", cfg.get("proof"), "c"),
+                    _valchip("face-detect", gtag, "g", dim=not vid_on),
                 ]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | s = source subs | "
-                            f"u = audio | o = override | v = video" + (" | g = GPU | d = device" if gpu_names else "")
-                            + " | k = decode"
-                            + f" | e = engine | r = report | Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                if len(gpu_names) > 1:
+                    chips.append(_valchip("device", devtxt, "d", dim=not vid_on))
+                chips.append(_valchip("decode", "keyframe" if cfg.get("kf") else "full", "k", dim=not vid_on))
+                chips.append(_valchip("gender", "vision-LLM" if cfg.get("vgender") else "InsightFace", "m",
+                                      dim=not vid_on))
+                selline = (f"{Fore.CYAN}{nsel}/{len(videos)} selected{Style.RESET_ALL}   "
+                           f"{Style.DIM}\u00b7 'o' = override one episode{Style.RESET_ALL}")
+                recline = (f"{Fore.GREEN}{Style.BRIGHT}\u2192 press 'b' for RECOMMENDED settings"
+                           f"{Style.RESET_ALL}{Fore.GREEN} (best gender accuracy: auto-configures "
+                           f"everything for your GPU + turns on logging){Style.RESET_ALL}")
+                head = ([f"{Fore.MAGENTA}{Style.BRIGHT}=== Gender-aware translation: pick videos + "
+                         f"options ==={Style.RESET_ALL}", selline, recline]
+                        + _pack_chips(chips, cols) + [""])
+                _fchips = ["\u2191\u2193 move", "Space = toggle", "a = all/none", "b = RECOMMENDED",
+                           "s = source subs", "u = audio", "o = override", "v = video"]
+                if gpu_names:
+                    _fchips += ["g = GPU", "d = device"]
+                _fchips += ["k = decode", "m = gender-model", "w = korean-source", "p = active-speaker", "e = engine",
+                            "r = report", "c = 2-pass edit", "Enter = run", "Esc = cancel"]
+                foot = [""] + [f"{Style.DIM}{ln}{Style.RESET_ALL}"
+                               for ln in _pack_chips(_fchips, cols, sep=" | ")]
                 avail = max(4, rows - len(head) - len(foot))
                 per = max(1, avail // 4)
                 pos = max(0, min(pos, len(videos) - 1))
@@ -5732,6 +7189,8 @@ def _gender_picker(videos, vinfo, cfg, gpu_names):
                         return ("run", chosen)
                 elif k == ("char", "o"):
                     return ("over", pos)
+                elif k == ("char", "b"):
+                    return ("recommend",)
                 elif k == ("char", "s"):
                     return ("subs",)
                 elif k == ("char", "u"):
@@ -5746,8 +7205,16 @@ def _gender_picker(videos, vinfo, cfg, gpu_names):
                     cfg["use_video"] = not cfg["use_video"]
                 elif k == ("char", "k"):
                     cfg["kf"] = not cfg.get("kf")
+                elif k == ("char", "w"):
+                    cfg["kosrc"] = not cfg.get("kosrc")
+                elif k == ("char", "p"):
+                    cfg["asd"] = not cfg.get("asd")
+                elif k == ("char", "m"):
+                    cfg["vgender"] = not cfg.get("vgender")
+                elif k == ("char", "c"):
+                    cfg["proof"] = not cfg.get("proof")
                 elif k == ("char", "e"):
-                    cfg["eng_i"] = (cfg["eng_i"] + 1) % 2
+                    cfg["eng_i"] = (cfg["eng_i"] + 1) % 3
                 elif k == ("char", "r"):
                     cfg["want_report"] = not cfg["want_report"]
                 elif k == ("char", "g") and cfg["use_video"]:
@@ -5825,6 +7292,77 @@ def _ask_gemini_model_menu(key, default="gemini-2.0-flash"):
     return (uniq[r[0]][0] if r else default)
 
 
+def _recommend_config(cfg, gpu_names, args):
+    """Set every gender-translate option to the best-for-accuracy config based on the detected GPU/VRAM,
+    stash recommended model choices so the later prompts pre-select them, and turn on logging. This is
+    the one-key path to maximum Czech gender-agreement accuracy. Returns a short summary dict."""
+    vendor, vram = _detect_gpu_for_setup()
+    cfg["use_video"] = True        # video refines the speaker on borderline-pitch audio
+    cfg["asd"] = True              # active-speaker = the real speaker, not just the largest face
+    cfg["kf"] = False              # full decode = maximum accuracy
+    cfg["want_report"] = True      # verification report (per-cue audio/video/combined + ko/cz)
+    cfg["kosrc"] = True            # translate from the Korean ORIGINAL (best gender + register cues)
+    cfg["proof"] = True            # 2-pass proofreader fixes gender agreement (1st + 3rd person)
+    if gpu_names and "none" not in " ".join(gpu_names).lower():
+        cfg["gpu"] = True
+    models = _ollama_models() or []
+    # Translation = Google (universal, free, reliable). Ollama is used ONLY for intelligence: the
+    # character-gender map and the 2-pass corrector that fixes Czech gender agreement + naturalness.
+    cfg["eng_i"] = 0               # 0 = google in ["google","gemini","claude"]
+    if not models:
+        log_warn("    (No Ollama model found - gender correction needs one; e.g. 'ollama pull qwen3:14b'. "
+                 "Google will still translate, but without the AI gender/quality pass.)")
+    if vram >= 24:
+        prefs = ["gemma3:27b", "qwen3:30b-a3b", "qwen3:32b", "qwen3:14b"]
+    elif vram >= 16:
+        prefs = ["gemma3:27b", "qwen3:30b-a3b", "qwen3:14b"]
+    elif vram >= 11:
+        prefs = ["qwen3:14b", "gemma3:12b", "qwen3:8b"]
+    else:
+        prefs = ["qwen3:8b", "qwen3:4b"]
+    rec = None
+    for p in prefs:
+        rec = next((mm for mm in models if mm == p), None) or \
+            next((mm for mm in models if mm.split(":")[0] == p.split(":")[0]), None)
+        if rec:
+            break
+    cfg["_rec_model"] = rec or (models[0] if models else "qwen3:14b")
+    vmodels = [mm for mm in models if any(t in mm.lower()
+               for t in ("vl", "vision", "llava", "minicpm-v", "moondream"))]
+    if vmodels:
+        cfg["vgender"] = True
+        cfg["_rec_vmodel"] = vmodels[0]
+    else:
+        cfg["vgender"] = False
+        cfg.pop("_rec_vmodel", None)
+    if not _DEBUG:                  # turn on logging for troubleshooting
+        try:
+            if args is not None:
+                args.debug = True
+            _debug_start(args)
+        except Exception:
+            pass
+    eng = ["google", "gemini", "claude"][cfg["eng_i"] % 3]
+    dbg(f"recommended config applied: gpu={vendor} vram={vram}GB engine={eng} "
+        f"model={cfg.get('_rec_model')} vgender={cfg['vgender']} vmodel={cfg.get('_rec_vmodel')} "
+        f"| video+asd+korean-source+2pass+report all ON, full decode")
+    return dict(vendor=vendor, vram=vram, engine=eng, model=cfg.get("_rec_model"),
+                vgender=cfg["vgender"], vmodel=cfg.get("_rec_vmodel"))
+
+
+def _trans_cache_sig(events, comb, ko_lines, engine, model, use_ko, proof):
+    """Signature of everything that affects the translation output, so a re-run with identical inputs
+    can reuse the cached translation instead of re-running the (slow) LLM."""
+    import hashlib
+    payload = {
+        "v": 1, "engine": engine, "model": model or "", "use_ko": bool(use_ko), "proof": bool(proof),
+        "src": [e["text"] for e in events],
+        "ko": [(ko_lines[i] if ko_lines and i < len(ko_lines) else "") for i in range(len(events))] if use_ko else None,
+        "g": [c.get("g", "?") for c in comb],
+    }
+    return hashlib.sha1(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
 def run_gender_translate(args):
     """Scan videos, pick a SOURCE subtitle language, then translate that track into Czech with
     SPEAKER-GENDER awareness: detect each line's speaker gender from the AUDIO (voice pitch) and
@@ -5892,7 +7430,8 @@ def run_gender_translate(args):
     di = _discrete_gpu_index()
     cfg = {"use_video": True, "gpu": True, "dev": (di if di is not None else "auto"),
            "eng_i": 0, "want_report": True, "sel": [True] * len(videos), "over": {}, "pos": 0,
-           "global_sub": global_sub, "global_auds": global_auds, "kf": False}
+           "global_sub": global_sub, "global_auds": global_auds, "kf": False, "kosrc": False,
+           "asd": False, "vgender": False, "proof": False}
     while True:
         res = _gender_picker(videos, vinfo, cfg, gpu_names)
         if res is None:
@@ -5902,6 +7441,14 @@ def run_gender_translate(args):
             ns = _pick_sub()
             if ns:
                 cfg["global_sub"] = ns
+            continue
+        if res[0] == "recommend":                              # one-key best-for-accuracy config
+            rc = _recommend_config(cfg, gpu_names, args)
+            log_info(f"    Recommended config applied (GPU {rc['vendor']} {rc['vram']}GB): "
+                     f"translation = Google; gender + correction via Ollama {rc['model'] or '(none)'}"
+                     + (f"; vision-gender {rc['vmodel']}" if rc['vgender'] else "")
+                     + " | video+active-speaker+korean-source+2-pass+report ON, full decode, logging ON.")
+            log_info("    Just press Enter on the next screens to accept the recommendations.")
             continue
         if res[0] == "audio":                                  # change global audio track(s)
             pre = tuple(aud_langs.index(x) for x in cfg["global_auds"] if x in aud_langs)
@@ -5933,7 +7480,7 @@ def run_gender_translate(args):
         break
     global_sub, global_auds = cfg["global_sub"], cfg["global_auds"]
 
-    engine = ["gemini", "claude"][cfg["eng_i"] % 2]
+    engine = ["google", "gemini", "claude"][cfg["eng_i"] % 3]
     use_video, want_report = cfg["use_video"], cfg["want_report"]
     if engine == "gemini":
         key = (getattr(args, "gemini_key", None) or os.environ.get("GEMINI_API_KEY")
@@ -5945,12 +7492,44 @@ def run_gender_translate(args):
         default_model = "gemini-2.0-flash" if stale else cfgmodel
         model = _ask_gemini_model_menu(key, default_model)
         args.gemini_model = model
-    else:
+    elif engine == "claude":
         key = (getattr(args, "anthropic_key", None) or os.environ.get("ANTHROPIC_API_KEY")
                or ask_text("Anthropic API key", ""))
         model = getattr(args, "anthropic_model", None) or "claude-sonnet-4-6"
+    else:                                                     # local LLM via Ollama (no cloud, no limits)
+        key = "local"
+        models = _ollama_models()
+        if not models:
+            die("Local engine needs Ollama running. Install it from https://ollama.com, start it, then "
+                "pull a strong multilingual model, e.g.:  ollama pull qwen2.5:32b   (or aya-expanse:32b, "
+                "gemma2:27b). Bigger = more accurate. Then run this again.")
+        default = cfg.get("_rec_model") or getattr(args, "ollama_model", None) or _ollama_best_default(models)
+        pre = [models.index(default)] if default in models else [0]
+        sel = _ask_checkbox("Local model (Ollama). Pick one that FITS your GPU VRAM: a model larger "
+                            "than your VRAM spills to CPU and gets very slow (check 'ollama ps'). "
+                            "~16 GB card -> qwen3:14b or qwen3:30b-a3b; 24 GB+ -> qwen3:32b. "
+                            "qwen3 / aya-expanse / gemma3 are strong for KR/JP -> Czech:",
+                            models, preselect=pre, single=True)
+        model = models[sel[0]] if sel else (default or models[0])
+        args.ollama_model = model
     if not key:
-        die("No API key - the gender hints need an AI engine (gemini/claude).")
+        die("No API key - the gender hints need an AI engine (gemini/claude/local).")
+
+    vlm_model = None                              # optional vision-LLM for gender (looks at the face)
+    if cfg.get("vgender") and use_video:
+        _vms = _ollama_models() or []
+        _cands = [m for m in _vms if any(t in m.lower() for t in
+                  ("vl", "vision", "llava", "minicpm-v", "moondream", "gemma3", "llama3.2-vision"))]
+        if _cands:
+            _rvp = [_cands.index(cfg["_rec_vmodel"])] if cfg.get("_rec_vmodel") in _cands else [0]
+            _sel = _ask_checkbox("Vision model for gender (Ollama looks at the detected face; better on "
+                                 "Asian faces but slower). qwen2.5vl is a solid pick:",
+                                 _cands, preselect=_rvp, single=True)
+            vlm_model = _cands[_sel[0]] if _sel else _cands[0]
+            log_info(f"    gender via vision-LLM: {vlm_model}")
+        else:
+            log_warn("    vision-LLM gender needs a vision model in Ollama, e.g. "
+                     "'ollama pull qwen2.5vl:7b' (or qwen3-vl, llama3.2-vision) - using InsightFace instead.")
 
     detect = "audio+video" if use_video else "audio"
     dbg(f"gender-translate: {len(chosen)} video(s) | engine={engine} model={model} | detect={detect} | "
@@ -6001,46 +7580,118 @@ def run_gender_translate(args):
         aud = _gender_audio_merge(aud_list)
         _t_audio = time.perf_counter() - _t0
         _t0 = time.perf_counter()
-        vid = (_gender_from_video(ffmpeg_bin, v, events, prefix=f"  {stem} video gender ",
-                                  gpu=cfg["gpu"], dev=cfg["dev"], keyframe=cfg.get("kf", False)) if use_video else None)
+        dfaces = [] if (_DEBUG and use_video) else None    # face thumbnails for visual verification
+        if use_video and cfg.get("asd"):
+            import cv2 as _cv2asd
+            _backend = _gender_onnx_setup(_cv2asd, vlm_model=vlm_model)
+            vid = _gender_video_asd(ffmpeg_bin, v, events, 0, cfg["gpu"], cfg["dev"], _backend, _cv2asd,
+                                    prefix=f"  {stem} active-speaker ", debug_faces=dfaces)
+            if vid is None:
+                log_warn("    active-speaker needs the GPU/ONNX face path (pip install "
+                         "onnxruntime-directml) - falling back to standard video detection.")
+                vid = _gender_from_video(ffmpeg_bin, v, events, prefix=f"  {stem} video gender ",
+                                         gpu=cfg["gpu"], dev=cfg["dev"], keyframe=cfg.get("kf", False),
+                                         debug_faces=dfaces, vlm_model=vlm_model)
+        elif use_video:
+            vid = _gender_from_video(ffmpeg_bin, v, events, prefix=f"  {stem} video gender ",
+                                     gpu=cfg["gpu"], dev=cfg["dev"], keyframe=cfg.get("kf", False),
+                                     debug_faces=dfaces, vlm_model=vlm_model)
+        else:
+            vid = None
         _t_video = time.perf_counter() - _t0
         comb = _gender_combine(aud, vid)
         if len(aud_list) > 1:
             log_info(f"    merged {len(aud_list)} audio track(s): {'+'.join(want)}")
         for _ln in _gender_summary_lines(aud, vid, comb):
             print(_ln)
+        ko_lines = None
+        if cfg.get("kosrc"):
+            if not _whisper_available():
+                log_warn("    Korean source needs faster-whisper (pip install faster-whisper) - "
+                         "using the English subtitles as source instead.")
+            else:
+                segs = _ko_transcribe_cached(ffmpeg_bin, v, 0, "large-v3", prefix=f"  {stem} korean ASR ")
+                ko_lines = _align_ko_to_cues(events, segs) if segs else None
+                if ko_lines:
+                    got = sum(1 for x in ko_lines if x)
+                    log_info(f"    korean transcription aligned to {got}/{len(events)} cues (source of truth)")
+                else:
+                    log_warn("    Korean transcription failed - using English source.")
+        _use_ko = bool(ko_lines) and any(ko_lines)
+        _cachep = Path(v).with_name(Path(v).stem + ".cze.trans.json")
+        _sig = _trans_cache_sig(events, comb, ko_lines, engine, model, _use_ko, cfg.get("proof"))
+        translated = None
+        if _cachep.exists():
+            try:
+                _cd = json.loads(_cachep.read_text(encoding="utf-8"))
+                if _cd.get("sig") == _sig and len(_cd.get("lines", [])) == len(events):
+                    translated = [{"start": e["start"], "end": e["end"], "text": _clean_tr_line(t) or t}
+                                  for e, t in zip(events, _cd["lines"])]
+                    log_info(f"    using cached translation ({len(events)} lines) - delete "
+                             f"{_cachep.name} to force re-translate")
+            except Exception as _e:
+                dbg(f"translation cache unreadable ({_e}) - re-translating")
+                translated = None
         _t0 = time.perf_counter()
-        with _dbg_timer(f"gender-translate {Path(v).name}"):
-            translated = _gender_translate(events, comb, engine, key, model, src_name)
+        if translated is None:
+            # 'Intelligence' engine (character genders + 2-pass corrector): prefer LOCAL Ollama - the
+            # user's setup uses Ollama only for intelligence, not for the base translation (Google does
+            # that). If the translation engine is itself an AI (claude/gemini/local), reuse it.
+            _im = _ollama_models() or []
+            if engine in ("claude", "gemini", "local"):
+                ai_engine, ai_key, ai_model = engine, key, model
+            elif _im:
+                _rm = cfg.get("_rec_model")
+                ai_engine, ai_key, ai_model = "local", None, (_rm if _rm in _im else _ollama_best_default(_im))
+            else:
+                ai_engine, ai_key, ai_model = None, None, None
+            # character genders - reuse what we learned for this SHOW, detect the rest via the AI (universal).
+            charmap = _resolve_character_genders(args, v, events, ko_lines, ai_engine, ai_key, ai_model,
+                                                 mkvmerge_bin=getattr(args, 'mkvmerge', None))
+            with _dbg_timer(f"gender-translate {Path(v).name}"):
+                translated = _gender_translate(events, comb, engine, key, model, src_name,
+                                               ko_lines=ko_lines, charmap=charmap)
+            if cfg.get("proof") and ai_engine:       # Ollama (or the AI engine) corrects gender + Czech
+                with _dbg_timer(f"gender-proofread {Path(v).name}"):
+                    translated = _gender_proofread(events, translated, comb, ai_engine, ai_key, ai_model,
+                                                   src_name, ko_lines=ko_lines, charmap=charmap)
+            try:                                     # cache so an identical re-run is instant
+                _cachep.write_text(json.dumps({"sig": _sig, "lines": [t["text"] for t in translated]},
+                                              ensure_ascii=False), encoding="utf-8")
+                dbg(f"cached translation to {_cachep.name}")
+            except Exception as _e:
+                dbg(f"could not write translation cache: {_e}")
         _t_tr = time.perf_counter() - _t0
         n_changed = sum(1 for e, t in zip(events, translated) if t["text"] != e["text"])
-        timings = {"audio": _t_audio, "video": _t_video, "translate": _t_tr}
-        dbg_block = _gender_debug_block(aud_list, want, aud, vid, comb, timings, cfg, engine, model, detect)
-        dbg_block["translation"] = dict(lines=len(events), changed=n_changed)
-        dbg(f"    stats: audio {_t_audio:.1f}s video {_t_video:.1f}s translate {_t_tr:.1f}s | "
-            f"combined M={dbg_block['combined']['M']} F={dbg_block['combined']['F']} "
-            f"?={dbg_block['combined']['U']} | translated {n_changed}/{len(events)}"
-            + (f" | audio-vs-video agree={dbg_block['audio_vs_video']['agree']} "
-               f"disagree={dbg_block['audio_vs_video']['disagree']}" if vid else ""))
+        # Save the actual deliverable FIRST, so a later stats/report error can never lose it.
         outp = Path(v).with_name(Path(v).stem + ".cze.srt")
         write_srt(translated, outp)
         log_done(f"    saved {outp.name} ({len(translated)} lines)")
-        # full machine-readable debug block: always to the --debug / --debug-gui log, and to the
-        # report JSON when the report is on, or a standalone .gender.debug.json when it isn't.
-        if _DEBUG:
-            dbg("gender debug block: " + json.dumps(dbg_block, ensure_ascii=False))
-        if want_report:
-            _write_gender_report(os.path.splitext(str(outp))[0], v, src_name, engine, detect,
-                                 events, translated, aud, vid, comb, debug=dbg_block)
-        elif _DEBUG:
-            try:
+        done += 1
+        # Stats + report are best-effort: a bug here must not discard the subtitles above.
+        try:
+            timings = {"audio": _t_audio, "video": _t_video, "translate": _t_tr}
+            dbg_block = _gender_debug_block(aud_list, want, aud, vid, comb, timings, cfg, engine, model, detect)
+            dbg_block["translation"] = dict(lines=len(events), changed=n_changed)
+            dbg(f"    stats: audio {_t_audio:.1f}s video {_t_video:.1f}s translate {_t_tr:.1f}s | "
+                f"combined M={dbg_block['combined']['M']} F={dbg_block['combined']['F']} "
+                f"?={dbg_block['combined']['U']} | translated {n_changed}/{len(events)}"
+                + (f" | audio-vs-video agree={dbg_block['audio_vs_video']['agree']} "
+                   f"disagree={dbg_block['audio_vs_video']['disagree']}" if vid else ""))
+            if _DEBUG:
+                dbg("gender debug block: " + json.dumps(dbg_block, ensure_ascii=False))
+            if want_report:
+                _write_gender_report(os.path.splitext(str(outp))[0], v, src_name, engine, detect,
+                                     events, translated, aud, vid, comb, debug=dbg_block, faces=dfaces,
+                                     ko_lines=ko_lines)
+            elif _DEBUG:
                 with open(os.path.splitext(str(outp))[0] + ".gender.debug.json", "w", encoding="utf-8") as f:
                     json.dump(dict(video=os.path.basename(str(v)), src_lang=src_name, engine=engine,
                                    model=model, detect=detect, debug=dbg_block), f, ensure_ascii=False, indent=1)
                 dbg(f"    wrote {os.path.basename(os.path.splitext(str(outp))[0])}.gender.debug.json")
-            except Exception as _e:
-                dbg(f"    could not write standalone gender.debug.json: {_e}")
-        done += 1
+        except Exception as _e:
+            log_warn(f"    subtitles saved OK, but the stats/report step failed: {_e}")
+            dbg(f"gender report/stats failed (subtitles were saved): {_e}")
     print()
     log_done(f"Done: {done}/{len(chosen)} subtitle track(s) translated into Czech (gender-aware).")
 
@@ -7074,9 +8725,9 @@ def _pick_video_files(videos, title="Select files to work with", subtitle=None):
                                 f"{Style.RESET_ALL}  {Style.DIM}({nmatch} match) "
                                 f"Enter = apply | Esc = cancel{Style.RESET_ALL}")
                 head.append("")
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | "
+                foot = [""] + _menu_lines("\u2191\u2193 move | Space = toggle | a = all/none | "
                             f"+/- = check/uncheck by filter (e.g. *.mkv, *Viki*) | "
-                            f"Enter = confirm | Esc = cancel{Style.RESET_ALL}"]
+                            f"Enter = confirm | Esc = cancel", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 pos = max(0, min(pos, len(videos) - 1))
                 if pos < top:
@@ -9809,6 +11460,54 @@ def _fb_trunc(s, width):
     return s[:max(1, width - 1)] + "..."
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _visible_len(s):
+    """Length of a string as shown on screen (ANSI color codes don't take columns)."""
+    return len(_ANSI_RE.sub("", s))
+
+
+def _pack_chips(chips, cols, sep="    ", indent=""):
+    """Lay colored 'chip' strings into lines that fit `cols` visible columns, wrapping only at chip
+    boundaries (never mid-word). Returns a list of lines. Makes option headers responsive to the
+    terminal width so they always look tidy."""
+    lines, cur, curlen = [], indent, _visible_len(indent)
+    sw = len(sep)
+    for ch in chips:
+        w = _visible_len(ch)
+        if cur.strip() and curlen + sw + w > cols:
+            lines.append(cur)
+            cur, curlen = indent + ch, _visible_len(indent) + w
+        elif cur.strip():
+            cur += sep + ch
+            curlen += sw + w
+        else:
+            cur += ch
+            curlen += w
+    if cur.strip():
+        lines.append(cur)
+    return lines or [indent]
+
+
+def _menu_lines(text, cols, sep=" | ", style=None):
+    """Split a '|'-separated key-hint string into items and pack them responsively into styled lines
+    (dim by default), wrapping only at ' | ' boundaries so the hint bar never breaks mid-item and
+    always fits the current terminal width."""
+    st = Style.DIM if style is None else style
+    parts = [p.strip() for p in str(text).split("|") if p.strip()]
+    return [f"{st}{ln}{Style.RESET_ALL}" for ln in _pack_chips(parts, cols, sep=sep)]
+
+
+def _wrap_title(text, cols, style=None):
+    """Wrap a plain title/sentence to the terminal width into styled lines."""
+    import textwrap
+    st = (Fore.CYAN + Style.BRIGHT) if style is None else style
+    if not text:
+        return []
+    return [f"{st}{ln}{Style.RESET_ALL}" for ln in (textwrap.wrap(str(text), max(20, cols - 1)) or [str(text)])]
+
+
 def _fb_write_frame(lines):
     """Draws a frame with minimal flicker (home, per-line clear, clear-to-end)."""
     out = "\x1b[H" + "\n".join(line + "\x1b[K" for line in lines) + "\x1b[J"
@@ -9879,13 +11578,14 @@ def _fb_pick_location(cwd):
     opts.append(("Type a path manually...", "__manual__"))
     pos = 0
     while True:
+        cols, _ = _fb_termsize()
         lines = [f"{Fore.MAGENTA}=== Jump to ==={Style.RESET_ALL}", ""]
         for i, (lbl, _p) in enumerate(opts):
             if i == pos:
                 lines.append(f"{Fore.GREEN}{Style.BRIGHT}\u203a {lbl}{Style.RESET_ALL}")
             else:
                 lines.append(f"  {lbl}")
-        lines += ["", f"{Style.DIM}\u2191\u2193 move | Enter = go | Esc = cancel{Style.RESET_ALL}"]
+        lines += [""] + _menu_lines("\u2191\u2193 move | Enter = go | Esc = cancel", cols)
         _fb_write_frame(lines)
         k = _read_key()
         if k == "up":
@@ -9961,9 +11661,8 @@ def _fb_rename_preview(cwd, files):
         summary = (f"{Fore.GREEN}Changed: {len(changed)}{Style.RESET_ALL}   "
                    f"{Fore.RED}Conflicts: {len(skipped)}{Style.RESET_ALL}   "
                    f"{Style.DIM}Unchanged: {len(unchanged)}{Style.RESET_ALL}")
-        footer = (f"{Style.DIM}\u2191\u2193/PgUp/PgDn scroll | Enter = APPLY | Esc = cancel"
-                  f"{Style.RESET_ALL}")
-        _fb_write_frame(header + body + ["", summary, footer])
+        footer = _menu_lines("\u2191\u2193/PgUp/PgDn scroll | Enter = APPLY | Esc = cancel", cols)
+        _fb_write_frame(header + body + ["", summary] + footer)
         _fb_draw_scrollbar(len(header) + 1, len(body), len(view), rows_avail, top, cols)
 
         k = _read_key()
@@ -10685,7 +12384,7 @@ def _vid_pick_language(current):
                 head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Select language ==={Style.RESET_ALL}",
                         f"{Fore.CYAN}Current:{Style.RESET_ALL} {current or 'und'}    "
                         f"{Fore.YELLOW}Search:{Style.RESET_ALL} {filt}_", ""]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | type to search | Enter = select | Esc = cancel{Style.RESET_ALL}"]
+                foot = [""] + _menu_lines("\u2191\u2193 move | type to search | Enter = select | Esc = cancel", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 if pos < top:
                     top = pos
@@ -10756,7 +12455,7 @@ def _vid_track_list_screen(info, tracks, start=0):
                     else:
                         colr = Fore.YELLOW if kind == "audio" else Fore.CYAN
                         lines.append(f"  {colr}{row}{Style.RESET_ALL}")
-                lines += ["", f"{Style.DIM}\u2191\u2193 move | Enter = edit this track | Esc = done{Style.RESET_ALL}"]
+                lines += [""] + _menu_lines("\u2191\u2193 move | Enter = edit this track | Esc = done", cols)
                 _fb_write_frame(lines)
                 k = _read_key()
                 if k == "up":
@@ -10797,6 +12496,7 @@ def _vid_track_form(kind, t):
         _fb_enter_screen()
         try:
             while True:
+                cols, _ = _fb_termsize()
                 lines = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Edit track {tag}  ({_lang3_name(t['lang'])} {t['codec']}) ==={Style.RESET_ALL}", ""]
                 for i, r in enumerate(rows):
                     cur = (i == pos)
@@ -10819,8 +12519,8 @@ def _vid_track_form(kind, t):
                         lines.append(f"{mark} {hl}{r['label']:9}:{Style.RESET_ALL} {val}{arrows}")
                     if i == len(fields) - 1:
                         lines.append(f"  {Style.DIM}{'-' * 24}{Style.RESET_ALL}")
-                lines += ["", f"{Style.DIM}\u2191\u2193 move | type to edit text | <-/->/Space toggle | "
-                          f"Enter = confirm/apply | Esc = cancel{Style.RESET_ALL}"]
+                lines += [""] + _menu_lines("\u2191\u2193 move | type to edit text | <-/->/Space toggle | "
+                          f"Enter = confirm/apply | Esc = cancel", cols)
                 _fb_write_frame(lines)
                 k = _read_key()
                 r = rows[pos]
@@ -10977,6 +12677,7 @@ def _vidg_list_screen(nvideos, tracks, desired, orig, start=0):
         _fb_enter_screen()
         try:
             while True:
+                cols, _ = _fb_termsize()
                 lines = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Edit track metadata - ALL {nvideos} videos ==={Style.RESET_ALL}",
                          f"{Fore.CYAN}Edit on the first video as a template; changes apply to every video by track position.{Style.RESET_ALL}", ""]
                 for i, (kind, t) in enumerate(tracks):
@@ -10994,7 +12695,7 @@ def _vidg_list_screen(nvideos, tracks, desired, orig, start=0):
                     else:
                         colr = Fore.YELLOW if kind == "audio" else Fore.CYAN
                         lines.append(f"  {colr}{row}{Style.RESET_ALL}{edited}")
-                lines += ["", f"{Style.DIM}\u2191\u2193 move | Enter = edit this track | Esc = done (then apply to all){Style.RESET_ALL}"]
+                lines += [""] + _menu_lines("\u2191\u2193 move | Enter = edit this track | Esc = done (then apply to all)", cols)
                 _fb_write_frame(lines)
                 k = _read_key()
                 if k == "up":
@@ -11482,7 +13183,7 @@ def _vid_scroll_view(title, lines):
             while True:
                 cols, rows = _fb_termsize()
                 head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== {_fb_trunc(title, cols - 8)} ==={Style.RESET_ALL}", ""]
-                foot = ["", f"{Style.DIM}\u2191\u2193 / PgUp / PgDn / Home / End scroll | Esc = close{Style.RESET_ALL}"]
+                foot = [""] + _menu_lines("\u2191\u2193 / PgUp / PgDn / Home / End scroll | Esc = close", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 top = max(0, min(top, max(0, len(lines) - avail)))
                 body = []
@@ -12252,8 +13953,8 @@ def _online_live_match(args, g, info_fn=None):
                     f"{Fore.YELLOW}Search:{Style.RESET_ALL} {query}_",
                     f"{Style.DIM}{len(results)} result(s){Style.RESET_ALL}", "",
                 ]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | type / backspace to edit | "
-                        f"Tab = more info | Enter = select | Esc = cancel{Style.RESET_ALL}"]
+                foot = [""] + _menu_lines("\u2191\u2193 move | type / backspace to edit | "
+                        f"Tab = more info | Enter = select | Esc = cancel", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 if sel < top:
                     top = sel
@@ -12464,9 +14165,8 @@ def _online_rename_preview(args, videos):
                 summary = (f"{Fore.GREEN}Changed: {len(changed)}{Style.RESET_ALL}   "
                            f"{Fore.RED}Conflicts: {len(conf)}{Style.RESET_ALL}   "
                            f"{Style.DIM}Unchanged: {len(unchanged)}{Style.RESET_ALL}")
-                footer = (f"{Style.DIM}\u2191\u2193/PgUp/PgDn scroll | i/f/t toggle | l language | "
-                          f"m change match | Enter = APPLY | Esc = cancel{Style.RESET_ALL}")
-                _fb_write_frame(header + body + ["", summary, footer])
+                footer = _menu_lines("\u2191\u2193/PgUp/PgDn scroll | i/f/t toggle | l language | m change match | Enter = APPLY | Esc = cancel", cols)
+                _fb_write_frame(header + body + ["", summary] + footer)
                 _fb_draw_scrollbar(len(header) + 1, len(body), len(view), rows_avail, top, cols)
 
                 k = _read_key()
@@ -12700,8 +14400,8 @@ def _pick_languages_multi(selected):
                     f"{Fore.CYAN}Selected:{Style.RESET_ALL} {_fb_trunc(chosen, cols - 12)}",
                     f"{Fore.YELLOW}Search:{Style.RESET_ALL} {filt}_", "",
                 ]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | type = search | "
-                        f"Enter = confirm | Esc = cancel{Style.RESET_ALL}"]
+                foot = [""] + _menu_lines("\u2191\u2193 move | Space = toggle | type = search | "
+                        f"Enter = confirm | Esc = cancel", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 if pos < top:
                     top = pos
@@ -12928,7 +14628,7 @@ def _subs_pick_for_file(args, client, langs, video, tmdb_id, overwrite):
                 cols, rows = _fb_termsize()
                 head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Subtitles: {_fb_trunc(Path(video).name, 55)} ==={Style.RESET_ALL}",
                         f"{Style.DIM}{len(items)} version(s) - pick one to download{Style.RESET_ALL}", ""]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Enter = download this version | Esc = back{Style.RESET_ALL}"]
+                foot = [""] + _menu_lines("\u2191\u2193 move | Enter = download this version | Esc = back", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 sel = max(0, min(sel, len(items) - 1))
                 if sel < top:
@@ -13084,9 +14784,8 @@ def _subs_preview(args, videos):
                 summary = (f"{Fore.GREEN}Found: {found_pairs}{Style.RESET_ALL}   "
                            f"{Style.DIM}Missing: {missing_pairs}{Style.RESET_ALL}   "
                            f"(saved as name.<lang>.srt)")
-                footer = (f"{Style.DIM}\u2191\u2193 move | Enter = versions/download | Tab = info | "
-                          f"a = download all | l/h/o/m | Esc = cancel{Style.RESET_ALL}")
-                _fb_write_frame(header + body + ["", summary, footer])
+                footer = _menu_lines("\u2191\u2193 move | Enter = versions/download | Tab = info | a = download all | l/h/o/m | Esc = cancel", cols)
+                _fb_write_frame(header + body + ["", summary] + footer)
                 _fb_draw_scrollbar(len(header) + 1, len(body), len(plain), rows_avail, top, cols)
 
                 k = _read_key()
@@ -13526,11 +15225,38 @@ def _retime_apply_segments(events, segs):
     return out
 
 
-def _print_progress(i, n, prefix=""):
-    """One-line \\r progress bar: white while running, fully green at 100%."""
+_PROGRESS_STATE = {}
+
+
+def _fmt_dur(s):
+    s = int(max(0, s))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _print_progress(i, n, prefix="", unit="/s"):
+    """One-line \\r progress bar with a live throughput + ETA in the tail, and a final throughput
+    line written to the --debug log for troubleshooting (e.g. cues/s, or audio-sec/sec for Whisper)."""
     if n <= 0:
         return
-    _draw_bar(min(1.0, i / n), prefix=prefix, done=(i >= n))
+    now = time.perf_counter()
+    st = _PROGRESS_STATE.get(prefix)
+    if st is None or i <= 1 or i < st[1]:                 # (re)start timing this bar
+        _PROGRESS_STATE[prefix] = (now, i)
+        st = _PROGRESS_STATE[prefix]
+    t0, i0 = st
+    elapsed = now - t0
+    done_items = max(0, i - i0)
+    suffix = ""
+    if elapsed > 0.75 and done_items > 0:
+        rate = done_items / elapsed
+        eta = (n - i) / rate if rate > 0 and i < n else 0
+        suffix = f"{rate:.1f}{unit}" + (f" ETA {_fmt_dur(eta)}" if i < n and eta else f" ({_fmt_dur(elapsed)})")
+    _draw_bar(min(1.0, i / n), prefix=prefix, done=(i >= n), suffix=suffix)
+    if i >= n:
+        if elapsed > 0.2 and done_items > 0:
+            dbg(f"perf: {_LOG_ANSI_RE.sub('', prefix).strip()} - {n} items in {elapsed:.1f}s "
+                f"= {n / elapsed:.1f}{unit}")
+        _PROGRESS_STATE.pop(prefix, None)
 
 
 # --- precision knobs (all default ON for maximum accuracy; toggleable in the picker/CLI) ---
@@ -14064,7 +15790,7 @@ def _retime_pick_audio_langs(lang_count):
                     f"{Style.DIM}Pick which common-language tracks to analyse. More tracks = higher "
                     f"reliability (cross-checked), but slower.{Style.RESET_ALL}", "",
                 ]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | Enter = confirm | Esc = cancel{Style.RESET_ALL}"]
+                foot = [""] + _menu_lines("\u2191\u2193 move | Space = toggle | Enter = confirm | Esc = cancel", cols)
                 avail = max(3, rows - len(head) - len(foot))
                 pos = max(0, min(pos, len(items) - 1))
                 if pos < top:
@@ -14795,7 +16521,7 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
             return "auto"
         try:
             nm = gpu_names[int(_HWACCEL_DEVICE)]
-            return f"#{_HWACCEL_DEVICE} {_fb_trunc(nm, 22)}"
+            return f"#{_HWACCEL_DEVICE} {_fb_trunc(nm, 38)}"
         except (ValueError, IndexError, TypeError):
             return str(_HWACCEL_DEVICE)
 
@@ -14805,29 +16531,32 @@ def _retime_pick_jobs(jobs, ffmpeg_bin, use_video):
             while True:
                 cols, rows = _fb_termsize()
                 nsel = sum(sel)
-                head = [
-                    f"{Fore.MAGENTA}{Style.BRIGHT}=== Re-time: detected video+subtitle pairs ==={Style.RESET_ALL}",
-                    f"{Style.DIM}Auto-detected source subtitle + its video -> target video (by SxxExx). "
-                    f"All checked by default.{Style.RESET_ALL}",
-                    f"{Fore.CYAN}{nsel}/{len(jobs)} selected{Style.RESET_ALL}    "
+                head = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Re-time: detected video+subtitle pairs ==="
+                        f"{Style.RESET_ALL}"]
+                head += _wrap_title("Auto-detected source subtitle + its video -> target video "
+                                    "(by SxxExx). All checked by default.", cols, style=Style.DIM)
+                head += [f"{Fore.CYAN}{nsel}/{len(jobs)} selected{Style.RESET_ALL}"]
+                _chips = [
                     f"video analysis: {Fore.GREEN if use_video else Style.DIM}{'ON' if use_video else 'OFF'}"
-                    f"{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}    "
-                    f"GPU accel: {Fore.GREEN}{_hw_text()}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}"
-                    + (f"    GPU: {Fore.GREEN}{_dev_text()}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}"
-                       if len(gpu_names) > 1 else ""),
-                    f"{Style.DIM}precision:{Style.RESET_ALL} "
-                    f"envelope {Fore.GREEN}{_RETIME_ENV_HZ} Hz{Style.RESET_ALL} {Style.DIM}(h){Style.RESET_ALL}    "
-                    f"sub-sample interp: {Fore.GREEN if _RETIME_SUBSAMPLE else Style.DIM}"
-                    f"{'ON' if _RETIME_SUBSAMPLE else 'OFF'}{Style.RESET_ALL} {Style.DIM}(p){Style.RESET_ALL}    "
+                    f"{Style.RESET_ALL} {Style.DIM}(v){Style.RESET_ALL}",
+                    f"GPU accel: {Fore.GREEN}{_hw_text()}{Style.RESET_ALL} {Style.DIM}(g){Style.RESET_ALL}",
+                ]
+                if len(gpu_names) > 1:
+                    _chips.append(f"GPU: {Fore.GREEN}{_dev_text()}{Style.RESET_ALL} {Style.DIM}(d){Style.RESET_ALL}")
+                _chips += [
+                    f"envelope {Fore.GREEN}{_RETIME_ENV_HZ} Hz{Style.RESET_ALL} {Style.DIM}(h){Style.RESET_ALL}",
+                    f"interp: {Fore.GREEN if _RETIME_SUBSAMPLE else Style.DIM}"
+                    f"{'ON' if _RETIME_SUBSAMPLE else 'OFF'}{Style.RESET_ALL} {Style.DIM}(p){Style.RESET_ALL}",
                     f"video: {Fore.GREEN}{'keyframes (fast)' if _VIDEO_KEYFRAME else 'full (dense)'}"
-                    f"{Style.RESET_ALL} {Style.DIM}(k){Style.RESET_ALL}    "
+                    f"{Style.RESET_ALL} {Style.DIM}(k){Style.RESET_ALL}",
                     f"report: {Fore.GREEN if _RETIME_REPORT else Style.DIM}"
                     f"{'ON' if _RETIME_REPORT else 'off'}{Style.RESET_ALL} {Style.DIM}(r){Style.RESET_ALL}",
-                    "",
                 ]
-                foot = ["", f"{Style.DIM}\u2191\u2193 move | Space = toggle | a = all/none | v = video | "
-                            f"g = GPU | " + ("d = device | " if len(gpu_names) > 1 else "")
-                            + f"h = envelope Hz | p = interp | k = keyframe/full | r = report | Enter = run | Esc = cancel{Style.RESET_ALL}"]
+                head += _pack_chips(_chips, cols) + [""]
+                _ft = ("\u2191\u2193 move | Space = toggle | a = all/none | v = video | g = GPU | "
+                       + ("d = device | " if len(gpu_names) > 1 else "")
+                       + "h = envelope Hz | p = interp | k = keyframe/full | r = report | Enter = run | Esc = cancel")
+                foot = [""] + _menu_lines(_ft, cols)
                 avail = max(4, rows - len(head) - len(foot))
                 blk = 6 if (jobs and jobs[0].get("parts")) else 4   # 2-in-1 blocks are taller
                 per = max(1, avail // blk)
@@ -15772,6 +17501,16 @@ def _wizard_action_specs():
             help="Fixed preset: extracts the English track, translates to Czech (google, free) + rules "
                  "proofreading + readability fix, saves <video>.cs.srt. Asks only if several EN tracks exist.",
             kind="direct", run=run_p2, flag=None, preset=None),
+        "p2g": dict(
+            label="[preset] Translate ENGLISH -> CZECH with CORRECT GENDER + readability (--p2g)",
+            help="Like --p2 (google translation + readability) but the Czech gets the right gender: "
+                 "speaker gender from the voice pitch, an AI character-gender map, and a 2nd-pass AI "
+                 "corrector (Ollama) that fixes udelal/udelala, adjectives and on/ona. No video, no Whisper.",
+            kind="direct", run=run_p2g, flag=None, preset=None),
+        "pfix": dict(
+            label="[preset] FIX GENDER in existing CZECH subtitles (--pfix)",
+            help="For videos that already have a Czech .srt: detects the speaker gender from the voice, builds an AI character-gender map and fixes udelal/udelala, adjective agreement and on/ona in place. Wording and timing are kept; the original file is backed up as .srt.orig.",
+            kind="direct", run=run_pfix, flag=None, preset=None),
         "p3vg": dict(
             label="[preset] Re-time to a different source, ALL tracks + video (GPU) (--p3vg)",
             help="Fixed preset: re-times to a different video source using ALL matching common-language audio "
@@ -15854,7 +17593,7 @@ def _wizard_action_specs():
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
      ["sync-one", "sync-folder", "translate", "scan-translate", "gender-translate", "extract-subs", "merge-pro",
-      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p3vg", "p3vc", "p3", "p3aud"]),
+      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p2g", "pfix", "p3vg", "p3vc", "p3", "p3aud"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
@@ -16334,6 +18073,258 @@ def run_p2(args):
     log_done(f"Done: {done} .cs.srt from {len(videos)} videos ({skipped} skipped).")
 
 
+def run_p2g(args):
+    """FIXED PRESET (--p2g): --p2 plus CORRECT CZECH GENDER. Same speed profile as --p2 for the
+    translation itself (English track -> Czech via free 'google'), but adds:
+      * speaker gender per line from the voice pitch of the primary audio track (a few seconds),
+      * an AI character-gender map (who is male/female) remembered per show,
+      * a 2nd-pass AI corrector (local Ollama) that fixes 'udelal/udelala', adjective agreement and
+        on/ona, jeho/jeji against the source line,
+    then the same readability fix as --p1/--p2. Saves <video>.cs.srt. No video analysis, no Whisper."""
+    print(f"{Fore.MAGENTA}=== Preset --p2g: ENGLISH -> CZECH with correct gender + readability "
+          f"(.cs.srt) ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    videos = collect_videos(directory, bool(getattr(args, "recursive", False)))
+    if not videos:
+        die("No videos in the directory.")
+    log_info(f"Found {len(videos)} videos.")
+
+    mkvmerge_bin, mkvextract_bin, _ff_unused, _ = _resolve_tools_for_extract(args, Path(videos[0]))
+    if not mkvmerge_bin:
+        die("Could not find mkvmerge (MKVToolNix). Install MKVToolNix (see --help).")
+    args.mkvmerge = getattr(args, "mkvmerge", None) or mkvmerge_bin
+    if mkvextract_bin:
+        args.mkvextract = getattr(args, "mkvextract", None) or mkvextract_bin
+    # ffmpeg must be resolved separately: _resolve_tools_for_extract only returns it for non-MKV files,
+    # but we always need it for the audio (voice-pitch) gender analysis.
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    args.ffmpeg = getattr(args, "ffmpeg", None) or ffmpeg_bin
+    if not ffmpeg_bin:
+        die("ffmpeg is required for the voice-pitch gender detection (see --help).")
+
+    models = _ollama_models() or []
+    _om = getattr(args, "ollama_model", None)
+    ai_model = (_om if (_om in models and not _is_vision_model(_om))
+                else (_ollama_best_default(models) if models else None))
+    if ai_model:
+        log_info(f"    gender correction via Ollama '{ai_model}' (translation itself stays on google)")
+    else:
+        log_warn("    No Ollama model found - the AI gender correction will be skipped (install Ollama "
+                 "and e.g. 'ollama pull qwen3:8b'). Falling back to rule-based proofreading.")
+
+    interactive = sys.stdin.isatty()
+    infos = _probe_lang_subs(mkvmerge_bin, videos, "eng")
+    chosen_key, aborted = _select_lang_track_key(videos, infos, "subs", "English ", interactive)
+    if aborted:
+        return
+    if chosen_key is None:
+        die("No English text subtitle track found in any video.")
+
+    done = skipped = 0
+    for v in videos:
+        vp = Path(v)
+        chosen = _pick_video_track(infos, v, chosen_key, "subs")
+        if chosen is None:
+            log_warn(f"{vp.name}: no matching English track - skipping.")
+            skipped += 1
+            continue
+        events, _ch = extract_subtitle_events(args, vp, track_id=chosen["id"])
+        if not events:
+            log_warn(f"{vp.name}: extracting track #{chosen['id']} failed - skipping.")
+            skipped += 1
+            continue
+        stem = vp.stem[:38]
+        # 1) speaker gender from the primary audio track (voice pitch) - seconds, very reliable
+        aud = None
+        td = tempfile.mkdtemp(prefix="p2g_", dir=_temp_root())
+        try:
+            wav = Path(td) / "a.wav"
+            extract_audio_wav(ffmpeg_bin, vp, 0, wav, sample_rate=16000,
+                              progress_prefix=f"  {stem} reading audio ")
+            samples, sr = read_wav_mono(wav)
+            aud = _gender_from_audio(samples, sr, events, prefix=f"  {stem} speaker gender ")
+        except Exception as e:
+            log_warn(f"    could not analyse the audio ({e}) - continuing without gender hints.")
+            dbg(f"p2g audio gender failed: {e}")
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+        comb = _gender_combine(aud, None) if aud else None
+
+        # 2) base translation - identical to --p2 (free google, no key)
+        log_info(f"{vp.name}: translating {len(events)} subtitles into 'cs' (google)...")
+        translated = translate_events_to(events, "google", "cs")
+        if translated is None:
+            die("Translator 'google' is not available (check your internet connection).")
+        if sum(1 for a, b in zip(events, translated) if a["text"] != b["text"]) == 0:
+            log_warn(f"{vp.name}: translation produced no changes - NOT saving as 'cs'. Skipping.")
+            skipped += 1
+            continue
+
+        # 3) AI gender correction: character map (remembered per show) + 2nd-pass corrector
+        if ai_model and comb:
+            charmap = _resolve_character_genders_quiet(args, vp, events, ai_model,
+                                                       mkvmerge_bin=getattr(args, 'mkvmerge', None))
+            with _dbg_timer(f"p2g-proofread {vp.name}"):
+                translated = _gender_proofread(events, translated, comb, "local", None, ai_model,
+                                               "English", ko_lines=None, charmap=charmap)
+        else:
+            apply_proofread(translated, "rules", "cs", args)
+
+        # 4) readability fix - same values as --p1/--p2
+        translated, n_ext = fix_short_durations(
+            translated, min_cps=9.0, min_duration_floor=2.5, min_gap=0.084, line_overhead=0.2)
+        out = vp.with_name(vp.stem + ".cs.srt")
+        try:
+            write_srt(translated, out)
+        except Exception as e:
+            log_warn(f"{vp.name}: write failed ({e}) - skipping.")
+            skipped += 1
+            continue
+        gstat = ""
+        if comb:
+            gstat = (f", gender M={sum(1 for c in comb if c['g'] == 'M')} "
+                     f"F={sum(1 for c in comb if c['g'] == 'F')} "
+                     f"?={sum(1 for c in comb if c['g'] == '?')}")
+        log_done(f"{vp.name}: track #{chosen['id']} (eng) -> {out.name} "
+                 f"({len(translated)} subtitles, extended {n_ext}{gstat})")
+        if comb:
+            _preset_debug_report(vp, events, translated, aud, comb, "google", "audio", "eng", model=ai_model)
+        done += 1
+
+    print()
+    log_done(f"Done: {done} .cs.srt from {len(videos)} videos ({skipped} skipped).")
+
+
+def _preset_debug_report(video, events, translated, aud, comb, engine, detect, src_lang, model=None):
+    """In a --debug/--debug-gui run the presets also write the same gender report (HTML + JSON) as the
+    interactive gender-translate, so a run can be inspected afterwards. Best-effort: never fatal."""
+    if not _DEBUG:
+        return
+    try:
+        base = str(Path(video).with_suffix(""))      # -> <video>.gender.report.html / .json
+        blk = _gender_debug_block([aud] if aud else [], ["audio"], aud, None, comb, {},
+                                  {"gpu": False, "dev": None}, engine, model, detect)
+        _write_gender_report(base, video, src_lang, engine, detect, events, translated,
+                             aud, None, comb, debug=blk)
+        dbg(f"preset report: {os.path.basename(base)}.gender.report.html")
+    except Exception as e:
+        dbg(f"preset report failed: {e}")
+
+
+def _find_czech_srt(video_path):
+    """Existing Czech .srt sitting next to a video: <stem>.cze/.ces/.cz/.cs.srt first, then any
+    <stem>*.srt whose suffix looks Czech, then a bare <stem>.srt. Returns a Path or None."""
+    vp = Path(video_path)
+    for suf in (".cze.srt", ".ces.srt", ".cs.srt", ".cz.srt", ".czech.srt"):
+        p = vp.with_name(vp.stem + suf)
+        if p.exists():
+            return p
+    cands = sorted(vp.parent.glob(vp.stem + "*.srt"))
+    for p in cands:
+        tail = p.name[len(vp.stem):].lower()
+        if re.search(r"\b(cze|ces|czech|cesky|cestina)\b|[._-](cs|cz)[._-]", tail):
+            return p
+    bare = vp.with_suffix(".srt")
+    return bare if bare.exists() else None
+
+
+def run_pfix(args):
+    """FIXED PRESET (--pfix): the videos ALREADY have Czech subtitles - this only CHECKS and FIXES the
+    grammatical gender in them. It detects the speaker's gender per line from the voice pitch of the
+    primary audio track, builds an AI character-gender map (remembered per show), and runs the AI
+    corrector in fix-only mode: 'udelal/udelala', adjective/participle agreement and on/ona, jeho/jeji
+    are corrected, the wording and the TIMING are left untouched. The original file is backed up."""
+    print(f"{Fore.MAGENTA}=== Preset --pfix: fix GENDER in existing CZECH subtitles ==={Style.RESET_ALL}")
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    videos = collect_videos(directory, bool(getattr(args, "recursive", False)))
+    if not videos:
+        die("No videos in the directory.")
+    pairs = [(v, _find_czech_srt(v)) for v in videos]
+    pairs = [(v, s) for v, s in pairs if s]
+    if not pairs:
+        die("No existing Czech .srt found next to the videos (looked for <video>.cze/.ces/.cs/.cz.srt).")
+    log_info(f"Found {len(pairs)} video(s) with a Czech subtitle file.")
+
+    # NOTE: _resolve_tools_for_extract returns ffmpeg only for non-MKV containers, so resolve it
+    # separately here - we always need ffmpeg for the audio (voice-pitch) analysis.
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    args.ffmpeg = getattr(args, "ffmpeg", None) or ffmpeg_bin
+    if not ffmpeg_bin:
+        die("ffmpeg is required for the voice-pitch gender detection (see --help).")
+    models = _ollama_models() or []
+    _om = getattr(args, "ollama_model", None)
+    ai_model = (_om if (_om in models and not _is_vision_model(_om))
+                else (_ollama_best_default(models) if models else None))
+    if not ai_model:
+        die("This preset needs a local AI for the correction. Install Ollama (https://ollama.com) and "
+            "pull a model, e.g.:  ollama pull qwen3:8b")
+    log_info(f"    gender correction via Ollama '{ai_model}'")
+
+    done = skipped = 0
+    for v, srt in pairs:
+        vp, stem = Path(v), Path(v).stem[:38]
+        events = parse_srt(srt)
+        if not events:
+            log_warn(f"{srt.name}: could not read any subtitles - skipping.")
+            skipped += 1
+            continue
+        # 1) speaker gender per line from the voice pitch of the primary audio track
+        aud = None
+        td = tempfile.mkdtemp(prefix="pfix_", dir=_temp_root())
+        try:
+            wav = Path(td) / "a.wav"
+            extract_audio_wav(ffmpeg_bin, vp, 0, wav, sample_rate=16000,
+                              progress_prefix=f"  {stem} reading audio ")
+            samples, sr = read_wav_mono(wav)
+            aud = _gender_from_audio(samples, sr, events, prefix=f"  {stem} speaker gender ")
+        except Exception as e:
+            log_warn(f"    could not analyse the audio ({e}) - skipping {srt.name}.")
+            dbg(f"pfix audio gender failed: {e}")
+            skipped += 1
+            continue
+        finally:
+            shutil.rmtree(td, ignore_errors=True)
+        comb = _gender_combine(aud, None)
+
+        # 2) who is male/female in this show (AI, remembered across episodes)
+        charmap = _resolve_character_genders_quiet(args, vp, events, ai_model,
+                                                       mkvmerge_bin=getattr(args, 'mkvmerge', None))
+
+        # 3) correct the gender IN PLACE (wording and timing untouched)
+        with _dbg_timer(f"pfix-proofread {vp.name}"):
+            fixed = _gender_proofread(events, events, comb, "local", None, ai_model, "Czech",
+                                      ko_lines=None, charmap=charmap, fix_only=True)
+        n_changed = sum(1 for a, b in zip(events, fixed) if a["text"] != b["text"])
+        if n_changed == 0:
+            log_info(f"{srt.name}: no gender/grammar changes needed.")
+            done += 1
+            continue
+        bak = srt.with_name(srt.name + ".orig")
+        try:
+            if not bak.exists():
+                shutil.copy2(srt, bak)
+            write_srt(fixed, srt)
+        except Exception as e:
+            log_warn(f"{srt.name}: write failed ({e}) - skipping.")
+            skipped += 1
+            continue
+        log_done(f"{srt.name}: corrected {n_changed}/{len(events)} lines "
+                 f"(gender M={sum(1 for c in comb if c['g'] == 'M')} "
+                 f"F={sum(1 for c in comb if c['g'] == 'F')} ?={sum(1 for c in comb if c['g'] == '?')}) "
+                 f"- original kept as {bak.name}")
+        _preset_debug_report(vp, events, fixed, aud, comb, "local", "audio", "ces", model=ai_model)
+        done += 1
+
+    print()
+    log_done(f"Done: {done} subtitle file(s) checked ({skipped} skipped).")
+
+
 def _dependency_help():
     """Colored dependency section for --help. When something is added/removed,
     update it HERE (one source of truth for --help and the README)."""
@@ -16342,29 +18333,72 @@ def _dependency_help():
     return f"""
 {M}{B}=== DEPENDENCIES / INSTALLATION ==={R}
 
-{Y}Python packages (pip):{R}
-  {G}Required:{R}     pip install numpy
-  {G}Recommended:{R}  pip install numpy colorama charset-normalizer deep-translator
-  {G}All/optional:{R} pip install numpy colorama charset-normalizer deep-translator argostranslate langdetect py7zr
+{Y}Install EVERYTHING at once (all features, all engines):{R}
+  pip install numpy colorama charset-normalizer deep-translator argostranslate langdetect py7zr opencv-python onnxruntime-directml faster-whisper
+  {C}GPU note:{R} onnxruntime-directml above runs the gender model on {G}both AMD and NVIDIA{R} (DirectX 12) on Windows.
+  {C}NVIDIA only{R}, additionally for fast Whisper on the GPU:  pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+  {C}AMD:{R} Whisper has no AMD-GPU backend -> it runs on CPU (works, just slower); everything else uses the AMD GPU.
 
-    numpy               {C}REQUIRED{R} - the script won't start without it
-    colorama            colored output (needed for colors on Windows; on Linux colors even without it)
-    charset-normalizer  subtitle encoding detection (VIU/CJK/UTF-16); alternative: chardet
-    deep-translator     translation via Google and DeepL
-    argostranslate      offline translation (large - downloads language models)   [optional]
-    langdetect          language detection (the script has its own fallback too) [optional]
-    py7zr               Windows only: auto-download of MKVToolNix (.7z)          [optional]
-  (AI translation Claude/Gemini/OpenAI and OpenSubtitles run over HTTP - no SDK needed.)
+{Y}...or only what you need, by feature:{R}
+
+  {G}Core (always required):{R}
+    pip install numpy colorama charset-normalizer
+      numpy               {C}REQUIRED{R} - the script won't start without it
+      colorama            colored output (needed for colors on Windows)
+      charset-normalizer  subtitle encoding detection (VIU/CJK/UTF-16); alt: chardet
+
+  {G}Translation engines:{R}
+    pip install deep-translator            # free Google / DeepL web endpoints (no API key)
+    pip install argostranslate langdetect  # fully OFFLINE translation (downloads lang models)
+      (Claude / Gemini use YOUR API key over HTTPS - no SDK/package needed.)
+
+  {G}Gender-aware translation - face & gender detection from video:{R}
+    pip install opencv-python onnxruntime-directml
+      onnxruntime-directml  runs on {G}AMD, Intel and NVIDIA{R} GPUs on Windows (DirectX 12) - the cross-vendor choice
+      {C}Linux NVIDIA:{R}  pip install onnxruntime-gpu     {C}Linux AMD:{R}  pip install onnxruntime-rocm
+      {C}CPU only:{R}      pip install onnxruntime
+      opencv-python  any version works with the ONNX/GPU path; ONLY the CPU Caffe
+                     fallback (no onnxruntime) needs {C}pip install "opencv-python<5"{R}
+      (YuNet + InsightFace ONNX models auto-download on first run, then run offline.)
+
+  {G}Korean audio as source + active-speaker detection:{R}
+    pip install faster-whisper
+      (transcribes the Korean audio; model ~3 GB downloads once, then cached & offline.)
+      {C}NVIDIA (much faster, CUDA):{R}  pip install nvidia-cublas-cu12 nvidia-cudnn-cu12
+      {C}AMD:{R}  faster-whisper has no AMD-GPU backend -> runs on CPU (slower but fine; it's cached
+            after the first run). For AMD-GPU speech-to-text use whisper.cpp (Vulkan) separately.
+      (Whisper auto-uses CUDA when the libs above are present, otherwise CPU.)
+
+  {G}Optional extras:{R}
+    pip install py7zr                      # Windows: auto-download of MKVToolNix (.7z)
 
 {Y}System tools (NOT via pip):{R}
+  {G}ffmpeg + ffprobe{R}  needed for AUDIO/VIDEO features (gender, sync/VAD, Korean ASR, MP4).
   {G}MKVToolNix{R} (mkvmerge/mkvextract/mkvpropedit) - working with MKV tracks (extract, mux, default/remove)
-  {G}ffmpeg{R} - only for AUDIO-based synchronization (VAD) and for MP4; not needed for normal subtitle work
+  {G}Ollama{R}  {C}OPTIONAL{R} - the local LLM 'local' translation engine + vision-LLM gender (no cloud, no limits).
+        install from https://ollama.com , then pull models (see the 16 GB GPU list below).
+        {C}NVIDIA:{R} uses CUDA automatically. {C}AMD:{R} uses ROCm on supported GPUs (else CPU). The 16 GB
+        guidance below is the same for both - what matters is VRAM size, not the vendor.
+
+{Y}Ollama models to pull (tuned for a ~16 GB GPU, e.g. RTX 4080/4080S):{R}
+  {G}Translation (engine 'local') - pick ONE that fits 16 GB:{R}
+    ollama pull qwen3:14b        # ~9 GB, fully on GPU, fast - recommended default for KO->CS
+    ollama pull qwen3:30b-a3b    # MoE (~18 GB, only 3B active) - higher quality, still fast
+    ollama pull gemma3:27b       # ~17 GB, strong Czech grammar (minor RAM offload)
+    ollama pull aya-expanse:8b   # small multilingual alternative
+    {C}(avoid qwen3:32b on 16 GB - ~20 GB spills to CPU and gets very slow.){R}
+  {G}Vision-LLM gender (option 'm', looks at the face) - pick ONE:{R}
+    ollama pull qwen2.5vl:7b     # ~8 GB, good on Asian faces - recommended
+    ollama pull qwen2.5vl:3b     # ~4 GB, faster / leaves room for the translation model
+    ollama pull llama3.2-vision  # ~8 GB alternative
+    {C}(runs only on the ~130 active-speaker faces, so 7b fits alongside a 14b translator.){R}
+  {C}Check what's loaded and the GPU/CPU split:{R}  ollama ps    (want '100% GPU')
 
   {C}Windows:{R}              the script downloads MKVToolNix and ffmpeg itself when needed
   {C}Debian/Ubuntu:{R}        sudo apt install mkvtoolnix ffmpeg
   {C}Fedora:{R}               sudo dnf install mkvtoolnix ffmpeg
   {C}Arch:{R}                 sudo pacman -S mkvtoolnix-cli ffmpeg
-  {C}AlmaLinux/Rocky/RHEL:{R} (verze: rpm -E %rhel)
+  {C}AlmaLinux/Rocky/RHEL:{R} (version: rpm -E %rhel)
      MKVToolNix (official bunkus.org repo):
         EL8:     sudo rpm -Uhv https://mkvtoolnix.download/almalinux/bunkus-org-repo-2-4.noarch.rpm
         EL9/10:  sudo rpm -Uhv https://mkvtoolnix.download/centosstream/bunkus-org-repo-2-4.noarch.rpm
@@ -16374,7 +18408,387 @@ def _dependency_help():
         sudo dnf config-manager --set-enabled crb
         sudo dnf install --nogpgcheck https://mirrors.rpmfusion.org/free/el/rpmfusion-free-release-$(rpm -E %rhel).noarch.rpm
         sudo dnf install ffmpeg
+
+{M}{B}=== LEARNING DB (remembered character genders) ==={R}
+  To keep {C}on/ona, jeho/jeji{R} consistent across every episode of a series, the tool remembers each
+  show's character genders in a small JSON file (NOT in .temp - it is kept between runs):
+     {G}~/.video_tools/memory.json{R}   (Windows: C:\\Users\\<you>\\.video_tools\\memory.json)
+  See it / clear it:
+     {C}--show-memory{R}                  print the DB path and everything remembered
+     {C}--clear-memory{R}                 delete the whole DB
+     {C}--clear-memory "Show Name"{R}     forget just one series
+  (Or simply delete the memory.json file yourself.)
 """
+
+
+def _detect_gpu_for_setup():
+    """Best-effort GPU vendor + VRAM(GB) BEFORE any deps are installed -> (vendor, vram_gb).
+    vendor in {nvidia, amd, intel, none}; vram_gb is 0 when it can't be read."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=8)
+        nums = [int(x) for x in r.stdout.split() if x.strip().isdigit()] if r.returncode == 0 else []
+        if nums:
+            return "nvidia", max(1, round(max(nums) / 1024))
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["rocm-smi", "--showmeminfo", "vram"], capture_output=True, text=True, timeout=8)
+        if r.returncode == 0:
+            tot = [int(x) for x in re.findall(r"[Tt]otal\D*(\d{9,})", r.stdout)]
+            if tot:
+                return "amd", max(1, round(max(tot) / (1024 ** 3)))
+    except Exception:
+        pass
+    names = ""
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                "Get-CimInstance Win32_VideoController | "
+                                "Select-Object -ExpandProperty Name"],
+                               capture_output=True, text=True, timeout=12)
+            names = (r.stdout or "").lower()
+        else:
+            r = subprocess.run(["bash", "-c", "lspci | grep -Ei 'vga|3d|display'"],
+                               capture_output=True, text=True, timeout=8)
+            names = (r.stdout or "").lower()
+    except Exception:
+        pass
+    if any(t in names for t in ("nvidia", "geforce", "rtx", "quadro", "tesla")):
+        return "nvidia", 0
+    if any(t in names for t in ("amd", "radeon", "rx ")):
+        return "amd", 0
+    if "intel" in names:
+        return "intel", 0
+    return "none", 0
+
+
+def run_setup(assume_yes=False):
+    """--setup: detect the GPU and install the right pip packages + pull suitable Ollama models for
+    the detected VRAM. Does NOT install apps (ffmpeg / MKVToolNix / Ollama) - install those yourself."""
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}=== video_tools setup: Python deps + Ollama models ==={Style.RESET_ALL}")
+    vendor, vram = _detect_gpu_for_setup()
+    print(f"Detected GPU: {Fore.GREEN}{vendor}{Style.RESET_ALL}"
+          + (f" (~{vram} GB VRAM)" if vram else " (VRAM unknown)"))
+    if not vram and vendor in ("nvidia", "amd"):
+        sel = _ask_checkbox("How much GPU VRAM? (drives the Ollama model sizes)",
+                            ["8 GB", "12 GB", "16 GB", "24 GB or more"], single=True)
+        vram = {0: 8, 1: 12, 2: 16, 3: 24}.get(sel[0] if sel else 2, 16)
+
+    pip_pkgs = ["numpy", "colorama", "charset-normalizer", "deep-translator", "argostranslate",
+                "langdetect", "py7zr", "opencv-python", "onnxruntime-directml", "faster-whisper"]
+    if vendor == "nvidia":
+        pip_pkgs += ["nvidia-cublas-cu12", "nvidia-cudnn-cu12"]      # GPU Whisper (CUDA)
+
+    if vram >= 24:
+        tr, vl = "qwen3:32b", "qwen2.5vl:7b"
+    elif vram >= 16:
+        tr, vl = "qwen3:14b", "qwen2.5vl:7b"
+    elif vram >= 11:
+        tr, vl = "qwen3:8b", "qwen2.5vl:3b"
+    else:
+        tr, vl = "qwen3:4b", "qwen2.5vl:3b"
+    have_ollama = bool(shutil.which("ollama"))
+    pipcmd = [sys.executable, "-m", "pip", "install"] + pip_pkgs
+
+    print(f"\n{Fore.YELLOW}Plan (apps like ffmpeg / Ollama are NOT installed - only pip + models):{Style.RESET_ALL}")
+    print(f"  {Fore.CYAN}pip:{Style.RESET_ALL}    {' '.join(pipcmd)}")
+    if have_ollama:
+        print(f"  {Fore.CYAN}ollama:{Style.RESET_ALL} ollama pull {tr}   {Style.DIM}# translation{Style.RESET_ALL}")
+        print(f"          ollama pull {vl}   {Style.DIM}# vision-LLM gender{Style.RESET_ALL}")
+    else:
+        print(f"  {Fore.CYAN}ollama:{Style.RESET_ALL} {Fore.YELLOW}not found{Style.RESET_ALL} - install from "
+              f"https://ollama.com, then: ollama pull {tr} ; ollama pull {vl}")
+    if vendor == "amd":
+        print(f"  {Style.DIM}note: Whisper has no AMD-GPU backend -> it runs on CPU (fine, cached after 1st run)."
+              f"{Style.RESET_ALL}")
+    elif vendor in ("intel", "none"):
+        print(f"  {Style.DIM}note: no discrete NVIDIA/AMD GPU detected -> gender via DirectML/CPU, Whisper on CPU."
+              f"{Style.RESET_ALL}")
+
+    if not assume_yes:
+        ok = _ask_checkbox("Run this now?", ["Yes - install everything", "No - just show the commands"], single=True)
+        if not ok or ok[0] != 0:
+            print("Nothing installed. Copy the commands above to run them yourself.")
+            return 0
+    print(f"\n{Fore.CYAN}Installing pip packages...{Style.RESET_ALL}")
+    if subprocess.run(pipcmd).returncode != 0:
+        print(f"{Fore.RED}pip install reported an error (see above). Some packages may still have installed."
+              f"{Style.RESET_ALL}")
+    if have_ollama:
+        for m in (tr, vl):
+            print(f"\n{Fore.CYAN}ollama pull {m}...{Style.RESET_ALL}")
+            try:
+                subprocess.run(["ollama", "pull", m])
+            except Exception as e:
+                print(f"{Fore.RED}  ollama pull {m} failed: {e}{Style.RESET_ALL}")
+    print(f"\n{Fore.GREEN}{Style.BRIGHT}Setup done.{Style.RESET_ALL} Running a quick self-test...\n")
+    run_selftest()
+    print(f"\nStart with:  python {os.path.basename(sys.argv[0])} --debug-gui")
+    return 0
+
+
+def _total_ram_gb():
+    try:
+        if os.name == "nt":
+            import ctypes
+
+            class _MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            ms = _MS()
+            ms.dwLength = ctypes.sizeof(_MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+            return round(ms.ullTotalPhys / (1024 ** 3))
+        if os.path.exists("/proc/meminfo"):
+            for ln in open("/proc/meminfo"):
+                if ln.startswith("MemTotal"):
+                    return round(int(ln.split()[1]) / (1024 ** 2))
+    except Exception:
+        pass
+    return 0
+
+
+def _list_gpus():
+    """GPU names (with VRAM where available) for the HW summary."""
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+                           capture_output=True, text=True, timeout=8)
+        gs = [ln.strip() for ln in r.stdout.splitlines() if ln.strip()] if r.returncode == 0 else []
+        if gs:
+            return gs
+    except Exception:
+        pass
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                "Get-CimInstance Win32_VideoController | ForEach-Object { $_.Name }"],
+                               capture_output=True, text=True, timeout=12)
+        else:
+            r = subprocess.run(["bash", "-c", "lspci | grep -Ei 'vga|3d|display' | cut -d: -f3-"],
+                               capture_output=True, text=True, timeout=8)
+        gs = [x.strip() for x in (r.stdout or "").splitlines() if x.strip()]
+        return gs or ["(none detected)"]
+    except Exception:
+        return ["(unknown)"]
+
+
+def _hw_info_lines():
+    import platform
+    out = [f"OS:     {platform.platform()}",
+           f"Python: {platform.python_version()} ({platform.machine()})"]
+    cpu = platform.processor() or ""
+    try:
+        if os.name == "nt":
+            r = subprocess.run(["powershell", "-NoProfile", "-Command", "(Get-CimInstance Win32_Processor).Name"],
+                               capture_output=True, text=True, timeout=10)
+            if r.stdout.strip():
+                cpu = r.stdout.strip().splitlines()[0].strip()
+        elif os.path.exists("/proc/cpuinfo"):
+            for ln in open("/proc/cpuinfo"):
+                if "model name" in ln:
+                    cpu = ln.split(":", 1)[1].strip()
+                    break
+    except Exception:
+        pass
+    out.append(f"CPU:    {cpu or '?'}  ({os.cpu_count()} threads)")
+    ram = _total_ram_gb()
+    if ram:
+        out.append(f"RAM:    {ram} GB")
+    for g in _list_gpus():
+        out.append(f"GPU:    {g}")
+    return out
+
+
+def run_selftest():
+    """--test: real checks that everything works, including GPU acceleration - imports, ffmpeg +
+    hwaccels, a real DirectML/GPU gender inference (ms/infer), a real GPU video-decode, a real
+    Whisper CUDA run (tiny model), and Ollama generate + vision. Prints PASS/FAIL per check."""
+    G, Rr, Y, C, Mg, RS = Fore.GREEN, Fore.RED, Fore.YELLOW, Fore.CYAN, Fore.MAGENTA, Style.RESET_ALL
+    print(f"{Mg}{Style.BRIGHT}=== video_tools self-test (real GPU / acceleration checks) ==={RS}")
+    print(f"{C}Hardware:{RS}")
+    for ln in _hw_info_lines():
+        print(f"  {ln}")
+    print(f"{C}Checks:{RS}")
+    cnt = {"pass": 0, "fail": 0}
+
+    def line(name, ok, detail=""):
+        cnt["pass" if ok else "fail"] += 1
+        print(f"  [{G}PASS{RS}]" if ok else f"  [{Rr}FAIL{RS}]", name + (f" - {detail}" if detail else ""))
+        return ok
+
+    import importlib
+    for mod, label in [("numpy", "numpy"), ("cv2", "opencv-python"), ("onnxruntime", "onnxruntime"),
+                       ("faster_whisper", "faster-whisper"), ("deep_translator", "deep-translator"),
+                       ("charset_normalizer", "charset-normalizer"), ("colorama", "colorama")]:
+        try:
+            m = importlib.import_module(mod)
+            line(f"import {label}", True, f"v{getattr(m, '__version__', '?')}")
+        except Exception as e:
+            line(f"import {label}", False, str(e)[:60])
+
+    ff = shutil.which("ffmpeg")
+    if not ff and os.name == "nt":
+        for p in (r"C:\Program Files\ffmpeg\bin\ffmpeg.exe", r"C:\Program Files\ffmpeg\ffmpeg.exe"):
+            if os.path.exists(p):
+                ff = p
+                break
+    if ff:
+        try:
+            r = subprocess.run([ff, "-hide_banner", "-version"], capture_output=True, text=True, timeout=15)
+            line("ffmpeg", r.returncode == 0, (r.stdout.splitlines()[0] if r.stdout else "")[:48])
+            hr = subprocess.run([ff, "-hide_banner", "-hwaccels"], capture_output=True, text=True, timeout=15)
+            hws = [x for x in hr.stdout.split() if x.lower() not in ("hardware", "acceleration", "methods:")]
+            line("ffmpeg hwaccels", bool(hws), " ".join(hws)[:60])
+        except Exception as e:
+            line("ffmpeg", False, str(e)[:60])
+    else:
+        line("ffmpeg", False, "not found on PATH")
+
+    # real DirectML/GPU gender inference
+    try:
+        import cv2
+        import numpy as np
+        import onnxruntime as ort
+        import time as _t
+        provs = ort.get_available_providers()
+        line("GPU inference provider", any(p in provs for p in ("DmlExecutionProvider", "CUDAExecutionProvider",
+             "ROCMExecutionProvider")), ",".join(p.replace("ExecutionProvider", "") for p in provs)[:60])
+        be = _gender_onnx_setup(cv2)
+        if be and be.get("gsess"):
+            sess, gin = be["gsess"], be["gin"]
+            shp = sess.get_inputs()[0].shape
+            dims = [(d if isinstance(d, int) and d > 0 else (1 if i == 0 else (3 if i == 1 else 96)))
+                    for i, d in enumerate(shp)]
+            blob = np.random.rand(*dims).astype(np.float32)
+            sess.run(None, {gin: blob})
+            t0 = _t.perf_counter()
+            for _ in range(20):
+                sess.run(None, {gin: blob})
+            ms = (_t.perf_counter() - t0) / 20 * 1000
+            line("gender GPU inference", True,
+                 f"{ms:.2f} ms/infer ({1000 / ms:.0f} faces/s) via {be.get('label', '?')}")
+        else:
+            line("gender GPU backend", False, "no ONNX backend (pip install onnxruntime-directml)")
+    except Exception as e:
+        line("gender GPU", False, str(e)[:70])
+
+    # real GPU video decode
+    if ff:
+        try:
+            import tempfile as _tf
+            import time as _t2
+            td = _tf.mkdtemp()
+            tv = os.path.join(td, "t.mp4")
+            subprocess.run([ff, "-y", "-f", "lavfi", "-i", "testsrc=size=1280x720:rate=25", "-t", "4", tv],
+                           capture_output=True, timeout=40)
+            method = _hwaccel_for_decode(ff)
+            if method:
+                t0 = _t2.perf_counter()
+                r = subprocess.run([ff, "-y", "-hwaccel", method, "-i", tv, "-f", "null", "-"],
+                                   capture_output=True, timeout=40)
+                dt = _t2.perf_counter() - t0
+                line(f"ffmpeg GPU decode ({method})", r.returncode == 0,
+                     f"100 frames (720p) in {dt:.2f}s = {100 / dt:.0f} fps" if r.returncode == 0
+                     else "failed -> will use CPU decode")
+            else:
+                line("ffmpeg GPU decode", False, "no hwaccel for this GPU -> CPU decode")
+            shutil.rmtree(td, ignore_errors=True)
+        except Exception as e:
+            line("ffmpeg GPU decode", False, str(e)[:60])
+
+    # real Whisper CUDA run (tiny model)
+    if ff:
+        try:
+            _add_nvidia_dll_dirs()
+            from faster_whisper import WhisperModel
+            import tempfile as _tf
+            import time as _t3
+            td = _tf.mkdtemp()
+            wav = os.path.join(td, "s.wav")
+            subprocess.run([ff, "-y", "-f", "lavfi", "-i", "sine=frequency=200:duration=5", "-ac", "1",
+                            "-ar", "16000", wav], capture_output=True, timeout=20)
+            used, err, dt = None, "", 0.0
+            for dev, ct in (("cuda", "float16"), ("cpu", "int8")):
+                try:
+                    mdl = WhisperModel("tiny", device=dev, compute_type=ct)
+                    t0 = _t3.perf_counter()
+                    list(mdl.transcribe(wav, language="en")[0])
+                    dt = _t3.perf_counter() - t0
+                    used = dev
+                    break
+                except Exception as e:
+                    err = str(e)[:55]
+            shutil.rmtree(td, ignore_errors=True)
+            rtf = f", 5s audio in {dt:.2f}s = {5 / dt:.1f}x realtime" if dt else ""
+            _vendor, _ = _detect_gpu_for_setup()
+            if used == "cuda":
+                line("Whisper GPU (CUDA)", True, f"runs on cuda (float16){rtf}")
+            elif used == "cpu" and _vendor == "nvidia":
+                line("Whisper GPU (CUDA)", False,
+                     f"cuda unavailable -> CPU{rtf} (fix: pip install nvidia-cublas-cu12 nvidia-cudnn-cu12). {err}")
+            elif used == "cpu":
+                line("Whisper (CPU)", True,
+                     f"CPU{rtf} - expected on {_vendor} (faster-whisper has no CUDA/ROCm GPU backend)")
+            else:
+                line("Whisper", False, err or "failed")
+        except Exception as e:
+            line("Whisper", False, str(e)[:60])
+
+    # Ollama: server + generate + vision
+    models = _ollama_models()
+    if models is None:
+        line("Ollama server", False, "not reachable (start Ollama, then re-run --test)")
+    else:
+        line("Ollama server", True, f"{len(models)} model(s)")
+        vkey = ("vl", "vision", "llava", "minicpm-v", "moondream")
+        tr = [m for m in models if not any(t in m.lower() for t in vkey)]
+        vl = [m for m in models if any(t in m.lower() for t in vkey)]
+        if tr:
+            try:
+                import time as _t4
+                t0 = _t4.perf_counter()
+                resp = _ollama_generate("Write two short Czech sentences about the sea.", tr[0],
+                                        timeout=120, num_ctx=2048)
+                dt = _t4.perf_counter() - t0
+                toks = max(len((resp or "").split()), len(resp or "") // 4)   # rough token estimate
+                rate = f"~{toks / dt:.0f} tok/s" if resp and dt and toks else "response OK"
+                line(f"Ollama generate ({tr[0]})", bool(resp),
+                     f"{dt:.1f}s, {rate} (1st call also loads the model; check 'ollama ps' for GPU/CPU split)")
+            except Exception as e:
+                line(f"Ollama generate ({tr[0]})", False, str(e)[:50])
+        else:
+            line("Ollama translation model", False, "none pulled (ollama pull qwen3:14b)")
+        if vl:
+            try:
+                import cv2
+                import numpy as np
+                import time as _t5
+                t0 = _t5.perf_counter()
+                gg, _cc = _ollama_vision_gender(np.full((128, 128, 3), 128, np.uint8), cv2, vl[0])
+                line(f"Ollama vision ({vl[0]})", True, f"responded ({gg or '?'}) in {_t5.perf_counter() - t0:.1f}s")
+            except Exception as e:
+                line(f"Ollama vision ({vl[0]})", False, str(e)[:50])
+        else:
+            line("Ollama vision model", False, "none pulled (ollama pull qwen2.5vl:7b) - only needed for option 'm'")
+        ps = _ollama_ps_lines()
+        if ps:
+            print(f"  {C}ollama ps (GPU/CPU split of loaded models):{RS}")
+            for pl in ps:
+                col = G if "100% GPU" in pl else (Y if "CPU" in pl else "")
+                print(f"    {col}{pl}{RS}")
+
+    tot = cnt["pass"] + cnt["fail"]
+    col = G if cnt["fail"] == 0 else Y
+    print(f"\n{col}{Style.BRIGHT}Self-test: {cnt['pass']}/{tot} passed"
+          + (f", {cnt['fail']} failed{RS}" if cnt["fail"] else f"{RS}"))
+    if cnt["fail"]:
+        print(f"{Style.DIM}FAILs above show exactly what to install/enable. Re-run: python "
+              f"{os.path.basename(sys.argv[0])} --test{RS}")
+    return 0 if cnt["fail"] == 0 else 1
 
 
 def main():
@@ -16642,6 +19056,19 @@ DIFFERENT LANGUAGES (target vs reference):
                         help="Write a timestamped debug log next to the script (performance timings of every "
                              "ffmpeg decode, the commands run, decode-path choices, environment, and full "
                              "tracebacks on errors). The path is printed at start. Safe; only adds logging.")
+    parser.add_argument("--setup", dest="setup", action="store_true",
+                        help="Detect your GPU (NVIDIA/AMD/Intel) + VRAM and install the right pip "
+                             "packages and pull suitable Ollama models. Does not install apps "
+                             "(ffmpeg/Ollama).")
+    parser.add_argument("--clear-memory", dest="clear_memory", nargs="?", const="__ALL__", default=None,
+                        metavar="SHOW", help="Delete the learning DB (remembered character genders). "
+                        "With no value clears everything; give a show name to clear just that series. "
+                        "Prints the DB location. Use --show-memory to see what's stored.")
+    parser.add_argument("--show-memory", dest="show_memory", action="store_true",
+                        help="Print where the learning DB is and what character genders it remembers.")
+    parser.add_argument("--test", dest="selftest", action="store_true",
+                        help="Run real self-tests: imports, ffmpeg + hwaccels, GPU gender inference, "
+                             "GPU video decode, Whisper CUDA, and Ollama generate/vision. Prints PASS/FAIL.")
     parser.add_argument("--debug-gui", dest="debug_gui", action="store_true",
                         help="Same debug logging as --debug, but ALSO opens the interactive wizard (menu) so you "
                              "can pick operations by hand while everything is logged.")
@@ -16674,6 +19101,19 @@ DIFFERENT LANGUAGES (target vs reference):
                              "rule-based proofreading and a readability fix (9 chars/s, min 2.5s), saving <video>.cs.srt. "
                              "If several English tracks exist it asks which to use. Optionally a path to the directory "
                              "as a positional argument.")
+    parser.add_argument("--p2g", action="store_true",
+                        help="FIXED PRESET: like --p2 (English track -> Czech via free 'google' + readability) "
+                             "but with CORRECT CZECH GENDER: speaker gender from the voice pitch, an AI "
+                             "character-gender map (remembered per show), and a 2nd-pass Ollama corrector that "
+                             "fixes udelal/udelala, adjective agreement and on/ona. No video analysis, no Whisper. "
+                             "Saves <video>.cs.srt. Optionally a path to the directory.")
+    parser.add_argument("--pfix", action="store_true",
+                        help="FIXED PRESET: the videos ALREADY have Czech subtitles - only CHECK and FIX the "
+                             "grammatical gender in them. Speaker gender comes from the voice pitch, an AI "
+                             "character-gender map (remembered per show) handles on/ona and jeho/jeji, and a "
+                             "local Ollama model corrects udelal/udelala and adjective agreement IN PLACE. "
+                             "Wording and timing are untouched; the original is kept as <name>.srt.orig. "
+                             "Optionally a path to the directory.")
     parser.add_argument("--p3vg", action="store_true",
                         help="FIXED PRESET: re-time to a DIFFERENT video source using ALL matching common-language "
                              "audio tracks (no track picker), with the VIDEO image cross-check ON and GPU acceleration "
@@ -16730,6 +19170,34 @@ DIFFERENT LANGUAGES (target vs reference):
     args = parser.parse_args()
 
     global _STORE_PATH, _STORE_URL, _FFMPEG_URL_OVERRIDE
+    if getattr(args, "setup", False):
+        sys.exit(run_setup(assume_yes=getattr(args, "yes", False)))
+    if getattr(args, "clear_memory", None) is not None:
+        show = None if args.clear_memory == "__ALL__" else _show_key(args.clear_memory)
+        print(_memory_clear(show))
+        sys.exit(0)
+    if getattr(args, "show_memory", False):
+        p = _memory_path()
+        db = _memory_load()
+        shows = db.get("shows", {})
+        print(f"Learning DB: {p}")
+        print(f"(to clear: delete that file, or run  {os.path.basename(sys.argv[0])} --clear-memory)")
+        if not shows:
+            print("  (empty - no characters remembered yet)")
+        for sh, d in shows.items():
+            chars = d.get("characters", {})
+            print(f"\n  {sh}  ({len(chars)} characters, updated {d.get('updated', '?')})")
+            for n, v in sorted(chars.items()):
+                if isinstance(v, str):
+                    print(f"    {n} = {v}   (legacy)")
+                    continue
+                votes = v.get("votes") or {}
+                vt = (" votes " + "/".join(f"{g}:{c}" for g, c in sorted(votes.items()))) if votes else ""
+                mark = "TMDB-verified" if v.get("src") == "tmdb" else "AI"
+                print(f"    {n} = {v.get('g', '?')}   ({mark}{vt})")
+        sys.exit(0)
+    if getattr(args, "selftest", False):
+        sys.exit(run_selftest())
     if getattr(args, "debug", False) or getattr(args, "debug_gui", False):
         _debug_start(args)
     _STORE_PATH = _normalize_store_path(getattr(args, "config_file", None) or getattr(args, "preset_file", None))
@@ -16773,6 +19241,14 @@ DIFFERENT LANGUAGES (target vs reference):
 
     if getattr(args, "p2", False):
         run_p2(args)
+        return
+
+    if getattr(args, "p2g", False):
+        run_p2g(args)
+        return
+
+    if getattr(args, "pfix", False):
+        run_pfix(args)
         return
 
     if getattr(args, "p3vg", False):

@@ -6,6 +6,7 @@ import sys
 from tqdm import tqdm
 import os
 import re
+import fnmatch
 import threading
 import math
 import shutil
@@ -97,10 +98,12 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "2.91.1"
+SCRIPT_VERSION = "3.0.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 EP_PROBE_MAX = 0                # (deprecated / unused — episode-number probing was removed)
 SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
+PREVIEW_MAX_SECONDS = 120       # downloads shorter than this are flagged as probable previews
+PREVIEW_MAX_MB = 60             # ...or smaller than this when the duration can't be read
 # Paths that look like an episode/watch page — used to recognise an episode index and to visit
 # those links first. Matches e.g. /episode/12, /watch/..., s01e05, /ep-3, /epizoda/2, /dil/4.
 _EP_LINK_RE = re.compile(
@@ -153,7 +156,7 @@ _REMOTE_CONFIG_KEYS = {
     'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
-    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
@@ -235,6 +238,52 @@ def _temp_artifact(final_path: str, suffix: str) -> str:
     except OSError:
         pass
     return os.path.join(tdir, os.path.basename(final_path) + suffix)
+
+
+def _detect_previews(files, verbose=False):
+    """Spot downloads that are suspiciously small/short — typically Patreon PREVIEW clips (~30 s)
+    served when the post is locked to a higher tier. Returns [(path, seconds_or_None, size)].
+    A file is flagged when its duration is under PREVIEW_MAX_SECONDS, or (when the duration can't
+    be read) when it is both under PREVIEW_MAX_MB and far smaller than the rest of the batch."""
+    infos = []
+    for f in files or ():
+        try:
+            if os.path.isfile(f):
+                infos.append((f, os.path.getsize(f)))
+        except OSError:
+            pass
+    if not infos:
+        return []
+    flagged = []
+    sizes = sorted(s for _f, s in infos)
+    median = sizes[len(sizes) // 2]
+    for f, size in infos:
+        secs = _ffprobe_duration(f, None, False)
+        if secs and secs > 0:
+            if secs <= PREVIEW_MAX_SECONDS:
+                flagged.append((f, secs, size))
+            continue
+        if size <= PREVIEW_MAX_MB * 1024 * 1024 and (len(infos) == 1 or size * 5 < median):
+            flagged.append((f, None, size))
+    return flagged
+
+
+def _report_previews(files, verbose=False):
+    """Warn about likely preview downloads and return a short human-readable note (or '')."""
+    flagged = _detect_previews(files, verbose)
+    if not flagged:
+        return ''
+    print(f"{CLR.YELLOW}[WARN]{CLR.RESET} {len(flagged)} downloaded file(s) look like PREVIEWS, "
+          f"not full videos (locked to a higher tier?):")
+    for f, secs, size in flagged[:20]:
+        length = f"{int(secs // 60)}:{int(secs % 60):02d}" if secs else "unknown length"
+        print(f"        {os.path.basename(f)}  —  {length}, {size / 1024 / 1024:.1f} MiB")
+    if len(flagged) > 20:
+        print(f"        ... and {len(flagged) - 20} more")
+    print("        Check your pledge tier for these posts, then delete the previews and re-run.")
+    return (f"{len(flagged)} file(s) look like previews (~"
+            f"{int(min((s for _f, s, _z in flagged if s), default=PREVIEW_MAX_SECONDS))}s) — "
+            "probably locked to a higher tier")
 
 
 def _cleanup_temp_dir(directory: str) -> None:
@@ -951,6 +1000,49 @@ def extract_dropbox_links_from_post(post: dict) -> list:
     return _extract_links_from_post(post, ('dropbox.com',), (_DROPBOX_URL_RE,))
 
 
+def _post_plain_text(post: dict) -> str:
+    """All human-readable text of a post (rich-text doc + teaser + html body), so things written in
+    the post — like 'Password: FirstKiss?' — can be found."""
+    a = post.get('attributes', {}) or {}
+    out = []
+    for key in ('content_json_string', 'teaser_text_json_string'):
+        blob = a.get(key)
+        if isinstance(blob, str) and blob:
+            try:
+                doc = json.loads(blob)
+            except Exception:
+                out.append(blob)
+                continue
+
+            def walk(node):
+                if isinstance(node, dict):
+                    if node.get('type') == 'text' and isinstance(node.get('text'), str):
+                        out.append(node['text'])
+                    for v in node.values():
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+            walk(doc)
+    for key in ('content', 'content_teaser_text', 'cleaned_teaser_text', 'title'):
+        v = a.get(key)
+        if isinstance(v, str) and v:
+            out.append(re.sub(r'<[^>]+>', ' ', v))
+    return ' '.join(out)
+
+
+def extract_vidyard_links_from_post(post: dict) -> list:
+    """Vidyard video links anywhere in a post."""
+    return _extract_links_from_post(post, ('vidyard.com',),
+                                    (re.compile(r'https?://[^\s"\'<>\\)]+'),))
+
+
+def extract_muse_links_from_post(post: dict) -> list:
+    """muse.ai / skiv.com video links anywhere in a post."""
+    return _extract_links_from_post(post, ('muse.ai', 'skiv.com'),
+                                    (re.compile(r'https?://[^\s"\'<>\\)]+'),))
+
+
 def extract_streamable_links_from_post(post: dict) -> list:
     """Return an ordered, de-duplicated list of Streamable URLs found anywhere in a post."""
     return _extract_links_from_post(post, ('streamable.com',), (_STREAMABLE_URL_RE,))
@@ -1077,17 +1169,20 @@ def _looks_like_dropbox_id(name: str) -> bool:
     return bool(re.fullmatch(r'[a-z0-9]{12,}', stem))
 
 
-def _dropbox_probe(url: str, session: requests.Session):
-    """One ranged GET that returns (size_bytes, real_filename) for a Dropbox direct URL:
-    total size from Content-Range, real name from Content-Disposition (or the final URL)."""
+def _dropbox_probe(url: str, session: requests.Session, extra_headers: dict = None):
+    """One ranged GET that returns (size_bytes, real_filename) for a direct URL: total size from
+    Content-Range, real name from Content-Disposition (or the final URL). `extra_headers` carries a
+    source's required headers (e.g. Vidyard's Referer) — without them a signed CDN can refuse the
+    range request, and an unknown size forces a slow single-connection download."""
     size, name, saw_html = 0, '', False
     working = url
+    base_h = {'User-Agent': USER_AGENT, 'Accept': '*/*'}
+    base_h.update(extra_headers or {})
     for variant in (url, _dropbox_raw_variant(url)):
         try:
             with connection_slot():
                 with session.get(variant, stream=True, allow_redirects=True,
-                                 headers={'User-Agent': USER_AGENT, 'Accept': '*/*',
-                                          'Range': 'bytes=0-0'},
+                                 headers=dict(base_h, **{'Range': 'bytes=0-0'}),
                                  timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)) as r:
                     cr = r.headers.get('content-range', '')
                     if '/' in cr and cr.rsplit('/', 1)[-1].strip().isdigit():
@@ -1107,6 +1202,19 @@ def _dropbox_probe(url: str, session: requests.Session):
                             return size, name, variant
         except requests.RequestException:
             pass
+    if not size:                       # some CDNs ignore Range -> ask for the size directly
+        try:
+            with connection_slot():
+                h = session.head(working, allow_redirects=True, headers=base_h,
+                                 timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+            cl = (h.headers.get('content-length') or '').strip()
+            if cl.isdigit() and int(cl) > 1:
+                size = int(cl)
+                name = name or _parse_content_disposition_filename(
+                    h.headers.get('Content-Disposition', '')) or \
+                    unquote(os.path.basename(urlparse(h.url).path))
+        except requests.RequestException:
+            pass
     if saw_html and not size:
         tqdm.write(f"[WARN] Dropbox returned an HTML page (not a file) for '{name or url}'. "
                    f"The link may point to a folder, be rate-limited, or be download-blocked; "
@@ -1122,6 +1230,10 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
     drive_videos = []
     dropbox_items = []   # {'url','filename','title'}
     streamable_items = []  # {'shortcode','title'}
+    muse_items = []        # {'svid','title','password'}
+    seen_muse = set()
+    vidyard_items = []     # {'uuid','title'}
+    seen_vidyard = set()
     hls_videos = []      # stream descriptors
     seen_ids = set()
     seen_dropbox = set()
@@ -1174,6 +1286,25 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             streamable_items.append({'shortcode': sc, 'title': post_title or sc})
             had_media = True
 
+        # --- Vidyard links ---
+        for url in extract_vidyard_links_from_post(post):
+            vy = _vidyard_id(url)
+            if not vy or vy in seen_vidyard:
+                continue
+            seen_vidyard.add(vy)
+            vidyard_items.append({'uuid': vy, 'title': post_title or vy})
+            had_media = True
+
+        # --- muse.ai links (often password-protected; the password is written in the post) ---
+        for url in extract_muse_links_from_post(post):
+            svid = _muse_id(url)
+            if not svid or svid in seen_muse:
+                continue
+            seen_muse.add(svid)
+            muse_items.append({'svid': svid, 'title': post_title or svid,
+                               'password': _muse_password_from_text(_post_plain_text(post))})
+            had_media = True
+
         # --- Native Patreon (Vimeo/Mux) streams ---
         for stream in extract_streams_from_post(post, verbose):
             hls_videos.append(stream)
@@ -1192,14 +1323,16 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             seen_ids.add(e['id'])
             drive_videos.append(e)
 
-    total = len(drive_videos) + len(dropbox_items) + len(streamable_items) + len(hls_videos)
+    total = (len(drive_videos) + len(dropbox_items) + len(streamable_items)
+             + len(muse_items) + len(vidyard_items) + len(hls_videos))
     if total == 0:
         print("[ERROR] Found no downloadable videos (no Drive/Dropbox links or native videos).")
         return
 
     print(f"[INFO] Found {total} item(s) across {posts_with_media} post(s): "
           f"{len(drive_videos)} Drive, {len(dropbox_items)} Dropbox, "
-          f"{len(streamable_items)} Streamable, {len(hls_videos)} native.")
+          f"{len(streamable_items)} Streamable, {len(muse_items)} muse.ai, "
+          f"{len(vidyard_items)} Vidyard, {len(hls_videos)} native.")
 
     if list_only:
         n = 0
@@ -1218,6 +1351,17 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             print(f"   {n:>3}) [Streamable] {st['title']}")
             if verbose:
                 print(f"        url: https://streamable.com/{st['shortcode']}")
+        for vy in vidyard_items:
+            n += 1
+            print(f"   {n:>3}) [Vidyard] {vy['title']}")
+            if verbose:
+                print(f"        url: https://share.vidyard.com/watch/{vy['uuid']}")
+        for mu in muse_items:
+            n += 1
+            lock = ' (password from post)' if mu.get('password') else ''
+            print(f"   {n:>3}) [muse.ai] {mu['title']}{lock}")
+            if verbose:
+                print(f"        url: https://muse.ai/v/{mu['svid']}")
         for h in hls_videos:
             tag = 'Mux' if h.get('source') == 'mux' else f"Vimeo {h.get('vimeo_id')}"
             n += 1
@@ -1237,6 +1381,8 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             combined = ([{'title': f"[Drive]   {v['title']}", '_k': 'drive', '_p': v} for v in drive_videos]
                         + [{'title': f"[Dropbox] {d['title']}", '_k': 'dbx', '_p': d} for d in dropbox_items]
                         + [{'title': f"[Streamable] {st['title']}", '_k': 'strm', '_p': st} for st in streamable_items]
+                        + [{'title': f"[Vidyard] {vy['title']}", '_k': 'vy', '_p': vy} for vy in vidyard_items]
+                        + [{'title': f"[muse.ai] {mu['title']}", '_k': 'muse', '_p': mu} for mu in muse_items]
                         + [{'title': f"[Native]  {h['title']}", '_k': 'hls', '_p': h} for h in hls_videos])
             chosen = _prompt_file_selection(combined)
             if not chosen:
@@ -1245,6 +1391,8 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             drive_videos = [c['_p'] for c in chosen if c['_k'] == 'drive']
             dropbox_items = [c['_p'] for c in chosen if c['_k'] == 'dbx']
             streamable_items = [c['_p'] for c in chosen if c['_k'] == 'strm']
+            muse_items = [c['_p'] for c in chosen if c['_k'] == 'muse']
+            vidyard_items = [c['_p'] for c in chosen if c['_k'] == 'vy']
             hls_videos = [c['_p'] for c in chosen if c['_k'] == 'hls']
             print(f"[INFO] Selected {len(chosen)} item(s).")
         else:
@@ -1276,12 +1424,14 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                                    conn_cap=DROPBOX_DEFAULT_CONNECTIONS)
         if streamable_items:
             strm_videos = []
+            used_strm_names = set()
             for st in streamable_items:
                 durl, title, _h = resolve_streamable(st['shortcode'], session, verbose)
                 if not durl:
                     print(f"[WARN] Streamable {st['shortcode']}: could not resolve; skipping.")
                     continue
-                fname = _streamable_fname(st['title'] or title, st['shortcode'])
+                fname = _unique_name(_streamable_fname(st['title'] or title, st['shortcode']),
+                                     used_strm_names)
                 strm_videos.append({'id': durl, 'title': fname, 'name': fname,
                                     'direct_url': durl, 'headers': STREAMABLE_HEADERS,
                                     'streamable_shortcode': st['shortcode']})
@@ -1289,6 +1439,16 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                 _log_source("Streamable", f"direct MP4 — {len(strm_videos)} file(s)")
                 download_folder_pooled(strm_videos, session, chunk_size, verbose,
                                        label="Streamable", conn_cap=max_connections)
+        if vidyard_items:
+            download_vidyard_pooled(vidyard_items, session, chunk_size, max_connections,
+                                    max_height, verbose)
+        if muse_items:
+            if not ensure_ffmpeg(verbose):
+                print("[ERROR] muse.ai videos need ffmpeg to mux audio+video, and it was not "
+                      "available. Skipping them.")
+            else:
+                download_muse_pooled(muse_items, session, chunk_size, max_connections,
+                                     max_height, verbose)
         if hls_videos:
             if not ensure_ffmpeg(verbose):
                 print("[ERROR] Native (Vimeo/Mux) videos need ffmpeg to mux audio+video, and it "
@@ -1933,6 +2093,8 @@ def _tui_read_key():
             return 'esc'
         if ch == b'\x03':
             raise KeyboardInterrupt
+        if ch in (b'\x01', b'\x04', b'\x12'):          # Ctrl+A / Ctrl+D / Ctrl+R
+            return {b'\x01': 'check_all', b'\x04': 'uncheck_all', b'\x12': 'invert'}[ch]
         for enc in ('utf-8', 'cp1250', 'latin-1'):
             try:
                 return ('char', ch.decode(enc))
@@ -1983,6 +2145,8 @@ def _tui_read_key():
         return 'backspace'
     if c0 == 0x03:
         raise KeyboardInterrupt
+    if c0 in (0x01, 0x04, 0x12):                      # Ctrl+A / Ctrl+D / Ctrl+R
+        return {0x01: 'check_all', 0x04: 'uncheck_all', 0x12: 'invert'}[c0]
     n_more = 3 if c0 >= 0xF0 else 2 if c0 >= 0xE0 else 1 if c0 >= 0xC0 else 0
     data = b
     for _ in range(n_more):
@@ -2043,14 +2207,34 @@ def _tui_list(prompt, labels, multi=False, preselected=None, header=None):
     header = list(header or [])
     checkset = set(preselected or []) if multi else set()
     filt = ''
+    pending = None                  # ('+'|'-', typed pattern) while the filter prompt is open
     sel_pos = 0
     prev_lines = 0
     first = True
 
+    def _match(pat):
+        """Indices matching a user-typed pattern. '*'/'?' = wildcard (fnmatch, matched anywhere),
+        otherwise a plain 'contains' match. Case-insensitive."""
+        p = (pat or '').strip().lower()
+        if not p:
+            return set()
+        if '*' in p or '?' in p:
+            q = p if p.startswith('*') else '*' + p
+            q = q if q.endswith('*') else q + '*'
+            return {i for i in range(n) if fnmatch.fnmatch(plain[i].lower(), q)}
+        return {i for i in range(n) if p in plain[i].lower()}
+
     def order():
+        """Indices matching the current search. Plain text = substring match; a query containing
+        '*' or '?' is treated as a wildcard pattern (fnmatch), e.g. 'ghostbusters*' or 'S0?E*'.
+        An unanchored pattern is matched anywhere in the label."""
         if not filt:
             return list(range(n))
         f = filt.lower()
+        if '*' in f or '?' in f:
+            pat = f if f.startswith('*') else '*' + f
+            pat = pat if pat.endswith('*') else pat + '*'
+            return [i for i in range(n) if fnmatch.fnmatch(plain[i].lower(), pat)]
         return [i for i in range(n) if f in plain[i].lower()]
 
     def size():
@@ -2078,7 +2262,8 @@ def _tui_list(prompt, labels, multi=False, preselected=None, header=None):
         for h in header:
             vis.append(trunc(h, maxw) if len(_tui_strip(h)) > maxw else h)
         vis.append(f"{CLR.YELLOW}{trunc(_tui_strip(prompt), maxw)}{CLR.RESET}")
-        keys = ("space = check · Enter = confirm" if multi else "Enter = select")
+        keys = ("space = toggle · * = all/none · +/- = check/uncheck by filter · Enter = confirm"
+                if multi else "Enter = select")
         hint = (f"↑↓ move · type = search · {keys} · "
                 + ("Esc = clear search" if filt else "Esc = cancel"))
         vis.append(f"{CLR.CYAN}{trunc(hint, maxw)}{CLR.RESET}")
@@ -2100,7 +2285,13 @@ def _tui_list(prompt, labels, multi=False, preselected=None, header=None):
         posinfo = f" [{sel_pos + 1}/{len(od)}]" if od else ""
         if multi:
             posinfo += f"  ✓{len(checkset)}"
-        vis.append(f"{CLR.MAGENTA}{trunc(('Search: ' + filt if filt else '(type to search)') + posinfo, maxw)}{CLR.RESET}")
+        if pending:
+            act = 'CHECK' if pending[0] == '+' else 'UNCHECK'
+            foot = (f"{act} by filter (e.g. *.mkv, *Viki*): {pending[1]}_"
+                    f"   [{len(_match(pending[1]))} match]  Enter = apply · Esc = cancel")
+            vis.append(f"{CLR.GREEN}{trunc(foot, maxw)}{CLR.RESET}")
+        else:
+            vis.append(f"{CLR.MAGENTA}{trunc(('Search: ' + filt if filt else '(type to search)') + posinfo, maxw)}{CLR.RESET}")
         buf.append('\n'.join(vis))
         sys.stdout.write(''.join(buf))
         sys.stdout.flush()
@@ -2115,6 +2306,21 @@ def _tui_list(prompt, labels, multi=False, preselected=None, header=None):
         _tui_flush_input()
         while True:
             key = _tui_read_key()
+            if pending is not None:
+                # Filter prompt is open: type a pattern, Enter applies it, Esc cancels.
+                act, buf_pat = pending
+                if key == 'enter':
+                    target = _match(buf_pat)
+                    checkset = (checkset | target) if act == '+' else (checkset - target)
+                    pending = None
+                elif key == 'esc':
+                    pending = None
+                elif key == 'backspace':
+                    pending = (act, buf_pat[:-1])
+                elif isinstance(key, tuple) and key[0] == 'char' and key[1].isprintable():
+                    pending = (act, buf_pat + key[1])
+                page = render(od)
+                continue
             if key == 'up' and od:
                 sel_pos = (sel_pos - 1) % len(od)
             elif key == 'down' and od:
@@ -2130,6 +2336,23 @@ def _tui_list(prompt, labels, multi=False, preselected=None, header=None):
             elif multi and isinstance(key, tuple) and key[0] == 'char' and key[1] == ' ':
                 if od:
                     checkset.symmetric_difference_update({od[sel_pos]})
+            elif multi and isinstance(key, tuple) and key[0] == 'char' and key[1] == '*':
+                checkset = set() if len(checkset) >= n else set(range(n))   # all <-> none
+            elif multi and isinstance(key, tuple) and key[0] == 'char' and key[1] in '+-':
+                if filt:                       # a search is active -> apply to what's shown
+                    target = set(od)
+                    checkset = (checkset | target) if key[1] == '+' else (checkset - target)
+                else:                          # otherwise ask for a pattern (e.g. *.mkv, *Viki*)
+                    pending = ('+' if key[1] == '+' else '-', '')
+            elif multi and key in ('check_all', 'uncheck_all', 'invert'):
+                # (also still available on Ctrl+A / Ctrl+D / Ctrl+R)
+                target = set(od)
+                if key == 'check_all':
+                    checkset |= target
+                elif key == 'uncheck_all':
+                    checkset -= target
+                else:
+                    checkset ^= target
             elif key in ('enter', 'right'):
                 if multi:
                     sys.stdout.write('\n')
@@ -2401,7 +2624,7 @@ def _download_segment(job: '_FileJob', seg: dict, session: requests.Session, chu
 
 def download_folder_pooled(videos: list, session: requests.Session, chunk_size: int, verbose: bool,
                            label: str = "Folder", conn_cap: int = None, seg_mib: int = None,
-                           dest_subdir: str = None) -> None:
+                           dest_subdir: str = None, record: bool = True) -> None:
     """Download all videos via a shared pool of `max_connections` workers pulling segments
     from any file. As files finish, workers automatically move to the remaining files, so
     the connection budget is always fully used and the last files speed up.
@@ -2436,7 +2659,8 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             if job.direct_url:
                 # Direct download (e.g. Dropbox): probe size, real filename, AND the URL
                 # variant (dl=1 vs raw=1) that actually serves the file, in one go.
-                size, real, working = _dropbox_probe(job.direct_url, session)
+                size, real, working = _dropbox_probe(
+                    job.direct_url, session, getattr(job, 'dl_headers', None))
                 job.direct_url = working
                 job.url = working
                 job.size = size if size > 0 else get_file_size(working, session)
@@ -2583,11 +2807,19 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         if job.locked:
             release_lock(job.lock_path)
         if ok:
-            _final = _apply_forced_container(_final, verbose)   # --container (no-op when auto)
-            _record_download(_final)
+            if record:
+                _final = _apply_forced_container(_final, verbose)   # --container (no-op when auto)
+                _record_download(_final)
         else:
+            _vy = job.entry.get('vidyard_uuid') if isinstance(job.entry, dict) else None
             _sc = job.entry.get('streamable_shortcode') if isinstance(job.entry, dict) else None
-            if _sc:
+            if _vy:
+                # Vidyard CDN links are signed and expire, so resume must re-resolve them.
+                _record_failed({'kind': 'vidyard', 'out_dir': os.getcwd(),
+                                'filename': os.path.basename(job.filename or job.title or ''),
+                                'reason': reason or 'download failed', 'uuid': _vy,
+                                'title': job.title})
+            elif _sc:
                 # Streamable's CDN URL is a signed link that expires, so resume must re-resolve it
                 # from the shortcode rather than replay the stale URL.
                 _record_failed({'kind': 'streamable', 'out_dir': os.getcwd(),
@@ -3015,14 +3247,33 @@ def resolve_streamable(shortcode, session, verbose):
     return url, data.get('title') or shortcode, best.get('height') or 0
 
 
+_VIDEO_EXTS = ('.mp4', '.mkv', '.mov', '.m4v', '.webm', '.avi', '.ts', '.flv')
+
+
+def _ensure_video_ext(name, default='.mp4'):
+    """Append a video extension unless the name already ends in one. Checked against a real list
+    because episode titles often end in something that only looks like an extension ('EP.1')."""
+    return name if os.path.splitext(name)[1].lower() in _VIDEO_EXTS else name + default
+
+
+def _unique_name(name, used):
+    """Make `name` unique within `used` (a set that gets updated). Two posts in a collection often
+    share a title, which would otherwise collide on one filename — and the second one would trip
+    over the first one's lock."""
+    stem, ext = os.path.splitext(name)
+    cand, i = name, 2
+    while cand.lower() in used:
+        cand = f"{stem} ({i}){ext}"
+        i += 1
+    used.add(cand.lower())
+    return cand
+
+
 def _streamable_fname(base, shortcode):
     """Build a safe .mp4 filename for a Streamable video. The explicit extension matters: without
     it the direct-download engine treats the name as extension-less and replaces it with the CDN
     URL basename (the shortcode)."""
-    fname = safe_filename(base or shortcode, shortcode)
-    if not os.path.splitext(fname)[1]:
-        fname += '.mp4'
-    return fname
+    return _ensure_video_ext(safe_filename(base or shortcode, shortcode))
 
 
 def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
@@ -5053,6 +5304,7 @@ def resolve_master(video, session, verbose):
 AUDIO_SEL = None                  # None/'ALL' = all audio tracks; 'SCAN' = list; [ints] = selection
 SUB_SEL = None                    # None/'ALL' = all subtitles; 'SCAN' = list; [ints] = selection
 SUBS_ONLY = False                 # True (--subs-only): download ONLY chosen-language subtitles
+MUSE_PASSWORD = None              # --password: for a single password-protected muse.ai video
 CENC_KEYS = []                    # user-supplied CENC/Widevine content keys (hex), for content you
 #                                   already hold keys for (own storage). NOT key extraction/DRM bypass.
 FORCE_CONTAINER = None            # None = auto (.mkv when multi-track, else .mp4); 'mp4'/'mkv' force it
@@ -6223,6 +6475,370 @@ def _cenc_tmp(out_path, name):
     tdir = os.path.join(os.path.dirname(os.path.abspath(out_path)), TEMP_SUBDIR)
     os.makedirs(tdir, exist_ok=True)
     return os.path.join(tdir, f"cenc_{h}_{name}")
+
+
+def _grab_dash_plain(mpd_url, headers, session, max_height, out_path, verbose):
+    """Download an UNENCRYPTED DASH stream natively: parse the MPD, pull the chosen video +
+    audio representations (parallel, with progress bars), grab subtitles, then mux. Honours -q,
+    --audio/--sub and --container. Returns (ok, reason)."""
+    mpd = _parse_mpd(mpd_url, session, headers, max_height, verbose)
+    if not mpd:
+        return False, "could not parse the MPD (unsupported DASH layout — send me the .mpd)"
+    if AUDIO_SEL == 'SCAN' or SUB_SEL == 'SCAN':
+        _hls_list_tracks(os.path.splitext(os.path.basename(out_path))[0],
+                         mpd['audios'], mpd['subs'])
+        return True, None
+    audios = _select_tracks(mpd['audios'], AUDIO_SEL)
+    subs = _select_tracks(mpd['subs'], SUB_SEL)
+    out_path = os.path.splitext(out_path)[0] + _container_ext(len(audios) > 1 or bool(subs))
+    made = []
+    vfile = _temp_artifact(out_path, ".v.mp4")
+    ok, why = _download_dash_raw(mpd['video'], headers, session, vfile, verbose,
+                                 f"video {mpd['video'].get('height') or '?'}p")
+    if not ok:
+        return False, f"video: {why}"
+    made.append(vfile)
+    afiles, ameta = [], []
+    for i, a in enumerate(audios):
+        af = _temp_artifact(out_path, f".a{i}.mp4")
+        tag = a.get('lang') or a.get('name') or '?'
+        ok, why = _download_dash_raw(a, headers, session, af, verbose, f"audio {i} [{tag}]")
+        if not ok:
+            for f in made:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            return False, f"audio {i}: {why}"
+        afiles.append(af)
+        ameta.append((a.get('lang'), a.get('name')))
+        made.append(af)
+    sfiles, smeta = [], []
+    for sf, lang, name in _grab_subs(subs, out_path, headers, session, verbose, suffix='sub'):
+        sfiles.append(sf)
+        smeta.append((lang, name))
+        made.append(sf)
+    ok, reason = _ffmpeg_mux_multi(vfile, afiles, sfiles, ameta, smeta, out_path, verbose)
+    for f in made:
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    return ok, reason
+
+
+# --- muse.ai / skiv.com --------------------------------------------------------------------- #
+# Creators embed muse.ai links in Patreon posts, often password-protected with the password written
+# in the post text. The page (after the password POST) carries a cacheVideos entry with the file id;
+# the actual media is a plain unencrypted DASH manifest on the skiv CDN.
+_MUSE_RE = re.compile(r'(?:muse\.ai|skiv\.com)/(?:v|embed)/([0-9A-Za-z]+)', re.I)
+_MUSE_PW_RE = re.compile(
+    r'(?:password|heslo|pass|pwd)\s*(?:is|:|=)\s*["\u201c]?([^\s"\u201d<\\]{2,40})', re.I)
+
+
+def _muse_id(url):
+    m = _MUSE_RE.search(url or '')
+    return m.group(1) if m else None
+
+
+def _muse_password_from_text(text):
+    """Pull the video password out of a post's text ('Password: FirstKiss?'). Returns None if the
+    post doesn't mention one (many muse.ai videos are not protected)."""
+    m = _MUSE_PW_RE.search(text or '')
+    if not m:
+        return None
+    return m.group(1).strip().rstrip('.,;')
+
+
+def resolve_muse(svid, session, password=None, verbose=False):
+    """Resolve a muse.ai video id to (dash_mpd_url, title, headers). Submits `password` when the
+    video is protected. Returns (None, None, None) when it can't be unlocked."""
+    page_url = f"https://muse.ai/v/{svid}"
+    hdrs = {'User-Agent': USER_AGENT, 'Accept-Language': 'en-US,en;q=0.9'}
+    try:
+        r = session.get(page_url, headers=hdrs, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        html = r.text or ''
+        locked = r.status_code == 403 or 'name="password"' in html or 'password' in (r.reason or '').lower()
+        if locked:
+            if not password:
+                tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} muse.ai {svid}: password protected and "
+                           "no password found in the post text.")
+                return None, None, None
+            r = session.post(page_url, data={'password': password}, headers=hdrs,
+                             timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT), allow_redirects=True)
+            html = r.text or ''
+            if r.status_code != 200 or f'cacheVideos.set("{svid}"' not in html:
+                tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} muse.ai {svid}: the password from the "
+                           f"post ('{password}') was not accepted.")
+                return None, None, None
+    except requests.RequestException as e:
+        if verbose:
+            tqdm.write(f"[WARN] muse.ai {svid}: {e}")
+        return None, None, None
+    m = re.search(r'cacheVideos\.set\(\s*"' + re.escape(svid) + r'"\s*,\s*(\{.*?\})\s*\)\s*;',
+                  html, re.S)
+    if not m:
+        m = re.search(r'\{[^{}]*"svid":\s*"' + re.escape(svid) + r'"[^{}]*\}', html)
+    if not m:
+        if verbose:
+            tqdm.write(f"[WARN] muse.ai {svid}: no video data on the page.")
+        return None, None, None
+    try:
+        info = json.loads(m.group(1) if m.lastindex else m.group(0))
+    except ValueError:
+        return None, None, None
+    base = (info.get('url') or '').split('?')[0].rstrip('/')
+    if base.endswith('/data'):
+        base = base[:-len('/data')]
+    if not base:
+        return None, None, None
+    title = info.get('title') or info.get('filename') or svid
+    return f"{base}/videos/dash.mpd", title, {'User-Agent': USER_AGENT, 'Referer': 'https://muse.ai/'}
+
+
+def download_muse_video(svid, session, out_dir, max_height, verbose, password=None, title=None):
+    """Download one muse.ai video (unencrypted DASH) into out_dir. Returns True on success."""
+    mpd_url, real_title, hdrs = resolve_muse(svid, session, password, verbose)
+    if not mpd_url:
+        return False
+    if password:
+        tqdm.write(f"[INFO] muse.ai: {real_title or svid} {CLR.DIM}[{svid}]{CLR.RESET}  "
+                   f"password: {CLR.GREEN}{password}{CLR.RESET}")
+    name = safe_filename(title or real_title or svid, 'video')
+    out = os.path.join(out_dir or '.', name + _container_ext(False))
+    if os.path.exists(out):
+        tqdm.write(f"[INFO] muse.ai: {os.path.basename(out)} already exists — skipping.")
+        return True
+    ok, why = _grab_dash_plain(mpd_url, hdrs, session, max_height, out, verbose)
+    if ok:
+        _record_download(out)
+    else:
+        tqdm.write(f"{CLR.RED}[FAIL]{CLR.RESET} muse.ai {svid}: {why}")
+    return ok
+
+
+# --- Vidyard --------------------------------------------------------------------------------- #
+# Vidyard's player config exposes ready-made progressive MP4 renditions (1080p/720p/480p/360p), so
+# these download through the same shared pool as Drive/Dropbox/Streamable — no ffmpeg mux needed.
+_VIDYARD_RE = re.compile(
+    r'vidyard\.com/(?:watch|share|embed)/([0-9A-Za-z_-]{8,})|play\.vidyard\.com/([0-9A-Za-z_-]{8,})',
+    re.I)
+
+
+def _vidyard_id(url):
+    m = _VIDYARD_RE.search(url or '')
+    if not m:
+        return None
+    vid = m.group(1) or m.group(2) or ''
+    return re.sub(r'\.(html?|jpg|jpeg|png|json)$', '', vid, flags=re.I) or None
+
+
+def _vidyard_fname(base, uuid):
+    return _ensure_video_ext(safe_filename(base or uuid, uuid))
+
+
+def _profile_height(p):
+    m = re.search(r'(\d{3,4})', str(p or ''))
+    return int(m.group(1)) if m else 0
+
+
+def resolve_vidyard(uuid, session, max_height=0, verbose=False):
+    """Resolve a Vidyard video to (direct_mp4_url, title, headers, height). Picks the best MP4 that
+    fits -q (max_height); falls back to the HLS rendition if no MP4 is offered."""
+    api = f"https://play.vidyard.com/player/{uuid}.json"
+    hdrs = {'User-Agent': USER_AGENT, 'Referer': 'https://play.vidyard.com/',
+            'Accept': 'application/json'}
+    try:
+        r = session.get(api, headers=hdrs, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if r.status_code != 200:
+            if verbose:
+                tqdm.write(f"[WARN] Vidyard {uuid}: HTTP {r.status_code}")
+            return None, None, None, 0
+        payload = (r.json() or {}).get('payload') or {}
+    except (requests.RequestException, ValueError) as e:
+        if verbose:
+            tqdm.write(f"[WARN] Vidyard {uuid}: {type(e).__name__}")
+        return None, None, None, 0
+    chapters = payload.get('chapters') or []
+    if not chapters:
+        return None, None, None, 0
+    ch = chapters[0]
+    title = ch.get('name') or payload.get('name') or uuid
+    sources = ch.get('sources') or {}
+    mp4s = [s for s in (sources.get('mp4') or []) if s.get('url')]
+    if mp4s:
+        ranked = sorted(mp4s, key=lambda s: _profile_height(s.get('profile')), reverse=True)
+        pick = next((s for s in ranked
+                     if not max_height or _profile_height(s.get('profile')) <= max_height), ranked[-1])
+        return pick['url'], title, hdrs, _profile_height(pick.get('profile'))
+    hls = [s for s in (sources.get('hls') or []) if s.get('url')]
+    if hls:                                     # no progressive rendition -> hand back the master
+        ranked = sorted(hls, key=lambda s: _profile_height(s.get('profile')), reverse=True)
+        pick = next((s for s in ranked
+                     if not max_height or _profile_height(s.get('profile')) <= max_height), ranked[-1])
+        return pick['url'], title, hdrs, _profile_height(pick.get('profile'))
+    return None, None, None, 0
+
+
+def download_vidyard_pooled(items, session, chunk_size, max_connections, max_height, verbose):
+    """Download Vidyard videos through the shared connection pool (same engine as Drive/Dropbox/
+    Streamable: parallel files, segment work-stealing, resume, per-file bars). `items` are
+    {'uuid', 'title'} dicts. HLS-only videos fall back to the native HLS path."""
+    entries, hls_jobs = [], []
+    used_names = set()
+    bar = make_bar(total=len(items), desc='resolving vidyard', unit='vid', leave=True)
+    lock = threading.Lock()
+
+    def _prep(it):
+        url, title, hdrs, height = resolve_vidyard(it['uuid'], session, max_height, verbose)
+        with lock:
+            if not url:
+                tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} Vidyard {it['uuid']}: could not resolve; "
+                           "skipping.")
+            elif '.m3u8' in url:
+                hls_jobs.append({'title': it.get('title') or title, 'master_url': url,
+                                 'source': 'vidyard', 'headers': hdrs})
+            else:
+                fname = _unique_name(_vidyard_fname(it.get('title') or title, it['uuid']),
+                                     used_names)
+                entries.append({'id': url, 'title': fname, 'name': fname, 'direct_url': url,
+                                'headers': hdrs, 'vidyard_uuid': it['uuid'],
+                                'vidyard_height': height})
+            bar.update(1)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, SCAN_PAGE_WORKERS)) as ex:
+        list(ex.map(_prep, items))
+    bar.close()
+    if entries:
+        qual = sorted({e['vidyard_height'] for e in entries if e['vidyard_height']}, reverse=True)
+        _log_source("Vidyard", f"direct MP4 via shared pool — {len(entries)} file(s)"
+                               + (f", up to {qual[0]}p" if qual else ""))
+        download_folder_pooled(entries, session, chunk_size, verbose, label="Vidyard",
+                               conn_cap=max_connections)
+    if hls_jobs:
+        if not ensure_ffmpeg(verbose):
+            print("[ERROR] Vidyard: these videos are HLS-only and need ffmpeg. Skipping.")
+        else:
+            _log_source("Vidyard", f"HLS + ffmpeg mux — {len(hls_jobs)} file(s)")
+            download_hls_pooled(hls_jobs, session, None,
+                                max_connections or DEFAULT_MAX_CONNECTIONS, max_height, verbose)
+
+
+def download_muse_pooled(items, session, chunk_size, max_connections, max_height, verbose):
+    """Download several muse.ai videos through the SAME shared connection pool the other direct
+    sources use: every video's DASH renditions are plain MP4 files, so all of them (video AND audio
+    of every episode) are pulled at once with segment work-stealing, then each pair is muxed.
+    Falls back to the sequential path for any video whose DASH layout isn't plain files."""
+    # Show which password came out of which post — plain text, so you can reuse it in a browser.
+    with_pw = [mu for mu in items if mu.get('password')]
+    if with_pw:
+        w = min(60, max(len(str(mu.get('title') or mu['svid'])) for mu in with_pw))
+        print("[INFO] muse.ai: password(s) found in the post text:")
+        for mu in with_pw:
+            title = str(mu.get('title') or mu['svid'])
+            title = title if len(title) <= w else title[:w - 1] + '\u2026'
+            print(f"        {title:<{w}}  {CLR.DIM}[{mu['svid']}]{CLR.RESET}  "
+                  f"password: {CLR.GREEN}{mu['password']}{CLR.RESET}")
+    if verbose:
+        n_open = sum(1 for mu in items if not mu.get('password'))
+        if n_open:
+            print(f"[INFO] muse.ai: {n_open} video(s) had no password in the post "
+                  "(fine if they aren't protected).")
+    resolved, fallback = [], []
+    bar = make_bar(total=len(items), desc='resolving muse.ai', unit='vid', leave=True)
+    lock = threading.Lock()
+
+    def _prep(mu):
+        mpd_url, real_title, hdrs = resolve_muse(mu['svid'], session, mu.get('password'), verbose)
+        out = None
+        if mpd_url:
+            tracks = _parse_mpd(mpd_url, session, hdrs, max_height, verbose)
+            if tracks and tracks.get('video'):
+                audios = _select_tracks(tracks['audios'], AUDIO_SEL)
+                subs = _select_tracks(tracks['subs'], SUB_SEL)
+                name = safe_filename(mu.get('title') or real_title or mu['svid'], 'video')
+                out = {'svid': mu['svid'], 'title': name, 'headers': hdrs, 'subs': subs,
+                       'video': tracks['video'], 'audios': audios, 'mpd': mpd_url,
+                       'plain': bool(tracks['video'].get('file')
+                                     and all(a.get('file') for a in audios))}
+        with lock:
+            (resolved if out and out['plain'] else
+             fallback if out else resolved).append(out or {'svid': mu['svid'], 'failed': True,
+                                                           'title': mu.get('title')})
+            bar.update(1)
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, SCAN_PAGE_WORKERS)) as ex:
+        list(ex.map(_prep, items))
+    bar.close()
+    jobs = [j for j in resolved if j and not j.get('failed')]
+    for j in [j for j in resolved if j and j.get('failed')]:
+        tqdm.write(f"{CLR.RED}[FAIL]{CLR.RESET} muse.ai {j['svid']}: could not resolve "
+                   f"({j.get('title') or ''}).")
+    # Every rendition is one plain MP4 -> feed them all into the shared pool at once.
+    entries, plan, used_finals = [], [], set()
+    for j in jobs:
+        ext = _container_ext(len(j['audios']) > 1 or bool(j['subs']))
+        final = _unique_name(j['title'] + ext, used_finals)
+        if os.path.exists(final):
+            tqdm.write(f"[INFO] muse.ai: {final} already exists — skipping.")
+            continue
+        stem = safe_filename(j['svid'] + '_' + j['title'], j['svid'])[:60]
+        vname = f".muse.{stem}.v.mp4"
+        vtmp = os.path.join(TEMP_SUBDIR, vname)
+        entries.append({'id': j['video']['file'], 'direct_url': j['video']['file'],
+                        'title': vname, 'name': vname, 'headers': j['headers']})
+        atmps = []
+        for i, a in enumerate(j['audios']):
+            aname = f".muse.{stem}.a{i}.mp4"
+            atmps.append((os.path.join(TEMP_SUBDIR, aname), a))
+            entries.append({'id': a['file'], 'direct_url': a['file'],
+                            'title': aname, 'name': aname, 'headers': j['headers']})
+        plan.append({'job': j, 'final': final, 'vtmp': vtmp, 'atmps': atmps})
+    if entries:
+        _log_source("muse.ai", f"DASH via shared pool — {len(plan)} video(s), "
+                               f"{len(entries)} stream(s)")
+        download_folder_pooled(entries, session, chunk_size, verbose, label="muse.ai",
+                               conn_cap=max_connections, record=False, dest_subdir=TEMP_SUBDIR)
+        for p in plan:                       # mux each finished pair
+            j = p['job']
+            vtmp = p['vtmp']
+            if not os.path.exists(vtmp):
+                tqdm.write(f"{CLR.RED}[FAIL]{CLR.RESET} muse.ai {j['title']}: video part missing.")
+                continue
+            afiles, ameta, made = [], [], [vtmp]
+            for atmp, a in p['atmps']:
+                if os.path.exists(atmp):
+                    afiles.append(atmp)
+                    ameta.append((a.get('lang'), a.get('name')))
+                    made.append(atmp)
+            sfiles, smeta = [], []
+            for sf, lang, name in _grab_subs(j['subs'], p['final'], j['headers'], session,
+                                             verbose, suffix='sub'):
+                sfiles.append(sf)
+                smeta.append((lang, name))
+                made.append(sf)
+            ok, why = _ffmpeg_mux_multi(vtmp, afiles, sfiles, ameta, smeta, p['final'], verbose)
+            for f in made:
+                try:
+                    os.remove(f)
+                except OSError:
+                    pass
+            if ok:
+                _record_download(p['final'])
+            else:
+                tqdm.write(f"{CLR.RED}[FAIL]{CLR.RESET} muse.ai {j['title']}: mux failed ({why}).")
+    for j in fallback:                       # segmented DASH (rare) -> one at a time
+        if not j:
+            continue
+        tqdm.write(f"[INFO] muse.ai {j['title']}: segmented DASH — using the sequential path.")
+        out = os.path.join('.', j['title'] + _container_ext(False))
+        ok, why = _grab_dash_plain(j['mpd'], j['headers'], session, max_height, out, verbose)
+        if ok:
+            _record_download(out)
+        else:
+            tqdm.write(f"{CLR.RED}[FAIL]{CLR.RESET} muse.ai {j['title']}: {why}")
 
 
 def _cenc_grab_dash(mpd_url, headers, session, max_height, out_path, key_specs, verbose):
@@ -7834,6 +8450,14 @@ def _classify_input(id_or_url: str):
         sc = _streamable_id(id_or_url)
         if sc:
             return 'streamable', sc
+    if 'vidyard.com' in id_or_url:
+        vy = _vidyard_id(id_or_url)
+        if vy:
+            return 'vidyard', vy
+    if 'muse.ai' in id_or_url or 'skiv.com' in id_or_url:
+        sv = _muse_id(id_or_url)
+        if sv:
+            return 'muse', sv
     kind, tid = extract_drive_target(id_or_url)
     return kind, tid
 
@@ -8212,7 +8836,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     """Download from Google Drive (file/folder), Dropbox, Vimeo, a Patreon collection, or a
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
     summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
-               'failed': []}
+               'failed': [], 'title': None, 'preview_note': ''}
     global FFMPEG, FFMPEG_DOWNLOAD_URL
     if ffmpeg_path:
         FFMPEG = ffmpeg_path
@@ -8530,6 +9154,28 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             entry = {'id': durl, 'title': fname, 'name': fname, 'direct_url': durl}
             _with_out_dir(lambda: download_folder_pooled([entry], session, chunk_size, verbose,
                                                          label="Dropbox", conn_cap=DROPBOX_DEFAULT_CONNECTIONS))
+        elif kind == 'vidyard':
+            title = os.path.splitext(output_file)[0] if output_file else None
+            _with_out_dir(lambda: download_vidyard_pooled(
+                [{'uuid': target_id, 'title': title}], session, chunk_size, max_connections,
+                max_height, verbose))
+        elif kind == 'muse':
+            _log_source("muse.ai", "DASH + ffmpeg mux")
+            if not ensure_ffmpeg(verbose):
+                print("[ERROR] muse.ai videos need ffmpeg to mux audio+video.")
+                summary['error'] = "ffmpeg unavailable"
+                if return_summary:
+                    return summary
+                sys.exit(1)
+            title = os.path.splitext(output_file)[0] if output_file else None
+            ok = _with_out_dir(lambda: download_muse_video(target_id, session, None, max_height,
+                                                           verbose, password=MUSE_PASSWORD,
+                                                           title=title))
+            if not ok:
+                summary['error'] = "muse.ai download failed"
+                if return_summary:
+                    return summary
+                sys.exit(1)
         elif kind == 'streamable':
             _log_source("Streamable", "direct MP4")
             durl, title, _h = resolve_streamable(target_id, session, verbose)
@@ -8610,6 +9256,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     # rename, since renaming changes the names on disk.
     downloaded = _session_downloads_in(rename_dir)
     summary['downloaded'] = downloaded
+    summary['preview_note'] = _report_previews(downloaded, verbose) if downloaded else ''
     if do_rename and not list_only:
         summary['rename'] = offer_strict_rename(rename_dir, downloaded, verbose,
                                                 rename_mode=rename_mode)
@@ -8619,6 +9266,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     _cleanup_temp_dir(rename_dir)
 
     summary['ok'] = True
+    summary['title'] = _active_collection_title or _patreon_creator or None
     if return_summary:
         return summary
     return None
@@ -8807,11 +9455,14 @@ def _download_failed_entries(entries, session, verbose, chunk):
     pooled = defaultdict(list)      # out_dir -> [video dicts]
     native = defaultdict(list)      # (out_dir, max_height) -> [stream dicts]
     streamable = defaultdict(list)  # out_dir -> [failed streamable entries]
+    vidyard = defaultdict(list)     # out_dir -> [failed vidyard entries]
     for e in entries:
         if not isinstance(e, dict):
             continue
         od = e.get('out_dir') or os.getcwd()
-        if e.get('kind') == 'streamable' and e.get('shortcode'):
+        if e.get('kind') == 'vidyard' and e.get('uuid'):
+            vidyard[od].append(e)
+        elif e.get('kind') == 'streamable' and e.get('shortcode'):
             streamable[od].append(e)
         elif e.get('kind') in ('drive', 'dropbox') and isinstance(e.get('video'), dict):
             pooled[od].append(e['video'])
@@ -8820,6 +9471,21 @@ def _download_failed_entries(entries, session, verbose, chunk):
     for od, videos in pooled.items():
         _run_in_dir(od, lambda videos=videos: download_folder_pooled(
             videos, session, chunk, verbose, label="Retry"))
+    for od, entries_v in vidyard.items():
+        def _retry_vidyard(entries_v=entries_v):
+            vids = []
+            for e in entries_v:
+                url, title, hdrs, h = resolve_vidyard(e['uuid'], session, 0, verbose)
+                if not url or '.m3u8' in url:
+                    print(f"[WARN] Vidyard {e['uuid']}: could not re-resolve; skipping.")
+                    continue
+                fn = e.get('filename') or _vidyard_fname(title, e['uuid'])
+                vids.append({'id': url, 'title': fn, 'name': fn, 'direct_url': url,
+                             'headers': hdrs, 'vidyard_uuid': e['uuid'], 'vidyard_height': h})
+            if vids:
+                download_folder_pooled(vids, session, chunk, verbose, label="Retry",
+                                       conn_cap=_max_connections)
+        _run_in_dir(od, _retry_vidyard)
     for od, entries_s in streamable.items():
         def _retry_streamable(entries_s=entries_s):
             vids = []
@@ -8928,6 +9594,8 @@ def _write_url_list_log(results, out_dir, started):
 
         dl = r.get('downloaded') or []
         lines.append(f"      downloaded: {len(dl)} file(s)")
+        if r.get('preview_note'):
+            lines.append(f"      WARNING: {r['preview_note']}")
         rn = r.get('rename') or {}
         renames = rn.get('renames') or []
         renamed_olds = {o for o, _n in renames}
@@ -8974,9 +9642,10 @@ def _write_url_list_log(results, out_dir, started):
     return path
 
 
-def _comment_url_in_list(list_path, url):
-    """Prepend '# ' to the first uncommented line matching `url` in the list file, then flush
-    it straight to disk (so progress survives an interruption). Returns True if it edited."""
+def _comment_url_in_list(list_path, url, label=None, count=None, warn=None):
+    """Mark a finished URL in the list file: write a '# <collection/series name> — N file(s),
+    <date>' note above it and prepend '# ' to the URL itself, then flush straight to disk (so
+    progress survives an interruption). Returns True if it edited."""
     try:
         with open(list_path, 'r', encoding='utf-8') as f:
             lines = f.readlines()
@@ -8988,7 +9657,16 @@ def _comment_url_in_list(list_path, url):
         if s and not s.startswith('#') and s == url:
             indent = line[:len(line) - len(line.lstrip())]
             newline = '\n' if line.endswith('\n') else ''
-            lines[i] = f"{indent}# {s}{newline}"
+            note = ''
+            if label:
+                bits = [str(label).strip()]
+                if count:
+                    bits.append(f"{count} file(s)")
+                bits.append(datetime.now().strftime('%Y-%m-%d'))
+                note = f"{indent}# --- {' — '.join(bits)}\n"
+            if warn:
+                note += f"{indent}# !!! WARNING: {warn}\n"
+            lines[i] = f"{note}{indent}# {s}{newline}"
             edited = True
             break
     if not edited:
@@ -9035,13 +9713,15 @@ def run_url_list(list_path, base_kwargs, out_dir):
         print("\n" + "=" * 70)
         print(f"[URL {i}/{len(urls)}] {url}")
         print("=" * 70)
-        entry = {'index': i, 'url': url, 'ok': False, 'kind': None,
+        entry = {'index': i, 'url': url, 'ok': False, 'kind': None, 'title': None,
+                 'preview_note': '',
                  'downloaded': [], 'rename': None, 'error': None, 'failed': [], 'seconds': 0.0}
         t0 = time.time()
         try:
             res = main(url, **base_kwargs, rename_mode='auto', return_summary=True)
             if isinstance(res, dict):
-                for k in ('ok', 'kind', 'downloaded', 'rename', 'error', 'failed'):
+                for k in ('ok', 'kind', 'downloaded', 'rename', 'error', 'failed', 'title',
+                          'preview_note'):
                     entry[k] = res.get(k, entry[k])
         except KeyboardInterrupt:
             entry['error'] = "interrupted"
@@ -9061,8 +9741,12 @@ def run_url_list(list_path, base_kwargs, out_dir):
         # in the list file RIGHT NOW by prepending '#', flushing straight to disk — so an
         # interrupted run resumes at the first not-yet-done URL.
         if entry['ok'] and not entry['error'] and not entry.get('failed'):
-            if _comment_url_in_list(list_path, url):
-                print(f"[INFO] Marked as done in {os.path.basename(list_path)} (# prepended).")
+            label = entry.get('title') or None
+            n_files = len(entry.get('downloaded') or [])
+            if _comment_url_in_list(list_path, url, label=label, count=n_files,
+                                    warn=entry.get('preview_note') or None):
+                extra = f" — noted as '{label}'" if label else ""
+                print(f"[INFO] Marked as done in {os.path.basename(list_path)}{extra}.")
 
     log_path = _write_url_list_log(results, out_dir, started)
     _notify_url_list_report(results, log_path)
@@ -9141,6 +9825,7 @@ if __name__ == "__main__":
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--follow-links", action="store_true", help="With --scan: treat the given URL as an index/listing page — visit every same-site link (episode pages) and scan each for media too, instead of only the given page. Combines with --subs-only.")
+    parser.add_argument("--password", type=str, default=None, help="Password for a single password-protected video (muse.ai). In Patreon collections the password is found automatically in the post text, so you rarely need this.")
     parser.add_argument("--subs-only", action="store_true", help="Subtitles-only mode: for a collection or any scanned page (HLS .m3u8 or DASH .mpd), find the videos, show which subtitle languages are available, let you multi-select which to grab, then download ONLY those subtitles directly (no video/audio) and save them as .srt. If the given URL is an episode index (no stream of its own), it automatically follows the same-site episode links and scans each. Other modes are unaffected.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
@@ -9158,6 +9843,7 @@ if __name__ == "__main__":
     CENC_KEYS = _parse_cenc_keys(args.key, args.keys)
     FORCE_CONTAINER = args.container if args.container in ('mp4', 'mkv') else None
     SUBS_ONLY = args.subs_only
+    MUSE_PASSWORD = args.password
 
     _res = _parse_res(args.res)
     if isinstance(_res, int):
