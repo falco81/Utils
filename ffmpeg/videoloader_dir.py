@@ -98,7 +98,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.0.0"
+SCRIPT_VERSION = "3.4.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 EP_PROBE_MAX = 0                # (deprecated / unused — episode-number probing was removed)
 SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
@@ -9642,6 +9642,184 @@ def _write_url_list_log(results, out_dir, started):
     return path
 
 
+def _url_list_is_json(path, text=None):
+    """A list file counts as JSON when it ends in .json or its content starts with [ or {."""
+    if path.lower().endswith('.json'):
+        return True
+    try:
+        head = (text if text is not None else open(path, encoding='utf-8').read(400)).lstrip()
+    except OSError:
+        return False
+    return head[:1] in ('[', '{')
+
+
+def _json_list_entries(doc):
+    """The array of entries inside a JSON list document, whatever shape it uses:
+    ["url", ...] | [{"url": ...}, ...] | {"urls": [...]} | {"items": [...]}."""
+    if isinstance(doc, dict):
+        for key in ('urls', 'items', 'list'):
+            if isinstance(doc.get(key), list):
+                return doc[key]
+        return []
+    return doc if isinstance(doc, list) else []
+
+
+def _read_url_list(path):
+    """Read a --url-list file in EITHER format and return (pending_urls, fmt).
+    JSON: entries with "done": true are skipped. TXT: '#' comments and blanks are skipped."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            text = f.read()
+    except OSError as e:
+        print(f"[ERROR] Cannot read --url-list file '{path}': {e}")
+        sys.exit(1)
+    if _url_list_is_json(path, text):
+        try:
+            doc = json.loads(text)
+        except ValueError as e:
+            print(f"[ERROR] --url-list '{path}' is not valid JSON: {e}")
+            sys.exit(1)
+        pending, retries = [], 0
+        for it in _json_list_entries(doc):
+            if isinstance(it, str):
+                if it.strip():
+                    pending.append(it.strip())
+            elif isinstance(it, dict) and it.get('url'):
+                # Not done yet, OR done but flagged (no videos found / preview-only / failed) —
+                # those are worth another try, e.g. after a tier upgrade.
+                if not it.get('done'):
+                    pending.append(str(it['url']).strip())
+                elif it.get('warning'):
+                    pending.append(str(it['url']).strip())
+                    retries += 1
+        if retries:
+            print(f"[INFO] --url-list: retrying {retries} entry(ies) that finished with a warning "
+                  "(no videos / previews only / failed).")
+        return pending, 'json'
+    return [s.strip() for s in text.splitlines()
+            if s.strip() and not s.strip().startswith('#')], 'txt'
+
+
+def _json_mark_done(path, url, label=None, count=None, warn=None):
+    """Record the outcome of `url` in a JSON list file: done/title/files/warning/date. Plain-string
+    entries are upgraded to objects so the metadata has somewhere to live."""
+    try:
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return False
+    arr = _json_list_entries(doc)
+    stamp = datetime.now().strftime('%Y-%m-%d')
+    for i, it in enumerate(arr):
+        cur = it if isinstance(it, str) else (it.get('url') if isinstance(it, dict) else None)
+        if not cur or str(cur).strip() != url:
+            continue
+        if isinstance(it, dict) and it.get('done') and not it.get('warning'):
+            continue                       # already finished cleanly — leave it alone
+        rec = {'url': url} if isinstance(it, str) else dict(it)
+        rec['attempts'] = int(rec.get('attempts') or 0) + 1
+        rec['done'] = True
+        rec['date'] = stamp
+        if label:
+            rec['title'] = label
+        if count is not None:
+            rec['files'] = count
+        rec['warning'] = warn or None      # cleared when the retry finally succeeds
+        arr[i] = rec
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(doc, f, indent=2, ensure_ascii=False)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            return True
+        except OSError as e:
+            print(f"[WARN] Could not update {os.path.basename(path)}: {e}")
+            return False
+    return False
+
+
+def _sidecar_path(txt_path):
+    """The JSON twin of a TEXT list: downurl.txt -> downurl.json."""
+    return os.path.splitext(txt_path)[0] + '.json'
+
+
+def _sidecar_write(path, doc):
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(doc, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return True
+    except OSError as e:
+        print(f"[WARN] Could not update {os.path.basename(path)}: {e}")
+        return False
+
+
+def _sidecar_load(path, source_name):
+    try:
+        with open(path, encoding='utf-8') as f:
+            doc = json.load(f)
+        if isinstance(doc, dict) and isinstance(doc.get('urls'), list):
+            return doc
+        if isinstance(doc, list):
+            return {'source': source_name, 'urls': doc}
+    except (OSError, ValueError):
+        pass
+    return {'source': source_name, 'updated': None, 'urls': []}
+
+
+def _sidecar_init(txt_path, pending_urls):
+    """Create/refresh the JSON twin of a TEXT list so it holds every URL of the batch, with the
+    ones still to do marked done:false. Existing records (and any keys you added) are kept."""
+    path = _sidecar_path(txt_path)
+    doc = _sidecar_load(path, os.path.basename(txt_path))
+    known = {str(e.get('url')): e for e in doc['urls'] if isinstance(e, dict) and e.get('url')}
+    for u in pending_urls:
+        if u in known:
+            if not (known[u].get('done') and not known[u].get('warning')):
+                known[u]['done'] = False
+        else:
+            rec = {'url': u, 'done': False}
+            doc['urls'].append(rec)
+            known[u] = rec
+    doc['updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    _sidecar_write(path, doc)
+    return path
+
+
+def _sidecar_mark(txt_path, url, label=None, count=None, warn=None):
+    """Mirror one finished URL into the JSON twin of a TEXT list."""
+    path = _sidecar_path(txt_path)
+    doc = _sidecar_load(path, os.path.basename(txt_path))
+    rec = next((e for e in doc['urls']
+                if isinstance(e, dict) and str(e.get('url')) == url), None)
+    if rec is None:
+        rec = {'url': url}
+        doc['urls'].append(rec)
+    rec['attempts'] = int(rec.get('attempts') or 0) + 1
+    rec['done'] = True
+    rec['date'] = datetime.now().strftime('%Y-%m-%d')
+    if label:
+        rec['title'] = label
+    if count is not None:
+        rec['files'] = count
+    rec['warning'] = warn or None
+    doc['updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    return _sidecar_write(path, doc)
+
+
+def _mark_url_done(path, fmt, url, label=None, count=None, warn=None):
+    """Mark a finished URL in whichever list format is in use. For a TEXT list the same data is
+    ALSO mirrored into a structured JSON twin next to it (downurl.txt -> downurl.json)."""
+    if fmt == 'json':
+        return _json_mark_done(path, url, label=label, count=count, warn=warn)
+    edited = _comment_url_in_list(path, url, label=label, count=count, warn=warn)
+    _sidecar_mark(path, url, label=label, count=count, warn=warn)
+    return edited
+
+
 def _comment_url_in_list(list_path, url, label=None, count=None, warn=None):
     """Mark a finished URL in the list file: write a '# <collection/series name> — N file(s),
     <date>' note above it and prepend '# ' to the URL itself, then flush straight to disk (so
@@ -9683,25 +9861,22 @@ def _comment_url_in_list(list_path, url, label=None, count=None, warn=None):
 
 
 def run_url_list(list_path, base_kwargs, out_dir):
-    """Read one URL per line from `list_path` and download each in turn (auto-rename mode),
-    then write a report log. Blank lines and lines starting with '#' are ignored."""
-    try:
-        with open(list_path, encoding='utf-8') as f:
-            raw = f.readlines()
-    except OSError as e:
-        print(f"[ERROR] Cannot read --url-list file '{list_path}': {e}")
-        sys.exit(1)
-
-    urls = []
-    for line in raw:
-        s = line.strip()
-        if s and not s.startswith('#'):
-            urls.append(s)
+    """Download every URL in `list_path` in turn (auto-rename mode), then write a report log.
+    The list may be a plain TEXT file (one URL per line; '#' comments and blanks ignored) or a
+    JSON file (["url", ...] or [{"url": ..., "done": false}, ...] or {"urls": [...]}); finished
+    URLs are commented out / marked "done": true, together with the collection name and any
+    warning, so an interrupted run resumes where it stopped."""
+    urls, list_fmt = _read_url_list(list_path)
     if not urls:
-        print(f"[ERROR] --url-list file '{list_path}' contains no URLs.")
+        print(f"[ERROR] --url-list file '{list_path}' contains no URLs left to do.")
         sys.exit(1)
 
-    print(f"[INFO] --url-list: {len(urls)} URL(s) from '{list_path}'. Rename runs automatically "
+    if list_fmt == 'txt':
+        _sidecar_init(list_path, urls)
+        print(f"[INFO] --url-list: also mirroring progress to "
+              f"{os.path.basename(_sidecar_path(list_path))} (structured JSON).")
+    print(f"[INFO] --url-list: {len(urls)} URL(s) from '{list_path}' ({list_fmt.upper()} format). "
+          f"Rename runs automatically "
           f"(applies when there are no conflicts, otherwise it's skipped).")
     if _ntfy_enabled():
         print(f"[INFO] ntfy notifications ON -> {(NTFY_SERVER or 'https://ntfy.sh').rstrip('/')}/{NTFY_TOPIC}")
@@ -9740,13 +9915,27 @@ def run_url_list(list_path, base_kwargs, out_dir):
         # If this URL downloaded correctly (no error, nothing still failing), mark it as done
         # in the list file RIGHT NOW by prepending '#', flushing straight to disk — so an
         # interrupted run resumes at the first not-yet-done URL.
-        if entry['ok'] and not entry['error'] and not entry.get('failed'):
-            label = entry.get('title') or None
-            n_files = len(entry.get('downloaded') or [])
-            if _comment_url_in_list(list_path, url, label=label, count=n_files,
-                                    warn=entry.get('preview_note') or None):
+        label = entry.get('title') or None
+        n_files = len(entry.get('downloaded') or [])
+        clean = entry['ok'] and not entry['error'] and not entry.get('failed')
+        if clean and n_files:
+            if _mark_url_done(list_path, list_fmt, url, label=label, count=n_files,
+                              warn=entry.get('preview_note') or None):
                 extra = f" — noted as '{label}'" if label else ""
                 print(f"[INFO] Marked as done in {os.path.basename(list_path)}{extra}.")
+        else:
+            # Nothing came out of this URL (or it errored): still mark it done, but write the reason
+            # above it so the list itself says what happened (uncomment it to try again later).
+            if entry['error']:
+                why = f"failed: {entry['error']}"
+            elif entry.get('failed'):
+                why = f"{len(entry['failed'])} file(s) failed to download"
+            else:
+                why = ("no downloadable videos found (locked to a higher tier, or an unsupported "
+                       "video host)")
+            if _mark_url_done(list_path, list_fmt, url, label=label, count=n_files, warn=why):
+                print(f"{CLR.YELLOW}[WARN]{CLR.RESET} Marked as done in "
+                      f"{os.path.basename(list_path)} with a warning: {why}")
 
     log_path = _write_url_list_log(results, out_dir, started)
     _notify_url_list_report(results, log_path)
@@ -9795,7 +9984,7 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder), Dropbox, Vimeo, or a Patreon collection. A Patreon collection is fully mined: Google Drive links, Dropbox links, AND native Patreon/Vimeo/Mux videos are all downloaded.")
     parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL. Folders, collections and playlists download every video found. Omit when using --url-list.")
-    parser.add_argument("--url-list", type=str, default=None, help="Path to a text file with ONE URL per line (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
+    parser.add_argument("--url-list", type=str, default=None, help="Path to a TEXT file with ONE URL per line, or a JSON file ([\"url\", ...] / [{\"url\": ..., \"done\": false}] / {\"urls\": [...]}); finished entries are marked done with the collection name, file count and any warning (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders/collections).")
     parser.add_argument("-d", "--output-dir", type=str, default=None, help="Directory to save into (applies to any mode; created if missing). Default: current directory.")
     parser.add_argument("-c", "--chunk_size", type=positive_int, default=DEFAULT_CHUNK_SIZE, help=f"Streaming chunk size in bytes. Default {DEFAULT_CHUNK_SIZE} (edit DEFAULT_CHUNK_SIZE at the top of the script).")
