@@ -1712,9 +1712,9 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
         ]
         idx = interactive_menu(f"Replace {kind} on missing episodes with?",
                                labels + extra, default=len(labels) + len(extra) - 1,
-                               header=header)
+                               allow_cancel=True, header=header)
         if idx is None:
-            break
+            break  # Esc = leave the missing items unchanged (they stay 'skip')
         if idx < len(opts):
             alt = opts[idx]
             still, applied = [], 0
