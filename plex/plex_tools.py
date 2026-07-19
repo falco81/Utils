@@ -2071,6 +2071,11 @@ def select_and_configure(client, args, resume=None):
         audio_action = resume["audio_action"]
         audio_idx = resume.get("audio_idx")
         sub_idx = resume.get("sub_idx")
+        # restore the picker context too, so stepping further back (SUBS -> AUDIO ->
+        # ITEM) lands on the same library/item instead of an unset section
+        sec = resume.get("sec") or sec
+        lib_idx = resume.get("lib_idx", 0)
+        item_idx = dict(resume.get("item_idx") or {})
         step = SUBS if subs_interactive else AUDIO
     while True:
         if step == LIB:
@@ -2084,6 +2089,9 @@ def select_and_configure(client, args, resume=None):
             step = ITEM
 
         elif step == ITEM:
+            if sec is None:  # no library picked yet (e.g. resumed run) -> go pick one
+                step = LIB
+                continue
             items = client.items_in_section(sec["key"], sec["type"])
             if not items:
                 log_warn("The library is empty.")
@@ -2145,7 +2153,8 @@ def select_and_configure(client, args, resume=None):
         return None
     state = {"idata": idata, "audio_vars": audio_vars, "sub_vars": sub_vars,
              "header": header, "audio_action": audio_action, "audio_idx": audio_idx,
-             "sub_idx": sub_idx, "can_resume": subs_interactive or audio_interactive}
+             "sub_idx": sub_idx, "can_resume": subs_interactive or audio_interactive,
+             "sec": sec, "lib_idx": lib_idx, "item_idx": item_idx}
     return idata, audio_action, sub_action, state
 
 
