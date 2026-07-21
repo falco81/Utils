@@ -1655,7 +1655,56 @@ def ep_label(it):
     return it["title"]
 
 
-def resolve_coverage(kind, action, items_data, stream_type, allow_off, interactive):
+def _rescan_missing(client, section_key, items_data, missing, stream_type, variant,
+                    wait_total=90, interval=3):
+    """Trigger 'Scan Library Files' and wait until the missing items expose `variant`
+    (re-fetching their metadata). Updates items_data[i]['parts'] in place. Returns the
+    number of previously-missing items that now have the variant. Automates the manual
+    'F5 refresh, wait, retry' dance for freshly added external subtitle files."""
+    key = section_key
+    if key is None and missing:  # --show path: derive the section from the item
+        try:
+            md = client.get_metadata(items_data[missing[0]]["ratingKey"])
+            key = (md or {}).get("librarySectionID")
+        except Exception:
+            key = None
+    try:
+        if key is not None:
+            client.refresh_section(key)
+            log_info("Scan Library Files started; waiting for Plex to index the files…")
+        else:
+            for sec in client.sections():
+                client.refresh_section(sec["key"])
+            log_info("Scan Library Files started on all libraries; waiting…")
+    except Exception as ex:
+        log_warn(f"Could not start a scan: {ex}")
+
+    deadline = time.monotonic() + wait_total
+    while True:
+        still = [i for i in missing if not item_has_variant(items_data[i], stream_type, variant)]
+        if not still:
+            break
+        try:
+            md_map = client.get_metadata_many([items_data[i]["ratingKey"] for i in still])
+        except Exception:
+            md_map = {}
+        for i in still:
+            md = md_map.get(str(items_data[i]["ratingKey"]))
+            if md:
+                items_data[i]["parts"] = list(iter_parts(md))  # refresh scanned streams
+        have = sum(1 for i in missing if item_has_variant(items_data[i], stream_type, variant))
+        remaining = len(missing) - have
+        if remaining == 0 or time.monotonic() >= deadline:
+            break
+        print(f"\r  {Fore.CYAN}rescanning… {have}/{len(missing)} found, waiting for "
+              f"{remaining} more…{Style.RESET_ALL}   ", end="", flush=True)
+        time.sleep(interval)
+    print()
+    return sum(1 for i in missing if item_has_variant(items_data[i], stream_type, variant))
+
+
+def resolve_coverage(kind, action, items_data, stream_type, allow_off, interactive,
+                     client=None, section_key=None):
     """Returns a per-item plan (length == items_data), each element:
        ('var', variant) | ('off', None) | ('skip', None).
     If some episodes lack the track and we run interactively, ask for a replacement."""
@@ -1695,15 +1744,30 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
                     continue
                 avail.setdefault(v["key"], v)
                 cnt[v["key"]] = cnt.get(v["key"], 0) + 1
-        if not avail:
-            log_info("Missing items have no other track — leaving them unchanged.")
-            break
         opts = sorted(avail.values(), key=lambda v: (-cnt[v["key"]], v["label"].lower()))
         labels = [f"{v['label']}  (has {cnt[v['key']]}/{len(missing)} missing)" for v in opts]
-        extra = []
+
+        extra, extra_kind = [], []
+        if client is not None:
+            extra.append(f"{Fore.CYAN}↻ Rescan library files & re-check "
+                         f"(for freshly added files){Style.RESET_ALL}")
+            extra_kind.append("rescan")
         if allow_off:
             extra.append(f"{Fore.MAGENTA}— turn subtitles OFF on missing —{Style.RESET_ALL}")
+            extra_kind.append("off")
         extra.append(f"{Fore.MAGENTA}— leave missing unchanged (skip) —{Style.RESET_ALL}")
+        extra_kind.append("skip")
+
+        if not opts and "rescan" not in extra_kind:
+            log_info("Missing items have no other track — leaving them unchanged.")
+            break
+
+        # default to Rescan when the wanted track is external (the usual cause), else skip
+        if "rescan" in extra_kind and variant.get("external"):
+            default_idx = len(labels) + extra_kind.index("rescan")
+        else:
+            default_idx = len(labels) + len(extra) - 1
+
         mlbls = [ep_label(items_data[i]) for i in missing]
         header = [
             f"{Fore.YELLOW}{len(missing)} of {n} items lack {kind}: {variant['label']}{Style.RESET_ALL}",
@@ -1711,7 +1775,7 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
             "",
         ]
         idx = interactive_menu(f"Replace {kind} on missing episodes with?",
-                               labels + extra, default=len(labels) + len(extra) - 1,
+                               labels + extra, default=default_idx,
                                allow_cancel=True, header=header)
         if idx is None:
             break  # Esc = leave the missing items unchanged (they stay 'skip')
@@ -1729,14 +1793,32 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
             if missing:
                 log_info(f"{len(missing)} episodes lack this replacement — pick another.")
         else:
-            sel = extra[idx - len(opts)]
-            if allow_off and "OFF" in sel:
+            sel = extra_kind[idx - len(opts)]
+            if sel == "rescan":
+                found = _rescan_missing(client, section_key, items_data, missing,
+                                        stream_type, variant)
+                still, applied = [], 0
+                for i in missing:
+                    if item_has_variant(items_data[i], stream_type, variant):
+                        plan[i] = ("var", variant)
+                        applied += 1
+                    else:
+                        still.append(i)
+                if applied:
+                    log_done(f"After rescan, {applied} episodes now have "
+                             f"'{variant['label']}'.")
+                else:
+                    log_warn("Rescan finished but the files still aren't indexed yet "
+                             "(try again, or check the sidecar filenames).")
+                missing = still  # loop re-shows any that are still missing
+            elif sel == "off":
                 for i in missing:
                     plan[i] = ("off", None)
                 log_done(f"Subtitles turned OFF on {len(missing)} missing episodes.")
-            else:
+                break
+            else:  # skip
                 log_info(f"{len(missing)} episodes left unchanged.")
-            break
+                break
     return plan
 
 
@@ -2448,11 +2530,15 @@ def langsubs_flow(client, args):
         items_data, audio_action, sub_action, state = result
 
         interactive = not args.yes
+        sec = state.get("sec") if state else None
+        section_key = sec["key"] if sec else None
         print()
         audio_plan = resolve_coverage("audio", audio_action, items_data, ST_AUDIO,
-                                      allow_off=False, interactive=interactive)
+                                      allow_off=False, interactive=interactive,
+                                      client=client, section_key=section_key)
         sub_plan = resolve_coverage("subtitles", sub_action, items_data, ST_SUBTITLE,
-                                    allow_off=True, interactive=interactive)
+                                    allow_off=True, interactive=interactive,
+                                    client=client, section_key=section_key)
 
         if all(p[0] == "skip" for p in audio_plan) and all(p[0] == "skip" for p in sub_plan):
             log_warn("Nothing to change after all.")
