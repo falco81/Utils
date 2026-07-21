@@ -1749,7 +1749,7 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
 
         extra, extra_kind = [], []
         if client is not None:
-            extra.append(f"{Fore.CYAN}↻ Rescan library files & re-check "
+            extra.append(f"{Fore.CYAN}» Rescan library files & re-check "
                          f"(for freshly added files){Style.RESET_ALL}")
             extra_kind.append("rescan")
         if allow_off:
