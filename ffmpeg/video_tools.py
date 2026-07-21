@@ -1805,6 +1805,8 @@ def _call_with_timeout(fn, timeout):
 # It is not a user account - it is "baked into" Google's web translator.
 _GOOGLE_TRANSLATE_PA_KEY = "AIzaSyATBXajvzQLTDHEQbcpq0Ihe0vWDHmO520"
 _GOOGLE_TRANSLATE_PA_URL = "https://translate-pa.googleapis.com/v1/translateHtml"
+_GOOGLE_TRANSLATE_WAIT = False      # --p2w: on a rate limit, WAIT and retry Google instead of failing
+                                    # over to deep-translator (keeps the whole file on one engine)
 
 
 def google_translatehtml(texts, target_lang, source_lang="auto", timeout=30):
@@ -1873,6 +1875,21 @@ def make_translator(engine, pivot_lang, cache_path=None, api_key=None, model=Non
                 res = google_translatehtml(batch, pivot_lang)
                 if res is not None:
                     return res
+                if _GOOGLE_TRANSLATE_WAIT:
+                    # WAIT for the free Google endpoint to become available again and retry the SAME
+                    # engine - do not fail over, so the whole file stays consistently on Google.
+                    waits = [15, 30, 30, 60, 60, 120, 120, 300]
+                    for attempt in range(40):
+                        w = waits[min(attempt, len(waits) - 1)]
+                        log_warn(f"Google endpoint busy (rate limit) - waiting {w}s and retrying "
+                                 f"(wait mode, attempt {attempt + 1})...")
+                        time.sleep(w)
+                        res = google_translatehtml(batch, pivot_lang)
+                        if res is not None:
+                            return res
+                    log_warn("Google still unavailable after waiting a long time - leaving these lines "
+                             "untranslated (wait mode never uses a different engine).")
+                    return [None] * len(batch)
                 _gw_state["ok"] = False  # endpoint unavailable -> from now on fallback only
                 if dt is not None:
                     log_warn("Google 'translateHtml' unavailable - switching to deep-translator.")
@@ -17501,6 +17518,11 @@ def _wizard_action_specs():
             help="Fixed preset: extracts the English track, translates to Czech (google, free) + rules "
                  "proofreading + readability fix, saves <video>.cs.srt. Asks only if several EN tracks exist.",
             kind="direct", run=run_p2, flag=None, preset=None),
+        "p2w": dict(
+            label="[preset] Translate ENGLISH -> CZECH (google, WAIT on rate limit) (--p2w)",
+            help="Same as --p2, but if the free Google endpoint is rate-limited it WAITS and retries "
+                 "Google instead of switching to another engine - the whole file stays on one engine.",
+            kind="direct", run=run_p2w, flag=None, preset=None),
         "p2g": dict(
             label="[preset] Translate ENGLISH -> CZECH with CORRECT GENDER + readability (--p2g)",
             help="Like --p2 (google translation + readability) but the Czech gets the right gender: "
@@ -17593,7 +17615,7 @@ def _wizard_action_specs():
 _WIZARD_CATEGORIES = [
     ("Subtitles", "Sync, translate, extract, transplant, rename, readability",
      ["sync-one", "sync-folder", "translate", "scan-translate", "gender-translate", "extract-subs", "merge-pro",
-      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p2g", "pfix", "p3vg", "p3vc", "p3", "p3aud"]),
+      "resync-pro", "import-subs", "rename-subs", "subs-download", "retime-subs", "retime-subs-2in1", "fix-readability", "p1", "p2", "p2w", "p2g", "pfix", "p3vg", "p3vc", "p3", "p3aud"]),
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
@@ -17994,6 +18016,20 @@ def run_p1(args):
 
     print()
     log_done(f"Done: {done} .cze.srt from {len(videos)} videos ({skipped} skipped).")
+
+
+def run_p2w(args):
+    """--p2w: exactly like --p2, but if the free Google endpoint hits a rate limit it WAITS for it to
+    free up and retries Google, instead of failing over to deep-translator - so the whole file is
+    translated consistently by the same engine (just slower when Google is busy)."""
+    global _GOOGLE_TRANSLATE_WAIT
+    prev = _GOOGLE_TRANSLATE_WAIT
+    _GOOGLE_TRANSLATE_WAIT = True
+    log_info("Wait mode: on a Google rate limit the tool waits and retries Google (no engine switch).")
+    try:
+        return run_p2(args)
+    finally:
+        _GOOGLE_TRANSLATE_WAIT = prev
 
 
 def run_p2(args):
@@ -19101,6 +19137,9 @@ DIFFERENT LANGUAGES (target vs reference):
                              "rule-based proofreading and a readability fix (9 chars/s, min 2.5s), saving <video>.cs.srt. "
                              "If several English tracks exist it asks which to use. Optionally a path to the directory "
                              "as a positional argument.")
+    parser.add_argument("--p2w", action="store_true",
+                        help="Same as --p2 but WAIT for the free Google endpoint on a rate limit and retry "
+                             "Google instead of failing over to another translator. Optionally a directory path.")
     parser.add_argument("--p2g", action="store_true",
                         help="FIXED PRESET: like --p2 (English track -> Czech via free 'google' + readability) "
                              "but with CORRECT CZECH GENDER: speaker gender from the voice pitch, an AI "
@@ -19241,6 +19280,10 @@ DIFFERENT LANGUAGES (target vs reference):
 
     if getattr(args, "p2", False):
         run_p2(args)
+        return
+
+    if getattr(args, "p2w", False):
+        run_p2w(args)
         return
 
     if getattr(args, "p2g", False):
