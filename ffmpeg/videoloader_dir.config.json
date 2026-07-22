@@ -13,8 +13,12 @@
   "DEFAULT_MAX_HEIGHT": 0,
   "SCAN_LINK_CAP": 300,
   "SCAN_PAGE_WORKERS": 4,
+  "HLS_SEGMENT_WORKERS": 0,
+  "HLS_AUTO_WORKERS_CAP": 24,
   "PREVIEW_MAX_SECONDS": 120,
   "PREVIEW_MAX_MB": 60,
+  "RESUME_FILE": "resume.json",
+  "MAX_FILENAME_CHARS": 120,
   "FFMPEG": "ffmpeg",
   "FFMPEG_DOWNLOAD_URL": "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
   "FFMPEG_PROGRAM_FILES_DIRS": [

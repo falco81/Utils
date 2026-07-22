@@ -98,10 +98,20 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.4.0"
+SCRIPT_VERSION = "3.9.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 EP_PROBE_MAX = 0                # (deprecated / unused — episode-number probing was removed)
 SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
+# Native-HLS segment threads. Both accept a number, or 0 / null / "auto" / "max" meaning
+# "no limit of my own":
+#   HLS_SEGMENT_WORKERS = 12  -> exactly 12 threads (wins over everything below)
+#   HLS_SEGMENT_WORKERS = 0   -> AUTO: use HLS_AUTO_WORKERS_CAP
+#   HLS_AUTO_WORKERS_CAP = 24 -> AUTO uses at most 24 threads (CPU-friendly default)
+#   HLS_AUTO_WORKERS_CAP = 0  -> AUTO uses the full -m connection budget (pre-3.7 behaviour;
+#                                fastest on a throttled-per-connection CDN, but pins the CPU)
+HLS_SEGMENT_WORKERS = 0
+HLS_AUTO_WORKERS_CAP = 24
+MAX_FILENAME_CHARS = 120        # cap for generated filenames (Windows paths break past ~260 chars)
 PREVIEW_MAX_SECONDS = 120       # downloads shorter than this are flagged as probable previews
 PREVIEW_MAX_MB = 60             # ...or smaller than this when the duration can't be read
 # Paths that look like an episode/watch page — used to recognise an episode index and to visit
@@ -157,6 +167,7 @@ _REMOTE_CONFIG_KEYS = {
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB',
+    'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
@@ -165,6 +176,77 @@ _REMOTE_CONFIG_KEYS = {
     # -- YouTube / Twitch API constants (handy to hot-fix remotely when they rotate) --
     'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY', 'TWITCH_CLIENT_ID',
 }
+
+
+# Display order for --dump-config (grouped like the config sections). Any key missing here is
+# appended alphabetically, so a newly added setting can never fall out of the generated file.
+_CONFIG_KEY_ORDER = (
+    'DEFAULT_THREADS', 'DEFAULT_FOLDER_WORKERS', 'DEFAULT_MAX_CONNECTIONS', 'DEFAULT_CHUNK_SIZE',
+    'DEFAULT_RECURSIVE', 'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES',
+    'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP',
+    'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
+    'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
+    'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
+    'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY', 'TWITCH_CLIENT_ID',
+    'USE_COLOR', 'FORCE_ASCII_BARS', 'PER_FILE_BAR_LIMIT', 'BAR_NCOLS', 'BAR_DESC_WIDTH',
+    'ASCII_FILENAMES', 'AUTO_COOKIES', 'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'USER_AGENT',
+    'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
+)
+
+
+def dump_config_file(path):
+    """Write a JSON file holding EVERY remotely-overridable setting with this script's current
+    values — a ready-to-edit template for CONFIG_URL. Generated from the allowlist itself, so it
+    can never drift out of sync with the code."""
+    keys = [k for k in _CONFIG_KEY_ORDER if k in _REMOTE_CONFIG_KEYS]
+    keys += sorted(k for k in _REMOTE_CONFIG_KEYS if k not in _CONFIG_KEY_ORDER)
+    data = {k: globals().get(k) for k in keys}
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+        print(f"[INFO] Wrote {len(data)} setting(s) to {path} (v{SCRIPT_VERSION}). "
+              "Upload it to your CONFIG_URL and delete the keys you don't want to manage remotely.")
+        return True
+    except OSError as e:
+        print(f"[ERROR] Could not write {path}: {e}")
+        return False
+
+
+def _as_worker_setting(value):
+    """Normalise a worker knob: a positive number stays a number; 0 / null / "auto" / "max" /
+    "unlimited" (any case) mean "no limit from me" and return None."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, str):
+        v = value.strip().lower()
+        if v in ('', 'auto', 'max', 'none', 'off', 'unlimited', 'all'):
+            return None
+        try:
+            value = int(v)
+        except ValueError:
+            return None
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _hls_worker_count(max_connections):
+    """How many parallel segment threads native HLS should use (see the knobs at the top)."""
+    forced = _as_worker_setting(HLS_SEGMENT_WORKERS)
+    if forced:
+        return max(1, min(forced, max_connections))
+    cap = _as_worker_setting(HLS_AUTO_WORKERS_CAP)
+    if cap is None:                       # 0 / "auto" -> use the whole -m budget
+        return max(1, max_connections)
+    return max(1, min(max_connections, max(4, cap)))
+
+
+# Keys whose value may be a word ("auto") as well as a number, so they skip type coercion.
+_FLEXIBLE_CONFIG_KEYS = {'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP'}
 
 
 def _coerce_config_value(current, value):
@@ -209,7 +291,8 @@ def _apply_remote_config():
             skipped.append(key)
             continue
         try:
-            globals()[key] = _coerce_config_value(globals().get(key), value)
+            globals()[key] = (value if key in _FLEXIBLE_CONFIG_KEYS
+                              else _coerce_config_value(globals().get(key), value))
             applied.append(key)
         except (ValueError, TypeError):
             print(f"[WARN] Config: bad value for {key}; keeping local default.")
@@ -1947,14 +2030,31 @@ def _to_ascii(name: str) -> str:
 
 def safe_filename(name: str, fallback_id: str) -> str:
     """Sanitise a filename for Windows + Linux (also strips emoji, which cmd.exe renders as
-    boxes and which clutter filenames). With ASCII_FILENAMES/--ascii, transliterates to ASCII."""
+    boxes and which clutter filenames). With ASCII_FILENAMES/--ascii, transliterates to ASCII.
+    The result is also length-capped: creators sometimes put a whole paragraph in the post title,
+    and Windows then fails (OSError 22 / 206) once the path with the .temp folder and the
+    .lock/.part suffixes goes past its limit."""
     name = _EMOJI_RE.sub('', name)
     if ASCII_FILENAMES:
         name = _to_ascii(name)
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', name)
     name = re.sub(r'\s{2,}', ' ', name)
     name = re.sub(r'[. ]+$', '', name).strip()
+    name = _cap_filename(name)
     return name or f"{fallback_id}.mp4"
+
+
+def _cap_filename(name: str) -> str:
+    """Shorten an over-long filename, keeping a real video extension if it has one. Leaves room
+    for the .temp folder and the .part/.lock/.v.mp4 suffixes the downloader appends."""
+    limit = max(40, int(MAX_FILENAME_CHARS or 120))
+    if len(name) <= limit:
+        return name
+    ext = os.path.splitext(name)[1]
+    ext = ext if ext.lower() in _VIDEO_EXTS else ''
+    stem = name[:len(name) - len(ext)] if ext else name
+    stem = stem[:max(8, limit - len(ext))].rstrip(' .-_')
+    return stem + ext
 
 
 def prefer_mp4_ext(name: str) -> str:
@@ -5528,10 +5628,11 @@ def _download_hls_segment(url, path, session, headers):
                         continue
                     return False, last
                 tmp = path + '.tmp'
+                # copyfileobj runs the transfer loop in C: with a hundred-plus parallel segment
+                # threads a Python-level chunk loop burns a lot of CPU for no extra throughput.
                 with open(tmp, 'wb') as f:
-                    for chunk in r.iter_content(256 * 1024):
-                        if chunk:
-                            f.write(chunk)
+                    r.raw.decode_content = True
+                    shutil.copyfileobj(r.raw, f, 1024 * 1024)
                 os.replace(tmp, path)
                 return True, None
         except requests.RequestException as e:
@@ -7349,7 +7450,7 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
 def download_hls_pooled(videos, session, out_dir, max_connections, max_height, verbose):
     """Download all native (Vimeo/Mux) videos as HLS via a shared pool of segment workers,
     then mux each with ffmpeg. All videos progress at once; the budget is shared."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from concurrent.futures import ThreadPoolExecutor
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
@@ -7388,16 +7489,18 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
         return
 
     per_file_bars = len(jobs) <= PER_FILE_BAR_LIMIT
-    print(f"[INFO] Downloading {len(jobs)} native video(s) with a shared pool of {max_connections} "
-          f"connections; segments fetched in parallel, muxed with ffmpeg.\n")
+    _seg_workers = _hls_worker_count(max_connections)
+    print(f"[INFO] Downloading {len(jobs)} native video(s) with {_seg_workers} parallel segment "
+          f"thread(s) (of {max_connections} allowed connections), muxed with ffmpeg.\n")
 
     bar_lock = threading.Lock()
     overall = None
     if per_file_bars:
         for idx, job in enumerate(jobs):
             done = sum(1 for (_k, _i, _u, p) in job.tasks if os.path.exists(p) and os.path.getsize(p) > 0)
-            job.bar = make_bar(total=max(len(job.tasks), 1), initial=done, unit='seg', unit_scale=False,
-                               desc=os.path.basename(job.out_path), position=idx, leave=True)
+            job.bar = make_bar(total=max(len(job.tasks), 1), initial=done, unit='seg',
+                               unit_scale=False, desc=os.path.basename(job.out_path),
+                               position=idx, leave=True, mininterval=0.4)
     else:
         total_tasks = sum(len(j.tasks) for j in jobs)
         done = sum(1 for j in jobs for (_k, _i, _u, p) in j.tasks
@@ -7499,10 +7602,12 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
                 key, idx, url, path = job.tasks[k]
                 order.append((job, key, idx, url, path))
 
-    with ThreadPoolExecutor(max_workers=max_connections) as ex:
-        futures = [ex.submit(run_task, *t) for t in order]
-        for _ in as_completed(futures):
-            pass
+    workers = _hls_worker_count(max_connections)
+    # Submitting every segment up front (tens of thousands of Future objects) plus an
+    # as_completed() waiter over all of them costs real CPU; the pool drains on exit anyway.
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        for t in order:
+            ex.submit(run_task, *t)
 
     if per_file_bars:
         with bar_lock:
@@ -9968,6 +10073,13 @@ if __name__ == "__main__":
 
     # Optional remote config (CONFIG_URL) overrides USER CONFIG here, BEFORE argparse builds its
     # defaults from those globals — so the command line still wins over both. No-op when unset.
+    # Many parallel download threads make CPython hand the GIL around very aggressively; a slightly
+    # longer switch interval cuts that contention (pure CPU saving, no effect on throughput).
+    try:
+        sys.setswitchinterval(0.02)
+    except (AttributeError, ValueError):
+        pass
+
     _apply_remote_config()
 
     def positive_int(v):
@@ -10016,6 +10128,7 @@ if __name__ == "__main__":
     parser.add_argument("--follow-links", action="store_true", help="With --scan: treat the given URL as an index/listing page — visit every same-site link (episode pages) and scan each for media too, instead of only the given page. Combines with --subs-only.")
     parser.add_argument("--password", type=str, default=None, help="Password for a single password-protected video (muse.ai). In Patreon collections the password is found automatically in the post text, so you rarely need this.")
     parser.add_argument("--subs-only", action="store_true", help="Subtitles-only mode: for a collection or any scanned page (HLS .m3u8 or DASH .mpd), find the videos, show which subtitle languages are available, let you multi-select which to grab, then download ONLY those subtitles directly (no video/audio) and save them as .srt. If the given URL is an episode index (no stream of its own), it automatically follows the same-site episode links and scans each. Other modes are unaffected.")
+    parser.add_argument("--dump-config", nargs="?", const="videoloader_dir.config.json", metavar="FILE", help="Write a JSON file with every remotely-overridable setting and its current value (default name: videoloader_dir.config.json), then exit. Use it as the template for CONFIG_URL.")
     parser.add_argument("--test-notify", action="store_true", help="Send a test ntfy.sh push notification (uses NTFY_TOPIC/NTFY_SERVER set at the top of the script) and exit. Use this to verify your phone receives it.")
     parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
 
@@ -10038,6 +10151,9 @@ if __name__ == "__main__":
     if isinstance(_res, int):
         args.max_height = _res              # --res 1080 -> cap height (best up to 1080)
     _res_scan = (_res == 'SCAN')
+
+    if args.dump_config:
+        sys.exit(0 if dump_config_file(args.dump_config) else 1)
 
     if args.test_notify:
         if not _ntfy_enabled():

@@ -1114,6 +1114,7 @@ def parse_srt(path: Path, strict=True):
 
 
 def write_srt(events, path: Path):
+    path = path if isinstance(path, Path) else Path(path)   # accept plain strings too
     with path.open("w", encoding="utf-8") as f:
         for i, ev in enumerate(events, start=1):
             f.write(f"{i}\n")
@@ -3284,7 +3285,7 @@ def ask_readability_params(srt_files):
 
 _LANG_ALIASES = {
     "cze": "cs", "ces": "cs", "cz": "cs", "slk": "sk", "slo": "sk",
-    "ger": "de", "deu": "de", "ger": "de", "eng": "en", "fre": "fr", "fra": "fr",
+    "ger": "de", "deu": "de", "eng": "en", "fre": "fr", "fra": "fr",
     "spa": "es", "ita": "it", "por": "pt", "dut": "nl", "nld": "nl",
     "rus": "ru", "ukr": "uk", "hun": "hu", "pol": "pl", "rum": "ro", "ron": "ro",
 }
@@ -8525,17 +8526,6 @@ def _aggregate_track_keys(infos, kind):
                 order.append(key)
             meta[key][1] += 1
     return [(k, meta[k][0], meta[k][1]) for k in order]
-    videos, subs = [], []
-    walker = os.walk(directory) if recursive else [(directory, [], os.listdir(directory))]
-    for root, _d, files in walker:
-        for f in files:
-            ext = os.path.splitext(f)[1].lower()
-            full = os.path.join(root, f)
-            if ext in (".mkv", ".mp4"):
-                videos.append(full)
-            elif ext in sub_exts:
-                subs.append(full)
-    return sorted(videos), sorted(subs)
 
 
 def _parse_sub_meta(sub_name, forced_lang=None):
@@ -12458,6 +12448,7 @@ def _vid_track_list_screen(info, tracks, start=0):
         _fb_enter_screen()
         try:
             while True:
+                cols = _term_cols()
                 lines = [f"{Fore.MAGENTA}{Style.BRIGHT}=== Edit tracks - {_fb_trunc(info['path'].name, 60)} ==={Style.RESET_ALL}",
                          f"{Fore.CYAN}Enter on a track to edit its name / language / flags.{Style.RESET_ALL}", ""]
                 for i, (kind, t) in enumerate(tracks):
@@ -18305,7 +18296,10 @@ def run_pfix(args):
     done = skipped = 0
     for v, srt in pairs:
         vp, stem = Path(v), Path(v).stem[:38]
-        events = parse_srt(srt)
+        try:
+            events = parse_srt(srt)
+        except SystemExit:                 # a single unreadable file must not kill the whole batch
+            events = None
         if not events:
             log_warn(f"{srt.name}: could not read any subtitles - skipping.")
             skipped += 1
@@ -18588,8 +18582,9 @@ def _total_ram_gb():
     return 0
 
 
-def _list_gpus():
-    """GPU names (with VRAM where available) for the HW summary."""
+def _hw_gpu_list():
+    """GPU names (with VRAM where available) for the --test hardware summary. Separate from
+    _list_gpus(), which is the cached name-only list used for device selection."""
     try:
         r = subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
                            capture_output=True, text=True, timeout=8)
@@ -18634,7 +18629,7 @@ def _hw_info_lines():
     ram = _total_ram_gb()
     if ram:
         out.append(f"RAM:    {ram} GB")
-    for g in _list_gpus():
+    for g in _hw_gpu_list():
         out.append(f"GPU:    {g}")
     return out
 
