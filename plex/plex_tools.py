@@ -210,7 +210,7 @@ def resolve_config_path():
 # streamType in the Plex API
 ST_VIDEO, ST_AUDIO, ST_SUBTITLE = 1, 2, 3
 SECTION_TYPE_NUM = {"movie": 1, "show": 2}
-STATUS_AUTOHIDE = 4.0  # s: jak dlouho zůstane hláška (např. výsledek F5), než sama zmizí
+STATUS_AUTOHIDE = 4.0  # s: how long a status message (e.g. the F5 result) stays before it auto-hides
 
 PRODUCT = "plex_tools"
 PLEX_TV = "https://plex.tv"
@@ -495,8 +495,8 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
             sel_pos = max(0, len(order) - 1)
         page_rows = render(order, sel_pos)
         while True:
-            # když je zobrazená hláška (např. výsledek F5), čti s timeoutem,
-            # ať sama zmizí i bez stisku klávesy
+            # while a status message is showing (e.g. the F5 result), read with a
+            # timeout so it disappears on its own even without a keypress
             key = _read_key(STATUS_AUTOHIDE if status else None)
             if key == "timeout":
                 status = ""
@@ -827,7 +827,8 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
             render(order, sel_pos)
 
 
-
+def _ask_choice_classic(prompt, labels, default=0):
+    """Numbered menu fallback for terminals without TTY/arrow-key support."""
     def _show():
         print(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL}")
         for i, l in enumerate(labels):
@@ -1795,8 +1796,8 @@ def resolve_coverage(kind, action, items_data, stream_type, allow_off, interacti
         else:
             sel = extra_kind[idx - len(opts)]
             if sel == "rescan":
-                found = _rescan_missing(client, section_key, items_data, missing,
-                                        stream_type, variant)
+                _rescan_missing(client, section_key, items_data, missing,
+                                stream_type, variant)
                 still, applied = [], 0
                 for i in missing:
                     if item_has_variant(items_data[i], stream_type, variant):
