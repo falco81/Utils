@@ -179,6 +179,21 @@ which device type a USB bridge actually answers. Example:
 
 ## Notes
 
+- **Zoom and pan.** Scroll the mouse wheel over a chart to zoom, or pinch with two
+  fingers on a tablet; whatever moment sits under the pointer stays put while the
+  window widens or narrows. Drag with one finger (or the mouse) to move through
+  history. The range buttons are presets for the window width — after a free-form
+  zoom none of them is highlighted and the current width is shown next to them
+  instead. A "now" button appears while you're looking at the past, and the
+  auto-refresh pauses so a reload can't yank the view back mid-read.
+- **Two copies of the history.** `data.json` carries a down-sampled series
+  (`HISTORY_POINTS`) so the first paint stays fast; the collector also writes
+  `history-full.json` next to it with every recorded sample. The page fetches the
+  full copy lazily — via `index.php?series=full`, which reuses the same PHP chart
+  code — the first time you open Trends. Retention is `HISTORY_DAYS` (7 by
+  default) and is enforced by age, not sample count, so changing the timer
+  interval can't silently shorten it.
+
 - **Two tabs.** *Overview* holds the live state — status, activity, performance and the
   disk cards. *Trends* holds the charts. The chosen tab is kept in the URL fragment, so
   the 60-second auto-refresh leaves you where you were.

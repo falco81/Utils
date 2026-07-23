@@ -109,6 +109,15 @@ if ($data && !empty($data['disks'])) {
 }
 
 // Build the chart definitions here so the browser only has to draw them.
+// With ?series=full the same code runs against the full-resolution history and
+// the result is returned as JSON — that way panning uses every recorded sample
+// without duplicating any of this logic in JavaScript.
+$wantFull = isset($_GET['series']) && $_GET['series'] === 'full';
+if ($wantFull) {
+    $fullFile = __DIR__ . '/history-full.json';
+    $full = is_readable($fullFile) ? json_decode((string) file_get_contents($fullFile), true) : null;
+    if (is_array($full) && !empty($full['t'])) $data['history'] = $full;
+}
 $hist = $data['history'] ?? [];
 $ht   = $hist['t'] ?? [];
 $charts = [];
@@ -239,10 +248,47 @@ if (count($ht) >= 2) {
                      'label' => $data['system']['ncpu'] . ' cores']],
         'series' => [['label' => '1 min', 'color' => '#2dd4bf', 'data' => $hist['sys']['load'] ?? []]],
     ];
+    if (array_filter($hist['srv']['sess'] ?? [], fn($v) => $v !== null)) {
+        $charts[] = [
+            'id' => 'sess', 'title' => 'Active streams', 'unit' => '', 'min' => 0,
+            'note' => 'Concurrent playbacks. Pair this with CPU temperature and load to see '
+                    . 'what transcoding actually costs you.',
+            'series' => [['label' => 'streams', 'color' => '#f0883e', 'data' => $hist['srv']['sess']]],
+        ];
+    }
+    if (array_filter($hist['srv']['db'] ?? [], fn($v) => $v !== null)) {
+        $dbS = [['label' => 'library.db', 'color' => '#58a6ff',
+                 'data' => array_map(fn($v) => $v === null ? null : round($v / 1048576, 1), $hist['srv']['db'])]];
+        if (array_filter($hist['srv']['wal'] ?? [], fn($v) => $v !== null)) {
+            $dbS[] = ['label' => 'WAL', 'color' => '#d29922',
+                      'data' => array_map(fn($v) => $v === null ? null : round($v / 1048576, 1), $hist['srv']['wal'])];
+        }
+        $charts[] = [
+            'id' => 'db', 'title' => 'Database size', 'unit' => ' MB', 'min' => 0,
+            'note' => 'A WAL that keeps growing instead of being checkpointed is worth a look.',
+            'series' => $dbS,
+        ];
+    }
     $charts[] = [
         'id' => 'mem', 'title' => 'Memory used', 'unit' => ' %', 'min' => 0, 'max' => 100,
         'series' => [['label' => 'RAM', 'color' => '#a371f7', 'data' => $hist['sys']['mem'] ?? []]],
     ];
+}
+
+// JSON endpoint for the lazy full-resolution fetch.
+if ($wantFull) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    echo json_encode([
+        't' => $ht,
+        'charts' => array_map(fn($c) => [
+            'id' => $c['id'], 'unit' => $c['unit'] ?? '', 'min' => $c['min'] ?? null,
+            'max' => $c['max'] ?? null, 'bands' => $c['bands'] ?? [],
+            'series' => array_map(fn($s) => ['label' => $s['label'], 'color' => $s['color'],
+                                             'data' => $s['data']], $c['series']),
+        ], $charts),
+    ], JSON_UNESCAPED_SLASHES);
+    exit;
 }
 
 /**
@@ -375,6 +421,14 @@ function trend_per_day(array $times, array $vals): ?float {
   .crangewrap{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
   .crange{display:flex;gap:6px;flex-wrap:wrap}
   .crange button:disabled{opacity:.38;cursor:not-allowed}
+  .pannote{display:inline-flex;align-items:center;gap:8px;font-size:12.5px;color:var(--info);
+    background:var(--info-bg);border:1px solid rgba(88,166,255,.3);border-radius:999px;padding:3px 6px 3px 12px}
+  .pannote button{appearance:none;background:var(--info);color:#0d1117;border:0;border-radius:999px;
+    padding:2px 10px;font-size:12px;font-weight:700;cursor:pointer}
+  /* charts are draggable to scroll through history */
+  .cwrap{cursor:grab}
+  .cwrap.grabbing{cursor:grabbing}
+  .cwrap svg{user-select:none;-webkit-user-select:none}
   .crange button{appearance:none;background:var(--panel);border:1px solid var(--line);color:var(--tx-dim);
     font:inherit;font-size:13px;font-weight:600;padding:6px 13px;border-radius:9px;cursor:pointer}
   .crange button[aria-pressed="true"]{background:var(--info-bg);border-color:rgba(88,166,255,.4);color:var(--info)}
@@ -440,6 +494,8 @@ function trend_per_day(array $times, array $vals): ?float {
   .attrs .a .an{color:var(--tx-mut)} .attrs .a .av{font-weight:600}
   .attrs .a .av.bad{color:var(--crit)}
   .cachenote{font-size:11px;color:var(--tx-mut)}
+  .recent{display:flex;gap:14px;flex-wrap:wrap;margin-top:7px;font-size:12.5px;color:var(--tx-mut)}
+  .recent b{color:var(--tx);font-weight:700;font-size:13.5px}
 
   /* collapsible full attribute list */
   .moreattrs{margin-top:11px;border-top:1px solid var(--line);padding-top:10px}
@@ -815,6 +871,14 @@ function trend_per_day(array $times, array $vals): ?float {
             ≈<?= number_format($perYear, 0, '.', ' ') ?> spin-ups/year<?php
               if ($lccYear !== null): ?> · ≈<?= number_format($lccYear, 0, '.', ' ') ?> head parks/year<?php endif; ?>
           </div>
+          <?php
+            $s1 = $d['spinups_1h'] ?? null; $s24 = $d['spinups_24h'] ?? null;
+            if ($s1 !== null || $s24 !== null): ?>
+            <div class="recent">
+              <span>Spin-ups <b><?= $s1 !== null ? (int) $s1 : '—' ?></b> last hour</span>
+              <span><b><?= $s24 !== null ? (int) $s24 : '—' ?></b> last 24 h</span>
+            </div>
+          <?php endif; ?>
         <?php endif; ?>
 
         <?php if (!empty($d['stable_since']) && $d['smart_ok'] === true):
@@ -844,6 +908,8 @@ function trend_per_day(array $times, array $vals): ?float {
           <button data-h="0">All</button>
         </div>
         <span class="sub" id="rangenote"></span>
+        <span class="sub" id="resnote"></span>
+        <span class="pannote" id="pannote" hidden></span>
       </div>
       <div class="grid charts">
         <?php foreach ($charts as $c): ?>
@@ -916,7 +982,7 @@ function trend_per_day(array $times, array $vals): ?float {
       p.hidden = (p.id !== 'tab-' + name);
     });
     tabs.forEach(function (b) { b.setAttribute('aria-selected', b.dataset.tab === name ? 'true' : 'false'); });
-    if (name === 'trends') drawAll();
+    if (name === 'trends') { loadFull(); drawAll(); }
   }
   tabs.forEach(function (b) {
     b.addEventListener('click', function () {
@@ -929,9 +995,141 @@ function trend_per_day(array $times, array $vals): ?float {
   show(initial);
 
   // reload keeps the hash, so you stay on the tab you were reading
-  setTimeout(function () { location.reload(); }, 60000);
+  // Reloading mid-drag would yank the view back to "now", so hold off while the
+  // user is reading history and retry shortly after.
+  (function autoReload() {
+    setTimeout(function () {
+      if (panOffset > 0) { autoReload(); return; }
+      location.reload();
+    }, 60000);
+  })();
 
   var rangeH = 24;
+  var panOffset = 0;        // seconds shifted back from "now"
+  var fullLoaded = false;   // full-resolution history fetched yet?
+
+  /**
+   * Pull the full-resolution series once the user actually looks at Trends.
+   * data.json only carries a down-sampled copy so the first paint stays quick;
+   * this brings in every recorded sample so panning has something to reveal.
+   */
+  function loadFull() {
+    if (fullLoaded) return;
+    fullLoaded = true;
+    // Guard: an exception raised here would abort the rest of this script and
+    // take the range buttons and panning with it. Charts already have the
+    // down-sampled data, so failing quietly is the right fallback.
+    if (typeof fetch !== 'function') return;
+    try {
+      fetch('?series=full', { cache: 'no-store' })
+      .then(function (r) { return r.ok ? r.json() : null; })
+      .then(function (j) {
+        if (!j || !j.t || j.t.length < 2) return;
+        HIST.t = j.t;
+        // match incoming series to the charts already on the page
+        (j.charts || []).forEach(function (nc) {
+          var cur = CHARTS.filter(function (c) { return c.id === nc.id; })[0];
+          if (cur) cur.series = nc.series;
+        });
+        var n = document.getElementById('resnote');
+        if (n) n.textContent = j.t.length + ' samples loaded';
+        drawAll();
+      })
+      .catch(function () { /* keep the embedded low-res data */ });
+    } catch (e) { /* no full-resolution data; the embedded series still work */ }
+  }
+
+  /** Drag left/right on any chart to move through history. */
+  function attachPan(el) {
+    var dragging = false, startX = 0, startPan = 0, moved = false;
+    function span() {
+      var T = HIST.t || [];
+      return T.length > 1 ? T[T.length - 1] - T[0] : 0;
+    }
+
+    /**
+     * Zoom around a fixed point: whatever moment sits under the pointer stays
+     * under the pointer, which is what makes wheel and pinch feel predictable.
+     * rangeH is a float here, so zooming isn't limited to the button presets.
+     */
+    function zoomAt(factor, clientX) {
+      var T = HIST.t || [];
+      if (T.length < 2) return;
+      var total = span(), last = T[T.length - 1];
+      var cur = rangeH > 0 ? rangeH * 3600 : total;
+      var next = Math.min(total, Math.max(360, cur * factor));   // floor: 6 minutes
+      var r = el.getBoundingClientRect();
+      var f = r.width ? Math.min(1, Math.max(0, (clientX - r.left) / r.width)) : 0.5;
+      var to = last - panOffset, from = to - cur;
+      var anchor = from + f * cur;                                // time under the pointer
+      var from2 = anchor - f * next;
+      panOffset = Math.min(Math.max(0, total - next), Math.max(0, last - (from2 + next)));
+      rangeH = (next >= total - 1) ? 0 : next / 3600;             // fully zoomed out == "All"
+      if (rangeH === 0) panOffset = 0;
+      drawAll();
+    }
+
+    el.addEventListener('wheel', function (e) {
+      if (!e.deltaY) return;
+      e.preventDefault();
+      zoomAt(e.deltaY > 0 ? 1.25 : 1 / 1.25, e.clientX);
+    }, { passive: false });
+
+    // pinch to zoom (iPad and any other multi-touch screen)
+    var pinchDist = 0;
+    function dist(t) {
+      var dx = t[0].clientX - t[1].clientX, dy = t[0].clientY - t[1].clientY;
+      return Math.sqrt(dx * dx + dy * dy);
+    }
+    el.addEventListener('touchstart', function (e) {
+      if (e.touches.length === 2) { pinchDist = dist(e.touches); dragging = false; }
+    }, { passive: true });
+    el.addEventListener('touchmove', function (e) {
+      if (e.touches.length !== 2 || !pinchDist) return;
+      e.preventDefault();
+      var d2 = dist(e.touches);
+      if (Math.abs(d2 - pinchDist) < 4) return;
+      var mid = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+      zoomAt(pinchDist / d2, mid);
+      pinchDist = d2;
+    }, { passive: false });
+    el.addEventListener('touchend', function (e) {
+      if (e.touches.length < 2) pinchDist = 0;
+    });
+
+    function down(e) {
+      if (e.touches && e.touches.length > 1) return;   // two fingers = pinch, not pan
+      if (rangeH === 0) return;               // "All" already shows everything
+      dragging = true; moved = false;
+      startX = (e.touches ? e.touches[0].clientX : e.clientX);
+      startPan = panOffset;
+      el.classList.add('grabbing');
+    }
+    function move(e) {
+      if (!dragging) return;
+      var x = (e.touches ? e.touches[0].clientX : e.clientX);
+      var dx = x - startX;
+      if (Math.abs(dx) > 3) moved = true;
+      // one chart width == the visible window, so dragging maps 1:1 to time
+      var secPerPx = (rangeH * 3600) / Math.max(1, el.clientWidth);
+      var next = startPan + dx * secPerPx;
+      var maxPan = Math.max(0, span() - rangeH * 3600);
+      panOffset = Math.min(maxPan, Math.max(0, next));
+      if (e.cancelable && moved) e.preventDefault();
+      drawAll();
+    }
+    function up() {
+      dragging = false;
+      el.classList.remove('grabbing');
+    }
+    el.addEventListener('mousedown', down);
+    window.addEventListener('mousemove', move);
+    window.addEventListener('mouseup', up);
+    el.addEventListener('touchstart', down, { passive: true });
+    el.addEventListener('touchmove', move, { passive: false });
+    el.addEventListener('touchend', up);
+  }
+
   var rb = document.getElementById('ranges');
 
   /**
@@ -944,31 +1142,47 @@ function trend_per_day(array $times, array $vals): ?float {
     if (!rb) return;
     var T = HIST.t || [];
     var spanH = T.length > 1 ? (T[T.length - 1] - T[0]) / 3600 : 0;
-    var usable = null;
+
+    // A preset is only meaningful once the history outlasts it; otherwise every
+    // button shows the same full series and clicking them looks broken.
+    var usable = null, matched = false;
     rb.querySelectorAll('button').forEach(function (b) {
       var hrs = parseInt(b.dataset.h, 10);
-      var ok = hrs === 0 || spanH > hrs * 1.02;     // must actually cut something
+      var ok = hrs === 0 || spanH > hrs * 1.02;
       b.disabled = !ok;
       b.title = ok ? '' : 'Needs more than ' + b.textContent.trim() + ' of history';
       if (ok && hrs > 0 && usable === null) usable = hrs;
+      // wheel/pinch zoom lands between the presets, so highlight one only on an
+      // exact match rather than pretending a preset is active
+      var on = ok && Math.abs(hrs - rangeH) < 0.01;
+      b.setAttribute('aria-pressed', on ? 'true' : 'false');
+      if (on) matched = true;
     });
-    // if the active range is locked, fall back to showing everything
-    var active = rb.querySelector('button[aria-pressed="true"]');
-    if (!active || active.disabled) {
-      var target = rb.querySelector('button[data-h="' + (usable === null ? 0 : usable) + '"]')
-                || rb.querySelector('button[data-h="0"]');
-      rb.querySelectorAll('button').forEach(function (x) {
-        x.setAttribute('aria-pressed', x === target ? 'true' : 'false');
-      });
-      if (target) rangeH = parseInt(target.dataset.h, 10);
-    }
+
     var note = document.getElementById('rangenote');
     if (note) {
       var txt;
       if (spanH < 1)       txt = Math.max(1, Math.round(spanH * 60)) + ' min of history so far';
       else if (spanH < 48) txt = spanH.toFixed(1) + ' h of history so far';
       else                 txt = Math.round(spanH / 24) + ' d of history';
+      if (!matched && rangeH > 0) {
+        txt = (rangeH < 1 ? Math.round(rangeH * 60) + ' min' : rangeH.toFixed(1) + ' h') + ' window · ' + txt;
+      }
       note.textContent = txt + (usable === null ? ' — longer ranges unlock as it builds up' : '');
+    }
+
+    var pn = document.getElementById('pannote');
+    if (pn) {
+      if (panOffset > 60) {
+        var h = panOffset / 3600;
+        pn.innerHTML = 'viewing ' + (h < 48 ? h.toFixed(1) + ' h' : Math.round(h / 24) + ' d')
+                     + ' back <button type="button" id="pannow">now</button>';
+        pn.hidden = false;
+        var nb = document.getElementById('pannow');
+        if (nb) nb.onclick = function () { panOffset = 0; drawAll(); };
+      } else {
+        pn.hidden = true;
+      }
     }
   }
 
@@ -977,6 +1191,7 @@ function trend_per_day(array $times, array $vals): ?float {
       var b = e.target.closest('button');
       if (!b || b.disabled) return;
       rangeH = parseInt(b.dataset.h, 10);
+      panOffset = 0;                     // a new window always starts at "now"
       rb.querySelectorAll('button').forEach(function (x) {
         x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
       });
@@ -995,11 +1210,19 @@ function trend_per_day(array $times, array $vals): ?float {
     var T = HIST.t || [];
     if (T.length < 2) { wrap.innerHTML = '<div class="nodata">Not enough history yet.</div>'; return; }
 
-    // range filter
-    var from = 0;
-    if (rangeH > 0) from = T[T.length - 1] - rangeH * 3600;
+    // Visible window: rangeH wide, shifted back by panOffset seconds. Panning
+    // is what makes a week of five-minute samples explorable instead of just
+    // squashed into one screen.
+    var last = T[T.length - 1], first = T[0];
+    var from = 0, to = last;
+    if (rangeH > 0) {
+      to = last - panOffset;
+      from = to - rangeH * 3600;
+      if (from < first) { from = first; to = Math.min(last, first + rangeH * 3600); }
+      if (to > last) { to = last; from = to - rangeH * 3600; }
+    }
     var idx = [];
-    for (var i = 0; i < T.length; i++) if (T[i] >= from) idx.push(i);
+    for (var i = 0; i < T.length; i++) if (T[i] >= from && T[i] <= to) idx.push(i);
     if (idx.length < 2) idx = T.map(function (_, i) { return i; });
     var times = idx.map(function (i) { return T[i]; });
     var series = cfg.series.map(function (s) {
@@ -1073,6 +1296,7 @@ function trend_per_day(array $times, array $vals): ?float {
     leg += '</div>';
 
     wrap.innerHTML = svg + leg + '<div class="ctip"></div>';
+    if (!wrap.dataset.pan) { wrap.dataset.pan = '1'; attachPan(wrap); }
 
     // hover / touch readout
     var el = wrap.querySelector('svg'), tip = wrap.querySelector('.ctip'),

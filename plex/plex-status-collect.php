@@ -50,11 +50,14 @@ const PERF_PROXY_URL    = 'https://plex.falco81.net';
 
 // HISTORY
 // One rolling file holds every trended metric: API latency, CPU/load/memory and
-// per-disk temperature and fill level. It lives outside the web root and is
-// down-sampled before being embedded in data.json, so the page stays small.
+// per-disk temperature, fill level and wear counters. Retention is by age, not
+// sample count, so changing the timer interval can't silently shorten it.
 const HISTORY_FILE   = '/var/lib/plex-status/history.json';
-const HISTORY_KEEP   = 2016;   // samples retained ≈ 7 days at one run / 5 min
-const HISTORY_POINTS = 140;    // points handed to the page per series
+const HISTORY_DAYS   = 7;      // keep at least this much, whatever the poll rate
+const HISTORY_MAX    = 25000;  // hard cap so the file can't grow without bound
+const HISTORY_POINTS = 140;    // points embedded in data.json for the first paint
+// Full-resolution copy the page fetches on demand when you pan through history.
+const HISTORY_WEB    = '/var/www/html/smart/history-full.json';
 
 // If false: a disk in standby/sleeping is NOT woken for SMART (last-known cache is
 // shown instead) — this preserves spindown. Set true to always read SMART, which
@@ -591,7 +594,7 @@ function collect_perf(?string $token): array {
  * value for a sleeping disk would draw a flat line that never happened — a gap
  * is the honest representation, and the chart simply skips it.
  */
-function history_update(array $direct, array $sys, array $disks, bool $write): array {
+function history_update(array $direct, array $sys, array $disks, array $extra, bool $write): array {
     $h = json_decode((string) @file_get_contents(HISTORY_FILE), true) ?: [];
     $samples = $h['samples'] ?? [];
 
@@ -630,9 +633,21 @@ function history_update(array $direct, array $sys, array $disks, bool $write): a
             round((float) ($sys['load'][0] ?? 0), 2),
             $sys['mem_total'] ? (int) round($sys['mem_used'] / $sys['mem_total'] * 100) : null,
         ],
+        // server-level extras: concurrent streams, database growth, proxy cost
+        'x' => [
+            $extra['sessions'] ?? null,
+            $extra['db_bytes'] ?? null,
+            $extra['wal_bytes'] ?? null,
+            $extra['proxy_ms'] ?? null,
+        ],
         'd' => $d,
     ];
-    if (count($samples) > HISTORY_KEEP) $samples = array_slice($samples, -HISTORY_KEEP);
+    // Prune by age first — a five-minute timer gives 2016 samples a week, but a
+    // one-minute timer would give 10080, and a count-based limit would quietly
+    // throw away days of history.
+    $cutoff = time() - HISTORY_DAYS * 86400;
+    $samples = array_values(array_filter($samples, fn($s) => ($s['t'] ?? 0) >= $cutoff));
+    if (count($samples) > HISTORY_MAX) $samples = array_slice($samples, -HISTORY_MAX);
 
     if ($write) {
         @mkdir(dirname(HISTORY_FILE), 0755, true);
@@ -641,11 +656,34 @@ function history_update(array $direct, array $sys, array $disks, bool $write): a
     return $samples;
 }
 
+/**
+ * Spin-ups within a trailing window, read out of the recorded history.
+ *
+ * Readings only land while a disk is awake, so the count is taken as the
+ * difference between the newest reading and the last one at or before the start
+ * of the window — that way a window with a single reading in it still reports
+ * correctly rather than showing zero.
+ */
+function spinups_window(array $samples, string $key, int $seconds): ?int {
+    $cutoff = time() - $seconds;
+    $before = null; $latest = null;
+    foreach ($samples as $s) {
+        $v = $s['d'][$key][3] ?? null;          // Start_Stop_Count
+        if ($v === null) continue;
+        if (($s['t'] ?? 0) <= $cutoff) $before = (int) $v;
+        else { if ($latest === null) $latest = ['first' => (int) $v]; $latest['last'] = (int) $v; }
+    }
+    if ($latest === null) return null;          // nothing read inside the window
+    $base = $before ?? $latest['first'];
+    $d = $latest['last'] - $base;
+    return $d >= 0 ? $d : null;                 // negative means the disk was swapped
+}
+
 /** Down-sample the history into parallel arrays the page can chart directly. */
-function history_series(array $samples, array $disks): array {
+function history_series(array $samples, array $disks, int $points = HISTORY_POINTS): array {
     $n = count($samples);
-    if ($n > HISTORY_POINTS) {
-        $step = (int) ceil($n / HISTORY_POINTS);
+    if ($points > 0 && $n > $points) {
+        $step = (int) ceil($n / $points);
         $sel = [];
         for ($i = 0; $i < $n; $i += $step) $sel[] = $samples[$i];
         if ($sel[count($sel) - 1]['t'] !== $samples[$n - 1]['t']) $sel[] = $samples[$n - 1];
@@ -656,6 +694,7 @@ function history_series(array $samples, array $disks): array {
         't'     => [],
         'perf'  => ['id' => [], 'ls' => [], 'hb' => []],
         'sys'   => ['cpu' => [], 'load' => [], 'mem' => []],
+        'srv'   => ['sess' => [], 'db' => [], 'wal' => [], 'pxy' => []],
         'disks' => [],
     ];
     foreach ($disks as $disk) {
@@ -685,6 +724,10 @@ function history_series(array $samples, array $disks): array {
         $out['sys']['cpu'][]  = $s['s'][0] ?? null;
         $out['sys']['load'][] = $s['s'][1] ?? null;
         $out['sys']['mem'][]  = $s['s'][2] ?? null;
+        $out['srv']['sess'][] = $s['x'][0] ?? null;
+        $out['srv']['db'][]   = $s['x'][1] ?? null;
+        $out['srv']['wal'][]  = $s['x'][2] ?? null;
+        $out['srv']['pxy'][]  = $s['x'][3] ?? null;
         foreach ($out['disks'] as $k => &$dd) {
             $dd['temp'][] = $s['d'][$k][0] ?? null;
             $dd['fs'][]   = $s['d'][$k][1] ?? null;
@@ -1203,11 +1246,40 @@ $system = [
 ];
 
 // ---- history -------------------------------------------------------------
-$samples = history_update($perf['direct'] ?? [], $system, $disks, !$DRYRUN);
+$extra = [
+    'sessions'  => $plex['sessions'] ?? null,
+    'db_bytes'  => $perf['db']['bytes'] ?? null,
+    'wal_bytes' => $perf['db']['wal_bytes'] ?? null,
+    'proxy_ms'  => $perf['proxy']['overhead_ms'] ?? null,
+];
+$samples = history_update($perf['direct'] ?? [], $system, $disks, $extra, !$DRYRUN);
+
+// Recent spin-up counts, derived from the history we just wrote.
+foreach ($disks as &$dk) {
+    $key = ($dk['serial'] !== '—' && $dk['serial'] !== '') ? $dk['serial'] : $dk['dev'];
+    $dk['spinups_1h']  = spinups_window($samples, $key, 3600);
+    $dk['spinups_24h'] = spinups_window($samples, $key, 86400);
+}
+unset($dk);
 $history = history_series($samples, $disks);
-dbg("\nhistory: " . count($samples) . " samples stored, "
-    . count($history['t']) . " points handed to the page"
-    . ($DRYRUN ? " (dry-run: file not written)" : ""));
+dbg("\nhistory: " . count($samples) . " samples stored (" . HISTORY_DAYS . "d retention), "
+    . count($history['t']) . " points embedded for the first paint"
+    . ($DRYRUN ? " (dry-run: files not written)" : ""));
+
+// Full resolution goes to a separate file the page fetches only when you start
+// panning through history — keeping data.json small keeps the first paint fast.
+if (!$DRYRUN) {
+    $full = history_series($samples, $disks, 0);
+    @mkdir(dirname(HISTORY_WEB), 0755, true);
+    $tmpf = HISTORY_WEB . '.tmp';
+    if (@file_put_contents($tmpf, json_encode($full, JSON_UNESCAPED_SLASHES), LOCK_EX) !== false) {
+        @chmod($tmpf, 0644);
+        @rename($tmpf, HISTORY_WEB);
+        sh('restorecon -F ' . escapeshellarg(HISTORY_WEB));
+        dbg("history-full.json: " . count($full['t']) . " points, "
+            . round(filesize(HISTORY_WEB) / 1024) . " KB");
+    }
+}
 
 $payload = [
     'generated' => time(),
