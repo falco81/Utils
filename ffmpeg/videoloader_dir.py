@@ -46,8 +46,41 @@ except Exception:
 # EMPTY = disabled (the script behaves exactly as if this didn't exist). A short timeout means a
 # dead/unreachable URL never hangs startup. CONFIG_URL itself can NOT be set from the JSON (prevents
 # a redirect/config loop).
-CONFIG_URL = "http://nas.falco81.net/videoloader_dir.config.json"   # e.g. "http://nas.falco81.net/videoloader_dir.config.json"
+# SECURITY: prefer https:// here. This JSON may override FFMPEG (a path that gets EXECUTED) and
+# the tool download URLs, so anyone able to tamper with a plain-http response can make the script
+# run code of their choosing. Over plain http the script therefore ignores the keys that lead to
+# code execution (see _EXEC_SENSITIVE_CONFIG_KEYS below).
+CONFIG_URL = "https://nas.falco81.net/videoloader_dir.config.json"   # e.g. "https://nas.example/videoloader_dir.config.json"
+# --- Certificate checking, everywhere ------------------------------------------------------- #
+# True = never verify a TLS certificate, for ANY connection the script makes (config, page scans,
+# manifests, segments, every download). Broken, expired, self-signed, wrong hostname — all fine,
+# nothing ever fails because of a certificate. A warning is printed once per run so it is never a
+# silent state. Same idea as wget --no-check-certificate / curl -k; --insecure sets it for one run.
+# ON by default: a NAS or a local server almost always has a self-signed certificate, and nothing
+# should ever fail over that. Set both to False for strict checking.
+INSECURE_TLS = True
+# Allows a config fetched over an unverified connection to set the handful of settings that decide
+# WHICH PROGRAM the script runs (FFMPEG, the tool download URLs). On by default so everything works
+# out of the box; set to False if this machine is on a network you do not trust.
+CONFIG_TRUST_UNVERIFIED = True
 CONFIG_FETCH_TIMEOUT = 4          # seconds — keep short so an unreachable CONFIG_URL can't stall startup
+# --- TLS for CONFIG_URL (a NAS usually has a self-signed certificate) ---------------------- #
+# Pick ONE of these when https:// fails with an SSLError:
+#   CONFIG_PIN_SHA256 = "AB:CD:.."  BEST. The certificate's own fingerprint — this AUTHENTICATES a
+#                                   self-signed cert, so everything (including the settings that
+#                                   choose which program to run) stays enabled. Run the script once
+#                                   and it prints the fingerprint of whatever your NAS presented.
+#   CONFIG_CA_BUNDLE = "nas.pem"    Equally good: the path to your NAS's certificate (or its CA).
+#   CONFIG_VERIFY_TLS = False       Quickest, but the connection is then UNAUTHENTICATED — anyone on
+#                                   the network can impersonate the NAS, so the script keeps ignoring
+#                                   the handful of settings that could make it run someone else's
+#                                   program (exactly as it does over plain http). Everything else
+#                                   still applies.
+# These three are deliberately NOT remotely overridable: a config that could switch off the checks
+# guarding itself would be no protection at all.
+CONFIG_VERIFY_TLS = True
+CONFIG_CA_BUNDLE = ""
+CONFIG_PIN_SHA256 = ""
 DEFAULT_THREADS = 16              # -t : download threads per file
 DEFAULT_FOLDER_WORKERS = 0        # -w : videos downloaded at once (0 = ALL at once)
 DEFAULT_MAX_CONNECTIONS = 64      # -m : hard cap on simultaneous connections
@@ -100,9 +133,15 @@ SCAN_BROWSER_AUTO_HOSTS = {
 }
 SCRIPT_VERSION = "3.14.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
-EP_PROBE_MAX = 0                # (deprecated / unused — episode-number probing was removed)
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
                                 # its manifest (raise it on slow sites)
+# --scan-browser behaviour. A hidden window that nobody ever clicks is exactly the case where a
+# player never requests its manifest at all, so these default to a real, visible, interactive
+# browser session.
+SCAN_BROWSER_SHOW = True        # show the window (you can log in / press play in it yourself)
+SCAN_BROWSER_CLICK = True       # auto-press play buttons and start muted <video> elements
+SCAN_BROWSER_PROFILE = True     # keep cookies between runs, so a login survives
+SCAN_BROWSER_PROBE_MAX = 25     # max observed requests confirmed as a manifest by their content
 SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
 # Native-HLS segment threads. Both accept a number, or 0 / null / "auto" / "max" meaning
 # "no limit of my own":
@@ -169,13 +208,20 @@ _REMOTE_CONFIG_KEYS = {
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'PREVIEW_MAX_SECONDS',
-    'PREVIEW_MAX_MB',
+    'PREVIEW_MAX_MB', 'SCAN_BROWSER_SHOW', 'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE',
+    'SCAN_BROWSER_PROBE_MAX',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
     # -- filenames / identity --
-    'ASCII_FILENAMES', 'USER_AGENT',
+    'ASCII_FILENAMES', 'USER_AGENT', 'TEMP_SUBDIR',
+    # -- per-site request headers (handy to hot-fix when a site tightens hot-link checks) --
+    'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER',
+    # -- display --
+    'BAR_FORMAT', 'ARROW',
+    # -- filename sanitising and the rename heuristics (worth tuning per language) --
+    'ILLEGAL_WIN', 'RESERVED_WIN', 'EMOJI_RANGES', 'SMALL_WORDS', 'VOWELS', 'DEFAULT_STOP',
     # -- YouTube / Twitch API constants (handy to hot-fix remotely when they rotate) --
     'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY', 'TWITCH_CLIENT_ID',
 }
@@ -187,8 +233,9 @@ _CONFIG_KEY_ORDER = (
     'DEFAULT_THREADS', 'DEFAULT_FOLDER_WORKERS', 'DEFAULT_MAX_CONNECTIONS', 'DEFAULT_CHUNK_SIZE',
     'DEFAULT_RECURSIVE', 'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES',
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
-    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'HLS_SEGMENT_WORKERS',
-    'HLS_AUTO_WORKERS_CAP',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'SCAN_BROWSER_SHOW',
+    'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE', 'SCAN_BROWSER_PROBE_MAX',
+    'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP',
     'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
@@ -196,7 +243,61 @@ _CONFIG_KEY_ORDER = (
     'USE_COLOR', 'FORCE_ASCII_BARS', 'PER_FILE_BAR_LIMIT', 'BAR_NCOLS', 'BAR_DESC_WIDTH',
     'ASCII_FILENAMES', 'AUTO_COOKIES', 'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'USER_AGENT',
     'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
+    'TEMP_SUBDIR', 'BAR_FORMAT', 'ARROW',
+    'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER',
+    'ILLEGAL_WIN', 'RESERVED_WIN', 'EMOJI_RANGES', 'SMALL_WORDS', 'VOWELS', 'DEFAULT_STOP',
 )
+
+
+# Constants that must NEVER come from a remote config, with the reason. Everything else that
+# looks like a setting has to be in _REMOTE_CONFIG_KEYS — _audit_config_keys() enforces exactly
+# that, so a constant added later cannot silently fall out of the configurable set.
+_NEVER_REMOTE_KEYS = {
+    'CONFIG_URL': "would let a config redirect to another config (loop / hijack)",
+    'CONFIG_FETCH_TIMEOUT': "already spent by the time the config arrives",
+    'INSECURE_TLS': "a config must not be able to switch off the checks protecting itself",
+    'CONFIG_TRUST_UNVERIFIED': "a config must not be able to grant itself more trust",
+    'CONFIG_VERIFY_TLS': "guards the config fetch itself — a config must not relax its own checks",
+    'CONFIG_CA_BUNDLE': "guards the config fetch itself",
+    'CONFIG_PIN_SHA256': "guards the config fetch itself",
+    'SCRIPT_VERSION': "identity, must not be spoofable",
+    # Runtime state, filled in while running — not settings.
+    'CLR': "runtime palette object built by setup_console()",
+    'ASCII_BARS': "runtime, derived from FORCE_ASCII_BARS by setup_console()",
+    'MP4DECRYPT': "runtime cache of the resolved executable path",
+    # Per-run choices that come from the command line.
+    'AUDIO_SEL': "per-run (--audio)", 'SUB_SEL': "per-run (--sub)",
+    'SUBS_ONLY': "per-run (--subs-only)", 'MUSE_PASSWORD': "per-run (--password)",
+    'CENC_KEYS': "per-run (--key/--keys)", 'FORCE_CONTAINER': "per-run (--container)",
+    # Derived automatically from USER_AGENT / YT_IOS_UA / VIMEO_REFERER after a config load.
+    'STREAMABLE_HEADERS': "derived from USER_AGENT", 'TWITCH_HEADERS': "derived from USER_AGENT",
+    'YOUTUBE_HEADERS': "derived from YT_IOS_UA", 'VIMEO_HEADERS': "derived from VIMEO_REFERER",
+    # Compiled regexes: a JSON string cannot become a compiled pattern safely.
+    'NUM_RE': "compiled regex", 'WORDCHARS': "compiled regex", 'TOKEN_RE': "compiled regex",
+}
+
+
+def _module_constants():
+    """Every public ALL_CAPS module-level name that holds a value (i.e. looks like a setting)."""
+    import types
+    out = {}
+    for name, val in list(globals().items()):
+        if not re.fullmatch(r'[A-Z][A-Z0-9_]*', name):
+            continue
+        if isinstance(val, (types.FunctionType, types.ModuleType, type)):
+            continue
+        out[name] = val
+    return out
+
+
+def _audit_config_keys():
+    """Return (unclassified, stale): constants that are neither overridable nor deliberately
+    excluded, and allowlist entries that no longer exist."""
+    consts = _module_constants()
+    unclassified = sorted(n for n in consts
+                          if n not in _REMOTE_CONFIG_KEYS and n not in _NEVER_REMOTE_KEYS)
+    stale = sorted(k for k in _REMOTE_CONFIG_KEYS if k not in consts)
+    return unclassified, stale
 
 
 def dump_config_file(path):
@@ -205,7 +306,14 @@ def dump_config_file(path):
     can never drift out of sync with the code."""
     keys = [k for k in _CONFIG_KEY_ORDER if k in _REMOTE_CONFIG_KEYS]
     keys += sorted(k for k in _REMOTE_CONFIG_KEYS if k not in _CONFIG_KEY_ORDER)
-    data = {k: globals().get(k) for k in keys}
+    data = {k: _json_ready(globals().get(k)) for k in keys}
+    unclassified, stale = _audit_config_keys()
+    if unclassified:
+        print(f"{CLR.YELLOW}[WARN]{CLR.RESET} These constants are neither remotely overridable "
+              f"nor listed as deliberately excluded: {', '.join(unclassified)}")
+    if stale:
+        print(f"{CLR.YELLOW}[WARN]{CLR.RESET} These config keys no longer exist in the script: "
+              f"{', '.join(stale)}")
     try:
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, ensure_ascii=False)
@@ -252,16 +360,203 @@ def _hls_worker_count(max_connections):
 # Keys whose value may be a word ("auto") as well as a number, so they skip type coercion.
 _FLEXIBLE_CONFIG_KEYS = {'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP'}
 
+# Keys that decide WHICH BINARY gets run or downloaded-and-run. Over an unauthenticated plain-http
+# CONFIG_URL anyone on the network path can forge the response, so these are ignored there; every
+# other setting is harmless enough to accept. Use https:// to manage them remotely.
+_EXEC_SENSITIVE_CONFIG_KEYS = {
+    'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
+    'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
+}
+
 
 def _coerce_config_value(current, value):
-    """Best-effort coerce a JSON value to the type of the existing default (e.g. "5" -> 5)."""
+    """Best-effort coerce a JSON value to the type of the existing default (e.g. "5" -> 5).
+
+    JSON has no set and no tuple, so a setting that is one locally arrives as a list and has to
+    be converted back — otherwise e.g. ILLEGAL_WIN would silently become a list and every
+    `ch in ILLEGAL_WIN` test would still work but `.add()` would not."""
     if isinstance(current, bool):
         return value if isinstance(value, bool) else str(value).strip().lower() in ('1', 'true', 'yes', 'on')
     if isinstance(current, int) and not isinstance(value, bool):
         return int(value)
     if isinstance(current, float):
         return float(value)
+    if isinstance(current, set):
+        if isinstance(value, (list, tuple, set)):
+            return set(value)
+        raise TypeError("expected a list of values")
+    if isinstance(current, tuple) and isinstance(value, list):
+        return tuple(value)
+    if isinstance(current, list) and isinstance(value, list):
+        # Keep an inner tuple shape (EMOJI_RANGES is a list of (lo, hi) pairs).
+        if current and isinstance(current[0], tuple):
+            return [tuple(x) if isinstance(x, (list, tuple)) else x for x in value]
+        return list(value)
     return value
+
+
+def _json_ready(value):
+    """Make a setting JSON-serialisable (sets have no JSON form; emit them sorted for a stable
+    diff between generated config files)."""
+    if isinstance(value, set):
+        try:
+            return sorted(value)
+        except TypeError:
+            return list(value)
+    if isinstance(value, tuple):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, list):
+        return [_json_ready(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _json_ready(v) for k, v in value.items()}
+    return value
+
+
+_INSECURE_TLS_ACTIVE = False
+
+
+def _apply_insecure_tls(announce=True):
+    """Turn off certificate verification for EVERY connection this process makes.
+
+    Patched in one place rather than at each call site, so nothing can be missed: requests (every
+    Session, however it was built) and the standard library's default HTTPS context both stop
+    verifying. Safe to call twice. Returns True if it is now active.
+
+    Not covered, and not coverable from here: ffmpeg/ffprobe already accept any certificate by
+    default (tls_verify is off), and the --scan-browser webview follows the system's own trust
+    settings — it may still show a certificate warning you have to accept once."""
+    global _INSECURE_TLS_ACTIVE
+    if _INSECURE_TLS_ACTIVE:
+        return True
+    _INSECURE_TLS_ACTIVE = True
+    try:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except Exception:
+        pass
+    try:
+        _orig_request = requests.Session.request
+
+        def _request(self, method, url, **kw):
+            # A string means the caller named a specific CA bundle to check against; honour that,
+            # otherwise the connection would be reported as verified when it was not. Everything
+            # else (unset, True, False) becomes "do not check".
+            if not isinstance(kw.get('verify'), str):
+                kw['verify'] = False
+            return _orig_request(self, method, url, **kw)
+
+        requests.Session.request = _request
+    except Exception:
+        pass
+    try:
+        import ssl as _ssl
+        # Two different entry points: urllib.request uses the private one, while other libraries
+        # call the public factory. Patch both, or "everywhere" would not be everywhere.
+        _ssl._create_default_https_context = _ssl._create_unverified_context
+        _orig_ctx = _ssl.create_default_context
+
+        def _unverified_context(*a, **kw):
+            c = _orig_ctx(*a, **kw)
+            c.check_hostname = False        # must come first: CERT_NONE with hostname checks raises
+            c.verify_mode = _ssl.CERT_NONE
+            return c
+
+        _ssl.create_default_context = _unverified_context
+    except Exception:
+        pass
+    if announce:
+        print(f"{CLR.DIM}[INFO] TLS certificate checking is off (INSECURE_TLS); bad or self-signed "
+              f"certificates are accepted everywhere.{CLR.RESET}")
+    return True
+
+
+def _cert_fingerprint(url):
+    """SHA-256 fingerprint of whatever certificate the host presents, or None.
+
+    Used to TELL the user the value to pin after an SSLError — pinning authenticates a
+    self-signed certificate properly, instead of turning verification off altogether."""
+    import socket
+    import ssl
+    import hashlib
+    pu = urlparse(url)
+    host, port = pu.hostname, pu.port or 443
+    if not host:
+        return None
+    try:
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=CONFIG_FETCH_TIMEOUT) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                der = ss.getpeercert(binary_form=True)
+        if not der:
+            return None
+        h = hashlib.sha256(der).hexdigest().upper()
+        return ':'.join(h[i:i + 2] for i in range(0, len(h), 2))
+    except (OSError, ValueError):
+        return None
+
+
+class _PinnedAdapter(HTTPAdapter):
+    """HTTPS adapter that accepts exactly one certificate, identified by its SHA-256 fingerprint.
+
+    This is real authentication for a self-signed certificate: the CA chain is irrelevant, but a
+    different certificate (an impersonator) is rejected outright."""
+
+    def __init__(self, fingerprint, **kw):
+        self._fp = fingerprint
+        super().__init__(**kw)
+
+    def init_poolmanager(self, connections, maxsize, block=False, **kw):
+        kw['assert_fingerprint'] = self._fp
+        kw['cert_reqs'] = 'CERT_NONE'          # the fingerprint IS the check
+        return super().init_poolmanager(connections, maxsize, block, **kw)
+
+
+def _config_fetch(url):
+    """Fetch the remote config honouring the TLS settings above.
+
+    Returns (response, authenticated, note). `authenticated` says whether we actually know we
+    talked to the right server — that is what decides if the program-selecting settings are
+    allowed through."""
+    is_https = url.lower().startswith('https://')
+    pin = (CONFIG_PIN_SHA256 or '').replace(':', '').replace(' ', '').strip().lower()
+    sess = requests.Session()
+    verify = True
+    note = ''
+    if not is_https:
+        return (sess.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
+                         headers={'User-Agent': USER_AGENT}),
+                False, 'plain http')
+    if _INSECURE_TLS_ACTIVE and not pin and not CONFIG_CA_BUNDLE:
+        # Global bypass is on: fetch it, no matter what the certificate looks like.
+        return (sess.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
+                         headers={'User-Agent': USER_AGENT}),
+                bool(CONFIG_TRUST_UNVERIFIED), 'certificate NOT checked (INSECURE_TLS)')
+    if pin:
+        sess.mount('https://', _PinnedAdapter(pin))
+        verify = False                          # the pin replaces CA verification
+        note = 'pinned certificate'
+        authenticated = True
+    elif CONFIG_CA_BUNDLE:
+        verify = CONFIG_CA_BUNDLE
+        note = f'CA bundle {CONFIG_CA_BUNDLE}'
+        authenticated = True
+    elif not CONFIG_VERIFY_TLS:
+        verify = False
+        note = 'certificate NOT verified'
+        authenticated = bool(CONFIG_TRUST_UNVERIFIED)
+        try:                                    # our choice, so don't spam the warning
+            import urllib3
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        except Exception:
+            pass
+    else:
+        note = 'verified certificate'
+        authenticated = True
+    r = sess.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
+                 headers={'User-Agent': USER_AGENT}, verify=verify)
+    return r, authenticated, note
 
 
 def _apply_remote_config():
@@ -273,13 +568,29 @@ def _apply_remote_config():
     url = (CONFIG_URL or "").strip()
     if not url:
         return
+    authenticated, tls_note = False, ''
     try:
-        r = requests.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
-                         headers={'User-Agent': USER_AGENT})
+        r, authenticated, tls_note = _config_fetch(url)
         if r.status_code != 200:
             print(f"[WARN] Config: {url} -> HTTP {r.status_code}; using local USER CONFIG only.")
             return
         data = r.json()
+    except requests.exceptions.SSLError as e:
+        # A NAS almost always has a self-signed certificate. Say exactly what to do, and hand over
+        # the fingerprint so the good option is a copy-paste away.
+        print(f"[WARN] Config: {url} — the certificate could not be verified ({type(e).__name__}).")
+        fp = _cert_fingerprint(url)
+        if fp:
+            print("       The server presented a certificate with this SHA-256 fingerprint:")
+            print(f"         {fp}")
+            print("       If that is your NAS, put it near the top of the script as:")
+            print(f'         CONFIG_PIN_SHA256 = "{fp}"')
+            print("       That authenticates the self-signed certificate, so every setting stays "
+                  "usable.")
+        print("       Alternatives: CONFIG_CA_BUNDLE = \"path/to/nas.pem\", or switch checking "
+              "off entirely with INSECURE_TLS = True (or --insecure).")
+        print("[WARN] Config: using local USER CONFIG only.")
+        return
     except requests.RequestException as e:
         print(f"[WARN] Config: {url} unreachable ({type(e).__name__}); using local USER CONFIG only.")
         return
@@ -289,10 +600,17 @@ def _apply_remote_config():
     if not isinstance(data, dict):
         print(f"[WARN] Config: {url} must be a JSON object; using local USER CONFIG only.")
         return
-    applied, skipped = [], []
+    # Unauthenticated (plain http, or https with verification switched off) means anyone on the
+    # network path could have written this response, so the settings that decide which program
+    # gets executed stay off limits.
+    insecure = not authenticated
+    applied, skipped, blocked = [], [], []
     for key, value in data.items():
         if key in ('CONFIG_URL', 'CONFIG_FETCH_TIMEOUT') or key not in _REMOTE_CONFIG_KEYS:
             skipped.append(key)
+            continue
+        if insecure and key in _EXEC_SENSITIVE_CONFIG_KEYS:
+            blocked.append(key)
             continue
         try:
             globals()[key] = (value if key in _FLEXIBLE_CONFIG_KEYS
@@ -306,8 +624,23 @@ def _apply_remote_config():
         h = globals().get(hname)
         if isinstance(h, dict) and 'User-Agent' in h:
             h['User-Agent'] = globals().get(uakey, h['User-Agent'])
-    print(f"[INFO] Config: loaded from {url} — {len(applied)} override(s) applied over local "
-          f"USER CONFIG" + (f", {len(skipped)} unknown key(s) ignored" if skipped else "") + ".")
+    # VIMEO_HEADERS is built from VIMEO_REFERER, so rebuild it if that changed.
+    if 'VIMEO_REFERER' in applied:
+        ref = globals().get('VIMEO_REFERER') or ''
+        globals()['VIMEO_HEADERS'] = {'Referer': ref,
+                                      'Origin': ref.rstrip('/') or 'https://player.vimeo.com'}
+    print(f"[INFO] Config: loaded from {url} ({tls_note}) — {len(applied)} override(s) applied "
+          f"over local USER CONFIG"
+          + (f", {len(skipped)} unknown key(s) ignored" if skipped else "") + ".")
+    if blocked:
+        why = ("is plain http" if url.lower().startswith('http://')
+               else "was fetched without verifying the certificate")
+        print(f"[WARN] Config: ignored {len(blocked)} key(s) that choose which program to run "
+              f"({', '.join(sorted(blocked))}) because the connection {why} and could be forged.")
+        print("       Set CONFIG_PIN_SHA256 (the script prints the fingerprint for you) or "
+              "CONFIG_CA_BUNDLE to enable them properly,")
+        print("       or CONFIG_TRUST_UNVERIFIED = True to allow them from an unverified "
+              "connection anyway.")
 
 
 def _temp_dir_for(final_path: str) -> str:
@@ -350,7 +683,10 @@ def _detect_previews(files, verbose=False):
             if secs <= PREVIEW_MAX_SECONDS:
                 flagged.append((f, secs, size))
             continue
-        if size <= PREVIEW_MAX_MB * 1024 * 1024 and (len(infos) == 1 or size * 5 < median):
+        # No readable duration: only a file that is BOTH small in absolute terms AND far
+        # smaller than its siblings is suspicious. A lone small file is not evidence of
+        # anything (plenty of legitimate videos are under PREVIEW_MAX_MB), so don't cry wolf.
+        if len(infos) > 1 and size <= PREVIEW_MAX_MB * 1024 * 1024 and size * 5 < median:
             flagged.append((f, None, size))
     return flagged
 
@@ -402,13 +738,10 @@ FFMPEG_PROGRAM_FILES_DIRS = [
     r"C:\Program Files\ffmpeg",
     r"C:\Program Files (x86)\ffmpeg",
 ]
-MKV_PROGRAM_FILES_DIRS = [        # reserved: this downloader muxes with ffmpeg, not mkvtoolnix
-    r"C:\Program Files\MKVToolNix",
-    r"C:\Program Files (x86)\MKVToolNix",
-]
 # mp4decrypt (Bento4) — for decrypting CENC/Widevine with a key you already hold. Same handling
 # as ffmpeg: PATH -> cache -> install folders -> download (NAS first, then the internet).
-MP4DECRYPT_DOWNLOAD_URL = "http://nas.falco81.net/mp4decrypt.zip"
+# SECURITY: this archive is unpacked and EXECUTED, so it must not travel over plain http.
+MP4DECRYPT_DOWNLOAD_URL = "https://nas.falco81.net/mp4decrypt.zip"
 MP4DECRYPT_FALLBACK_URL = ("https://github.com/axiomatic-systems/Bento4/releases/download/"
                            "v1.6.0-641/Bento4-SDK-1-6-0-641.x86_64-microsoft-win32.zip")
 MP4DECRYPT_PROGRAM_FILES_DIRS = [
@@ -657,6 +990,10 @@ def acquire_lock(lock_path: str) -> bool:
     Returns True if the lock was acquired. If another live process already holds it,
     prints a message and returns False. Stale locks (owner no longer running) are reclaimed.
     """
+    # Remember the ABSOLUTE path: downloads run with the CWD switched into -d/--output-dir, but
+    # the atexit release happens after it has been switched back, so a relative path would then
+    # point at the wrong directory and leave the real lock behind.
+    lock_path = os.path.abspath(lock_path)
     while True:
         try:
             fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -672,7 +1009,14 @@ def acquire_lock(lock_path: str) -> bool:
             except (ValueError, OSError):
                 owner = -1
 
-            if owner != os.getpid() and not _pid_alive(owner):
+            if owner == os.getpid():
+                # Our own lock: two items in this run resolved to the same file name.
+                print(f"[WARN] Two downloads in this run map to the same file name "
+                      f"({os.path.basename(lock_path)[:-5]}); keeping only the first.")
+                print("       Use -o to give one of them a different name.")
+                return False
+
+            if not _pid_alive(owner):
                 # Stale lock from a crashed run -> reclaim it and retry.
                 try:
                     os.remove(lock_path)
@@ -689,6 +1033,7 @@ def acquire_lock(lock_path: str) -> bool:
 
 def release_lock(lock_path: str) -> None:
     """Remove the lock file if it belongs to this process."""
+    lock_path = os.path.abspath(lock_path)   # must match how acquire_lock() stored it
     try:
         with open(lock_path) as f:
             owner = int((f.read().strip() or "-1"))
@@ -743,7 +1088,12 @@ def load_cookies_from_file(cookies_file: str) -> RequestsCookieJar:
             expires = cookie.get("expirationDate") or cookie.get("expires")
             if not name or value is None:
                 continue
-            jar.set(name, value, domain=domain, path=path, expires=expires)
+            # Keep the flags the export carries: the browser needs them to store the cookie the
+            # same way the original site set it (and HttpOnly decides whether it can be injected
+            # from JavaScript at all).
+            rest = {'HttpOnly': ''} if cookie.get("httpOnly") or cookie.get("httponly") else {}
+            jar.set(name, value, domain=domain, path=path, expires=expires,
+                    secure=bool(cookie.get("secure")), rest=rest)
         return jar
 
     generated_cookie_file = None
@@ -766,11 +1116,17 @@ def load_cookies_from_file(cookies_file: str) -> RequestsCookieJar:
 
     requests_jar = RequestsCookieJar()
     for cookie in cookie_jar:
+        # Carry the flags across. The old code copied only name/value/domain/path, which quietly
+        # turned every Secure cookie into a plain one, dropped every expiry, and lost the
+        # HttpOnly marker that --scan-browser needs to know how a cookie can be injected.
         requests_jar.set(
             cookie.name,
             cookie.value,
             domain=cookie.domain,
-            path=cookie.path
+            path=cookie.path,
+            secure=bool(cookie.secure),
+            expires=cookie.expires,
+            rest=dict(getattr(cookie, '_rest', None) or {}),
         )
 
     return requests_jar
@@ -1829,34 +2185,53 @@ def download_part_wrapper(errors, args):
         print(e)
         errors.append(e)
 
-def merge_parts(part_files: list[str], output_filename: str, verbose: bool) -> None:
-    """Merges all part files into the final output file."""
+def merge_parts(part_files: list[str], output_filename: str, verbose: bool) -> bool:
+    """Merge all part files into the final output file. Returns True on success.
+
+    Callers MUST check the result: a failed merge means no output file exists, so treating it
+    as a success would report a download that isn't there."""
     # Use tqdm.write for all messages: during pooled downloads there are many live progress
     # bars, and a plain print() would scribble over them and corrupt the display.
     if verbose:
         tqdm.write(f"[INFO] Merging {len(part_files)} parts into {os.path.basename(output_filename)}")
 
+    if not part_files:
+        tqdm.write(f"[ERROR] Nothing to merge for {os.path.basename(output_filename)}.")
+        return False
     missing = [pf for pf in part_files if not os.path.exists(pf)]
     if missing:
         tqdm.write(f"[ERROR] Missing parts: {missing}")
-        return
+        return False
 
     # Put the scratch .merging file next to the part files (they already live in CWD's .temp),
     # not next to the output — otherwise an output inside .temp would create a nested .temp/.temp.
     scratch_dir = os.path.dirname(part_files[0]) if part_files else _temp_dir_for(output_filename)
     tmp_output = os.path.join(scratch_dir, os.path.basename(output_filename) + ".merging")
-    with open(tmp_output, 'wb') as outfile:
-        for part_file in part_files:
-            with open(part_file, 'rb') as pf:
-                shutil.copyfileobj(pf, outfile, length=8 * 1024 * 1024)
-        outfile.flush()
-        os.fsync(outfile.fileno())
+    try:
+        with open(tmp_output, 'wb') as outfile:
+            for part_file in part_files:
+                with open(part_file, 'rb') as pf:
+                    shutil.copyfileobj(pf, outfile, length=8 * 1024 * 1024)
+            outfile.flush()
+            os.fsync(outfile.fileno())
 
-    # Atomic swap: the final name only appears once the file is fully written.
-    os.replace(tmp_output, output_filename)
+        # Atomic swap: the final name only appears once the file is fully written.
+        os.replace(tmp_output, output_filename)
+    except OSError as e:
+        # Out of disk space, permissions, a vanished part... keep the parts so a re-run resumes.
+        tqdm.write(f"[ERROR] Merge failed for {os.path.basename(output_filename)}: {e}")
+        try:
+            os.remove(tmp_output)
+        except OSError:
+            pass
+        return False
 
     for part_file in part_files: # Cleanup
-        os.remove(part_file)
+        try:
+            os.remove(part_file)
+        except OSError:
+            pass
+    return True
 
 def download_file(url: str, session: requests.Session, filename: str, chunk_size: int, num_threads: int, verbose: bool, position: int = 0, show_part_bars: bool = True) -> bool:
     """Downloads the file using multiple threads, each handling a byte-range segment.
@@ -1868,6 +2243,13 @@ def download_file(url: str, session: requests.Session, filename: str, chunk_size
 
     errors = []
     num_threads = max(1, num_threads)
+
+    # The final name only ever appears after a complete download (both paths below write into
+    # .temp first and then move), so its presence means the file is done -> skip, like the
+    # pooled folder engine does.
+    if os.path.exists(filename) and os.path.getsize(filename) > 0:
+        print(f"[INFO] Already have {os.path.basename(filename)}, skipping.")
+        return True
 
     total_size = get_file_size(url, session)
     if num_threads == 1:
@@ -1914,7 +2296,11 @@ def download_file(url: str, session: requests.Session, filename: str, chunk_size
     for i in range(num_threads):
         start = i * part_size
         end = min(start + part_size - 1, total_size - 1)
-        part_filename = _temp_artifact(filename, f".part{i}")
+        # The split size is part of the scratch name: parts left over from a run with a
+        # DIFFERENT -t (or a different segment size) describe different byte ranges, and
+        # silently appending to them would produce a corrupt file that still passes the
+        # total-size check. Different split -> different name -> never reused by mistake.
+        part_filename = _temp_artifact(filename, f".p{part_size}.part{i}")
         part_files.append(part_filename)
 
         worker_session = new_session_from(session)
@@ -1945,13 +2331,20 @@ def download_file(url: str, session: requests.Session, filename: str, chunk_size
         print(f"[ERROR] One of the parts failed for {filename}. Check the console for details.")
         return False
 
-    # Verify all parts downloaded correctly
+    # Verify all parts downloaded correctly. Both directions matter: too FEW bytes means a
+    # truncated download, too MANY means the parts don't line up with the expected split
+    # (stale scratch files) and merging them would produce a corrupt file.
     downloaded_total = sum(os.path.getsize(pf) for pf in part_files if os.path.exists(pf))
     if downloaded_total < total_size:
         print(f"[ERROR] Download incomplete for {filename}: got {downloaded_total}/{total_size} bytes.")
         return False
+    if downloaded_total > total_size:
+        print(f"[ERROR] Inconsistent parts for {filename}: got {downloaded_total} bytes but the "
+              f"file is {total_size}. Delete the .temp scratch files and re-run.")
+        return False
 
-    merge_parts(part_files, filename, verbose)
+    if not merge_parts(part_files, filename, verbose):
+        return False
     filename = _apply_forced_container(filename, verbose)   # --container (no-op when auto)
     _record_download(filename)
     if show_part_bars:
@@ -1959,17 +2352,23 @@ def download_file(url: str, session: requests.Session, filename: str, chunk_size
     return True
 
 def download_single_threaded(url: str, session: requests.Session, filename: str, chunk_size: int, verbose: bool, position: int = 0) -> bool:
-    """Fallback single-threaded download (original behavior)."""
+    """Fallback single-threaded download (used for -t 1 and when the size is unknown).
+
+    Writes into a scratch .part file inside .temp and only moves it to its final name once the
+    transfer completes, so an interrupted run can never leave a truncated file under the real
+    name — and a re-run resumes from what is already there."""
     headers = {
         'Referer': 'https://drive.google.com/',
     }
+    part_file = _temp_artifact(filename, ".part")
     file_mode = 'wb'
     downloaded_size = 0
 
-    if os.path.exists(filename):
-        downloaded_size = os.path.getsize(filename)
-        headers['Range'] = f"bytes={downloaded_size}-"
-        file_mode = 'ab'
+    if os.path.exists(part_file):
+        downloaded_size = os.path.getsize(part_file)
+        if downloaded_size > 0:
+            headers['Range'] = f"bytes={downloaded_size}-"
+            file_mode = 'ab'
 
     if verbose:
         print(f"[INFO] Starting single-threaded download from {url}")
@@ -1977,9 +2376,21 @@ def download_single_threaded(url: str, session: requests.Session, filename: str,
     with connection_slot():
         with session.get(url, stream=True, headers=headers,
                          timeout=(CONNECT_TIMEOUT, DOWNLOAD_READ_TIMEOUT)) as response:
-            if response.status_code in (200, 206):  # 200 new, 206 partial
-                total_size = int(response.headers.get('content-length', 0)) + downloaded_size
-                with open(filename, file_mode) as file:
+            # 416 to a resume request means the server considers the range past the end, i.e.
+            # what we already have IS the whole file.
+            if response.status_code == 416 and downloaded_size > 0:
+                if verbose:
+                    print(f"[INFO] {filename} was already complete; finishing it.")
+            elif response.status_code in (200, 206):  # 200 new/full, 206 partial
+                # A 200 answer to a Range request means the server IGNORED the range and is
+                # streaming from byte 0. Appending that would corrupt the file, so start over.
+                if downloaded_size > 0 and response.status_code == 200:
+                    if verbose:
+                        print(f"[WARN] Server ignored Range for {filename}; restarting from scratch.")
+                    downloaded_size = 0
+                    file_mode = 'wb'
+                total_size = int(response.headers.get('content-length', 0) or 0) + downloaded_size
+                with open(part_file, file_mode) as file:
                     with make_bar(total=total_size, initial=downloaded_size, unit='B', unit_scale=True,
                                   desc=os.path.basename(filename),
                                   position=position if position is not None else 0,
@@ -1988,11 +2399,22 @@ def download_single_threaded(url: str, session: requests.Session, filename: str,
                             if chunk:
                                 file.write(chunk)
                                 pbar.update(len(chunk))
-                print(f"\n{filename} downloaded successfully.")
-                return True
             else:
                 print(f"[ERROR] Error downloading {filename}, status code: {response.status_code}")
                 return False
+
+    if not os.path.exists(part_file) or os.path.getsize(part_file) == 0:
+        print(f"[ERROR] Download produced no data for {filename}.")
+        return False
+    try:
+        os.replace(part_file, filename)     # atomic: the final name means "finished"
+    except OSError as e:
+        print(f"[ERROR] Could not finalize {filename}: {e}")
+        return False
+    filename = _apply_forced_container(filename, verbose)   # --container (no-op when auto)
+    _record_download(filename)              # so the rename offer / --url-list report see it
+    print(f"\n{filename} downloaded successfully.")
+    return True
 
 def fetch_video(video_id: str, session: requests.Session, verbose: bool) -> tuple[str, str]:
     """Resolve a Drive file id to its (playback_url, title). Returns (None, None) on failure."""
@@ -2044,6 +2466,12 @@ def safe_filename(name: str, fallback_id: str) -> str:
     name = re.sub(r'[<>:"/\\|?*\x00-\x1F]', '', name)
     name = re.sub(r'\s{2,}', ' ', name)
     name = re.sub(r'[. ]+$', '', name).strip()
+    # Windows refuses to create a file whose stem is a device name — and the extension does not
+    # help, so "CON.mp4" fails just as hard as "CON". Only the rename step guarded against this,
+    # which left the DOWNLOAD failing with a bare OSError on such a title.
+    _stem, _ext = os.path.splitext(name)
+    if _stem.upper() in RESERVED_WIN:
+        name = f"_{_stem}{_ext}"
     name = _cap_filename(name)
     return name or f"{fallback_id}.mp4"
 
@@ -2841,11 +3269,16 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             for i in range(n):
                 s = i * seg_size
                 e = min(s + seg_size - 1, job.size - 1)
+                # See download_file(): the split size is baked into the scratch name so parts
+                # written with a different SEGMENT_MIB / -t can never be resumed into the wrong
+                # byte range.
                 job.segments.append({'start': s, 'end': e,
-                                     'path': _temp_artifact(job.filename, f".part{i}")})
+                                     'path': _temp_artifact(job.filename, f".p{seg_size}.part{i}")})
         else:
+            # Unknown size: one open-ended part. Distinct suffix so it can't be mistaken for a
+            # sized segment 0.
             job.segments.append({'start': 0, 'end': None,
-                                 'path': _temp_artifact(job.filename, ".part0")})
+                                 'path': _temp_artifact(job.filename, ".whole.part0")})
         job.remaining = len(job.segments)
         ready.append(job)
 
@@ -2860,7 +3293,8 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
     per_file_bars = len(ready) <= PER_FILE_BAR_LIMIT
 
     print(f"[INFO] Downloading {len(ready)} file(s) with a shared pool of {budget} connections "
-          f"({SEGMENT_MIB} MiB segments). Freed connections flow to the remaining files.\n")
+          f"({seg_size // (1024 * 1024)} MiB segments). Freed connections flow to the "
+          f"remaining files.\n")
 
     bar_lock = threading.Lock()
     overall = None
@@ -2896,16 +3330,23 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         else:
             got = sum(os.path.getsize(s['path']) for s in job.segments if os.path.exists(s['path']))
             if job.size > 0:
-                if got >= job.size:
-                    merge_parts([s['path'] for s in job.segments], _final, verbose)
-                    ok = True
+                if got > job.size:
+                    # Stale scratch files whose byte ranges don't match this split — merging
+                    # them would silently produce a corrupt video.
+                    reason = (f"inconsistent parts ({got} bytes for a {job.size}-byte file) — "
+                              f"delete the .temp scratch files and re-run")
+                elif got == job.size:
+                    ok = merge_parts([s['path'] for s in job.segments], _final, verbose)
+                    if not ok:
+                        reason = "merge failed (see above); parts kept for resume"
                 else:
                     reason = f"incomplete {got}/{job.size} bytes"
             else:
                 # Size unknown (Google wouldn't report it): accept only if we actually got data.
                 if got > 0:
-                    merge_parts([s['path'] for s in job.segments], _final, verbose)
-                    ok = True
+                    ok = merge_parts([s['path'] for s in job.segments], _final, verbose)
+                    if not ok:
+                        reason = "merge failed (see above); parts kept for resume"
                 else:
                     reason = "no data received (size unknown)"
         if job.locked:
@@ -2954,13 +3395,22 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         # Even when the job has already failed we must still decrement `remaining` (just
         # skip the work), otherwise the counter never reaches 0 and finalize() — which
         # tallies the result and releases the lock — is never called for that file.
-        if not job.failed:
-            sess = _segment_session(session)
-            if not _download_segment(job, seg, sess, chunk_size, on_bytes(job), verbose):
-                job.failed = True
-        with job.url_lock:
-            job.remaining -= 1
-            last = (job.remaining == 0)
+        try:
+            if not job.failed:
+                sess = _segment_session(session)
+                if not _download_segment(job, seg, sess, chunk_size, on_bytes(job), verbose):
+                    job.failed = True
+        except Exception as exc:
+            # An unexpected error must still count as "this segment is done", otherwise
+            # `remaining` never reaches 0 and finalize() — which tallies the result and
+            # releases the lock — would never run for this file.
+            job.failed = True
+            if job.fail_reason is None:
+                job.fail_reason = f"{type(exc).__name__}: {exc}"
+        finally:
+            with job.url_lock:
+                job.remaining -= 1
+                last = (job.remaining == 0)
         if last:
             finalize(job)
 
@@ -2974,8 +3424,15 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
 
     with ThreadPoolExecutor(max_workers=budget) as ex:
         futures = [ex.submit(run_segment, job, seg) for job, seg in order]
-        for _ in as_completed(futures):
-            pass
+        for fut in as_completed(futures):
+            # Calling result() is what makes a worker crash visible: without it an exception
+            # inside run_segment/finalize (full disk, permissions, ...) would vanish silently
+            # and the file would be counted as neither succeeded nor failed.
+            try:
+                fut.result()
+            except Exception as exc:
+                tqdm.write(f"{CLR.RED}[ERROR]{CLR.RESET} Download worker crashed: "
+                           f"{type(exc).__name__}: {exc}")
 
     if per_file_bars:
         with bar_lock:
@@ -3180,15 +3637,41 @@ def _find_cached_ffmpeg():
 
 
 def _extract_archive(path, dest, url):
+    """Extract a downloaded tool archive into `dest`, refusing any member that would escape it.
+
+    A plain extractall() honours absolute paths and '..' inside the archive ("Zip Slip"), which
+    would let a tampered download overwrite files anywhere the user can write. Every member is
+    therefore checked against `dest` first, and symlinks/hardlinks/devices are skipped."""
     lower = (url or path).lower()
     import zipfile
     import tarfile
+
+    root = os.path.realpath(dest)
+
+    def _safe(name):
+        target = os.path.realpath(os.path.join(root, name))
+        return target == root or target.startswith(root + os.sep)
+
     if lower.endswith('.zip') or zipfile.is_zipfile(path):
         with zipfile.ZipFile(path) as z:
-            z.extractall(dest)
+            members = [n for n in z.namelist() if _safe(n)]
+            if len(members) != len(z.namelist()):
+                raise ValueError("Archive contains paths outside the target directory — refusing "
+                                 "to extract (tampered or malicious download?)")
+            z.extractall(dest, members=members)
     elif tarfile.is_tarfile(path):
         with tarfile.open(path) as t:
-            t.extractall(dest)
+            for m in t.getmembers():
+                if not (m.isfile() or m.isdir()):
+                    raise ValueError(f"Archive contains a non-regular entry ({m.name}) — "
+                                     "refusing to extract")
+                if not _safe(m.name):
+                    raise ValueError("Archive contains paths outside the target directory — "
+                                     "refusing to extract (tampered or malicious download?)")
+            try:
+                t.extractall(dest, filter='data')   # Python 3.12+: strongest built-in filter
+            except TypeError:
+                t.extractall(dest)                  # older Python: our own checks above apply
     else:
         raise ValueError("Unknown ffmpeg archive format (expected .zip or .tar.*)")
 
@@ -4662,7 +5145,11 @@ def _yt_solve(base_js, sig_list, n_list, verbose):
             tqdm.write(f"[WARN] YouTube solver: {out.get('error')}")
         return {}, {}
     sig_map, n_map = {}, {}
-    for req, resp in zip(reqs, out.get('responses', [])):
+    responses = out.get('responses') or []
+    if len(responses) < len(reqs) and verbose:
+        tqdm.write(f"[WARN] YouTube solver returned {len(responses)} of {len(reqs)} response(s); "
+                   f"the missing part stays unsolved (downloads may be throttled).")
+    for req, resp in zip(reqs, responses):
         if resp.get('type') == 'result':
             (sig_map if req['type'] == 'sig' else n_map).update(resp.get('data') or {})
     return sig_map, n_map
@@ -5087,19 +5574,21 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
             print(f'        Fix: "{sys.executable}" -m pip install pywebview')
             return
         base = safe_filename(prefer_mp4_ext(desc['title']), it['youtube_id'])
-        base = os.path.splitext(base)[0] + _container_ext(False)
         stem = os.path.splitext(base)[0]
+        # The RAW streams keep their native container (.mp4/.m4a) inside .temp; only the finished
+        # file honours --container (ffmpeg writes it directly, so no extra remux is needed).
+        final_ext = _container_ext(False)
         if desc['mode'] == 'progressive':
             raw_jobs.append({'direct_url': desc['url'], 'id': it['youtube_id'],
                              'title': stem, 'name': stem + '.mp4'})
-            mux_plan.append((stem + '.mp4', os.path.join(TEMP_SUBDIR, stem + '.mp4'), None))
+            mux_plan.append((stem + final_ext, os.path.join(TEMP_SUBDIR, stem + '.mp4'), None))
         else:
             vname, aname = stem + '.ytv.mp4', stem + '.yta.m4a'
             raw_jobs.append({'direct_url': desc['video_url'], 'id': it['youtube_id'] + ':v',
                              'title': vname, 'name': vname})
             raw_jobs.append({'direct_url': desc['audio_url'], 'id': it['youtube_id'] + ':a',
                              'title': aname, 'name': aname})
-            mux_plan.append((stem + '.mp4', os.path.join(TEMP_SUBDIR, vname),
+            mux_plan.append((stem + final_ext, os.path.join(TEMP_SUBDIR, vname),
                              os.path.join(TEMP_SUBDIR, aname)))
 
     if not raw_jobs:
@@ -5109,8 +5598,11 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
     # Download the raw video/audio streams INTO .temp (so they never clutter the folder; only
     # the finished .mp4 lands next to the script). googlevideo gives each range request a fast
     # initial burst then throttles, so small segments + a modest connection count keep speed up.
+    # record=False is essential: these are raw intermediates inside .temp. Recording them would
+    # also run --container's remux on them (renaming .ytv.mp4 -> .ytv.mkv and deleting the
+    # original), after which the mux step below would find nothing to mux.
     download_folder_pooled(raw_jobs, session, chunk_size, verbose, label="YouTube",
-                           conn_cap=16, seg_mib=5, dest_subdir=TEMP_SUBDIR)
+                           conn_cap=16, seg_mib=5, dest_subdir=TEMP_SUBDIR, record=False)
 
     if not ensure_ffmpeg(verbose):
         print("[ERROR] ffmpeg is required to finalize YouTube videos.")
@@ -5119,14 +5611,29 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
         vpath = vfile if os.path.isabs(vfile) else os.path.join(os.getcwd(), vfile)
         final_path = os.path.join(os.getcwd(), final)
         if afile is None:
-            # Progressive: the downloaded file IS the result — move it out of .temp.
-            if os.path.exists(vpath):
+            # Progressive: the downloaded file IS the result. Same container -> just move it out
+            # of .temp; a forced different container (--container mkv) needs a real remux, since
+            # renaming .mp4 to .mkv would only mislabel it.
+            if not os.path.exists(vpath):
+                print(f"[WARN] Missing stream: {final} (nothing downloaded)")
+                continue
+            if os.path.splitext(vpath)[1].lower() == os.path.splitext(final_path)[1].lower():
                 try:
                     os.replace(vpath, final_path)
-                    _record_download(os.path.abspath(final_path))
-                    tqdm.write(f"[OK] {final}")
                 except OSError as e:
                     print(f"[WARN] Could not finalize {final}: {e}")
+                    continue
+            else:
+                ok, err = _ffmpeg_mux(vpath, None, final_path, verbose)
+                if not ok:
+                    print(f"[WARN] Could not convert {final} to {FORCE_CONTAINER}: {err}")
+                    continue
+                try:
+                    os.remove(vpath)
+                except OSError:
+                    pass
+            _record_download(os.path.abspath(final_path))
+            tqdm.write(f"[OK] {final}")
             continue
         apath = afile if os.path.isabs(afile) else os.path.join(os.getcwd(), afile)
         if not (os.path.exists(vpath) and os.path.exists(apath)):
@@ -8471,8 +8978,8 @@ def process_youtube(video_id, session, max_connections, max_height, verbose, lis
                             session, None, max_connections, max_height, verbose)
         return True
     # Regular VOD: DASH formats decoded via the node signature/n solver, muxed with ffmpeg.
-    download_youtube([{'youtube_id': video_id, 'title': output_file and
-                       os.path.splitext(os.path.basename(output_file))[0] or video_id}],
+    _title = os.path.splitext(os.path.basename(output_file))[0] if output_file else ''
+    download_youtube([{'youtube_id': video_id, 'title': _title or video_id}],
                      session, DEFAULT_CHUNK_SIZE, max_connections, max_height, verbose)
     return True
 
@@ -8687,31 +9194,67 @@ def _classify_media_url(u):
 
 _BROWSER_COLLECT_JS = r"""
 (function(){
-  var out = {urls: [], title: document.title || ''};
+  var out = {urls: [], all: [], title: document.title || ''};
+  var isMedia = function(n){
+    return /\.(m3u8|mpd|mp4|webm|mov|m4v)(\?|#|\/|$)/i.test(n) ||
+           /\(format=(mpd|m3u8)[^)]*\)/i.test(n) ||
+           /\.isml?\/(?:\.?mpd|manifest|$)/i.test(n) ||
+           /(youtube|youtu\.be|vimeo|twitch\.tv|drive\.google|dropbox)\.?/i.test(n);
+  };
+  // Segments, images and scripts are noise. Everything else the page fetched is reported
+  // separately, because a manifest served from an address with no extension (for instance
+  // /api/playback?type=dash) is indistinguishable from an ordinary request out here — Python
+  // settles it by reading the first few KB of each candidate.
+  var isAsset = function(n){
+    return /\.(jpe?g|png|gif|webp|avif|svg|ico|css|js|mjs|woff2?|ttf|otf|map|m4s|ts|aac|vtt|json)(\?|#|$)/i.test(n) ||
+           /^(data|blob|about|chrome|file):/i.test(n);
+  };
+  var push = function(n){
+    if (!n) return;
+    n = String(n);
+    if (isMedia(n)) out.urls.push(n);
+    else if (!isAsset(n) && /^https?:/i.test(n) && out.all.length < 600) out.all.push(n);
+  };
   try {
     var og = document.querySelector('meta[property="og:title"]');
     if (og && og.content) out.title = og.content;
-    document.querySelectorAll('video,source,audio').forEach(function(e){
-      if (e.src) out.urls.push(e.src);
-      if (e.currentSrc) out.urls.push(e.currentSrc);
-    });
-    document.querySelectorAll('iframe').forEach(function(e){ if (e.src) out.urls.push(e.src); });
-    // A DASH/HLS player fetches its manifest with XHR/fetch and feeds the <video> element a
-    // blob: URL, so the manifest only ever shows up as a NETWORK request - never in the DOM.
-    var isMedia = function(n){
-      return /\.(m3u8|mpd|mp4|webm|mov|m4v)(\?|#|\/|$)/i.test(n) ||
-             /\(format=(mpd|m3u8)[^)]*\)/i.test(n) ||
-             /\.isml?\/(?:\.?mpd|manifest|$)/i.test(n) ||
-             /(youtube|youtu\.be|vimeo|twitch\.tv|drive\.google|dropbox)\.?/i.test(n);
-    };
-    var res = (window.performance && window.performance.getEntriesByType) ?
-              window.performance.getEntriesByType('resource') : [];
-    res.forEach(function(e){
-      var n = e.name || '';
-      if (isMedia(n)) out.urls.push(n);
-    });
-    (window.__vlSeen || []).forEach(function(n){ if (isMedia(n)) out.urls.push(n); });
-  } catch (err) {}
+  } catch (e) {}
+  var scrape = function(doc){
+    try {
+      Array.prototype.forEach.call(doc.querySelectorAll('video,source,audio'), function(e){
+        if (e.src) out.urls.push(e.src);
+        if (e.currentSrc) out.urls.push(e.currentSrc);
+      });
+      Array.prototype.forEach.call(doc.querySelectorAll('iframe'), function(e){
+        if (e.src) out.urls.push(e.src);
+      });
+      // Player configuration frequently sits in data-* attributes rather than a real src.
+      ['data-src','data-url','data-mpd','data-dash','data-hls','data-manifest','data-stream',
+       'data-video','data-source','data-file','data-setup'].forEach(function(a){
+        try {
+          Array.prototype.forEach.call(doc.querySelectorAll('[' + a + ']'), function(e){
+            var v = e.getAttribute(a); if (v) out.urls.push(v);
+          });
+        } catch (e) {}
+      });
+    } catch (e) {}
+  };
+  scrape(document);
+  var perf = function(w){
+    try {
+      var res = (w.performance && w.performance.getEntriesByType) ?
+                w.performance.getEntriesByType('resource') : [];
+      for (var i = 0; i < res.length; i++) push(res[i].name || '');
+    } catch (e) {}
+  };
+  perf(window);
+  try {
+    for (var i = 0; i < window.frames.length; i++) {
+      try { scrape(window.frames[i].document); } catch (e) {}
+      try { perf(window.frames[i]); } catch (e) {}
+    }
+  } catch (e) {}
+  try { (window.__vlSeen || []).forEach(push); } catch (e) {}
   return JSON.stringify(out);
 })()
 """
@@ -8719,25 +9262,98 @@ _BROWSER_COLLECT_JS = r"""
 
 _BROWSER_HOOK_JS = r"""
 (function(){
-  if (window.__vlHooked) return true;
-  window.__vlHooked = true; window.__vlSeen = [];
+  // Installed as early as possible, and re-runnable: every call also covers frames that have
+  // appeared since. Everything funnels into the TOP window's __vlSeen, so one collect gets all.
+  if (!window.__vlSeen) window.__vlSeen = [];
   var note = function(u){ try { if (u) window.__vlSeen.push(String(u)); } catch (e) {} };
+  var install = function(w){
+    try {
+      if (!w || w.__vlHooked) return;
+      w.__vlHooked = true;
+      // The default resource-timing buffer holds ~250 entries; on a heavy page the manifest
+      // request is long evicted by the time we look. Enlarge it AND observe live.
+      try { w.performance.setResourceTimingBufferSize(5000); } catch (e) {}
+      try {
+        var po = new w.PerformanceObserver(function(list){
+          try { list.getEntries().forEach(function(en){ note(en.name); }); } catch (e) {}
+        });
+        po.observe({entryTypes: ['resource']});
+      } catch (e) {}
+      try {
+        var ox = w.XMLHttpRequest.prototype.open;
+        w.XMLHttpRequest.prototype.open = function(m, u){ note(u); return ox.apply(this, arguments); };
+      } catch (e) {}
+      try {
+        var of = w.fetch;
+        w.fetch = function(r){ note((r && r.url) ? r.url : r); return of.apply(this, arguments); };
+      } catch (e) {}
+      try {
+        var ob = w.navigator.sendBeacon;
+        if (ob) w.navigator.sendBeacon = function(u){ note(u); return ob.apply(this, arguments); };
+      } catch (e) {}
+    } catch (e) {}
+  };
+  install(window);
   try {
-    var ox = XMLHttpRequest.prototype.open;
-    XMLHttpRequest.prototype.open = function(m, u){ note(u); return ox.apply(this, arguments); };
-  } catch (e) {}
-  try {
-    var of = window.fetch;
-    window.fetch = function(r){ note((r && r.url) ? r.url : r); return of.apply(this, arguments); };
+    for (var i = 0; i < window.frames.length; i++) {
+      try { install(window.frames[i]); } catch (e) {}   // cross-origin frames throw: skipped
+    }
   } catch (e) {}
   return true;
 })()
 """
 
 
-def _browser_worker(url, wait_s, conn):
-    """Separate process: open the page in a real webview, let JS/players run, then collect media
-    URLs from the DOM + performance resource timings."""
+# Most players never request their manifest until something presses play, so a passive page load
+# finds nothing at all. This mutes and starts every <video> and clicks the usual play buttons.
+_BROWSER_PLAY_JS = r"""
+(function(){
+  var n = 0;
+  var sels = ['button[aria-label*="play" i]', 'button[title*="play" i]', '[aria-label*="Přehrát" i]',
+              '.vjs-big-play-button', '.jw-icon-playback', '.jw-display-icon-container',
+              '.plyr__control--overlaid', '.ytp-large-play-button', '.shaka-play-button',
+              '[class*="play-button"]', '[class*="playButton"]', '[class*="btn-play"]',
+              '[id*="play-button"]', '[data-testid*="play"]', 'button.play', 'a.play'];
+  var poke = function(doc){
+    try {
+      Array.prototype.forEach.call(doc.querySelectorAll('video'), function(v){
+        try {
+          v.muted = true; v.defaultMuted = true; v.autoplay = true;
+          var p = v.play(); if (p && p.catch) p.catch(function(){});
+          n++;
+        } catch (e) {}
+      });
+      sels.forEach(function(s){
+        try {
+          Array.prototype.forEach.call(doc.querySelectorAll(s), function(el){
+            try {
+              if (el.__vlClicked) return;
+              el.__vlClicked = 1;
+              el.click();
+              n++;
+            } catch (e) {}
+          });
+        } catch (e) {}
+      });
+    } catch (e) {}
+  };
+  poke(document);
+  try {
+    for (var i = 0; i < window.frames.length; i++) {
+      try { poke(window.frames[i].document); } catch (e) {}
+    }
+  } catch (e) {}
+  return n;
+})()
+"""
+
+
+def _browser_worker(url, wait_s, conn, opts=None):
+    """Separate process: open the page in a REAL webview, let its scripts and player run, press
+    play, and keep collecting media URLs the whole time.
+
+    Polling repeatedly (rather than looking once at the end) matters: a player may fetch its
+    manifest, hand the <video> element a blob: URL and move on, so the evidence is transient."""
     try:
         import webview
     except Exception as e:
@@ -8747,34 +9363,89 @@ def _browser_worker(url, wait_s, conn):
         except Exception:
             pass
         return
-    holder = {}
+    opts = opts or {}
+    do_click = opts.get('click', True)
+    show = opts.get('show', True)
+    profile = opts.get('profile') or None
+    cookies = opts.get('cookies') or []
+    cookie_txt = opts.get('cookie_txt') or None
+    login_only = opts.get('login', False)
+    holder = {'urls': [], 'all': [], 'title': None, 'cookies': 'none'}
+
+    def _merge(raw):
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else raw
+        except (ValueError, TypeError):
+            return
+        if not isinstance(data, dict):
+            return
+        for key in ('urls', 'all'):
+            for u in (data.get(key) or []):
+                if u not in holder[key]:
+                    holder[key].append(u)
+        if data.get('title') and not holder['title']:
+            holder['title'] = data['title']
 
     def _on_start(window):
         import time as _t
-        for _ in range(int(wait_s * 4)):     # hook XHR/fetch as early as we can get in
+        # Cookies must exist BEFORE the real page loads, otherwise the site has already decided
+        # you are a guest. So the window starts on the site's root, cookies go in, and only then
+        # does it navigate to the page we actually care about.
+        if cookies:
+            _t.sleep(1.2)                    # let the placeholder page settle
+            holder['cookies'] = _browser_apply_cookies(window, cookies, url, cookie_txt)
             try:
-                if window.evaluate_js(_BROWSER_HOOK_JS):
-                    break
+                window.load_url(url)
             except Exception:
                 pass
-            _t.sleep(0.25)
-        _t.sleep(wait_s)                     # let the page's JS build the player / fetch media
-        for _ in range(20):
+            _t.sleep(1.5)
+
+        if login_only:
+            # Manual-login mode: leave the window open. webview.start() returns when the user
+            # closes it, and the profile keeps whatever session was established.
+            return
+
+        deadline = _t.time() + max(4, wait_s) * 3
+        played = 0
+        while _t.time() < deadline:
             try:
-                holder['r'] = window.evaluate_js(_BROWSER_COLLECT_JS)
+                window.evaluate_js(_BROWSER_HOOK_JS)      # idempotent; also covers new frames
             except Exception:
-                holder['r'] = None
-            if holder.get('r'):
+                pass
+            if do_click:
+                try:
+                    played += int(window.evaluate_js(_BROWSER_PLAY_JS) or 0)
+                except Exception:
+                    pass
+            try:
+                _merge(window.evaluate_js(_BROWSER_COLLECT_JS))
+            except Exception:
+                pass
+            # Stop early once something conclusive turned up, but always give the page at least
+            # the configured wait so a slow player isn't cut off.
+            if holder['urls'] and _t.time() > deadline - max(4, wait_s) * 2:
                 break
             _t.sleep(0.5)
+        holder['played'] = played
         try:
             window.destroy()
         except Exception:
             pass
 
     try:
-        w = webview.create_window('scan', url=url, hidden=True)
-        webview.start(_on_start, (w,))
+        pu = urlparse(url)
+        start_url = f"{pu.scheme}://{pu.netloc}/" if cookies and pu.netloc else url
+        w = webview.create_window('videoloader scan', url=start_url, hidden=not show,
+                                  width=1280, height=800)
+        kwargs = {}
+        if profile:
+            # A persistent profile keeps a login you performed in this window, so the next run
+            # sees the real stream instead of a paywall.
+            kwargs = {'private_mode': False, 'storage_path': profile}
+        try:
+            webview.start(_on_start, (w,), **kwargs)
+        except TypeError:
+            webview.start(_on_start, (w,))     # older pywebview without those options
     except Exception as e:
         try:
             conn.send({'error': str(e)})
@@ -8783,44 +9454,399 @@ def _browser_worker(url, wait_s, conn):
             pass
         return
     try:
-        conn.send({'result': holder.get('r')})
+        conn.send({'result': json.dumps({'urls': holder['urls'], 'all': holder['all'],
+                                         'title': holder['title'], 'cookies': holder['cookies'],
+                                         'cookie_notes': holder.get('cookie_notes') or [],
+                                         'played': holder.get('played', 0)})})
         conn.close()
     except Exception:
         pass
 
 
-def _browser_collect_media(page_url, verbose, wait_s=None):
-    """Load a page in a headless system webview and return (media_urls, page_title). Requires
-    pywebview (same engine used for YouTube signatures)."""
+# Requests the player made that MIGHT be a manifest even though the address says nothing. These
+# are settled by fetching a few KB and looking at what actually comes back, so an endpoint like
+# /api/playback?type=dash is recognised while /api/user/profile is not.
+_NON_MANIFEST_EXT_RE = re.compile(
+    r'\.(?:jpe?g|png|gif|webp|avif|svg|ico|css|js|mjs|woff2?|ttf|otf|eot|map|wasm|m4s|ts|aac|'
+    r'vtt|srt|html?|php)(?:[?#]|$)', re.I)
+_MANIFEST_HINT_RE = re.compile(
+    r'(?:/|[?&=])(?:manifest|master|playlist|index|stream|streams|playback|dash|hls|mpd|m3u8|'
+    r'smil|media|source|video)(?:[/.?&=#]|$)|\.isml?/', re.I)
+
+
+def _looks_probeable(u):
+    """True if a URL is worth spending one small ranged GET on."""
+    if not u or not u.lower().startswith(('http://', 'https://')):
+        return False
+    if _NON_MANIFEST_EXT_RE.search(u):
+        return False
+    if re.search(r'\.(?:mp4|webm|mov|m4v)(?:[?#]|$)', u, re.I):
+        return False        # already handled as a direct file
+    return bool(_MANIFEST_HINT_RE.search(u))
+
+
+def _sniff_manifest(head, content_type=''):
+    """Decide what a response actually is from its first bytes plus Content-Type."""
+    ct = (content_type or '').lower()
+    if 'dash+xml' in ct:
+        return 'mpd'
+    if 'mpegurl' in ct:
+        return 'hls'
+    txt = head.decode('utf-8', 'ignore') if isinstance(head, bytes) else (head or '')
+    txt = txt[:2048].lstrip('\ufeff \t\r\n')
+    if txt.startswith('#EXTM3U'):
+        return 'hls'
+    if re.match(r'<MPD\b', txt, re.I) or \
+            (re.match(r'<\?xml', txt, re.I) and re.search(r'<MPD\b', txt[:1200], re.I)):
+        return 'mpd'
+    return None
+
+
+def _confirm_manifest_urls(urls, session, headers, verbose, budget):
+    """Fetch the first few KB of each plausible URL and return the confirmed [(kind, url)]."""
+    cands = [u for u in dict.fromkeys(urls or []) if _looks_probeable(u)]
+    if not cands or budget <= 0:
+        return []
+
+    def _rank(u):
+        low = u.lower()
+        return -sum(w for kw, w in (('manifest', 4), ('dash', 4), ('mpd', 4), ('.ism', 3),
+                                    ('master', 3), ('playlist', 3), ('m3u8', 3), ('hls', 2),
+                                    ('playback', 2), ('stream', 1)) if kw in low)
+
+    cands = sorted(cands, key=_rank)
+    total = len(cands)
+    cands = cands[:budget]
+    if verbose:
+        if total > len(cands):
+            tqdm.write(f"[DBG] --scan-browser: probing the {len(cands)} most likely of {total} "
+                       f"candidate request(s) — raise SCAN_BROWSER_PROBE_MAX to try them all")
+        else:
+            tqdm.write(f"[DBG] --scan-browser: probing {len(cands)} request(s) for a manifest")
+    found, lock = [], threading.Lock()
+
+    def _one(u):
+        try:
+            h = dict(headers or {})
+            h.setdefault('User-Agent', USER_AGENT)
+            h['Range'] = 'bytes=0-8191'
+            h['Accept'] = '*/*'
+            with connection_slot():
+                with session.get(u, headers=h, stream=True, allow_redirects=True,
+                                 timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT)) as r:
+                    if r.status_code not in (200, 206):
+                        return
+                    ct = r.headers.get('Content-Type', '')
+                    if 'text/html' in ct.lower():
+                        return
+                    chunk = next(r.iter_content(chunk_size=8192), b'') or b''
+            kind = _sniff_manifest(chunk, ct)
+            if kind:
+                if verbose:
+                    tqdm.write(f"[DBG] --scan-browser: confirmed {kind.upper()} at {u}")
+                with lock:
+                    found.append((kind, u))
+        except (requests.RequestException, StopIteration, ValueError, OSError):
+            return
+
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=max(1, min(len(cands), SCAN_PAGE_WORKERS))) as ex:
+        list(ex.map(_one, cands))
+    return found
+
+
+def _cookies_for_browser(session):
+    """The session's cookies as plain dicts, so they can be handed to the webview process.
+
+    The webview keeps its OWN cookie store, entirely separate from the requests session, so
+    without this the browser opens logged out no matter what --cookies loaded."""
+    out = []
+    try:
+        for c in session.cookies:
+            if not getattr(c, 'name', None):
+                continue
+            rest = getattr(c, '_rest', None) or {}
+            # requests puts a placeholder {'HttpOnly': None} on EVERY cookie it creates, so the
+            # key merely existing proves nothing — only a non-None value marks a real HttpOnly.
+            httponly = any(k.lower() == 'httponly' and rest[k] is not None for k in rest)
+            out.append({
+                'name': c.name,
+                'value': c.value or '',
+                'domain': (c.domain or '').lower(),
+                'path': c.path or '/',
+                'secure': bool(c.secure),
+                'expires': int(c.expires) if getattr(c, 'expires', None) else 0,
+                # An HttpOnly cookie can never be set from JavaScript, which is exactly why the
+                # JS fallback alone cannot carry a login session.
+                'httponly': httponly,
+            })
+    except Exception:
+        return []
+    return out
+
+
+def _write_netscape_cookies(cookies, path):
+    """Write cookies as a Netscape cookies.txt (the format WebKitGTK can load directly)."""
+    try:
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("# Netscape HTTP Cookie File\n")
+            f.write("# Generated by videoloader_dir.py for --scan-browser\n\n")
+            for c in cookies:
+                dom = c['domain'] or ''
+                sub = 'TRUE' if dom.startswith('.') else 'FALSE'
+                f.write("\t".join([dom, sub, c['path'] or '/',
+                                   'TRUE' if c['secure'] else 'FALSE',
+                                   str(c['expires'] or 0), c['name'], c['value']]) + "\n")
+        return path
+    except OSError:
+        return None
+
+
+# Setting cookies in the webview has no single portable API, so three routes are tried in order
+# of how much they can do. Only the native ones can carry an HttpOnly session cookie — which is
+# precisely the kind a login uses.
+_BROWSER_SET_COOKIE_JS = r"""
+(function(list){
+  var n = 0;
+  try {
+    JSON.parse(list).forEach(function(c){
+      try {
+        var s = c.name + '=' + c.value + '; path=' + (c.path || '/');
+        if (c.domain) s += '; domain=' + c.domain;
+        if (c.expires) s += '; expires=' + new Date(c.expires * 1000).toUTCString();
+        if (c.secure) s += '; secure';
+        document.cookie = s;
+        n++;
+      } catch (e) {}
+    });
+  } catch (e) {}
+  return n;
+})(%s)
+"""
+
+
+def _cookie_applies(domain, host):
+    """True if a cookie for `domain` would be sent to `host` (its own domain or a parent of it)."""
+    d = (domain or '').lstrip('.').lower()
+    h = (host or '').lower()
+    return bool(d) and (h == d or h.endswith('.' + d))
+
+
+def _browser_apply_cookies(window, cookies, page_url, cookie_txt, verbose_note=None):
+    """Push the session's cookies into the webview.
+
+    Returns {'how', 'complete', 'set', 'relevant', 'lost'} — `complete` is False only when a cookie
+    THIS SITE needs could not be carried, which is the only case worth warning about."""
+    if not cookies:
+        return {'how': "none", 'complete': True, 'set': 0, 'relevant': 0, 'lost': 0}
+
+    # 1) WebView2 (Windows) — its CookieManager accepts HttpOnly cookies properly.
+    try:
+        native = getattr(window, 'native', None)
+        core = getattr(native, 'CoreWebView2', None) if native is not None else None
+        cm = getattr(core, 'CookieManager', None) if core is not None else None
+        if cm is not None:
+            done = 0
+            for c in cookies:
+                try:
+                    ck = cm.CreateCookie(c['name'], c['value'], c['domain'], c['path'] or '/')
+                    ck.IsSecure = bool(c['secure'])
+                    ck.IsHttpOnly = bool(c['httponly'])
+                    if c['expires']:
+                        ck.Expires = float(c['expires'])
+                    cm.AddOrUpdateCookie(ck)
+                    done += 1
+                except Exception:
+                    continue
+            if done:
+                return {'how': f"WebView2 cookie store ({done} cookie(s), HttpOnly included)",
+                        'complete': True, 'set': done, 'relevant': len(cookies), 'lost': 0}
+        elif verbose_note is not None:
+            verbose_note.append("WebView2 CookieManager not reachable through this pywebview build "
+                                "(window.native has no CoreWebView2) — falling back")
+    except Exception as e:
+        if verbose_note is not None:
+            verbose_note.append(f"WebView2 cookie store unavailable ({type(e).__name__})")
+
+    # 2) WebKitGTK (Linux) — its cookie manager reads a Netscape cookies.txt straight off disk.
+    try:
+        if cookie_txt and os.path.exists(cookie_txt):
+            import gi
+            gi.require_version('WebKit2', '4.0')
+            from gi.repository import WebKit2
+            ctx = WebKit2.WebContext.get_default()
+            cm = ctx.get_cookie_manager()
+            cm.set_persistent_storage(cookie_txt, WebKit2.CookiePersistentStorage.TEXT)
+            return {'how': "WebKitGTK persistent cookie file (HttpOnly included)",
+                    'complete': True, 'set': len(cookies), 'relevant': len(cookies), 'lost': 0}
+    except Exception:
+        pass
+
+    # 3) Anything else: document.cookie. Only cookies belonging to THIS site can be set that way —
+    #    the browser silently drops an attempt to set a cookie for someone else's domain, so pushing
+    #    a whole 3000-entry export through would be wasted work reported as a meaningless count.
+    try:
+        host = (urlparse(page_url).hostname or '').lower()
+        mine = [c for c in cookies if _cookie_applies(c['domain'], host)]
+        usable = [c for c in mine if not c['httponly']]
+        lost = [c for c in mine if c['httponly']]
+        if not mine:
+            return {'how': f"document.cookie — none of the {len(cookies)} cookie(s) belong to {host}",
+                    'complete': False, 'set': 0, 'relevant': 0, 'lost': 0}
+        n = 0
+        if usable:
+            n = window.evaluate_js(_BROWSER_SET_COOKIE_JS % json.dumps(json.dumps(usable))) or 0
+        return {'how': f"document.cookie ({n} of {len(mine)} cookie(s) for {host})",
+                'complete': not lost, 'set': int(n), 'relevant': len(mine), 'lost': len(lost)}
+    except Exception as e:
+        return {'how': f"failed ({type(e).__name__})", 'complete': False,
+                'set': 0, 'relevant': 0, 'lost': 0}
+
+
+def _browser_profile_dir():
+    """Where the webview keeps its profile (cookies/logins) between runs."""
+    base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+    d = os.path.join(base, '.videoloader_browser')
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return None
+    return d
+
+
+def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_only=False):
+    """Load a page in a real webview and return (media_urls, page_title, other_requests).
+
+    `session` supplies the cookies loaded from --cookies / an auto-detected cookie file, so the
+    browser is logged in the same way the rest of the script is. `other_requests` is everything
+    else the page fetched that wasn't obviously an asset — a manifest served from an
+    extension-less address hides in there, so the caller confirms those by reading their first
+    bytes. Requires pywebview (same engine used for YouTube signatures)."""
     if wait_s is None:
         wait_s = max(1, int(SCAN_BROWSER_WAIT or 6))
     if not _yt_pywebview_available():
         print("[ERROR] --scan-browser needs pywebview. Install it with:  pip install pywebview")
-        return [], None
+        return [], None, []
     import multiprocessing as _mp
+    profile = _browser_profile_dir() if SCAN_BROWSER_PROFILE else None
+    cookies = _cookies_for_browser(session) if session is not None else []
+    cookie_txt = None
+    if cookies:
+        cookie_txt = _write_netscape_cookies(
+            cookies, os.path.join(profile or tempfile.gettempdir(), 'videoloader_cookies.txt'))
+        _host = (urlparse(page_url).hostname or '').lower()
+        _mine = [c for c in cookies if _cookie_applies(c['domain'], _host)]
+        _http = sum(1 for c in _mine if c['httponly'])
+        print(f"[INFO] --scan-browser: passing {len(cookies)} cookie(s) to the browser; "
+              f"{len(_mine)} of them belong to {_host}"
+              + (f" ({_http} HttpOnly)" if _http else "") + ".")
+    elif session is not None:
+        print("[INFO] --scan-browser: no cookies loaded — use --cookies FILE (or drop a cookie "
+              ".json next to the script) if the page needs a login.")
+    opts = {'click': bool(SCAN_BROWSER_CLICK), 'show': bool(SCAN_BROWSER_SHOW) or login_only,
+            'profile': profile, 'cookies': cookies, 'cookie_txt': cookie_txt,
+            'login': bool(login_only)}
+    if opts['show'] and not login_only:
+        print("[INFO] --scan-browser: a browser window will open — you can log in or press play "
+              "in it if the page needs that; it closes on its own.")
     got = None
     try:
         ctx = _mp.get_context('spawn')
         parent, child = ctx.Pipe()
-        proc = ctx.Process(target=_browser_worker, args=(page_url, wait_s, child), daemon=True)
+        proc = ctx.Process(target=_browser_worker, args=(page_url, wait_s, child, opts),
+                           daemon=True)
         proc.start()
-        got = parent.recv() if parent.poll(wait_s + 60) else None
+        # The worker keeps polling for up to 3x the wait, so allow for that plus startup.
+        budget = 3600 if login_only else max(4, wait_s) * 3 + 60
+        got = parent.recv() if parent.poll(budget) else None
         proc.join(5)
         if proc.is_alive():
             proc.terminate()
     except Exception as e:
         if verbose:
             print(f"[WARN] --scan-browser webview failed: {e}")
-        return [], None
+        return [], None, []
     if not got or got.get('error') or not got.get('result'):
         if got and got.get('error'):
             print(f"[WARN] --scan-browser: {got['error']}")
-        return [], None
+        return [], None, []
     try:
         data = json.loads(got['result'])
     except (ValueError, TypeError):
-        return [], None
-    return list(dict.fromkeys(data.get('urls') or [])), (data.get('title') or None)
+        return [], None, []
+    ck = data.get('cookies')
+    if cookies and isinstance(ck, dict):
+        if verbose:
+            for note in (data.get('cookie_notes') or []):
+                tqdm.write(f"[DBG] --scan-browser: {note}")
+        # Only a cookie THIS SITE needs going missing is worth a warning. Cookies for other
+        # domains in the export are irrelevant here and were never going to be set anyway.
+        if ck.get('complete'):
+            print(f"[INFO] --scan-browser: cookies applied via {ck.get('how')}.")
+        else:
+            lost = ck.get('lost') or 0
+            print(f"{CLR.YELLOW}[WARN]{CLR.RESET} --scan-browser: cookies applied via "
+                  f"{ck.get('how')}"
+                  + (f"; {lost} HttpOnly cookie(s) for this site could NOT be set" if lost else "")
+                  + ".")
+            print("       If the page turns out to be logged out, run --browser-login once: it "
+                  "opens the site so you can sign in, and the session is remembered afterwards.")
+    if verbose:
+        tqdm.write(f"[DBG] --scan-browser: {data.get('played', 0)} play attempt(s), "
+                   f"{len(data.get('urls') or [])} media hit(s), "
+                   f"{len(data.get('all') or [])} other request(s) observed")
+    return (list(dict.fromkeys(data.get('urls') or [])),
+            (data.get('title') or None),
+            list(dict.fromkeys(data.get('all') or [])))
+
+
+def _browser_scan_items(page_url, session, verbose, wait_s=None):
+    """One page's worth of --scan-browser discovery: open it in the real browser, take what the
+    DOM and the player's own requests reveal, and confirm the ambiguous ones by their content.
+
+    Returns discovery items shaped like scan_page_for_media()'s, so both callers (--scan-browser
+    and --davka-browser) go through exactly the same logic."""
+    items = []
+    burls, btitle, bother = _browser_collect_media(page_url, verbose, wait_s=wait_s,
+                                                   session=session)
+    if verbose:
+        tqdm.write(f"[DBG] browser collected {len(burls)} candidate URL(s):")
+        for u in burls:
+            print(f"      {u}")
+        # The manifest may well be sitting in the "other" pile with nothing in its address to
+        # give it away, so with -v show that pile in full too — it is the only way to tell
+        # "the player never fetched it" from "we filtered it out".
+        if bother:
+            probeable = [u for u in bother if _looks_probeable(u)]
+            tqdm.write(f"[DBG] browser also observed {len(bother)} other request(s); "
+                       f"{len(probeable)} of them look worth probing:")
+            for u in probeable:
+                print(f"      ? {u}")
+            for u in bother:
+                if u not in probeable:
+                    print(f"        {u}")
+
+    def _add(kind, url, label):
+        if not any(i['url'] == url for i in items):
+            items.append({'kind': kind, 'url': url, 'label': label, 'name': btitle,
+                          'page': page_url})
+
+    for u in burls:
+        cls = _classify_media_url(u)
+        if cls:
+            _add(cls[0], cls[1], cls[2] + ' (browser)')
+    # The player may have fetched its manifest from an address containing no .mpd/.m3u8 at all.
+    # Those look like any other request, so they are settled by their content.
+    if bother and SCAN_BROWSER_PROBE_MAX:
+        pg = urlparse(page_url)
+        hdrs = {'User-Agent': USER_AGENT, 'Referer': page_url,
+                'Origin': f"{pg.scheme}://{pg.netloc}"}
+        known = {i['url'] for i in items}
+        for k, cu in _confirm_manifest_urls([u for u in bother if u not in known],
+                                            session, hdrs, verbose, SCAN_BROWSER_PROBE_MAX):
+            _add(k, cu, ('DASH stream (.mpd)' if k == 'mpd' else 'HLS stream (.m3u8)')
+                 + ' (browser request)')
+    return items
 
 
 def _direct_label(url):
@@ -8968,7 +9994,7 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follo
                 break
             done += 1
             if verbose:
-                tqdm.write(f"[DBG] --scan: following iframe {src[:80]}")
+                tqdm.write(f"[DBG] --scan: following iframe {src}")
             for s in scan_page_for_media(src, session, verbose, _depth + 1, _title=title):
                 add(s['kind'], s['url'], s['label'] + ' (iframe)', name=s.get('name'),
                     page=s.get('page'))
@@ -9151,8 +10177,14 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     # Viki subtitles-only: pull every episode's .vtt straight from Viki's API (subscriber session).
     if SUBS_ONLY and _viki_url_kind(id_or_url):
         _log_source("Viki", "subtitle API (auth_subtitles) -> .srt")
-        _with_out_dir(lambda: _download_viki_subs(id_or_url, session, None, verbose))
-        return
+        try:
+            _with_out_dir(lambda: _download_viki_subs(id_or_url, session, None, verbose))
+        finally:
+            session.close()
+        summary['ok'] = True
+        if return_summary:
+            return summary
+        return None
 
     if not scan_mode and _classify_media_url(id_or_url) and \
             _classify_media_url(id_or_url)[0] in ('mpd', 'hls'):
@@ -9169,31 +10201,22 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         found = scan_page_for_media(id_or_url, session, verbose, follow_links=_follow)
         if browser_scan:
             print("[INFO] --scan-browser: loading the page in a browser (JS) to find media...")
-            burls, btitle = _browser_collect_media(id_or_url, verbose)
-            if verbose:
-                tqdm.write(f"[DBG] browser collected {len(burls)} candidate URL(s):")
-                for u in burls:
-                    print(f"      {u[:160]}")
-            for u in burls:
-                cls = _classify_media_url(u)
-                if not cls:
-                    continue
-                k, cu, lbl = cls
-                if not any(f['url'] == cu for f in found):
-                    found.append({'kind': k, 'url': cu, 'label': lbl + ' (browser)',
-                                  'name': btitle, 'page': id_or_url})
+            for _it in _browser_scan_items(id_or_url, session, verbose):
+                if not any(f['url'] == _it['url'] for f in found):
+                    found.append(_it)
         if not found:
             print("[INFO] --scan: found no downloadable media on that page.")
+            session.close()
             if return_summary:
                 return summary
-            return
+            return None
         # --scan N: deterministically take just the N-th discovered item (1-indexed), in the
         # order they were found — e.g. --scan 2 on a page with several .mpd grabs the second.
         if scan_pick is not None:
             if 1 <= scan_pick <= len(found):
                 chosen = found[scan_pick - 1]
                 print(f"[INFO] --scan {scan_pick}: {len(found)} item(s) found; taking #{scan_pick} "
-                      f"[{chosen['kind']}] {chosen['url'][:90]}")
+                      f"[{chosen['kind']}] {chosen['url']}")
                 found = [chosen]
             else:
                 print(f"[WARN] --scan {scan_pick}: only {len(found)} item(s) found — index out of "
@@ -9224,9 +10247,10 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                 [dict(it, title=f"{it['label']} — {it['url']}") for it in found])
             if not picked:
                 print("[INFO] --scan: nothing selected.")
+                session.close()
                 if return_summary:
                     return summary
-                return
+                return None
             found = picked
         else:
             verb = "found (listing only)" if list_only else "found"
@@ -9264,9 +10288,11 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                                     'title': safe_filename(base, 'video')})
             _with_out_dir(lambda: _download_subs_only(sub_sources, session, None, max_height,
                                                       verbose))
+            session.close()
+            summary['ok'] = True
             if return_summary:
                 return summary
-            return
+            return None
         for it in found:
             try:
                 if it['kind'] == 'url':
@@ -9352,15 +10378,21 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                             if verbose:
                                 tqdm.write("[INFO] --scan: native HLS produced nothing; retrying "
                                            "via ffmpeg (handles encryption).")
-                            _ffmpeg_grab_stream(it['url'], hdrs, final, verbose)
+                            _ok, _why = _ffmpeg_grab_stream(it['url'], hdrs, final, verbose)
+                            if not _ok:
+                                print(f"[WARN] --scan: could not grab the stream: {_why}")
                     _with_out_dir(_grab)
             except SystemExit:
                 pass
             except Exception as e:
-                print(f"[WARN] --scan: failed on {it['url'][:60]}: {e}")
+                print(f"[WARN] --scan: failed on {it['url']}: {e}")
+        session.close()
+        # The scan itself succeeded; per-item problems were reported above.
+        summary['ok'] = True
+        summary['downloaded'] = _session_downloads_in(rename_dir)
         if return_summary:
             return summary
-        return
+        return None
 
     try:
         if kind == 'patreon':
@@ -9685,7 +10717,7 @@ def _run_in_dir(directory, fn):
 def _download_failed_entries(entries, session, verbose, chunk):
     """Re-download a list of failed-job entries once, grouped by kind/dir. Any that fail again
     are re-recorded into _failed_jobs by the engines' finalize()."""
-    pooled = defaultdict(list)      # out_dir -> [video dicts]
+    pooled = defaultdict(list)      # (out_dir, kind) -> [video dicts]
     native = defaultdict(list)      # (out_dir, max_height) -> [stream dicts]
     streamable = defaultdict(list)  # out_dir -> [failed streamable entries]
     vidyard = defaultdict(list)     # out_dir -> [failed vidyard entries]
@@ -9698,12 +10730,15 @@ def _download_failed_entries(entries, session, verbose, chunk):
         elif e.get('kind') == 'streamable' and e.get('shortcode'):
             streamable[od].append(e)
         elif e.get('kind') in ('drive', 'dropbox') and isinstance(e.get('video'), dict):
-            pooled[od].append(e['video'])
+            pooled[(od, e['kind'])].append(e['video'])
         elif e.get('kind') == 'native' and isinstance(e.get('stream'), dict):
             native[(od, e.get('max_height', 0))].append(e['stream'])
-    for od, videos in pooled.items():
-        _run_in_dir(od, lambda videos=videos: download_folder_pooled(
-            videos, session, chunk, verbose, label="Retry"))
+    for (od, kind_p), videos in pooled.items():
+        # A Dropbox retry must keep the same gentle connection cap as the original attempt,
+        # otherwise it goes straight back to the full -m budget and gets rate-limited again.
+        cap = DROPBOX_DEFAULT_CONNECTIONS if kind_p == 'dropbox' else None
+        _run_in_dir(od, lambda videos=videos, cap=cap: download_folder_pooled(
+            videos, session, chunk, verbose, label="Retry", conn_cap=cap))
     for od, entries_v in vidyard.items():
         def _retry_vidyard(entries_v=entries_v):
             vids = []
@@ -9795,8 +10830,8 @@ def run_resume(base_kwargs):
     return True
 
 
-def _write_url_list_log(results, out_dir, started):
-    """Write a plain-text report of a --url-list run and return its path."""
+def _write_url_list_log(results, out_dir, started, label="--url-list"):
+    """Write a plain-text report of a batch run and return its path."""
     directory = os.path.abspath(out_dir) if out_dir else os.getcwd()
     try:
         os.makedirs(directory, exist_ok=True)
@@ -9805,7 +10840,7 @@ def _write_url_list_log(results, out_dir, started):
     path = os.path.join(directory, f"videoloader_report_{started.strftime('%Y%m%d_%H%M%S')}.log")
     ok_n = sum(1 for r in results if r['ok'] and not r['error'])
     lines = [
-        "videoloader_dir.py  --url-list report",
+        f"videoloader_dir.py  {label} report",
         f"Started : {started.strftime('%Y-%m-%d %H:%M:%S')}",
         f"Finished: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"Result  : {ok_n}/{len(results)} URL(s) succeeded",
@@ -9815,6 +10850,8 @@ def _write_url_list_log(results, out_dir, started):
         failed = r.get('failed') or []
         if r['error'] or not r['ok']:
             status = "FAILED"
+        elif r.get('skipped'):
+            status = "SKIP  "   # already on disk before this run — nothing was downloaded
         elif failed:
             status = "PARTIAL"
         elif not (r.get('downloaded')):
@@ -9822,7 +10859,12 @@ def _write_url_list_log(results, out_dir, started):
         else:
             status = "OK    "
         lines.append("")
-        lines.append(f"[{r['index']}] {status}  {r['url']}")
+        # Identify the entry by its NAME when it has one (that is what the user wrote in the
+        # list); the address goes on the line below so nothing is lost.
+        name = (r.get('title') or '').strip()
+        lines.append(f"[{r['index']}] {status}  {name or r['url']}")
+        if name:
+            lines.append(f"      url : {r['url']}")
         lines.append(f"      kind: {r.get('kind')}   time: {r.get('seconds', 0.0):.1f}s")
 
         dl = r.get('downloaded') or []
@@ -9880,7 +10922,10 @@ def _url_list_is_json(path, text=None):
     if path.lower().endswith('.json'):
         return True
     try:
-        head = (text if text is not None else open(path, encoding='utf-8').read(400)).lstrip()
+        if text is None:
+            with open(path, encoding='utf-8') as _f:
+                text = _f.read(400)
+        head = text.lstrip()
     except OSError:
         return False
     return head[:1] in ('[', '{')
@@ -10099,6 +11144,7 @@ def run_url_list(list_path, base_kwargs, out_dir):
     JSON file (["url", ...] or [{"url": ..., "done": false}, ...] or {"urls": [...]}); finished
     URLs are commented out / marked "done": true, together with the collection name and any
     warning, so an interrupted run resumes where it stopped."""
+    setup_console(base_kwargs.get('use_color', True))   # style the header lines too
     urls, list_fmt = _read_url_list(list_path)
     if not urls:
         print(f"[ERROR] --url-list file '{list_path}' contains no URLs left to do.")
@@ -10181,6 +11227,364 @@ def run_url_list(list_path, base_kwargs, out_dir):
         sys.exit(1)
 
 
+# =============================================================================
+#  --davka  (batch list: name + stream URL + decryption key, per video)
+# =============================================================================
+# A plain text file describing one video per block:
+#
+#     Serial S01E01
+#     https://host/path/asset.ism/.mpd
+#     26dc8baa20b557a47c9f10b43f0a6fad:4ad13f26045246112815b49c6da3ed0f
+#     Serial S01E02
+#     https://host/path/asset2.ism/.mpd
+#     11112222333344445555666677778888:9999aaaabbbbccccddddeeeeffff0000
+#
+# Line 1 = the name the finished file should get, line 2 = the .mpd/.m3u8 (or a direct file),
+# line 3 = the key you already hold for it. Blank lines and '#' comments are ignored, the key is
+# optional (unencrypted streams just leave it out) and several key lines may follow one URL when
+# the tracks use different keys.
+
+# A key-shaped line: 'KID:KEY' or a bare 32-hex KEY. Deliberately loose (any alphanumerics) so a
+# typo'd key is recognised as an ATTEMPTED key and reported, instead of being silently mistaken
+# for the next video's name.
+_BATCH_KEY_SHAPE_RE = re.compile(
+    r'^(?:0x)?[0-9A-Za-z]{8,64}\s*:\s*(?:0x)?[0-9A-Za-z]{8,64}$|^(?:0x)?[0-9A-Fa-f]{32}$')
+_BATCH_VIDEO_EXTS = ('.mkv', '.mp4', '.m4v', '.webm', '.mov')
+
+
+def _read_batch_file(path):
+    """Parse a --davka file into [{name, url, keys, line}] plus a list of complaints.
+
+    Lines are recognised by SHAPE, not by position, so an entry may legitimately have no key, or
+    several, and a stray blank line can't shift the whole file by one."""
+    try:
+        with open(path, encoding='utf-8-sig') as f:
+            raw_lines = f.read().splitlines()
+    except OSError as e:
+        print(f"[ERROR] --davka: could not read '{path}': {e}")
+        sys.exit(1)
+
+    entries, problems = [], []
+    cur = None
+    for n, raw in enumerate(raw_lines, 1):
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if re.match(r'^https?://', line, re.I):
+            if cur is None or cur['url']:
+                cur = {'name': None, 'url': None, 'keys': [], 'line': n}
+                entries.append(cur)
+            cur['url'] = line
+        elif _BATCH_KEY_SHAPE_RE.match(line):
+            if cur is None or not cur['url']:
+                problems.append(f"line {n}: a key with no video URL above it — ignored")
+                continue
+            cur['keys'].append(line)
+        else:
+            cur = {'name': line, 'url': None, 'keys': [], 'line': n}
+            entries.append(cur)
+
+    good, used = [], set()
+    for e in entries:
+        if not e['url']:
+            problems.append(f"line {e['line']}: '{(e['name'] or '')[:50]}' has no video URL "
+                            f"below it — skipped")
+            continue
+        # Validate the keys now: downloading an encrypted stream with a broken key would produce
+        # a file that plays as garbage, so it is far better to stop and say so.
+        specs = _parse_cenc_keys(e['keys'], None) if e['keys'] else []
+        if e['keys'] and not specs:
+            problems.append(f"line {e['line']}: '{(e['name'] or '?')[:50]}' has no usable key "
+                            f"(need 32-hex KEY or KID:KEY) — skipped")
+            continue
+        # Fall back to the URL's own name when the block had no title line.
+        base = e['name']
+        if not base:
+            parts = [p for p in urlparse(e['url']).path.split('/') if p]
+            base = re.sub(r'\.isml?$', '', parts[-2], flags=re.I) if len(parts) > 1 else 'video'
+        # Strip only a REAL container extension. A blind splitext() would turn a perfectly
+        # normal name like "Film 2.dil" into "Film 2", because ".dil" looks like an extension.
+        stem = safe_filename(base, 'video')
+        root, ext = os.path.splitext(stem)
+        if ext.lower() in _BATCH_VIDEO_EXTS and root:
+            stem = root
+        stem = stem or 'video'
+        if stem.lower() in used:                     # two blocks named the same
+            i = 2
+            while f"{stem} ({i})".lower() in used:
+                i += 1
+            problems.append(f"line {e['line']}: duplicate name '{stem}' — saving as '{stem} ({i})'")
+            stem = f"{stem} ({i})"
+        used.add(stem.lower())
+        good.append({'name': stem, 'url': e['url'], 'keys': specs, 'line': e['line']})
+    return good, problems
+
+
+def _batch_existing_output(stem, directory=None):
+    """Path of an already-finished file for this entry, or None. The container is chosen by the
+    downloader (.mkv when multi-track, else .mp4), so every plausible extension is checked.
+    A zero-byte leftover does not count as done."""
+    for ext in _BATCH_VIDEO_EXTS:
+        p = os.path.join(directory, stem + ext) if directory else stem + ext
+        try:
+            if os.path.exists(p) and os.path.getsize(p) > 0:
+                return p
+        except OSError:
+            pass
+    return None
+
+
+def _batch_resolve_page(page_url, session, verbose, use_browser):
+    """Turn an ordinary web page into the one stream worth downloading.
+
+    Used by --davka-browser, where the list holds page addresses instead of manifests. The
+    picking order mirrors --scan: a real manifest beats a plain file (it is adaptive, so it
+    carries the best quality), and same-stream renditions collapse to the best one."""
+    found = scan_page_for_media(page_url, session, verbose)
+    if use_browser:
+        for it in _browser_scan_items(page_url, session, verbose):
+            if not any(f['url'] == it['url'] for f in found):
+                found.append(it)
+    if not found:
+        return None
+    for kinds in (('mpd', 'hls'), ('direct',), ('url',)):
+        subset = [f for f in found if f['kind'] in kinds]
+        if not subset:
+            continue
+        if len(subset) > 1:
+            subset = _scan_resolution_winners(subset)
+        if verbose and len(found) > 1:
+            tqdm.write(f"[DBG] --davka-browser: {len(found)} item(s) found, taking "
+                       f"[{subset[0]['kind']}] {subset[0]['url']}")
+        return subset[0]
+    return None
+
+
+def _download_batch_entry(entry, session, max_height, verbose, chunk_size=DEFAULT_CHUNK_SIZE,
+                          use_browser=False, cookies_file=None):
+    """Download one --davka entry into the current directory. Returns (ok, reason, path).
+
+    With use_browser the entry's address is treated as a PAGE: it is opened in the real browser
+    first and whatever stream that reveals is what gets downloaded, under the entry's name and
+    with the entry's key."""
+    url, stem, keys = entry['url'], entry['name'], entry['keys']
+    page_url = None
+
+    # A page address needs resolving; an address that already IS a manifest or a file does not,
+    # so a list may freely mix the two.
+    if use_browser and not _classify_media_url(url):
+        print(f"[INFO] --davka-browser: opening {url}")
+        hit = _batch_resolve_page(url, session, verbose, True)
+        if not hit:
+            return False, "no stream found on that page (try raising SCAN_BROWSER_WAIT)", None
+        page_url, url = url, hit['url']
+        print(f"[INFO] --davka-browser: found [{hit['kind']}] {url}")
+
+    # CDNs commonly reject a manifest request that lacks the page's Referer/Origin, so those come
+    # from the PAGE the stream was found on whenever we know it.
+    pg = urlparse(page_url or url)
+    headers = {'User-Agent': USER_AGENT, 'Accept': '*/*'}
+    if pg.scheme and pg.netloc:
+        headers['Referer'] = f"{pg.scheme}://{pg.netloc}/"
+        headers['Origin'] = f"{pg.scheme}://{pg.netloc}"
+
+    cls = _classify_media_url(url)
+    kind = cls[0] if cls else None
+    if kind == 'url':
+        # A YouTube/Vimeo/Drive/... link: hand it to the normal pipeline under the given name.
+        res = main(url, output_file=stem + '.mp4', verbose=verbose, max_height=max_height,
+                   cookies_file=cookies_file, do_rename=False, return_summary=True, auto=True)
+        okay = bool(res and res.get('ok') and res.get('downloaded'))
+        # Report the actual file so the run's summary and the next run's skip-check see it.
+        got = _batch_existing_output(stem)
+        return okay, (None if okay else ((res or {}).get('error') or "no file downloaded")), got
+    if kind == 'direct':
+        fname = stem + (os.path.splitext(urlparse(url).path)[1] or '.mp4')
+        download_folder_pooled([{'id': url, 'title': fname, 'name': fname, 'direct_url': url,
+                                 'headers': headers}], session, chunk_size, verbose,
+                               label="Davka", conn_cap=16)
+        got = _batch_existing_output(stem) or (fname if os.path.exists(fname) else None)
+        return bool(got), (None if got else "direct download failed"), got
+
+    if kind is None:
+        # Not obviously a manifest — let ffmpeg decide; it recognises far more than the URL does.
+        kind = 'mpd' if '.mpd' in url.lower() else 'hls' if '.m3u8' in url.lower() else 'mpd'
+
+    out_path = stem + '.mp4'      # the grabbers replace the extension per --container / tracks
+    if keys:
+        if kind == 'mpd':
+            ok, why = _cenc_grab_dash(url, headers, session, max_height, out_path, keys, verbose)
+        else:
+            ok, why = _cenc_grab_hls(url, headers, session, max_height, out_path, keys, verbose)
+    elif kind == 'mpd':
+        ok, why = _grab_dash_plain(url, headers, session, max_height, out_path, verbose)
+        if not ok:
+            if verbose:
+                tqdm.write(f"[INFO] --davka: native DASH failed ({why}); retrying through ffmpeg.")
+            ok, why = _ffmpeg_grab_stream(url, headers, out_path, verbose)
+    else:
+        ok, why = _ffmpeg_grab_hls(url, headers, session, max_height, out_path, verbose)
+
+    got = _batch_existing_output(stem)
+    if ok and not got:
+        return False, "the downloader reported success but produced no file", None
+    if got:
+        _record_download(os.path.abspath(got))
+    return bool(ok and got), (None if ok else why), got
+
+
+def run_batch(list_path, base_kwargs, out_dir):
+    """--davka: download every video described in a name/URL/key text file.
+
+    Re-running is safe and cheap: entries whose output file already exists are skipped, so an
+    interrupted batch simply continues where it stopped."""
+    # Colour, UTF-8 output and ASCII progress bars must be set up BEFORE the first message —
+    # exactly like main() and run_resume() do. Doing it later (or not at all on the --list and
+    # error-exit paths) is why the very first lines came out unstyled.
+    setup_console(base_kwargs.get('use_color', True))
+
+    entries, problems = _read_batch_file(list_path)
+    use_browser = bool(base_kwargs.get('browser'))
+    mode = '--davka-browser' if use_browser else '--davka'
+    verbose = base_kwargs.get('verbose', False)
+    max_height = base_kwargs.get('max_height', DEFAULT_MAX_HEIGHT)
+    list_only = base_kwargs.get('list_only', False)
+    for p in problems:
+        print(f"{CLR.YELLOW}[WARN]{CLR.RESET} {mode}: {p}")
+    if not entries:
+        print(f"[ERROR] {mode}: '{list_path}' contains no usable video entries.")
+        print("        Expected blocks of: name / URL / key (key optional), one per line.")
+        sys.exit(1)
+
+    enc_n = sum(1 for e in entries if e['keys'])
+    print(f"[INFO] {mode}: {len(entries)} video(s) from '{list_path}' "
+          f"({enc_n} with a decryption key)."
+          + ("  Each address is opened in a real browser to find its stream."
+             if use_browser else ""))
+    if list_only:
+        for i, e in enumerate(entries, 1):
+            print(f"  {i:>3}. {e['name']}")
+            print(f"       {e['url']}")
+            print(f"       keys: {len(e['keys'])}" if e['keys'] else "       keys: none")
+        return
+
+    # Work out what is already downloaded FIRST. Nothing below should demand a tool for work
+    # that no longer needs doing — re-running a finished batch must succeed even on a machine
+    # without ffmpeg or mp4decrypt installed.
+    base_dir = os.path.abspath(out_dir) if out_dir else os.getcwd()
+    results, started, interrupted = [], datetime.now(), False
+    todo = []
+    for i, e in enumerate(entries, 1):
+        have = _batch_existing_output(e['name'], base_dir)
+        if have:
+            results.append({'index': i, 'url': e['url'], 'ok': True, 'kind': 'davka',
+                            'title': e['name'], 'preview_note': '',
+                            'downloaded': [os.path.basename(have)], 'rename': None,
+                            'error': None, 'failed': [], 'seconds': 0.0, 'skipped': True})
+        else:
+            todo.append((i, e))
+    if len(todo) < len(entries):
+        print(f"[INFO] {mode}: {len(entries) - len(todo)} video(s) already downloaded — "
+              f"skipping those; {len(todo)} left to do.")
+    if not todo:
+        print(f"{CLR.GREEN}[INFO]{CLR.RESET} {mode}: everything in '{list_path}' is already "
+              f"downloaded — nothing to do.")
+        return
+
+    if not ensure_ffmpeg(verbose):
+        print(f"[ERROR] {mode}: ffmpeg is required to mux the downloaded streams.")
+        sys.exit(1)
+    if any(e['keys'] for _i, e in todo) and not ensure_mp4decrypt(verbose):
+        print(f"[ERROR] {mode}: mp4decrypt (Bento4) is required to use the keys in this file.")
+        sys.exit(1)
+    if _ntfy_enabled():
+        print(f"[INFO] ntfy notifications ON -> "
+              f"{(NTFY_SERVER or 'https://ntfy.sh').rstrip('/')}/{NTFY_TOPIC}")
+
+    try:
+        session = get_cookies_session(
+            [base_kwargs['cookies_file']] if base_kwargs.get('cookies_file')
+            else (auto_detect_cookies(verbose) if base_kwargs.get('auto_cookies', True) else []))
+    except (FileNotFoundError, ValueError) as e:
+        print(f"[ERROR] {mode}: failed to load cookies: {e}")
+        sys.exit(1)
+
+    global _max_conn_explicit
+    mc = base_kwargs.get('max_connections')
+    _max_conn_explicit = mc is not None
+    if mc is None:
+        mc = _auto_settings()[1] if base_kwargs.get('auto', True) else DEFAULT_MAX_CONNECTIONS
+    set_connection_limit(mc)
+
+    def _run_all():
+        nonlocal interrupted
+        for n, (i, e) in enumerate(todo, 1):
+            print("\n" + "=" * 70)
+            print(f"[{n}/{len(todo)}] {e['name']}")
+            print("=" * 70)
+            r = {'index': i, 'url': e['url'], 'ok': False, 'kind': 'davka', 'title': e['name'],
+                 'preview_note': '', 'downloaded': [], 'rename': None, 'error': None,
+                 'failed': [], 'seconds': 0.0}
+            # Re-check here as well: a parallel run (or a very long batch) may have finished it
+            # in the meantime.
+            have = _batch_existing_output(e['name'])
+            if have:
+                print(f"[INFO] Already have {os.path.basename(have)}, skipping.")
+                r.update(ok=True, downloaded=[os.path.basename(have)], skipped=True)
+                results.append(r)
+                continue
+            t0 = time.time()
+            try:
+                ok, why, got = _download_batch_entry(e, session, max_height, verbose,
+                                                     base_kwargs.get('chunk_size',
+                                                                     DEFAULT_CHUNK_SIZE),
+                                                     use_browser=use_browser,
+                                                     cookies_file=base_kwargs.get('cookies_file'))
+                r['ok'] = bool(ok)
+                if not ok:
+                    r['error'] = why or "download failed"
+                elif got:
+                    r['downloaded'] = [os.path.basename(got)]
+            except KeyboardInterrupt:
+                r['error'] = "interrupted"
+                r['seconds'] = time.time() - t0
+                results.append(r)
+                print("\n[WARN] Interrupted. Finished files are kept — re-run the same command "
+                      "to continue with the rest.")
+                interrupted = True
+                return
+            except Exception as exc:
+                r['error'] = f"{type(exc).__name__}: {exc}"
+            r['seconds'] = time.time() - t0
+            results.append(r)
+            if r['ok']:
+                print(f"{CLR.GREEN}[OK]{CLR.RESET} {r['downloaded'][0] if r['downloaded'] else e['name']}")
+            else:
+                print(f"{CLR.RED}[FAIL]{CLR.RESET} {e['name']}: {r['error']}")
+
+    try:
+        _run_in_dir(out_dir or '.', _run_all)
+    finally:
+        session.close()
+
+    results.sort(key=lambda r: r['index'])
+    log_path = _write_url_list_log(results, out_dir, started, label=mode)
+    _notify_url_list_report(results, log_path)
+    ok_n = sum(1 for r in results if r['ok'])
+    skip_n = sum(1 for r in results if r.get('skipped'))
+    print("\n" + "=" * 70)
+    print(f"[INFO] {mode} done: {ok_n}/{len(entries)} video(s) OK"
+          + (f" ({skip_n} were already downloaded)" if skip_n else "") + ".")
+    print(f"[INFO] Report saved to: {log_path}")
+    print("=" * 70)
+    for r in results:
+        if not r['ok']:
+            print(f"[WARN] {r['title']}: {r['error']}")
+    _cleanup_temp_dir(os.path.abspath(out_dir) if out_dir else os.getcwd())
+    if interrupted or ok_n != len(entries):
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     if sys.platform == "win32":
         # Put the console into UTF-8 so non-Latin titles (Korean, etc.) print correctly where the
@@ -10208,7 +11612,18 @@ if __name__ == "__main__":
     except (AttributeError, ValueError):
         pass
 
-    _apply_remote_config()
+    # --insecure has to take effect BEFORE the config is fetched, so it is read straight from
+    # argv rather than waiting for argparse.
+    args_insecure = any(a in ('--insecure', '--no-check-certificate', '--no-check-certificates')
+                        for a in sys.argv[1:])
+
+    if args_insecure or INSECURE_TLS:
+        _apply_insecure_tls()
+
+    # Purely local commands don't need the remote config, and waiting CONFIG_FETCH_TIMEOUT
+    # seconds (plus printing a warning) just to show --help or --version is pointless.
+    if not any(a in ('-h', '--help', '--version', '--dump-config') for a in sys.argv[1:]):
+        _apply_remote_config()
 
     def positive_int(v):
         iv = int(v)
@@ -10225,11 +11640,13 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder), Dropbox, Vimeo, or a Patreon collection. A Patreon collection is fully mined: Google Drive links, Dropbox links, AND native Patreon/Vimeo/Mux videos are all downloaded.")
     parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL. Folders, collections and playlists download every video found. Omit when using --url-list.")
     parser.add_argument("--url-list", type=str, default=None, help="Path to a TEXT file with ONE URL per line, or a JSON file ([\"url\", ...] / [{\"url\": ..., \"done\": false}] / {\"urls\": [...]}); finished entries are marked done with the collection name, file count and any warning (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
+    parser.add_argument("--davka", "--batch", dest="davka", type=str, default=None, metavar="FILE", help="Batch list: a TEXT file describing one video per block - NAME line, then the video URL (.mpd/.m3u8 or a direct file), then optionally the KID:KEY decryption key you already hold (several key lines are allowed, and unencrypted streams simply have none). Blank lines and '#' comments are ignored. Each video is saved under its NAME. Re-running skips videos whose file is already there, so an interrupted batch just continues. Add -l to only list what was parsed.")
+    parser.add_argument("--davka-browser", "--batch-browser", dest="davka_browser", type=str, default=None, metavar="FILE", help="Same list format and behaviour as --davka, except the middle line is a normal PAGE address instead of a stream: each one is opened in a real browser (as --scan-browser does), the stream its player fetches is discovered, and THAT is downloaded under the block's name with the block's key. Addresses that already point straight at a .mpd/.m3u8/file are used as-is, so a list may mix both.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders/collections).")
     parser.add_argument("-d", "--output-dir", type=str, default=None, help="Directory to save into (applies to any mode; created if missing). Default: current directory.")
     parser.add_argument("-c", "--chunk_size", type=positive_int, default=DEFAULT_CHUNK_SIZE, help=f"Streaming chunk size in bytes. Default {DEFAULT_CHUNK_SIZE} (edit DEFAULT_CHUNK_SIZE at the top of the script).")
-    parser.add_argument("-t", "--threads", type=positive_int, default=None, help=f"Download threads per file (>=1). Default {DEFAULT_THREADS}. Edit DEFAULT_THREADS at the top.")
-    parser.add_argument("-w", "--folder-workers", type=nonneg_int, default=DEFAULT_FOLDER_WORKERS, help=f"How many videos to download at once for a folder. 0 = ALL at once. Default {DEFAULT_FOLDER_WORKERS}. Edit DEFAULT_FOLDER_WORKERS at the top.")
+    parser.add_argument("-t", "--threads", type=positive_int, default=None, help=f"Download threads per file (>=1) for a SINGLE Google Drive file. Default {DEFAULT_THREADS}. Folders, collections and every other source use the shared segment pool instead, where -m is what matters. Edit DEFAULT_THREADS at the top.")
+    parser.add_argument("-w", "--folder-workers", type=nonneg_int, default=DEFAULT_FOLDER_WORKERS, help="DEPRECATED and ignored: the shared segment pool works on all files at once and is bounded by -m, so there is no per-file worker count any more. Accepted only so older commands keep working; use -m to control concurrency.")
     parser.add_argument("-m", "--max-connections", type=positive_int, default=None, help=f"Hard cap on simultaneous connections regardless of workers x threads. Default {DEFAULT_MAX_CONNECTIONS}. Lower (e.g. 16) if you hit 'insufficient resources'.")
     parser.add_argument("-q", "--max-height", type=nonneg_int, default=DEFAULT_MAX_HEIGHT, help="For native Patreon/Vimeo HLS videos: cap height (e.g. 720). 0 = best available (default).")
     parser.add_argument("--no-auto", action="store_true", help="Disable the default auto-tuning of threads/connections from the detected CPU (use the fixed defaults). Explicit -t/-m still win.")
@@ -10239,6 +11656,7 @@ if __name__ == "__main__":
     parser.add_argument("--ascii", action="store_true", help="Force plain-ASCII filenames: strip accents (é->e) and drop non-Latin characters (Korean, etc.). Useful so Windows cmd shows names correctly and progress bars line up. Files keep their content; only names change.")
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
     parser.add_argument("--scan", nargs='?', const=True, default=None, metavar='N', help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.mpd/.webm/.mov) and download them all. Give a number to grab only the N-th found item, e.g. --scan 2 (1-indexed, in discovery order).")
+    parser.add_argument("--browser-login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
     parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
@@ -10247,6 +11665,7 @@ if __name__ == "__main__":
     parser.add_argument("--container", choices=['auto', 'mp4', 'mkv'], default='auto', help="Force the final container: 'mp4' or 'mkv'. Default 'auto' = .mkv when there are multiple audio tracks or subtitles (names/languages show reliably), otherwise .mp4.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
+    parser.add_argument("--insecure", "--no-check-certificate", "--no-check-certificates", dest="insecure", action="store_true", help="Never verify TLS certificates, on any connection (config, page scans, manifests, every download). Expired, self-signed or wrong-hostname certificates all work. Prints a warning once. Set INSECURE_TLS = True at the top of the script to make it permanent.")
     parser.add_argument("--no-color", action="store_true", help="Disable colored output.")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose mode.")
     parser.add_argument("--cookies", type=str, help="Path to a Netscape cookies.txt file or JSON cookie export (Google Drive / Patreon session).")
@@ -10263,6 +11682,11 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"[INFO] videoloader_dir v{SCRIPT_VERSION}")
+
+    # Already applied from raw argv before the config fetch; repeating it is a no-op and keeps the
+    # parsed flag as the single source of truth for anything added later.
+    if args.insecure:
+        _apply_insecure_tls()
 
     if args.ascii:
         ASCII_FILENAMES = True
@@ -10297,8 +11721,44 @@ if __name__ == "__main__":
         print("[INFO] Sent - check your phone." if ok else "[WARN] Could not send (see above).")
         sys.exit(0 if ok else 1)
 
-    if args.url_list and args.video_id:
-        parser.error("give either a single URL or --url-list, not both.")
+    if args.browser_login:
+        setup_console(USE_COLOR and not args.no_color)
+        try:
+            _sess = get_cookies_session(
+                [args.cookies] if args.cookies
+                else (auto_detect_cookies(args.verbose)
+                      if (AUTO_COOKIES and not args.no_auto_cookies) else []))
+        except (FileNotFoundError, ValueError) as e:
+            print(f"[ERROR] Failed to load cookies: {e}")
+            sys.exit(1)
+        print("[INFO] --browser-login: sign in in the window, then close it. The session is kept "
+              "for later --scan-browser runs.")
+        try:
+            _browser_collect_media(args.browser_login, args.verbose, session=_sess,
+                                   login_only=True)
+        finally:
+            _sess.close()
+        print("[INFO] --browser-login: done.")
+        sys.exit(0)
+
+    if sum(bool(x) for x in (args.video_id, args.url_list, args.davka,
+                             args.davka_browser)) > 1:
+        parser.error("give only ONE of: a single URL, --url-list, --davka, or --davka-browser.")
+
+    # The batch modes run their own loop (name/URL/key blocks), so they short-circuit the rest.
+    if args.davka or args.davka_browser:
+        _list = args.davka or args.davka_browser
+        _mode = "--davka-browser" if args.davka_browser else "--davka"
+        if args.output:
+            print(f"[WARN] -o/--output is ignored with {_mode}; names come from the file.")
+        run_batch(_list, dict(
+            verbose=args.verbose, cookies_file=args.cookies, max_height=args.max_height,
+            max_connections=args.max_connections, use_color=(USE_COLOR and not args.no_color),
+            auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), list_only=args.list,
+            chunk_size=args.chunk_size, auto=(not args.no_auto),
+            browser=bool(args.davka_browser),
+        ), args.output_dir)
+        sys.exit(0)
 
     # Auto-scan: a URL whose host matches SCAN_AUTO_HOSTS / SCAN_BROWSER_AUTO_HOSTS runs as if
     # --scan / --scan-browser was given. Only an explicit --scan / --scan-browser disables this
@@ -10346,7 +11806,7 @@ if __name__ == "__main__":
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.
-    if not args.url_list and not args.video_id:
+    if not args.url_list and not args.video_id and not args.davka and not args.davka_browser:
         with _failed_lock:
             _failed_jobs.clear()
             _session_failed.clear()
