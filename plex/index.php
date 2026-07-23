@@ -123,11 +123,39 @@ if (count($ht) >= 2) {
         ],
     ];
 
-    $tempS = []; $capS = []; $ci = 0;
+    $tempS = []; $capS = []; $cycS = []; $parkS = []; $wrS = []; $rdS = []; $errS = []; $ci = 0;
     foreach (($hist['disks'] ?? []) as $dh) {
         $col = PALETTE[$ci % count(PALETTE)];
         if (array_filter($dh['temp'], fn($v) => $v !== null)) {
             $tempS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $dh['temp']];
+        }
+        $ssRate = rate_per_day($ht, $dh['ss'] ?? []);
+        if (array_filter($ssRate, fn($v) => $v !== null)) {
+            $cycS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $ssRate];
+        }
+        $lcRate = rate_per_day($ht, $dh['lc'] ?? []);
+        if (array_filter($lcRate, fn($v) => $v !== null)) {
+            $parkS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $lcRate];
+        }
+        // LBA counts are sector counts; scale to GB so the number means something
+        $ub = $dh['unit_b'] ?? 512;
+        $wr = rate_per_day($ht, $dh['lw'] ?? []);
+        if (array_filter($wr, fn($v) => $v !== null)) {
+            $wrS[] = ['label' => $dh['label'], 'color' => $col,
+                      'data' => array_map(fn($v) => $v === null ? null : round($v * $ub / 1e9, 2), $wr)];
+        }
+        $rd = rate_per_day($ht, $dh['lr'] ?? []);
+        if (array_filter($rd, fn($v) => $v !== null)) {
+            $rdS[] = ['label' => $dh['label'], 'color' => $col,
+                      'data' => array_map(fn($v) => $v === null ? null : round($v * $ub / 1e9, 2), $rd)];
+        }
+        // Error counters are charted only if something actually happened —
+        // otherwise it is a flat zero line that tells you nothing.
+        foreach ([['crc', 'CRC'], ['errs', 'sector errors']] as [$fld, $what]) {
+            $vals = array_filter($dh[$fld] ?? [], fn($v) => $v !== null);
+            if ($vals && max($vals) > 0) {
+                $errS[] = ['label' => $dh['label'] . ' ' . $what, 'color' => $col, 'data' => $dh[$fld]];
+            }
         }
         // Real units, not percent: 94% of an 8 TB disk and 94% of a 1 TB disk
         // are very different amounts of space, and only TB tells you how much
@@ -160,6 +188,43 @@ if (count($ht) >= 2) {
             'series' => $capS,
         ];
     }
+    if ($cycS) {
+        $charts[] = [
+            'id' => 'cyc', 'title' => 'Spin-ups per day', 'unit' => '/d', 'min' => 0,
+            'note' => 'How hard the spin-down policy works the motors. Readings only land '
+                    . 'while a disk is awake, so the line is sparse by design.',
+            'series' => $cycS,
+        ];
+    }
+    if ($wrS || $rdS) {
+        $charts[] = [
+            'id' => 'thr', 'title' => 'Data written per day', 'unit' => ' GB/d', 'min' => 0,
+            'note' => 'How much each volume actually takes in — useful for spotting which '
+                    . 'disk carries the write load.',
+            'series' => $wrS ?: $rdS,
+        ];
+    }
+    if ($rdS && $wrS) {
+        $charts[] = [
+            'id' => 'thrd', 'title' => 'Data read per day', 'unit' => ' GB/d', 'min' => 0,
+            'series' => $rdS,
+        ];
+    }
+    if ($parkS) {
+        $charts[] = [
+            'id' => 'park', 'title' => 'Head parks per day', 'unit' => '/d', 'min' => 0,
+            'note' => 'Heads park far more often than the motor stops. Rated for 600,000 cycles.',
+            'series' => $parkS,
+        ];
+    }
+    if ($errS) {
+        $charts[] = [
+            'id' => 'err', 'title' => 'Error counters', 'unit' => '', 'min' => 0,
+            'note' => 'Only drives with a non-zero counter appear here. Any step up is worth '
+                    . 'investigating — CRC errors point at the cable or bridge, sector errors at the disk.',
+            'series' => $errS,
+        ];
+    }
     if (array_filter($hist['sys']['cpu'] ?? [], fn($v) => $v !== null)) {
         $charts[] = [
             'id' => 'cpu', 'title' => 'CPU temperature', 'unit' => ' °C',
@@ -178,6 +243,30 @@ if (count($ht) >= 2) {
         'id' => 'mem', 'title' => 'Memory used', 'unit' => ' %', 'min' => 0, 'max' => 100,
         'series' => [['label' => 'RAM', 'color' => '#a371f7', 'data' => $hist['sys']['mem'] ?? []]],
     ];
+}
+
+/**
+ * Turn a cumulative SMART counter into a per-day rate.
+ *
+ * Charting the raw counter would just draw a line that only ever goes up; what
+ * actually matters is how fast it climbs, because that is what the spin-down
+ * policy costs the drive. Readings are sparse (a sleeping disk isn't polled),
+ * so each rate is derived from the gap to the previous real reading.
+ */
+function rate_per_day(array $times, array $counts): array {
+    $out = array_fill(0, count($counts), null);
+    $prev = null;
+    foreach ($counts as $i => $v) {
+        if ($v === null || !isset($times[$i])) continue;
+        if ($prev !== null) {
+            $dt = $times[$i] - $times[$prev];
+            $dv = $v - $counts[$prev];
+            // negative means the counter reset or the disk was swapped: skip it
+            if ($dt >= 600 && $dv >= 0) $out[$i] = round($dv / $dt * 86400, 1);
+        }
+        $prev = $i;
+    }
+    return $out;
 }
 
 /** Least-squares slope per day; used to project when a disk fills up. */
@@ -351,6 +440,22 @@ function trend_per_day(array $times, array $vals): ?float {
   .attrs .a .an{color:var(--tx-mut)} .attrs .a .av{font-weight:600}
   .attrs .a .av.bad{color:var(--crit)}
   .cachenote{font-size:11px;color:var(--tx-mut)}
+
+  /* collapsible full attribute list */
+  .moreattrs{margin-top:11px;border-top:1px solid var(--line);padding-top:10px}
+  .moreattrs summary{cursor:pointer;list-style:none;font-size:12.5px;color:var(--tx-dim);
+    display:flex;align-items:center;gap:8px;user-select:none;padding:2px 0}
+  .moreattrs summary::-webkit-details-marker{display:none}
+  .moreattrs summary::before{content:"▸";color:var(--tx-mut);transition:transform .15s;display:inline-block}
+  .moreattrs[open] summary::before{transform:rotate(90deg)}
+  .moreattrs summary:hover{color:var(--tx)}
+  .moreattrs summary span{margin-left:auto;font-size:11px;color:var(--tx-mut);
+    background:var(--panel2);border-radius:9px;padding:1px 7px}
+  .mgrid{display:grid;grid-template-columns:1fr;gap:5px;margin-top:10px;font-size:13px}
+  .mgrid .a{display:flex;justify-content:space-between;gap:10px;padding:3px 0}
+  .mgrid .a+.a{border-top:1px solid rgba(38,44,55,.5)}
+  .mgrid .an{color:var(--tx-mut)} .mgrid .av{font-weight:600;text-align:right}
+  .mgrid .av.bad{color:var(--crit)}
 
   .tip{position:relative;display:inline-flex}
   .tip .pill,.tip .state{cursor:help}
@@ -652,8 +757,65 @@ function trend_per_day(array $times, array $vals): ?float {
             <span class="av <?= (int) $d['uncorrect'] > 0 ? 'bad' : '' ?>"><?= $d['uncorrect'] ?? '—' ?></span></div>
           <div class="a"><span class="an">Power-on</span>
             <span class="av"><?= $d['poh'] !== null ? number_format((int) $d['poh'], 0, '.', ' ') . ' h' : '—' ?></span></div>
+          <div class="a"><span class="an">Spin-ups</span>
+            <span class="av"><?= $d['start_stop'] !== null ? number_format((int) $d['start_stop'], 0, '.', ' ') : '—' ?></span></div>
+          <div class="a"><span class="an">Head parks</span>
+            <span class="av"><?= $d['load_cycle'] !== null ? number_format((int) $d['load_cycle'], 0, '.', ' ') : '—' ?></span></div>
         <?php endif; ?>
         </div>
+
+        <?php
+          // Everything else lives behind a disclosure so the card stays scannable.
+          $lbaW = $d['lba_written'] ?? null; $lbaR = $d['lba_read'] ?? null;
+          $nvW  = $d['nvme_written'] ?? null; $nvR = $d['nvme_read'] ?? null;
+          $wrTb = $lbaW !== null ? $lbaW * 512 / 1e12 : ($nvW !== null ? $nvW * 512000 / 1e12 : null);
+          $rdTb = $lbaR !== null ? $lbaR * 512 / 1e12 : ($nvR !== null ? $nvR * 512000 / 1e12 : null);
+          $more = [];
+          if ($d['crc_err'] !== null)       $more['Interface CRC errors'] = [(int) $d['crc_err'], (int) $d['crc_err'] > 0];
+          if ($d['reported_unc'] !== null)  $more['Reported uncorrectable'] = [(int) $d['reported_unc'], (int) $d['reported_unc'] > 0];
+          if ($d['spin_retry'] !== null)    $more['Spin retries'] = [(int) $d['spin_retry'], (int) $d['spin_retry'] > 0];
+          if ($d['cmd_timeout'] !== null)   $more['Command timeouts'] = [number_format((int) $d['cmd_timeout'], 0, '.', ' '), false];
+          if ($d['offretract'] !== null)    $more['Emergency head retracts'] = [(int) $d['offretract'], false];
+          if ($d['power_cycle'] !== null)   $more['Power cycles'] = [(int) $d['power_cycle'], false];
+          if ($d['spinup_ms'] !== null && $d['spinup_ms'] > 0) $more['Spin-up time'] = [$d['spinup_ms'] . ' ms', false];
+          if ($wrTb !== null)               $more['Data written'] = [number_format($wrTb, 1) . ' TB', false];
+          if ($rdTb !== null)               $more['Data read'] = [number_format($rdTb, 1) . ' TB', false];
+          if (($d['tmax'] ?? null) !== null) {
+              $rangeTxt = ($d['tmin'] ?? null) !== null
+                  ? $d['tmin'] . '–' . $d['tmax'] . ' °C'
+                  : 'max ' . $d['tmax'] . ' °C';
+              $more['Lifetime temp'] = [$rangeTxt, $d['tmax'] >= ($thr['temp_crit'] ?? 58)];
+          }
+          if ($d['unsafe_shutdown'] !== null) $more['Unsafe shutdowns'] = [(int) $d['unsafe_shutdown'], false];
+          if ($d['err_log'] !== null)       $more['Error log entries'] = [(int) $d['err_log'], (int) $d['err_log'] > 0];
+          if ($d['margin'] !== null)        $more['Closest to threshold'] = [$d['margin_attr'] . ' (+' . $d['margin'] . ')', $d['margin'] <= 0];
+          if (!empty($d['selftest']))       $more['Last self-test'] = [$d['selftest']['type'] . ' — ' . $d['selftest']['status'], !$d['selftest']['passed']];
+        ?>
+        <?php if ($more): ?>
+        <details class="moreattrs">
+          <summary>All SMART values<span><?= count($more) ?></span></summary>
+          <div class="mgrid">
+          <?php foreach ($more as $k => [$v, $bad]): ?>
+            <div class="a"><span class="an"><?= h($k) ?></span>
+              <span class="av <?= $bad ? 'bad' : '' ?>"><?= h((string) $v) ?></span></div>
+          <?php endforeach; ?>
+          </div>
+        </details>
+        <?php endif; ?>
+
+        <?php
+          // Absolute counts mean little without a timescale — the rate is what
+          // tells you whether the spin-down policy is wearing the drive out.
+          $ssc = $d['start_stop'] ?? null; $poh = $d['poh'] ?? null;
+          if ($ssc !== null && $poh > 100):
+              $perYear = $ssc / ($poh / 8766);
+              $lcc = $d['load_cycle'] ?? null;
+              $lccYear = $lcc !== null ? $lcc / ($poh / 8766) : null; ?>
+          <div class="sub" style="margin-top:9px">
+            ≈<?= number_format($perYear, 0, '.', ' ') ?> spin-ups/year<?php
+              if ($lccYear !== null): ?> · ≈<?= number_format($lccYear, 0, '.', ' ') ?> head parks/year<?php endif; ?>
+          </div>
+        <?php endif; ?>
 
         <?php if (!empty($d['stable_since']) && $d['smart_ok'] === true):
                 $stable = time() - (int) $d['stable_since']; ?>

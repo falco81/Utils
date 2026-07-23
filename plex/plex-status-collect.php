@@ -178,6 +178,70 @@ function parse_poh(string $out): ?int {
 }
 
 /**
+ * Full attribute row: raw value plus the normalised VALUE / WORST / THRESH.
+ *
+ * The raw number is what humans read, but only the normalised value is
+ * comparable across vendors — Seagate packs several counters into one raw
+ * field, so e.g. Command_Timeout can read in the billions while the drive
+ * considers itself perfectly healthy. Failure is defined as VALUE <= THRESH.
+ */
+function smart_attr_full(string $out, string $needle): ?array {
+    foreach (explode("\n", $out) as $line) {
+        if (!preg_match('/^\s*\d+\s+\S/', $line) || stripos($line, $needle) === false) continue;
+        $c = preg_split('/\s+/', trim($line));
+        if (count($c) < 10) continue;
+        return [
+            'id'     => (int) $c[0],
+            'value'  => is_numeric($c[3]) ? (int) $c[3] : null,
+            'worst'  => is_numeric($c[4]) ? (int) $c[4] : null,
+            'thresh' => is_numeric($c[5]) ? (int) $c[5] : null,
+            'prefail'=> stripos($c[6], 'pre-fail') !== false,
+            'raw'    => preg_match('/\d+/', $c[9], $m) ? (int) $m[0] : null,
+            'rawtxt' => implode(' ', array_slice($c, 9)),
+        ];
+    }
+    return null;
+}
+
+/** Smallest margin between a pre-fail attribute and its failure threshold. */
+function smart_margin(string $out): ?array {
+    $worstName = null; $worstMargin = null;
+    foreach (explode("\n", $out) as $line) {
+        if (!preg_match('/^\s*(\d+)\s+(\S+)/', $line, $mm)) continue;
+        $c = preg_split('/\s+/', trim($line));
+        if (count($c) < 10 || stripos($c[6], 'pre-fail') === false) continue;
+        if (!is_numeric($c[3]) || !is_numeric($c[5])) continue;
+        $margin = (int) $c[3] - (int) $c[5];
+        if ($worstMargin === null || $margin < $worstMargin) {
+            $worstMargin = $margin; $worstName = $mm[2];
+        }
+    }
+    return $worstMargin === null ? null : ['margin' => $worstMargin, 'attr' => $worstName];
+}
+
+/** Lifetime min/max temperature, which Seagate appends to the raw temp value. */
+function parse_temp_minmax(string $out): array {
+    if (preg_match('/Min\/Max\s+(-?\d+)\/(-?\d+)/i', $out, $m)) {
+        return ['tmin' => (int) $m[1], 'tmax' => (int) $m[2]];
+    }
+    if (preg_match('/^194\s+\S+.*?\s(\d+)\s+\((\d+)\s+(\d+)/m', $out, $m)) {
+        return ['tmin' => (int) $m[3], 'tmax' => null];
+    }
+    return ['tmin' => null, 'tmax' => null];
+}
+
+/** Most recent entry from the SMART self-test log. */
+function parse_selftest(string $out): ?array {
+    if (!preg_match('/^#\s*1\s+(.+?)\s\s+(.+?)\s\s+(\d+%)\s+(\d+)/m', $out, $m)) return null;
+    return [
+        'type'   => trim($m[1]),
+        'status' => trim($m[2]),
+        'at_poh' => (int) $m[4],
+        'passed' => stripos($m[2], 'without error') !== false,
+    ];
+}
+
+/**
  * Read SMART trying several -d types and MERGE the best value of each field.
  * Some USB bridges answer one -d type with only a health status and another with
  * only a temperature; taking the best of each field gives the most complete result
@@ -189,7 +253,12 @@ function smart_collect(string $devpath, string $tran): array {
         ? ['nvme', 'auto']
         : ['sat', 'sat,12', 'sat,16', 'usbjmicron', 'auto', 'scsi'];
     $r = ['temp' => null, 'health' => null, 'poh' => null, 'realloc' => null, 'pending' => null, 'uncorrect' => null,
+          'start_stop' => null, 'load_cycle' => null, 'power_cycle' => null,
+          'crc_err' => null, 'reported_unc' => null, 'cmd_timeout' => null, 'spin_retry' => null,
+          'offretract' => null, 'spinup_ms' => null, 'lba_written' => null, 'lba_read' => null,
           'nvme_used' => null, 'nvme_spare' => null, 'nvme_media_err' => null,
+          'nvme_written' => null, 'nvme_read' => null, 'unsafe_shutdown' => null, 'err_log' => null,
+          'tmin' => null, 'tmax' => null, 'margin' => null, 'margin_attr' => null, 'selftest' => null,
           'real_model' => null, 'real_serial' => null];
     $used = [];
     foreach ($types as $t) {
@@ -202,10 +271,30 @@ function smart_collect(string $devpath, string $tran): array {
             'realloc'   => smart_attr($out, 'Reallocated_Sector_Ct'),
             'pending'   => smart_attr($out, 'Current_Pending_Sector'),
             'uncorrect' => smart_attr($out, 'Offline_Uncorrectable'),
+            // mechanical wear: every spin-up is a start/stop, and heads park
+            // far more often than that. Both are rated in the datasheet.
+            'start_stop'  => smart_attr($out, 'Start_Stop_Count'),
+            'load_cycle'  => smart_attr($out, 'Load_Cycle_Count'),
+            'power_cycle' => smart_attr($out, 'Power_Cycle_Count'),
+            // link integrity — the single most valuable attribute on USB, since a
+            // failing cable or bridge shows up here long before data is lost
+            'crc_err'     => smart_attr($out, 'UDMA_CRC_Error_Count'),
+            'reported_unc'=> smart_attr($out, 'Reported_Uncorrect'),
+            'cmd_timeout' => smart_attr($out, 'Command_Timeout'),
+            'spin_retry'  => smart_attr($out, 'Spin_Retry_Count'),
+            'offretract'  => smart_attr($out, 'Power-Off_Retract_Count'),
+            'spinup_ms'   => smart_attr($out, 'Spin_Up_Time'),
+            // lifetime data volume (LBAs are 512 B on these drives)
+            'lba_written' => smart_attr($out, 'Total_LBAs_Written'),
+            'lba_read'    => smart_attr($out, 'Total_LBAs_Read'),
             // NVMe has its own health metrics instead of ATA attributes
             'nvme_used'      => preg_match('/Percentage Used:\s*(\d+)%/i', $out, $m) ? (int) $m[1] : null,
             'nvme_spare'     => preg_match('/Available Spare:\s*(\d+)%/i', $out, $m) ? (int) $m[1] : null,
             'nvme_media_err' => preg_match('/Media and Data Integrity Errors:\s*([\d,]+)/i', $out, $m) ? (int) str_replace(',', '', $m[1]) : null,
+            'nvme_written'   => preg_match('/Data Units Written:\s*([\d,]+)/i', $out, $m) ? (int) str_replace(',', '', $m[1]) : null,
+            'nvme_read'      => preg_match('/Data Units Read:\s*([\d,]+)/i', $out, $m) ? (int) str_replace(',', '', $m[1]) : null,
+            'unsafe_shutdown'=> preg_match('/Unsafe Shutdowns:\s*([\d,]+)/i', $out, $m) ? (int) str_replace(',', '', $m[1]) : null,
+            'err_log'        => preg_match('/Error Information Log Entries:\s*([\d,]+)/i', $out, $m) ? (int) str_replace(',', '', $m[1]) : null,
             // the DRIVE's own identity — USB bridges report the enclosure's instead
             'real_model'  => preg_match('/^(?:Device Model|Model Number):\s*(.+)$/mi', $out, $m) ? trim($m[1]) : null,
             'real_serial' => preg_match('/^Serial Number:\s*(.+)$/mi', $out, $m) ? trim($m[1]) : null,
@@ -217,6 +306,17 @@ function smart_collect(string $devpath, string $tran): array {
         dbg(sprintf("    smartctl -d %-9s : health=%s temp=%s poh=%s%s", $t,
             $vals['health'] ?? '-', $vals['temp'] !== null ? $vals['temp'] : '-',
             $vals['poh'] !== null ? $vals['poh'] : '-', $gained ? '  (+' . implode(',', $gained) . ')' : ''));
+        // derived values: computed from whichever output actually had a table
+        if ($r['margin'] === null) {
+            $mg = smart_margin($out);
+            if ($mg) { $r['margin'] = $mg['margin']; $r['margin_attr'] = $mg['attr']; }
+        }
+        if ($r['tmax'] === null) {
+            $mm2 = parse_temp_minmax($out);
+            if ($mm2['tmax'] !== null) { $r['tmin'] = $mm2['tmin']; $r['tmax'] = $mm2['tmax']; }
+        }
+        if ($r['selftest'] === null) $r['selftest'] = parse_selftest($out);
+
         if ($gained) $used[] = $t;
         if ($r['health'] !== null && $r['temp'] !== null && $r['poh'] !== null) break; // got the essentials
     }
@@ -502,6 +602,19 @@ function history_update(array $direct, array $sys, array $disks, bool $write): a
             $disk['from_cache'] ? null : $disk['temp'],   // fresh readings only
             $disk['fs_pct'],                              // statfs, always fresh
             $disk['fs_used_b'] ?? null,                   // raw bytes, for real-unit charts
+            // wear counters, also only when freshly read — the page turns these
+            // cumulative values into a per-day rate
+            $disk['from_cache'] ? null : ($disk['start_stop'] ?? null),
+            $disk['from_cache'] ? null : ($disk['load_cycle'] ?? null),
+            // lifetime data volume -> the page turns this into GB/day of real work
+            $disk['from_cache'] ? null : ($disk['lba_written'] ?? $disk['nvme_written'] ?? null),
+            $disk['from_cache'] ? null : ($disk['lba_read'] ?? $disk['nvme_read'] ?? null),
+            // error counters, summed: normally a flat zero, and any step up matters
+            $disk['from_cache'] ? null : ($disk['crc_err'] ?? null),
+            $disk['from_cache'] ? null : (
+                ($disk['realloc'] ?? 0) + ($disk['pending'] ?? 0)
+                + ($disk['uncorrect'] ?? 0) + ($disk['reported_unc'] ?? 0)
+            ),
         ];
     }
 
@@ -555,6 +668,13 @@ function history_series(array $samples, array $disks): array {
             'temp'    => [],
             'fs'      => [],
             'used'    => [],
+            'ss'      => [],
+            'lc'      => [],
+            'lw'      => [],
+            'lr'      => [],
+            'crc'     => [],
+            'errs'    => [],
+            'unit_b'  => ($disk['tran'] === 'nvme') ? 512000 : 512,
         ];
     }
     foreach ($samples as $s) {
@@ -569,6 +689,12 @@ function history_series(array $samples, array $disks): array {
             $dd['temp'][] = $s['d'][$k][0] ?? null;
             $dd['fs'][]   = $s['d'][$k][1] ?? null;
             $dd['used'][] = $s['d'][$k][2] ?? null;   // null on samples predating v2.1
+            $dd['ss'][]   = $s['d'][$k][3] ?? null;
+            $dd['lc'][]   = $s['d'][$k][4] ?? null;
+            $dd['lw'][]   = $s['d'][$k][5] ?? null;
+            $dd['lr'][]   = $s['d'][$k][6] ?? null;
+            $dd['crc'][]  = $s['d'][$k][7] ?? null;
+            $dd['errs'][] = $s['d'][$k][8] ?? null;
         }
         unset($dd);
     }
@@ -787,6 +913,8 @@ foreach ($devs as $dev) {
         $realloc = $c['realloc'] ?? null; $pending = $c['pending'] ?? null;
         $uncorr = $c['uncorrect'] ?? null; $stype = ($c['smart_type'] ?? 'cache');
         $nvme_used = $c['nvme_used'] ?? null; $nvme_spare = $c['nvme_spare'] ?? null; $nvme_media_err = $c['nvme_media_err'] ?? null;
+        $start_stop = $c['start_stop'] ?? null; $load_cycle = $c['load_cycle'] ?? null; $power_cycle = $c['power_cycle'] ?? null;
+        $crc_err = $c['crc_err'] ?? null; $reported_unc = $c['reported_unc'] ?? null; $cmd_timeout = $c['cmd_timeout'] ?? null; $spin_retry = $c['spin_retry'] ?? null; $offretract = $c['offretract'] ?? null; $spinup_ms = $c['spinup_ms'] ?? null; $lba_written = $c['lba_written'] ?? null; $lba_read = $c['lba_read'] ?? null; $nvme_written = $c['nvme_written'] ?? null; $nvme_read = $c['nvme_read'] ?? null; $unsafe_shutdown = $c['unsafe_shutdown'] ?? null; $err_log = $c['err_log'] ?? null; $tmin = $c['tmin'] ?? null; $tmax = $c['tmax'] ?? null; $margin = $c['margin'] ?? null; $margin_attr = $c['margin_attr'] ?? null; $selftest = $c['selftest'] ?? null;
         $real_model = $c['real_model'] ?? null; $real_serial = $c['real_serial'] ?? null;
         $from_cache = true; $cache_age = time() - (int) ($c['ts'] ?? time());
         dbg("    SMART skipped (disk asleep) -> using cache from {$cache_age}s ago");
@@ -794,6 +922,8 @@ foreach ($devs as $dev) {
         // asleep (or unverifiable) and no cache yet — leave blank, don't wake it
         $temp = $health = $smart_ok = $poh = $realloc = $pending = $uncorr = null;
         $nvme_used = $nvme_spare = $nvme_media_err = null;
+        $start_stop = $load_cycle = $power_cycle = null;
+        $crc_err = $reported_unc = $cmd_timeout = $spin_retry = $offretract = $spinup_ms = $lba_written = $lba_read = $nvme_written = $nvme_read = $unsafe_shutdown = $err_log = $tmin = $tmax = $margin = $margin_attr = $selftest = null;
         $real_model = $real_serial = null;
         $stype = 'n/a';
         dbg("    SMART skipped (not verifiably awake) -> no cache yet, leaving blank");
@@ -804,6 +934,8 @@ foreach ($devs as $dev) {
         $temp = $sm['temp']; $health = $sm['health']; $smart_ok = $sm['smart_ok'];
         $poh = $sm['poh']; $realloc = $sm['realloc']; $pending = $sm['pending']; $uncorr = $sm['uncorrect'];
         $nvme_used = $sm['nvme_used']; $nvme_spare = $sm['nvme_spare']; $nvme_media_err = $sm['nvme_media_err'];
+        $start_stop = $sm['start_stop']; $load_cycle = $sm['load_cycle']; $power_cycle = $sm['power_cycle'];
+        $crc_err = $sm['crc_err']; $reported_unc = $sm['reported_unc']; $cmd_timeout = $sm['cmd_timeout']; $spin_retry = $sm['spin_retry']; $offretract = $sm['offretract']; $spinup_ms = $sm['spinup_ms']; $lba_written = $sm['lba_written']; $lba_read = $sm['lba_read']; $nvme_written = $sm['nvme_written']; $nvme_read = $sm['nvme_read']; $unsafe_shutdown = $sm['unsafe_shutdown']; $err_log = $sm['err_log']; $tmin = $sm['tmin']; $tmax = $sm['tmax']; $margin = $sm['margin']; $margin_attr = $sm['margin_attr']; $selftest = $sm['selftest'];
         $real_model = $sm['real_model']; $real_serial = $sm['real_serial'];
         $stype = $sm['type'];
         if ($real_serial) dbg("    drive identity: {$real_model} / {$real_serial}");
@@ -819,6 +951,8 @@ foreach ($devs as $dev) {
             'temp' => $temp, 'health' => $health, 'smart_ok' => $smart_ok, 'poh' => $poh,
             'realloc' => $realloc, 'pending' => $pending, 'uncorrect' => $uncorr,
             'nvme_used' => $nvme_used, 'nvme_spare' => $nvme_spare, 'nvme_media_err' => $nvme_media_err,
+            'start_stop' => $start_stop, 'load_cycle' => $load_cycle, 'power_cycle' => $power_cycle,
+            'crc_err' => $crc_err, 'reported_unc' => $reported_unc, 'cmd_timeout' => $cmd_timeout, 'spin_retry' => $spin_retry, 'offretract' => $offretract, 'spinup_ms' => $spinup_ms, 'lba_written' => $lba_written, 'lba_read' => $lba_read, 'nvme_written' => $nvme_written, 'nvme_read' => $nvme_read, 'unsafe_shutdown' => $unsafe_shutdown, 'err_log' => $err_log, 'tmin' => $tmin, 'tmax' => $tmax, 'margin' => $margin, 'margin_attr' => $margin_attr, 'selftest' => $selftest,
             'real_model' => $real_model, 'real_serial' => $real_serial,
             'smart_type' => $stype, 'ts' => time(),
         ];
@@ -875,6 +1009,26 @@ foreach ($devs as $dev) {
         'pending'    => $pending,
         'uncorrect'  => $uncorr,
         'stable_since' => $counters_ts,   // when the error counters last moved
+        'crc_err'      => $crc_err,       // link/cable errors — key on USB
+        'reported_unc' => $reported_unc,
+        'cmd_timeout'  => $cmd_timeout,
+        'spin_retry'   => $spin_retry,
+        'offretract'   => $offretract,   // emergency head retracts (power loss)
+        'spinup_ms'    => $spinup_ms,
+        'lba_written'  => $lba_written,  // x512 B = bytes written over its life
+        'lba_read'     => $lba_read,
+        'nvme_written' => $nvme_written, // NVMe data units (x512000 B)
+        'nvme_read'    => $nvme_read,
+        'unsafe_shutdown' => $unsafe_shutdown,
+        'err_log'      => $err_log,
+        'tmin'         => $tmin,
+        'tmax'         => $tmax,         // highest temperature ever recorded
+        'margin'       => $margin,       // closest any pre-fail attr is to failing
+        'margin_attr'  => $margin_attr,
+        'selftest'     => $selftest,
+        'start_stop'  => $start_stop,     // spin-ups (motor start/stop cycles)
+        'load_cycle'  => $load_cycle,     // head park/unpark cycles
+        'power_cycle' => $power_cycle,
         'nvme_used'      => $nvme_used,      // % of rated write endurance consumed
         'nvme_spare'     => $nvme_spare,     // % spare capacity remaining
         'nvme_media_err' => $nvme_media_err, // media & data integrity errors
@@ -984,6 +1138,24 @@ foreach ($disks as $d) {
     }
     if ((int) $d['uncorrect'] > 0) {
         $reasons[] = ['warn', "$label — {$d['uncorrect']} uncorrectable sector(s)"];
+    }
+    // On USB, CRC errors almost always mean a cable, bridge or power problem
+    // rather than a dying disk — but they do mean data had to be re-sent.
+    if ((int) ($d['crc_err'] ?? 0) > 0) {
+        $reasons[] = ['warn', "$label — {$d['crc_err']} interface CRC error(s): suspect the cable, "
+                            . "the USB bridge or its power, not the platters"];
+    }
+    if ((int) ($d['spin_retry'] ?? 0) > 0) {
+        $reasons[] = ['crit', "$label — {$d['spin_retry']} spin retry(s): the motor struggled to start"];
+    }
+    // Only an actual breach counts. A small margin means nothing on its own:
+    // Seagate ships Spin_Retry_Count with a normal value of 100 and a threshold
+    // of 97, so "3 points from failing" is the healthy state for every drive.
+    if ($d['margin'] !== null && $d['margin'] <= 0) {
+        $reasons[] = ['crit', "$label — attribute {$d['margin_attr']} has reached its failure threshold"];
+    }
+    if (!empty($d['selftest']) && $d['selftest']['passed'] === false) {
+        $reasons[] = ['crit', "$label — last self-test: {$d['selftest']['status']}"];
     }
     if ($d['temp'] !== null && $d['temp'] >= TEMP_CRIT) {
         $reasons[] = ['crit', "$label — {$d['temp']} °C, at or above the critical threshold of " . TEMP_CRIT . " °C"];
