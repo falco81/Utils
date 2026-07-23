@@ -24,8 +24,15 @@ const PLEX_PREFS = '/var/lib/plexmediaserver/Library/Application Support/Plex Me
 // Web App version; if that fails, set it explicitly here (leave '' to auto-detect).
 const PLEX_WEB_VERSION = '';
 
-const TEMP_WARN  = 45;   // °C
-const TEMP_CRIT  = 55;   // °C
+// Temperature thresholds (°C).
+// These Seagate drives raise their own alarm at 60 °C: SMART attribute 190
+// (Airflow_Temperature_Cel) carries THRESH 040, and Seagate normalises that
+// attribute as 100 − temperature. Keeping CRIT under 60 means the dashboard
+// turns red *before* the drive itself starts complaining, not after.
+// WARN sits above the 43–45 °C these disks reach under load, so it flags a real
+// cooling problem without crying wolf during normal work.
+const TEMP_WARN  = 50;   // °C — worth a look
+const TEMP_CRIT  = 58;   // °C — act now; just under the drives' own 60 °C alarm
 const IO_SAMPLE  = 1.0;  // seconds to sample disk I/O activity
 
 // If false: a disk in standby/sleeping is NOT woken for SMART (last-known cache is
@@ -83,6 +90,24 @@ function dbg(string $msg): void {
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/**
+ * PHP falls back to UTC when date.timezone isn't set in php.ini, which makes
+ * the timestamps printed here disagree with the server's own clock. Follow the
+ * system zone instead.
+ */
+function use_system_timezone(): void {
+    if (ini_get('date.timezone') && strcasecmp((string) ini_get('date.timezone'), 'UTC') !== 0) return;
+    $tz = '';
+    if (is_readable('/etc/timezone')) $tz = trim((string) @file_get_contents('/etc/timezone'));
+    if ($tz === '' && is_link('/etc/localtime')) {
+        $target = (string) @readlink('/etc/localtime');
+        if (preg_match('#zoneinfo/(.+)$#', $target, $m)) $tz = $m[1];
+    }
+    if ($tz !== '' && in_array($tz, timezone_identifiers_list(), true)) date_default_timezone_set($tz);
+}
+use_system_timezone();
+
 function sh(string $cmd): string {
     return (string) @shell_exec($cmd . ' 2>/dev/null');
 }

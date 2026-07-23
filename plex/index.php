@@ -6,6 +6,31 @@
  */
 declare(strict_types=1);
 
+/**
+ * PHP falls back to UTC when date.timezone isn't set in php.ini, which makes
+ * every timestamp here disagree with the server's own clock. Follow the system
+ * zone instead, so "12:50:09" means what the shell would say.
+ */
+function use_system_timezone(): void {
+    if (ini_get('date.timezone')) {
+        // php.ini has an explicit setting — but if it's a bare UTC while the
+        // host is on something else, prefer the host's zone.
+        if (strcasecmp((string) ini_get('date.timezone'), 'UTC') !== 0) return;
+    }
+    $tz = '';
+    if (is_readable('/etc/timezone')) {
+        $tz = trim((string) @file_get_contents('/etc/timezone'));
+    }
+    if ($tz === '' && is_link('/etc/localtime')) {
+        $target = (string) @readlink('/etc/localtime');
+        if (preg_match('#zoneinfo/(.+)$#', $target, $m)) $tz = $m[1];
+    }
+    if ($tz !== '' && in_array($tz, timezone_identifiers_list(), true)) {
+        date_default_timezone_set($tz);
+    }
+}
+use_system_timezone();
+
 const DATA_FILE = __DIR__ . '/data.json';
 
 $data = is_readable(DATA_FILE) ? json_decode((string) file_get_contents(DATA_FILE), true) : null;
