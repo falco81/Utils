@@ -287,7 +287,8 @@ def _read_key(timeout=None):
             c2 = msvcrt.getwch()
             return {"H": "up", "P": "down", "K": "left", "M": "right",
                     "G": "home", "O": "end", "I": "pgup", "Q": "pgdn",
-                    "?": "f5"}.get(c2, "other")  # F5 = scan code 0x3F ('?')
+                    "?": "f5", "C": "f9"}.get(c2, "other")  # F5 = 0x3F '?', F9 = 0x43 'C'
+
         if ch in ("\r", "\n"):
             return "enter"
         if ch == "\x08":
@@ -327,7 +328,8 @@ def _read_key(timeout=None):
                     break
             return {"A": "up", "B": "down", "C": "right", "D": "left",
                     "H": "home", "F": "end", "1~": "home", "4~": "end",
-                    "5~": "pgup", "6~": "pgdn", "15~": "f5"}.get(seq, "esc")
+                    "5~": "pgup", "6~": "pgdn", "15~": "f5",
+                    "20~": "f9"}.get(seq, "esc")
         if c in (0x0d, 0x0a):
             return "enter"
         if c in (0x7f, 0x08):
@@ -383,7 +385,7 @@ def clear_screen():
 
 
 def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
-                     refresh_cb=None, header=None):
+                     refresh_cb=None, header=None, refresh_all_cb=None):
     """Arrow-key menu + type-to-search. Returns an index, or None (cancelled).
     Behaves like an app: clears the screen up front and redraws only the current
     view (no scrolling). header = context lines above the list.
@@ -448,6 +450,8 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
             hint = "↑↓ move · type = search · Enter = select"
         if refresh_cb is not None:
             hint += " · F5 = scan library"
+        if refresh_all_cb is not None:
+            hint += " · F9 = refresh all metadata"
         vis_lines.append(f"{Fore.CYAN}{trunc(hint, maxw)}{Style.RESET_ALL}")
 
         if not order:
@@ -501,8 +505,17 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
                 status = ""
                 render(order, sel_pos)
                 continue
-            if key != "f5" and status:
+            if key not in ("f5", "f9") and status:
                 status = ""  # status message also disappears on any keypress
+            if key == "f9" and refresh_all_cb is not None:
+                idx = order[sel_pos] if order else None
+                try:
+                    status = refresh_all_cb(idx) or ""
+                except Exception as ex:
+                    status = f"{Fore.RED}Refresh All Metadata failed: {ex}{Style.RESET_ALL}"
+                first = True          # the progress screen overwrote everything
+                render(order, sel_pos)
+                continue
             if key == "up" and order:
                 sel_pos = (sel_pos - 1) % len(order)
             elif key == "down" and order:
@@ -638,7 +651,8 @@ def _checkbox_classic(prompt, rows, header=None):
 
 
 def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate=False,
-                  ui_state=None, scope_picker=None):
+                  ui_state=None, scope_picker=None, action_cb=None, f9_cb=None,
+                  edit_cb=None):
     """Smart app-like multi-select with [x]/[ ] checkboxes.
     tristate=True: rows carry 'state' ("on"/"off"/"mixed") instead of 'selected';
     Space cycles on -> off -> (mixed, if that was the original state) and the box
@@ -660,6 +674,16 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         return _checkbox_classic(prompt, rows, header)
 
     plain = [strip_ansi(r["label"]) for r in rows]
+
+    def _sync_plain():
+        """Row labels can change while the menu is open (e.g. after re-reading the
+        metadata language), so refresh the plain-text copy before using it."""
+        if len(plain) != len(rows):
+            plain[:] = [strip_ansi(r["label"]) for r in rows]
+            return
+        for i, r in enumerate(rows):
+            plain[i] = strip_ansi(r["label"])
+
     header = list(header or [])
     seasons = sorted({r["season"] for r in rows if r.get("season") is not None})
     scopes = [None] + seasons            # None = all seasons
@@ -706,6 +730,7 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         return group_eps(r.get("season"))
 
     def visible_order():
+        _sync_plain()
         s = cur_season()
         pat = filt
         out = []
@@ -750,6 +775,7 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
 
     def render(order, sel_pos):
         nonlocal prev_lines, first
+        _sync_plain()
         cols, rows_total = term_size()
         maxw = max(10, cols - 2)
         page_rows = max(3, rows_total - (8 + len(header)
@@ -784,6 +810,8 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         line2 = ((f"[ / ] change season ({scope_txt}) · " if has_seasons else "") +
                  "/ search · +/- check/uncheck by pattern"
                  + (" · l label" if scope_picker is not None else "")
+                 + (" · F9 refresh checked" if f9_cb is not None else "")
+                 + (" · e edit" if edit_cb is not None else "")
                  + " · Enter apply · Esc "
                  + ("clear" if (filt or s is not None or ext_scope is not None) else "cancel"))
         vis.append(f"{Fore.CYAN}{trunc(line2, maxw)}{Style.RESET_ALL}")
@@ -802,18 +830,47 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         if not order:
             vis.append(f"  {Fore.RED}(no match){Style.RESET_ALL}")
         else:
-            # fixed status column so watched/unwatched line up
-            status_col = any("watched" in r for r in rows)
-            statw = len("unwatched")  # 9
+            # fixed status column so watched/unwatched and other tags line up
+            has_tag = any(r.get("tag") for r in rows)
+            has_watch = any("watched" in r for r in rows)
+            # align to the longest title that actually carries a tag, so the column
+            # stays next to the text instead of drifting to the right edge
+            longest = max((len(plain[i]) for i in order
+                           if not is_header(rows[i])
+                           and (rows[i].get("tag") or "watched" in rows[i])),
+                          default=0)
+            statw = len("unwatched") if has_watch else 0
+            if has_tag:
+                statw = max(statw, max(len(strip_ansi(r.get("tag") or "")) for r in rows))
+                statw = min(statw, max(10, maxw // 2))     # never eat the whole line
             statgap = 2
+            # keep the tag column right after the longest title instead of pushing it
+            # to the far right edge, so the eye doesn't have to travel
+            textw = max(6, min(maxw - 8 - (statgap + statw), longest + 1))
 
             def fit(s, w):
                 if len(s) > w:
                     return s[:max(1, w - 1)] + "…"
                 return s + " " * (w - len(s))
 
-            start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
-            window = order[start:start + page_rows]
+            # rows may carry extra sub-lines (r["sub"]), so build the window by
+            # accumulating real display heights instead of counting items
+            heights = [1 + len(rows[i].get("sub") or []) for i in order]
+            start = end = sel_pos
+            total = heights[sel_pos] if order else 0
+            half = max(1, page_rows // 2)
+            # keep the cursor near the middle: fill upwards first, then downwards,
+            # then use whatever space is left above
+            while start > 0 and total + heights[start - 1] <= half:
+                start -= 1
+                total += heights[start]
+            while end + 1 < len(order) and total + heights[end + 1] <= page_rows:
+                end += 1
+                total += heights[end]
+            while start > 0 and total + heights[start - 1] <= page_rows:
+                start -= 1
+                total += heights[start]
+            window = order[start:end + 1]
             sbr = _scrollbar_range(len(window), len(order), len(window), start)
             if start > 0:
                 vis.append(f"  {Fore.CYAN}▲ ({start} above){Style.RESET_ALL}")
@@ -838,24 +895,33 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
                             box = {"on": "[x]", "off": "[ ]", "mixed": "[~]"}[st_]
                     else:
                         box = "[x]" if r.get("selected") else "[ ]"
-                    if "watched" in r:
+                    if r.get("tag"):
+                        tag = f"{' ' * statgap}{r['tag']}"
+                    elif "watched" in r:
                         word = "watched" if r["watched"] else "unwatched"
                         color = Fore.GREEN if r["watched"] else Style.DIM
                         tag = f"{' ' * statgap}{color}{word}{Style.RESET_ALL}"
                     else:
-                        tag = (" " * (statgap + statw)) if status_col else ""
-                    textw = max(6, maxw - 8 - (statgap + statw if status_col else 0))
-                    text = fit(plain[i], textw)  # pad/truncate so the status column aligns
+                        tag = ""      # no tag -> no trailing padding
+                    if r.get("tag") or "watched" in r:
+                        text = fit(plain[i], textw)   # pad so the tag column lines up
+                    else:
+                        text = trunc(plain[i], max(6, maxw - 8))   # no tag -> full width
                     hit = bool(mark_mode and mark_buf and _match_filter(plain[i], mark_buf))
                     if hit:      # show what the +/- pattern will affect
                         line = f"    {Fore.MAGENTA}{box} {text}{Style.RESET_ALL}{tag}"
-                    elif cursor:
-                        line = f"{Fore.GREEN}{Style.BRIGHT}›   {box} {text}{Style.RESET_ALL}{tag}"
+                    elif cursor:     # highlight the whole row, tag included
+                        line = (f"{Fore.GREEN}{Style.BRIGHT}›   {box} {text}"
+                                f"{strip_ansi(tag)}{Style.RESET_ALL}")
                     else:
                         on_ = (r.get("state") == "on") if tristate else r.get("selected")
                         boxc = f"{Fore.GREEN}{box}{Style.RESET_ALL}" if on_ else box
                         line = f"    {boxc} {text}{tag}"
                 vis.append(_with_scrollbar(line, cols, pos - start, sbr))
+                for sub in (r.get("sub") or []):
+                    sp = strip_ansi(sub)
+                    vis.append("        " + (sub if len(sp) <= maxw - 8
+                                             else trunc(sp, maxw - 8)))
             rest = len(order) - (start + len(window))
             if rest > 0:
                 vis.append(f"  {Fore.CYAN}▼ ({rest} below){Style.RESET_ALL}")
@@ -965,6 +1031,33 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
                 scope_idx = (scope_idx + (1 if key == ("char", "]") else -1)) % len(scopes)
                 order = visible_order()
                 sel_pos = 0
+            elif key == ("char", "e") and edit_cb is not None:
+                if order:
+                    try:
+                        edit_cb(rows[order[sel_pos]])
+                    except Exception as ex:
+                        log_warn(f"Failed: {ex}")
+                    order = visible_order()
+                    sel_pos = min(sel_pos, max(0, len(order) - 1))
+                    first = True
+            elif key == "f9" and f9_cb is not None:
+                checked = [r for r in rows if (r.get("state") == "on") if tristate] \
+                          if tristate else [r for r in rows if r.get("selected")]
+                try:
+                    f9_cb(checked)
+                except Exception as ex:
+                    log_warn(f"Failed: {ex}")
+                order = visible_order()
+                sel_pos = min(sel_pos, max(0, len(order) - 1))
+                first = True          # the progress screen overwrote everything
+            elif key == ("char", "m") and action_cb is not None:
+                try:
+                    action_cb()
+                except Exception as ex:
+                    log_warn(f"Failed: {ex}")
+                order = visible_order()
+                sel_pos = min(sel_pos, max(0, len(order) - 1))
+                first = True          # the action drew over the screen
             elif key == ("char", "l") and scope_picker is not None:
                 picked_scope = scope_picker()
                 if picked_scope is not None:
@@ -1415,7 +1508,8 @@ class PlexClient:
 
     def sections(self):
         j = self.get_json("/library/sections")
-        return [{"key": d.get("key"), "title": d.get("title"), "type": d.get("type")}
+        return [{"key": d.get("key"), "title": d.get("title"), "type": d.get("type"),
+                 "language": d.get("language"), "agent": d.get("agent")}
                 for d in j.get("MediaContainer", {}).get("Directory", [])]
 
     def items_in_section(self, section_key, sec_type, query=None):
@@ -1466,9 +1560,11 @@ class PlexClient:
         j = self.get_json(f"/library/metadata/{show_key}/allLeaves")
         return j.get("MediaContainer", {}).get("Metadata", [])
 
-    def refresh_section(self, section_key):
-        """Trigger 'Scan Library Files' on the library (GET .../refresh)."""
-        st, _ = http_raw("GET", self._url(f"/library/sections/{section_key}/refresh"),
+    def refresh_section(self, section_key, force=False):
+        """'Scan Library Files' on the library (GET .../refresh). force=True is the
+        heavy 'Refresh All Metadata' - it re-downloads metadata for every item."""
+        params = {"force": 1} if force else None
+        st, _ = http_raw("GET", self._url(f"/library/sections/{section_key}/refresh", params),
                          headers=self._headers(), verify=self.verify, timeout=self.timeout)
         if st >= 400:
             raise RuntimeError(f"HTTP {st}")
@@ -1489,6 +1585,92 @@ class PlexClient:
         if st >= 400:
             raise RuntimeError(f"HTTP {st}")
         return st
+
+    def item_prefs(self, rating_key):
+        """Per-item advanced settings (GET /library/metadata/{id}/prefs) as
+        {id: value}. 'languageOverride' is the item's Metadata language; an empty
+        value means 'Library default'."""
+        try:
+            j = self.get_json(f"/library/metadata/{rating_key}/prefs")
+        except Exception:
+            return {}
+        out = {}
+        for s in j.get("MediaContainer", {}).get("Setting", []) or []:
+            if s.get("id") is not None:
+                out[s["id"]] = s.get("value")
+        return out
+
+    def activities(self):
+        """Background jobs the server is running (GET /activities) - used to show
+        the progress of a library refresh."""
+        try:
+            j = self.get_json("/activities")
+        except Exception:
+            return []
+        return j.get("MediaContainer", {}).get("Activity", []) or []
+
+    def matches(self, rating_key, language=None, manual=1):
+        """Agent search results for an item (GET /library/metadata/{id}/matches).
+        Returns [{'name','guid','year','score'}]. With language='en' the names come
+        back in English - used to look up an English title without re-matching."""
+        params = {"manual": manual}
+        if language:
+            params["language"] = language
+        st, text = http_raw("GET", self._url(f"/library/metadata/{rating_key}/matches", params),
+                            headers={"X-Plex-Token": self.token,
+                                     "X-Plex-Client-Identifier": self.client_id},
+                            verify=self.verify, timeout=self.timeout)
+        if st >= 400:
+            raise RuntimeError(f"HTTP {st}")
+        try:
+            root = ET.fromstring(text)
+        except Exception:
+            return []
+        out = []
+        for el in root.iter("SearchResult"):
+            out.append({"name": el.get("name"), "guid": el.get("guid"),
+                        "year": el.get("year"),
+                        "score": int(el.get("score") or 0)})
+        return out
+
+    def fix_match(self, rating_key, guid, name):
+        """Re-match an item to a specific entry (PUT /library/metadata/{id}/match).
+        Passing the item's CURRENT guid keeps the same identity - it only makes the
+        agent re-pull the metadata for that entry."""
+        return self.put(f"/library/metadata/{rating_key}/match",
+                        {"guid": guid, "name": name})
+
+    def set_prefs(self, rating_key, **prefs):
+        """Per-item advanced settings (PUT /library/metadata/{id}/prefs?key=value).
+        languageOverride='en' makes the agent deliver English metadata for THIS item."""
+        return self.put(f"/library/metadata/{rating_key}/prefs", prefs)
+
+    def refresh_item(self, rating_key, force=False):
+        """Re-pull metadata for one item (PUT /library/metadata/{id}/refresh).
+        No re-match: the item keeps its guid, so watched state, resume positions and
+        the media files (and their default track choices) are not affected."""
+        params = {"force": 1} if force else {}
+        return self.put(f"/library/metadata/{rating_key}/refresh", params)
+
+    def unlock_field(self, section_key, sec_type, rating_key, field="title"):
+        """Unlock a metadata field so a refresh may update it again."""
+        return self.put(f"/library/sections/{section_key}/all",
+                        {"type": SECTION_TYPE_NUM.get(sec_type, 2),
+                         "id": str(rating_key), f"{field}.locked": 0})
+
+    def set_title(self, section_key, sec_type, rating_key, title, sort_title=None,
+                  lock=True):
+        """Change the title (and optionally the sort title) of an item and lock the
+        fields so an agent refresh won't overwrite them. Nothing else (streams,
+        watched state, artwork) is touched."""
+        params = {"type": SECTION_TYPE_NUM.get(sec_type, 2),
+                  "id": str(rating_key),
+                  "title.value": title,
+                  "title.locked": 1 if lock else 0}
+        if sort_title is not None:
+            params["titleSort.value"] = sort_title
+            params["titleSort.locked"] = 1 if lock else 0
+        return self.put(f"/library/sections/{section_key}/all", params)
 
     def section_labels(self, section_key):
         """All label names that exist in a library."""
@@ -2748,6 +2930,135 @@ def mark_watched_flow(client, args):
 # ---------------------------------------------------------------------------
 # Labels flow (custom labels on shows/movies)
 # ---------------------------------------------------------------------------
+def _progress_bar(pct, width=40):
+    filled = max(0, min(width, round(width * pct / 100)))
+    return "[" + "#" * filled + "-" * (width - filled) + f"] {pct:3d}%"
+
+
+def refresh_all_metadata(client, section, wait=True):
+    """Start 'Refresh All Metadata' on a library and follow it via /activities.
+    Esc stops watching - the server keeps working. Returns a status line."""
+    title = section.get("title", "?")
+    try:
+        client.refresh_section(section["key"], force=True)
+    except Exception as ex:
+        return f"{Fore.RED}Refresh All Metadata failed: {ex}{Style.RESET_ALL}"
+    if not wait or not _tui_supported():
+        return (f"{Fore.GREEN}» Refresh All Metadata started on '{title}'."
+                f"{Style.RESET_ALL}")
+
+    clear_screen()
+    log_info(f"Refresh All Metadata running on '{Fore.CYAN}{title}{Style.RESET_ALL}'.")
+    print(f"{Style.DIM}Plex re-downloads metadata for every item. Esc stops watching "
+          f"(the server keeps going).{Style.RESET_ALL}")
+    print()
+    started = time.monotonic()
+    seen = False
+    aborted = False
+    with _RawMode():
+        while True:
+            acts = [a for a in client.activities()
+                    if "library" in str(a.get("type", "")).lower()
+                    or "refresh" in str(a.get("type", "")).lower()]
+            if acts:
+                seen = True
+                pct = max(int(a.get("progress") or 0) for a in acts)
+                sub = (acts[0].get("subtitle") or acts[0].get("title") or "")[:60]
+                sys.stdout.write(f"\r  {Fore.CYAN}{_progress_bar(pct)}{Style.RESET_ALL}  "
+                                 f"{sub}\x1b[K")
+                sys.stdout.flush()
+            elif seen:
+                break                       # activity finished
+            elif time.monotonic() - started > 25:
+                break                       # nothing ever showed up - server was quick
+            else:
+                sys.stdout.write(f"\r  {Fore.CYAN}{_progress_bar(0)}{Style.RESET_ALL}  "
+                                 f"waiting for the server…\x1b[K")
+                sys.stdout.flush()
+            if time.monotonic() - started > 3600:
+                break
+            if _read_key(1.0) == "esc":     # poll once a second, Esc aborts watching
+                aborted = True
+                break
+    print()
+    if aborted:
+        return (f"{Fore.YELLOW}» Still refreshing '{title}' in the background."
+                f"{Style.RESET_ALL}")
+    print(f"  {Fore.GREEN}{_progress_bar(100)}{Style.RESET_ALL}")
+    return f"{Fore.GREEN}» Refresh All Metadata finished on '{title}'.{Style.RESET_ALL}"
+
+
+def lang_name_from_code(code):
+    """'en' -> 'English'. Falls back to the raw code (also handles 'en-US')."""
+    if not code:
+        return None
+    code = str(code)
+    for c, name in PLEX_LANGS:
+        if c.lower() == code.lower():
+            return name
+    base = code.split("-")[0].lower()
+    for c, name in PLEX_LANGS:
+        if c.lower() == base:
+            return name
+    return code
+
+
+def library_language(client, section):
+    """The library's own metadata language ('en'). Falls back to the section prefs
+    when the section listing doesn't carry it."""
+    code = section.get("language")
+    if code:
+        return code
+    try:
+        j = client.get_json(f"/library/sections/{section['key']}/prefs")
+        for s in j.get("MediaContainer", {}).get("Setting", []) or []:
+            if s.get("id") in ("languageOverride", "language"):
+                if s.get("value"):
+                    return s["value"]
+    except Exception:
+        pass
+    return None
+
+
+def read_metadata_languages(client, rows, section):
+    """Ask the server for each item's real Metadata language (languageOverride).
+    Empty means 'Library default', so the library's own language is used. Updates
+    rows in place (lang / certain) and shows progress. Esc aborts."""
+    lib_code = library_language(client, section)
+    lib_name = lang_name_from_code(lib_code) or "library default"
+    total = len(rows)
+    clear_screen()
+    log_info(f"Reading the real Metadata language of {total} item(s) from the server.")
+    print(f"{Style.DIM}Library default for '{section.get('title','?')}' is "
+          f"{lib_name}. Esc stops - already read items keep their value."
+          f"{Style.RESET_ALL}")
+    print()
+    aborted = False
+    with _RawMode():
+        for i, r in enumerate(rows, 1):
+            prefs = client.item_prefs(r["rk"])
+            code = (prefs.get("languageOverride") or "").strip()
+            if code:
+                r["lang"] = lang_name_from_code(code)
+                r["src"] = "item"
+            else:
+                r["lang"] = lib_name
+                r["src"] = "library default"
+            r["certain"] = True
+            if i % 2 == 0 or i == total:
+                pct = i * 100 // total
+                sys.stdout.write(f"\r  {Fore.CYAN}{_progress_bar(pct)}{Style.RESET_ALL}  "
+                                 f"({i}/{total})  {r['title'][:40]}\x1b[K")
+                sys.stdout.flush()
+            if _read_key(0) == "esc":
+                aborted = True
+                break
+    print()
+    if aborted:
+        log_warn("Stopped - the rest keeps the guess from the title text.")
+    return not aborted
+
+
 def _pick_library(client, default=0):
     """Pick a video library. Returns (section, index, single) where `single` means
     there was nothing to choose from (so Esc one level up should leave the tool)."""
@@ -2767,7 +3078,9 @@ def _pick_library(client, default=0):
 
     labels = [f"{s['title']}  [{s['type']}]" for s in vid]
     i = interactive_menu("Select a library:", labels, default=default,
-                         allow_cancel=True, refresh_cb=scan_lib)
+                         allow_cancel=True, refresh_cb=scan_lib,
+                         refresh_all_cb=(lambda idx: refresh_all_metadata(client, vid[idx])
+                                         if idx is not None else None))
     if i is None:
         return None, default, False
     return vid[i], i, False
@@ -3131,6 +3444,852 @@ def _labels_editor(client, sec, picked, args):
 
 
 # ---------------------------------------------------------------------------
+# Titles flow (find non-English titles, switch them to the English one)
+# ---------------------------------------------------------------------------
+_SCRIPT_RANGES = [
+    ("Hangul (Korean)", ((0x1100, 0x11FF), (0x3130, 0x318F), (0xA960, 0xA97F),
+                         (0xAC00, 0xD7AF))),
+    ("Kana (Japanese)", ((0x3040, 0x30FF), (0x31F0, 0x31FF))),
+    ("Han (Chinese/Japanese)", ((0x3400, 0x4DBF), (0x4E00, 0x9FFF), (0xF900, 0xFAFF))),
+    ("Cyrillic", ((0x0400, 0x04FF), (0x0500, 0x052F))),
+    ("Greek", ((0x0370, 0x03FF),)),
+    ("Arabic", ((0x0600, 0x06FF), (0x0750, 0x077F))),
+    ("Hebrew", ((0x0590, 0x05FF),)),
+    ("Thai", ((0x0E00, 0x0E7F),)),
+    ("Devanagari", ((0x0900, 0x097F),)),
+]
+
+
+# Letters that give a Latin-script language away. Lowercase only and strictly
+# non-ASCII - 'İ'.lower() contains a plain 'i', which would match almost anything.
+_LANG_CHARS = [
+    ("Czech", "ěřů"),
+    ("Polish", "ąćęłńśźż"),
+    ("Slovak", "ľĺŕô"),
+    ("Hungarian", "őű"),
+    ("Romanian", "ăîșț"),
+    ("Turkish", "ğı"),
+    ("Spanish", "ñ¿¡"),
+    ("Portuguese", "ãõ"),
+    ("German", "ß"),
+    ("Nordic", "åæø"),
+    ("French", "œ"),
+]
+# Weaker, shared signals - a family rather than one language.
+_LANG_CHARS_SHARED = [
+    ("Czech/Slovak", "žščďťň"),
+    ("German", "äöü"),
+    ("French/Romance", "çèêëàùû"),
+]
+# Function words that give a language away even without diacritics.
+_LANG_WORDS = {
+    "Czech": {"a", "o", "u", "v", "ve", "na", "do", "po", "za", "se", "si", "je",
+              "jsou", "byl", "byla", "bylo", "byly", "neni", "nebylo", "to", "ta", "ten",
+              "ty", "jak", "kdy", "kde", "ze", "ale", "nebo", "az", "ano", "ne",
+              "muj", "moje", "nas", "nase", "jeho", "jeji", "jedna", "jedno", "jednou",
+              "vsechno", "vsema", "mezi", "bez", "pro", "pres", "tak", "jen", "jeste",
+              "uz", "kdyz", "aby", "laska", "lasky", "srdce", "zivot", "svatba", "sny",
+              "svet", "svetlo", "pripad", "muz", "zena", "divka", "kluk", "skola",
+              "mesto", "mestecko", "domu", "beru", "peklo", "polibek", "hmota", "duse"},
+    "Slovak": {"sa", "ako", "ked", "aby", "alebo", "velmi", "zivot", "laska", "svet",
+               "dievca"},
+    "English": {"the", "an", "of", "and", "or", "in", "on", "at", "to", "for",
+                "with", "my", "your", "his", "her", "our", "their", "is", "are", "was",
+                "were", "be", "you", "we", "they", "it", "this", "that", "from", "by",
+                "about", "love", "story", "man", "woman", "girl", "boy", "life",
+                "world", "house", "night", "day", "who", "what", "when", "where",
+                "why", "how", "up", "out", "down", "into", "over", "under", "again"},
+    "German": {"der", "die", "das", "und", "ein", "eine", "ist", "mit", "von", "fur",
+               "nicht", "auf", "aus", "dem", "den", "im", "zu"},
+    "French": {"le", "les", "un", "une", "des", "et", "du", "au", "aux", "la", "de",
+               "pour", "dans", "avec", "sur", "est", "qui", "que", "mon", "ma"},
+    "Spanish": {"el", "los", "las", "una", "y", "del", "que", "en", "la", "de", "casa",
+                "por", "para", "con", "es", "mi", "su", "amor", "vida"},
+    "Italian": {"il", "lo", "gli", "una", "di", "del", "che", "per", "con",
+                "non", "sono", "amore", "vita"},
+}
+_LANG_WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
+
+def _deaccent(s):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFKD", s)
+                   if not unicodedata.combining(c))
+
+
+def title_language(text):
+    """Best guess at the language of a title. Non-Latin scripts are decided by the
+    writing system (reliable); Latin-script languages are guessed from distinctive
+    letters and common function words, so treat them as a hint, not a verdict."""
+    text = (text or "").strip()
+    if not text:
+        return "unknown"
+    script = title_script(text)
+    if script.startswith("Hangul"):
+        return "Korean"
+    if script.startswith("Kana"):
+        return "Japanese"
+    if script.startswith("Han"):
+        return "Chinese/Japanese"
+    if script in ("Cyrillic", "Greek", "Arabic", "Hebrew", "Thai", "Devanagari"):
+        return script
+    low = text.lower()
+    for lang, chars in _LANG_CHARS:
+        if any(c in low for c in chars):
+            return lang
+    for lang, chars in _LANG_CHARS_SHARED:
+        if any(c in low for c in chars):
+            return lang
+    words = {w.lower() for w in _LANG_WORD_RE.findall(_deaccent(text))}
+    if words:
+        hits = {lang: len(words & ws) for lang, ws in _LANG_WORDS.items()}
+        best = max(hits, key=lambda k: hits[k])
+        # one shared little word ("del" in "Hotel Del Luna") proves nothing - ask for two
+        if hits[best] >= 2:
+            rivals = sorted(k for k, v in hits.items() if v == hits[best])
+            if len(rivals) > 1 and "English" in rivals:
+                rivals.remove("English")   # a tie with English is not English enough
+            return rivals[0] + "?"         # word-based guess: flagged as uncertain
+    return ("unknown (has accents)" if script == "Latin (accented)" else "unknown")
+
+
+def title_script(text):
+    """Which writing system a title uses: a script name, 'Latin (accented)' for
+    things like Czech/French, or 'Latin' for plain ASCII."""
+    text = text or ""
+    for name, ranges in _SCRIPT_RANGES:
+        for ch in text:
+            o = ord(ch)
+            if any(lo <= o <= hi for lo, hi in ranges):
+                return name
+    return "Latin" if all(ord(c) < 128 for c in text) else "Latin (accented)"
+
+
+def _lang_candidate(client, rating_key, current, guid=None, lang="en"):
+    """Name the Plex agent has for THIS item in `lang`. Prefers the candidate whose
+    guid equals the item's current guid, i.e. the very same match - no re-matching
+    happens, only the title text is read. Returns
+    {'name','score','exact'} or None; exact=False means the guid did not line up,
+    so the name may belong to a different entry and needs a human check."""
+    try:
+        cands = client.matches(rating_key, language=lang)
+    except Exception:
+        return None
+    same, best = None, None
+    for c in cands:
+        name = (c.get("name") or "").strip()
+        if not name or name == current:
+            continue
+        if guid and c.get("guid") == guid:
+            same = {"name": name, "score": c["score"], "exact": True}
+            break
+        if best is None or c["score"] > best["score"]:
+            best = {"name": name, "score": c["score"], "exact": False}
+    return same or best
+
+
+def titles_flow(client, args):
+    """Find items whose title isn't in English and switch the title to the English
+    one the Plex agent knows. Only the title field is written (and locked) - streams,
+    watched state, subtitles and artwork are untouched. Returns True if changed."""
+    tgt = pick_target_language()
+    if tgt is None:
+        return False
+    lang_code, lang_name = tgt
+    lib_idx = 0
+    item_cursor = [0]
+    item_view = {}
+    lang_read_done = [False]
+    while True:
+        lang_read_done[0] = False
+        sec, lib_idx, single_lib = _pick_library(client, default=lib_idx)
+        if sec is None:
+            return False
+        items = client.items_in_section(sec["key"], sec["type"])
+        if not items:
+            log_warn("The library is empty.")
+            if single_lib:
+                return False
+            continue
+        items.sort(key=lambda x: (x["title"] or "").lower())
+        rows = []
+        for it in items:
+            rows.append({"rk": it["ratingKey"], "title": it["title"],
+                         "lang": title_language(it["title"]), "certain": False,
+                         "src": "guessed from the title",
+                         "guid": it.get("guid"), "selected": False, "label": ""})
+
+        # the reliable source: each item's Metadata language (Library default -> the
+        # library's own language). Costs one request per item, so it is offered, not forced.
+        if not lang_read_done[0]:
+            ans = ask_yes_back(f"Read the real Metadata language of {len(rows)} item(s) "
+                               f"from the server? (accurate, but one request per item)",
+                               default=len(rows) <= 400)
+            if ans:
+                read_metadata_languages(client, rows, sec)
+            lang_read_done[0] = True
+
+        def relabel():
+            """Title stays in the label; the language and lock notes go to r['tag'],
+            which the menu prints in its own aligned column."""
+            lang_txt, lock_txt = {}, {}
+            for r in rows:
+                hit = _is_target_lang(r["lang"], lang_name)
+                mark = "" if (r.get("certain") or str(r["lang"]).startswith("unknown")) else "?"
+                lang_txt[id(r)] = "" if hit else f"[{r['lang']}{mark}]"
+                if sort_title_differs(r["title"], r.get("sort")):
+                    lock_txt[id(r)] = f"[sort: {r['sort']}]"
+                if r.get("locked"):
+                    order_pref = ["title", "titleSort", "originalTitle", "summary"]
+                    names = ([f for f in order_pref if f in r["locked"]]
+                             + sorted(f for f in r["locked"] if f not in order_pref))
+                    shown = [lock_field_label(f) for f in names[:4]]
+                    more = f" +{len(names) - 4}" if len(names) > 4 else ""
+                    lock_txt[id(r)] = (lock_txt.get(id(r), "") + " " if lock_txt.get(id(r)) else "") \
+                                      + f"[locked: {', '.join(shown)}{more}]"
+                else:
+                    lock_txt.setdefault(id(r), "")
+            lw = max([len(v) for v in lang_txt.values()] or [0])
+            for r in rows:
+                lt, kt = lang_txt[id(r)], lock_txt[id(r)]
+                pad = " " * (lw - len(lt) + (2 if lw else 0))
+                tag = ""
+                if lt:
+                    tag += f"{Style.DIM}{lt}{Style.RESET_ALL}"
+                if kt:
+                    tag += f"{pad}{Fore.YELLOW}{kt}{Style.RESET_ALL}"
+                elif lt:
+                    tag = f"{Style.DIM}{lt}{Style.RESET_ALL}"
+                r["label"] = r["title"]
+                r["tag"] = tag
+        relabel()
+
+        def do_reread():
+            read_metadata_languages(client, rows, sec)
+            relabel()
+        guid_n = {}
+        for r in rows:
+            if r.get("guid"):
+                guid_n[r["guid"]] = guid_n.get(r["guid"], 0) + 1
+        for r in rows:
+            if r.get("guid") and guid_n.get(r["guid"], 0) > 1:
+                r["dup"] = True          # manual split: several items share one match
+                r["label"] += f"   {Fore.YELLOW}[split]{Style.RESET_ALL}"
+        counts = {}
+        for r in rows:
+            counts[r["lang"]] = counts.get(r["lang"], 0) + 1
+
+        def pick_lang_scope():
+            order_names = sorted(counts, key=lambda s: (-counts[s], s))
+            names = [f"{s}   ({counts[s]})" for s in order_names]
+            names.append(f"{Style.DIM}(everything that isn't {lang_name}){Style.RESET_ALL}")
+            names.append(f"{Fore.CYAN}» Re-read the Metadata language from the server"
+                         f"{Style.RESET_ALL}")
+            names.append(f"{Fore.YELLOW}» Items with a LOCKED title or sort title"
+                         f"{Style.RESET_ALL}")
+            names.append(f"{Fore.YELLOW}» Items with a LOCKED title{Style.RESET_ALL}")
+            names.append(f"{Fore.YELLOW}» Items with a LOCKED sort title{Style.RESET_ALL}")
+            names.append(f"{Fore.YELLOW}» Items with ANY locked field{Style.RESET_ALL}")
+            names.append(f"{Fore.YELLOW}» Items where title and sort title differ"
+                         f"{Style.RESET_ALL}")
+            i = interactive_menu("Show only titles detected as:", names, allow_cancel=True)
+            if i is None:
+                return None
+            if i >= len(order_names) + 2:
+                if any(r.get("locked") is None for r in rows):
+                    read_locked_fields(client, rows)
+                    relabel()
+                which = i - (len(order_names) + 2)   # 0 = title|sort, 1 = title, 2 = sort, 3 = any
+                if which == 0:
+                    want, tag = {"title", "titleSort"}, "locked title or sort title"
+                elif which == 1:
+                    want, tag = {"title"}, "locked title"
+                elif which == 2:
+                    want, tag = {"titleSort"}, "locked sort title"
+                elif which == 3:
+                    want, tag = None, "any locked field"
+                else:
+                    rks = {str(r["rk"]) for r in rows
+                           if sort_title_differs(r["title"], r.get("sort"))}
+                    if not rks:
+                        log_warn("Every item's sort title matches its title.")
+                        return None
+                    return ("title != sort title", rks)
+                rks = {str(r["rk"]) for r in rows
+                       if (r.get("locked") or set()) and
+                          (want is None or (r["locked"] & want))}
+                if not rks:
+                    log_warn(f"No item matches '{tag}'.")
+                    return None
+                return (tag, rks)
+            if i == len(order_names) + 1:
+                read_metadata_languages(client, rows, sec)
+                relabel()
+                return ("re-read", {str(r["rk"]) for r in rows})   # keeps every row visible
+            if i == len(order_names):
+                return (f"not {lang_name}", {str(r["rk"]) for r in rows
+                                             if not _is_target_lang(r["lang"], lang_name)})
+            s = order_names[i]
+            return (s, {str(r["rk"]) for r in rows if r["lang"] == s})
+
+        foreign = sum(1 for r in rows if not _is_target_lang(r["lang"], lang_name))
+        header = [
+            f"{Fore.CYAN}Library:{Style.RESET_ALL} {sec['title']}   ({len(rows)} items, "
+            f"{Fore.YELLOW}{foreign}{Style.RESET_ALL} don't look like {lang_name}) "
+            f"  {Fore.GREEN}target: {lang_name} [{lang_code}]{Style.RESET_ALL}",
+            f"{Style.DIM}l = filter by detected language · / = search · +/- = check/uncheck "
+            f"by pattern · a = all shown{Style.RESET_ALL}",
+            f"{Style.DIM}m = re-read the Metadata language · F9 = refresh metadata of "
+            f"the checked items · a trailing '?' means the language was only guessed."
+            f"{Style.RESET_ALL}",
+            "",
+        ]
+        while True:
+            res = checkbox_menu(f"Select items whose title should become {lang_name}:", rows,
+                                header=header, start_pos=item_cursor[0], pos_out=item_cursor,
+                                ui_state=item_view, scope_picker=pick_lang_scope,
+                                action_cb=do_reread,
+                                f9_cb=lambda checked: refresh_items(client, checked))
+            if res is None:
+                if single_lib:
+                    return False
+                break
+            picked = [r for r in rows if r["selected"]]
+            if not picked:
+                log_info("Nothing selected.")
+                continue
+            clear_screen()
+            log_info(f"{len(picked)} item(s) selected. How should the {lang_name} "
+                     f"title be applied?")
+            print()
+            print(f"  {Fore.CYAN}1){Style.RESET_ALL} Rewrite just the title text — the "
+                  f"item keeps everything else exactly as it is.")
+            print(f"  {Fore.CYAN}2){Style.RESET_ALL} Set the item's metadata language to "
+                  f"{lang_name} and refresh — also fixes episode titles and summary.")
+            print(f"  {Fore.CYAN}3){Style.RESET_ALL} Fix Match to the item's own entry "
+                  f"(same guid) in {lang_name} — the heavy hammer.")
+            print(f"     {Style.DIM}Items with a locked title or a manual split are "
+                  f"skipped by options 2 and 3 unless you insist.{Style.RESET_ALL}")
+            print(f"     {Style.DIM}No re-match happens either way: the guid stays, so "
+                  f"watched state, resume positions and the default audio/subtitle "
+                  f"tracks are not touched.{Style.RESET_ALL}")
+            print(f"     {Style.DIM}Option 2 does re-download artwork and summary from "
+                  f"the agent (in English).{Style.RESET_ALL}")
+            print()
+            how = interactive_menu("Method:", [
+                "Rewrite the title only (surgical)",
+                f"Set metadata language to {lang_name} + refresh (full localisation)",
+                f"Fix Match to the same entry in {lang_name} (re-match)",
+            ], allow_cancel=True)
+            if how is None:
+                continue
+            done = (_titles_apply(client, sec, picked, args, lang_code, lang_name) if how == 0
+                    else _titles_relanguage(client, sec, picked, args, lang_code, lang_name) if how == 1
+                    else _titles_fixmatch(client, sec, picked, args, lang_code, lang_name))
+            if done:
+                return True
+
+
+# Metadata languages Plex agents can deliver (ISO 639-1 codes).
+PLEX_LANGS = [
+    ("en", "English"), ("cs", "Czech"),          # kept first on purpose
+    ("ar", "Arabic"), ("bg", "Bulgarian"), ("ca", "Catalan"), ("zh", "Chinese"),
+    ("hr", "Croatian"), ("da", "Danish"), ("nl", "Dutch"), ("et", "Estonian"),
+    ("fi", "Finnish"), ("fr", "French"), ("de", "German"), ("el", "Greek"),
+    ("he", "Hebrew"), ("hi", "Hindi"), ("hu", "Hungarian"), ("id", "Indonesian"),
+    ("it", "Italian"), ("ja", "Japanese"), ("ko", "Korean"), ("lv", "Latvian"),
+    ("lt", "Lithuanian"), ("ms", "Malay"), ("nb", "Norwegian"), ("fa", "Persian"),
+    ("pl", "Polish"), ("pt", "Portuguese"), ("pt-BR", "Portuguese (Brazil)"),
+    ("ro", "Romanian"), ("ru", "Russian"), ("sr", "Serbian"), ("sk", "Slovak"),
+    ("sl", "Slovenian"), ("es", "Spanish"), ("es-MX", "Spanish (Mexico)"),
+    ("sv", "Swedish"), ("th", "Thai"), ("tr", "Turkish"), ("uk", "Ukrainian"),
+    ("vi", "Vietnamese"),
+]
+
+
+def pick_target_language(default_code="en"):
+    """Choose the language titles should end up in. English and Czech are on top,
+    everything else alphabetical; type to search. Returns (code, name) or None."""
+    head = [l for l in PLEX_LANGS[:2]]
+    rest = sorted(PLEX_LANGS[2:], key=lambda l: l[1].lower())
+    langs = head + rest
+    labels = [f"{name}   {Style.DIM}[{code}]{Style.RESET_ALL}" for code, name in langs]
+    default = next((i for i, (c, _) in enumerate(langs) if c == default_code), 0)
+    i = interactive_menu("Target language for the titles:", labels,
+                         default=default, allow_cancel=True)
+    return None if i is None else langs[i]
+
+
+def _is_target_lang(detected, target_name):
+    """Does a detected language line up with the chosen target?"""
+    d = (detected or "").rstrip("?")
+    if d == "library default":
+        return True          # the library decides and we could not read which language
+    if target_name == "English":
+        return d in ("English", "unknown")
+    return d == target_name or d.startswith(target_name + "/") or d.endswith("/" + target_name)
+
+
+def refresh_items(client, rows):
+    """Refresh metadata of the given items (PUT /library/metadata/{id}/refresh).
+    No re-match, no unlocking: the item keeps its guid, its locked fields and its
+    watched state - Plex just re-pulls the agent data. Esc stops early."""
+    if not rows:
+        log_warn("Nothing is checked - check the items first.")
+        _pause_to_menu()
+        return
+    total = len(rows)
+    clear_screen()
+    log_info(f"Refreshing metadata of {total} checked item(s).")
+    print(f"{Style.DIM}Locked fields stay as they are; watched state and files are "
+          f"untouched. Esc stops.{Style.RESET_ALL}")
+    print()
+    ok = fail = 0
+    with _RawMode():
+        for i, r in enumerate(rows, 1):
+            try:
+                client.refresh_item(r["rk"])
+                ok += 1
+            except Exception:
+                fail += 1
+            pct = i * 100 // total
+            sys.stdout.write(f"\r  {Fore.CYAN}{_progress_bar(pct)}{Style.RESET_ALL}  "
+                             f"({i}/{total})  {str(r.get('title', ''))[:40]}\x1b[K")
+            sys.stdout.flush()
+            if _read_key(0) == "esc":
+                break
+    print()
+    color = Fore.GREEN if not fail else Fore.YELLOW
+    print(f"{color}Done: {ok} item(s) queued for refresh"
+          + (f", {fail} failed" if fail else "") + f".{Style.RESET_ALL}")
+    log_info("Plex works through them in the background.")
+    _pause_to_menu()
+
+
+def read_locked_fields(client, rows):
+    """Which metadata fields are locked on each item (batched, so it is cheap).
+    Sets r['locked'] to a set like {'title', 'titleSort'}."""
+    total = len(rows)
+    clear_screen()
+    log_info(f"Reading locked fields of {total} item(s)…")
+    done = 0
+    step = 40
+    for i in range(0, total, step):
+        chunk = rows[i:i + step]
+        try:
+            md_map = client.get_metadata_many([r["rk"] for r in chunk])
+        except Exception:
+            md_map = {}
+        for r in chunk:
+            md = md_map.get(str(r["rk"])) or {}
+            r["locked"] = _locked_fields(md)
+            r["sort"] = md.get("titleSort") or ""
+        done += len(chunk)
+        pct = done * 100 // total
+        sys.stdout.write(f"\r  {Fore.CYAN}{_progress_bar(pct)}{Style.RESET_ALL} "
+                         f"({done}/{total})\x1b[K")
+        sys.stdout.flush()
+    print()
+    return True
+
+
+# Human-readable names for the metadata fields Plex can lock.
+LOCK_FIELD_NAMES = {
+    "title": "title", "titleSort": "sort title", "originalTitle": "original title",
+    "summary": "summary", "tagline": "tagline", "studio": "studio",
+    "contentRating": "content rating", "originallyAvailableAt": "release date",
+    "year": "year", "rating": "rating", "audienceRating": "audience rating",
+    "thumb": "poster", "art": "background", "banner": "banner", "theme": "theme",
+    "genre": "genres", "collection": "collections", "label": "labels",
+    "director": "directors", "writer": "writers", "producer": "producers",
+    "country": "countries", "similar": "similar", "editionTitle": "edition",
+}
+
+
+def lock_field_label(name):
+    return LOCK_FIELD_NAMES.get(name, name)
+
+
+_SUFFIX_RE = re.compile(r"\s+[-\u2013\u2014]\s+([^-\u2013\u2014]{1,24})$")
+
+
+def title_suffix(title):
+    """A manual marker at the end of a title, e.g. ' - Viki' in
+    'Vlastní (ne)cestou - Viki'. Returns '' when there is none."""
+    m = _SUFFIX_RE.search(title or "")
+    return f" - {m.group(1).strip()}" if m else ""
+
+
+def sort_title_differs(title, sort):
+    """True when the sort title is really something else. Plex drops a leading
+    article ('The Wire' -> 'Wire') on its own, which is normal and not a mismatch."""
+    if not sort:
+        return False
+    t, s = (title or "").strip(), sort.strip()
+    if t == s:
+        return False
+    low = t.lower()
+    for art in ("the ", "a ", "an "):
+        if low.startswith(art) and t[len(art):].strip() == s:
+            return False
+    return True
+
+
+def _locked_fields(md):
+    """Field names an item has locked (Plex returns <Field name=.. locked=1/>)."""
+    out = set()
+    for f in (md or {}).get("Field", []) or []:
+        if f.get("locked") in (1, True, "1", "true") and f.get("name"):
+            out.add(f["name"])
+    return out
+
+
+def _protected_items(client, picked):
+    """Items that must not be touched blindly:
+      - a locked title (somebody named it by hand, e.g. '… - Viki')
+      - the guid is shared with another item in the library (a manual SPLIT, where
+        each part points at a different folder/version of the same show)
+    Returns {ratingKey: [reasons]}."""
+    reasons = {}
+    try:
+        md_map = client.get_metadata_many([r["rk"] for r in picked])
+    except Exception:
+        md_map = {}
+    for r in picked:
+        why = []
+        if "title" in _locked_fields(md_map.get(str(r["rk"]))):
+            why.append("title is locked")
+        if r.get("dup"):
+            why.append("split/duplicate entry (shares its match with another item)")
+        if why:
+            reasons[str(r["rk"])] = why
+    return reasons
+
+
+def _drop_protected(client, picked, what, args):
+    """Filter out protected items. Returns the safe list (possibly everything, if the
+    user knowingly opts in)."""
+    prot = _protected_items(client, picked)
+    if not prot:
+        return picked
+    clear_screen()
+    log_warn(f"{len(prot)} of the {len(picked)} selected item(s) look risky for {what}:")
+    for r in picked:
+        why = prot.get(str(r["rk"]))
+        if why:
+            print(f"    {r['title']}   {Style.DIM}- {'; '.join(why)}{Style.RESET_ALL}")
+    print()
+    log_info("A locked title is usually a name you gave the item on purpose, and a "
+             "split entry is a second copy that must keep its own identity. Changing "
+             "those can undo a manual split or wipe your custom name.")
+    print()
+    safe = [r for r in picked if str(r["rk"]) not in prot]
+    if not args.yes:
+        inc = ask_yes_back(f"Skip these {len(prot)} and continue with the other "
+                           f"{len(safe)}?", default=True)
+        if inc is None:
+            return []
+        if not inc:
+            inc2 = ask_yes_back("Include the risky ones anyway (not recommended)?",
+                                default=False)
+            if inc2:
+                return picked
+            return []
+    if not safe:
+        log_info("Nothing safe is left to change.")
+        _pause_to_menu()
+    return safe
+
+
+def _titles_fixmatch(client, sec, picked, args, lang="en", lang_name="English"):
+    """Fix Match each item to ITS OWN entry (same guid) with metadata in `lang`.
+    Skips locked titles and split duplicates unless the user insists."""
+    picked = _drop_protected(client, picked, "a re-match", args)
+    if not picked:
+        return False
+    clear_screen()
+    log_info(f"Looking up the {lang_name} entry for {len(picked)} item(s)…")
+    plan = []
+    for i, r in enumerate(picked, 1):
+        try:
+            cands = client.matches(r["rk"], language=lang)
+        except Exception:
+            cands = []
+        same = next((c for c in cands if r.get("guid") and c.get("guid") == r["guid"]), None)
+        if same:
+            plan.append({"rk": r["rk"], "guid": same["guid"], "name": same["name"],
+                         "old": r["title"]})
+        print(f"\r  {Fore.CYAN}looking up: {i * 100 // len(picked):3d}%{Style.RESET_ALL} "
+              f"({i}/{len(picked)})   ", end="", flush=True)
+    print()
+    missing = len(picked) - len(plan)
+    if missing:
+        log_warn(f"{missing} item(s) had no candidate with their own guid and are "
+                 f"skipped - re-matching them could point at a different show.")
+    if not plan:
+        _pause_to_menu()
+        return False
+
+    clear_screen()
+    log_info(f"Will re-match {len(plan)} item(s) to the SAME entry, in {lang_name}:")
+    shown = plan[:30]
+    w = min(max([len(p["old"]) for p in shown] or [0]), 60)
+    for p in shown:
+        old = p["old"] if len(p["old"]) <= w else p["old"][:w - 1] + "…"
+        print(f"    {old + ' ' * (w - len(old))}   {Fore.CYAN}->{Style.RESET_ALL}   "
+              f"{Fore.GREEN}{p['name']}{Style.RESET_ALL}")
+    if len(plan) > 30:
+        print(f"    … (+{len(plan) - 30} more)")
+    print()
+    print(f"{Style.DIM}The guid does not change, so the item keeps its identity - watched "
+          f"state, resume positions and the files (with their default tracks) stay. Plex "
+          f"re-downloads titles, summary and artwork for that entry.{Style.RESET_ALL}")
+    print()
+    if not args.yes:
+        ans = ask_yes_back("Proceed with the re-match?", default=False)
+        if not ans:
+            return False
+    print()
+    ok = fail = 0
+    for i, p in enumerate(plan, 1):
+        try:
+            client.fix_match(p["rk"], p["guid"], p["name"])
+            ok += 1
+        except Exception as ex:
+            fail += 1
+            print(f"\r  {Fore.RED}x{Style.RESET_ALL} {p['old']}: {ex}")
+        print(f"\r  {Fore.CYAN}applying: {i * 100 // len(plan):3d}%{Style.RESET_ALL} "
+              f"({i}/{len(plan)})   ", end="", flush=True)
+    print()
+    color = Fore.GREEN if not fail else Fore.YELLOW
+    print(f"{color}Done: {ok} item(s) re-matched" + (f", {fail} failed" if fail else "")
+          + f".{Style.RESET_ALL}")
+    log_info("Plex refreshes in the background - give it a moment, then reload the client.")
+    return True
+
+
+def _titles_relanguage(client, sec, picked, args, lang="en", lang_name="English"):
+    """Set each item's metadata language to `lang` and refresh it. This is NOT a
+    Fix Match - the item stays matched to the same guid, so watched state, resume
+    positions and the media/track selections are untouched; only the agent's texts
+    (title, episode titles, summary) and artwork are re-pulled in English."""
+    picked = _drop_protected(client, picked, "a metadata refresh", args)
+    if not picked:
+        return False
+    clear_screen()
+    log_info(f"Will set the metadata language to {lang_name} and refresh {len(picked)} item(s):")
+    for r in picked[:30]:
+        print(f"    {r['title']}")
+    if len(picked) > 30:
+        print(f"    … (+{len(picked) - 30} more)")
+    print()
+    print(f"{Style.DIM}The item keeps its current match (same guid) - no re-identification. "
+          f"Watched state, resume positions and default audio/subtitle tracks stay as they "
+          f"are. Summary and artwork are re-downloaded in {lang_name}.{Style.RESET_ALL}")
+    print()
+    if not args.yes:
+        ans = ask_yes_back("Proceed?", default=True)
+        if not ans:
+            return False
+    print()
+    ok = fail = 0
+    for i, r in enumerate(picked, 1):
+        try:
+            # a locked title would survive the refresh unchanged -> unlock it first
+            client.unlock_field(sec["key"], sec["type"], r["rk"], "title")
+            client.set_prefs(r["rk"], languageOverride=lang)
+            client.refresh_item(r["rk"])
+            ok += 1
+        except Exception as ex:
+            fail += 1
+            print(f"\r  {Fore.RED}x{Style.RESET_ALL} {r['title']}: {ex}")
+        print(f"\r  {Fore.CYAN}applying: {i * 100 // len(picked):3d}%{Style.RESET_ALL} "
+              f"({i}/{len(picked)})   ", end="", flush=True)
+    print()
+    color = Fore.GREEN if not fail else Fore.YELLOW
+    print(f"{color}Done: {ok} item(s) switched to {lang_name} metadata"
+          + (f", {fail} failed" if fail else "") + f".{Style.RESET_ALL}")
+    log_info("Plex refreshes in the background - give it a moment, then reload the client.")
+    return True
+
+
+def _titles_apply(client, sec, picked, args, lang="en", lang_name="English"):
+    """Look up English titles for the picked items, let the user confirm, then write
+    only the title field. Returns True if anything was changed."""
+    # locked titles are usually a name given by hand ("… - Viki"). Offer to rewrite
+    # them anyway while keeping that manual suffix - that is the whole point here.
+    # Locked titles are included straight away - their manual " - Viki" suffix is
+    # carried over to the new name and the field stays locked. Only split/duplicate
+    # entries are held back, because those must keep their own identity.
+    prot = _protected_items(client, picked)
+    keep_suffix = {str(r["rk"]): title_suffix(r["title"]) for r in picked
+                   if "title is locked" in prot.get(str(r["rk"]), [])}
+    if any(r.get("dup") for r in picked):
+        picked = _drop_protected(client, picked, "a title rewrite", args)
+    if not picked:
+        return False
+    clear_screen()
+    log_info(f"Asking Plex for {lang_name} titles ({len(picked)} item(s))…")
+    # current sort titles come along, so the preview can show both fields
+    try:
+        md_now = client.get_metadata_many([r["rk"] for r in picked])
+    except Exception:
+        md_now = {}
+    props = []
+    for i, r in enumerate(picked, 1):
+        best = _lang_candidate(client, r["rk"], r["title"], guid=r.get("guid"), lang=lang)
+        if best:
+            sfx = keep_suffix.get(str(r["rk"]), "")
+            if sfx and not best["name"].endswith(sfx):
+                best["name"] = best["name"] + sfx      # keep the manual "- Viki" marker
+            md = md_now.get(str(r["rk"])) or {}
+            old_sort = md.get("titleSort") or ""
+            props.append({"rk": r["rk"], "old": r["title"], "new": best["name"],
+                          "old_sort": old_sort, "new_sort": best["name"],
+                          "do_sort": True,     # both fields are fixed by default
+                          "exact": best["exact"],
+                          "selected": bool(best["exact"])})  # uncertain start unchecked
+        print(f"\r  {Fore.CYAN}looking up: {i * 100 // len(picked):3d}%{Style.RESET_ALL} "
+              f"({i}/{len(picked)})   ", end="", flush=True)
+    print()
+    if not props:
+        log_warn(f"No {lang_name} title was found for the selected items "
+                 f"(the agent may not offer one).")
+        _pause_to_menu()
+        return False
+    skipped = len(picked) - len(props)
+    if skipped:
+        log_info(f"{skipped} item(s) had no {lang_name} candidate and are left alone.")
+
+    def _col_width():
+        """Common width of the 'current value' column, so the arrows line up."""
+        vals = [p["old"] for p in props] + [(p["old_sort"] or "(none)") for p in props]
+        return min(max([len(v) for v in vals] or [0]), 60)
+
+    def prop_label(p, w=None):
+        """One checkbox per item, with the two fields listed underneath it."""
+        w = _col_width() if w is None else w
+
+        def col(s):
+            s = s if len(s) <= w else s[:w - 1] + "…"
+            return s + " " * (w - len(s))
+
+        warn = "" if p["exact"] else f"   {Fore.YELLOW}[different match - check!]{Style.RESET_ALL}"
+        p["label"] = f"{Style.BRIGHT}{p['old']}{Style.RESET_ALL}{warn}"
+        arrow = f"{Fore.CYAN}->{Style.RESET_ALL}"
+        sub = [f"{Style.DIM}title:{Style.RESET_ALL} {col(p['old'])}   {arrow}   "
+               f"{Fore.GREEN}{p['new']}{Style.RESET_ALL}"]
+        if p["do_sort"]:
+            sub.append(f"{Style.DIM}sort :{Style.RESET_ALL} "
+                       f"{col(p['old_sort'] or '(none)')}   {arrow}   "
+                       f"{Fore.GREEN}{p['new_sort']}{Style.RESET_ALL}")
+        else:
+            sub.append(f"{Style.DIM}sort : {col(p['old_sort'] or '(none)')}   "
+                       f"(kept unchanged){Style.RESET_ALL}")
+        p["sub"] = sub
+
+    def relabel_all():
+        w = _col_width()
+        for p in props:
+            prop_label(p, w)
+
+    relabel_all()
+
+    def edit_prop(p):
+        """Hand-edit one proposal: title, then sort title."""
+        if not p:
+            return
+        clear_screen()
+        log_info("Editing one item. Enter keeps the value, Esc leaves it unchanged.")
+        print(f"    {Style.DIM}current title:{Style.RESET_ALL} {p['old']}")
+        print(f"    {Style.DIM}current sort :{Style.RESET_ALL} {p['old_sort'] or '(none)'}")
+        print()
+        nt = ask_line("New title", default=p["new"])
+        if nt:
+            if p["do_sort"] and p["new_sort"] == p["new"]:
+                p["new_sort"] = nt          # the sort title was following the title
+            p["new"] = nt
+        ns = ask_line("New sort title", default=p["new_sort"] if p["do_sort"] else p["new"])
+        if ns:
+            p["do_sort"], p["new_sort"] = True, ns
+        else:
+            idx = interactive_menu("Sort title:", [
+                f"Set it to the new title  ({p['new']})",
+                f"Keep the current one  ({p['old_sort'] or '(none)'})",
+            ], default=0 if p["do_sort"] else 1, allow_cancel=True)
+            if idx == 0:
+                p["do_sort"], p["new_sort"] = True, p["new"]
+            elif idx == 1:
+                p["do_sort"] = False
+        relabel_all()
+
+    n_exact = sum(1 for p in props if p["exact"])
+    header = [
+        f"{Style.DIM}Only title (and sort title, where shown) is written and locked. "
+        f"No re-match - streams, subtitles, watched state and artwork stay untouched."
+        f"{Style.RESET_ALL}",
+        f"{Style.DIM}{n_exact}/{len(props)} come from the item's own match (same guid); "
+        f"the rest are pre-unchecked. Press 'e' to edit the highlighted row."
+        f"{Style.RESET_ALL}",
+        "",
+    ]
+    res = checkbox_menu("Confirm the new titles:", props, header=header, edit_cb=edit_prop)
+    if res is None:
+        return False
+    todo = [p for p in props if p["selected"]]
+    if not todo:
+        log_info("Nothing selected.")
+        return False
+
+    clear_screen()
+    log_info(f"Will rename {len(todo)} title(s):")
+    shown = todo[:30]
+    olds = [p["old"] for p in shown] + [(p["old_sort"] or "(none)")
+                                        for p in shown if p["do_sort"]]
+    w = min(max([len(s) for s in olds] or [0]), 60)
+
+    def col(s):
+        s = s if len(s) <= w else s[:w - 1] + "…"
+        return s + " " * (w - len(s))
+
+    for p in shown:
+        print(f"    title: {col(p['old'])}   {Fore.CYAN}->{Style.RESET_ALL}   "
+              f"{Fore.GREEN}{p['new']}{Style.RESET_ALL}")
+        if p["do_sort"]:
+            print(f"    {Style.DIM}sort :{Style.RESET_ALL} {col(p['old_sort'] or '(none)')}"
+                  f"   {Fore.CYAN}->{Style.RESET_ALL}   {Fore.GREEN}{p['new_sort']}"
+                  f"{Style.RESET_ALL}")
+        else:
+            print(f"    {Style.DIM}sort : {col(p['old_sort'] or '(none)')}   "
+                  f"(kept unchanged){Style.RESET_ALL}")
+    if len(todo) > 30:
+        print(f"    … (+{len(todo) - 30} more)")
+    print()
+    if not args.yes:
+        ans = ask_yes_back("Apply these titles?", default=True)
+        if not ans:
+            return False
+    print()
+    ok = fail = 0
+    for i, p in enumerate(todo, 1):
+        try:
+            client.set_title(sec["key"], sec["type"], p["rk"], p["new"],
+                             sort_title=p["new_sort"] if p["do_sort"] else None)
+            ok += 1
+        except Exception as ex:
+            fail += 1
+            print(f"\r  {Fore.RED}x{Style.RESET_ALL} {p['old']}: {ex}")
+        print(f"\r  {Fore.CYAN}applying: {i * 100 // len(todo):3d}%{Style.RESET_ALL} "
+              f"({i}/{len(todo)})   ", end="", flush=True)
+    print()
+    color = Fore.GREEN if not fail else Fore.YELLOW
+    print(f"{color}Done: {ok} title(s) changed" + (f", {fail} failed" if fail else "")
+          + f".{Style.RESET_ALL}")
+    log_info("The change shows in the client after a refresh.")
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Top-level menu (hub) + flows
 # ---------------------------------------------------------------------------
 def langsubs_flow(client, args):
@@ -3233,6 +4392,7 @@ def top_menu(client, args):
         ("Default audio & subtitles  —  set the default audio/subtitle track", langsubs_flow),
         ("Watched / unwatched  —  mark episodes or a whole show", mark_watched_flow),
         ("Labels  —  add / remove / rename custom labels on shows & movies", labels_flow),
+        ("Titles  —  find non-English titles and switch them to English", titles_flow),
     ]
     last = 0
     while True:
