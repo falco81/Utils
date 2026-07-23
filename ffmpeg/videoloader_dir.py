@@ -98,9 +98,11 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.9.0"
+SCRIPT_VERSION = "3.14.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 EP_PROBE_MAX = 0                # (deprecated / unused — episode-number probing was removed)
+SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
+                                # its manifest (raise it on slow sites)
 SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
 # Native-HLS segment threads. Both accept a number, or 0 / null / "auto" / "max" meaning
 # "no limit of my own":
@@ -166,7 +168,8 @@ _REMOTE_CONFIG_KEYS = {
     'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
-    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'PREVIEW_MAX_SECONDS',
+    'PREVIEW_MAX_MB',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
@@ -184,7 +187,8 @@ _CONFIG_KEY_ORDER = (
     'DEFAULT_THREADS', 'DEFAULT_FOLDER_WORKERS', 'DEFAULT_MAX_CONNECTIONS', 'DEFAULT_CHUNK_SIZE',
     'DEFAULT_RECURSIVE', 'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES',
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
-    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'HLS_SEGMENT_WORKERS',
+    'HLS_AUTO_WORKERS_CAP',
     'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
@@ -3301,6 +3305,9 @@ def _extract_player_config(html):
 
 # ---- Streamable (progressive MP4 via its public API) ---------------------- #
 STREAMABLE_HEADERS = {'User-Agent': USER_AGENT, 'Referer': 'https://streamable.com/'}
+# A path that looks like a media manifest/file (used to test relative sources found in a page).
+_MEDIA_PATH_RE = re.compile(
+    r'(?:\.(?:m3u8|mpd|mp4|webm|mov|m4v)(?:[?#/]|$)|\(format=(?:mpd|m3u8)[^)]*\))', re.I)
 _STREAMABLE_RESERVED = {'player', 'videos', 'video', 'image', 'about', 'login', 'signup',
                         'terms', 'privacy', 'settings', 'help', 'e', 'o', 's'}
 _STREAMABLE_RE = r'(?<![\w.])(?:www\.)?streamable\.com/(?:[eos]/)?([a-z0-9]{4,12})'
@@ -8667,12 +8674,14 @@ def _classify_media_url(u):
         return 'url', u, 'Dropbox file'
     if u.startswith('blob:') or u.startswith('data:'):
         return None                    # can't fetch these directly (MediaSource/inline)
-    if re.search(r'\.m3u8(?:[?#/]|$)', u, re.I):
+    if re.search(r'\.m3u8(?:[?#/]|$)', u, re.I) or re.search(r'\(format=m3u8[^)]*\)', u, re.I):
         return 'hls', u, 'HLS stream (.m3u8)'
-    if re.search(r'\.mpd(?:[?#/]|$)', u, re.I):
+    # '.mpd' covers foo.mpd and the Unified-Origin/IIS shape '<asset>.ism/.mpd'; the second form
+    # catches '<asset>.ism/manifest(format=mpd-time-csf)' used by the same origin servers.
+    if re.search(r'\.mpd(?:[?#/]|$)', u, re.I) or re.search(r'\(format=mpd[^)]*\)', u, re.I):
         return 'mpd', u, 'DASH stream (.mpd)'
     if re.search(r'\.(mp4|webm|mov|m4v)(?:[?#]|$)', u, re.I):
-        return 'direct', u, 'Direct video file'
+        return 'direct', u, _direct_label(u)
     return None
 
 
@@ -8687,15 +8696,41 @@ _BROWSER_COLLECT_JS = r"""
       if (e.currentSrc) out.urls.push(e.currentSrc);
     });
     document.querySelectorAll('iframe').forEach(function(e){ if (e.src) out.urls.push(e.src); });
-    var res = (window.performance && performance.getEntriesByType) ?
-              performance.getEntriesByType('resource') : [];
+    // A DASH/HLS player fetches its manifest with XHR/fetch and feeds the <video> element a
+    // blob: URL, so the manifest only ever shows up as a NETWORK request - never in the DOM.
+    var isMedia = function(n){
+      return /\.(m3u8|mpd|mp4|webm|mov|m4v)(\?|#|\/|$)/i.test(n) ||
+             /\(format=(mpd|m3u8)[^)]*\)/i.test(n) ||
+             /\.isml?\/(?:\.?mpd|manifest|$)/i.test(n) ||
+             /(youtube|youtu\.be|vimeo|twitch\.tv|drive\.google|dropbox)\.?/i.test(n);
+    };
+    var res = (window.performance && window.performance.getEntriesByType) ?
+              window.performance.getEntriesByType('resource') : [];
     res.forEach(function(e){
       var n = e.name || '';
-      if (/\.(m3u8|mp4|webm|mov|m4v)(\?|$)/i.test(n) ||
-          /(youtube|youtu\.be|vimeo|twitch\.tv|drive\.google|dropbox)\.?/i.test(n)) out.urls.push(n);
+      if (isMedia(n)) out.urls.push(n);
     });
+    (window.__vlSeen || []).forEach(function(n){ if (isMedia(n)) out.urls.push(n); });
   } catch (err) {}
   return JSON.stringify(out);
+})()
+"""
+
+
+_BROWSER_HOOK_JS = r"""
+(function(){
+  if (window.__vlHooked) return true;
+  window.__vlHooked = true; window.__vlSeen = [];
+  var note = function(u){ try { if (u) window.__vlSeen.push(String(u)); } catch (e) {} };
+  try {
+    var ox = XMLHttpRequest.prototype.open;
+    XMLHttpRequest.prototype.open = function(m, u){ note(u); return ox.apply(this, arguments); };
+  } catch (e) {}
+  try {
+    var of = window.fetch;
+    window.fetch = function(r){ note((r && r.url) ? r.url : r); return of.apply(this, arguments); };
+  } catch (e) {}
+  return true;
 })()
 """
 
@@ -8716,6 +8751,13 @@ def _browser_worker(url, wait_s, conn):
 
     def _on_start(window):
         import time as _t
+        for _ in range(int(wait_s * 4)):     # hook XHR/fetch as early as we can get in
+            try:
+                if window.evaluate_js(_BROWSER_HOOK_JS):
+                    break
+            except Exception:
+                pass
+            _t.sleep(0.25)
         _t.sleep(wait_s)                     # let the page's JS build the player / fetch media
         for _ in range(20):
             try:
@@ -8747,9 +8789,11 @@ def _browser_worker(url, wait_s, conn):
         pass
 
 
-def _browser_collect_media(page_url, verbose, wait_s=6):
+def _browser_collect_media(page_url, verbose, wait_s=None):
     """Load a page in a headless system webview and return (media_urls, page_title). Requires
     pywebview (same engine used for YouTube signatures)."""
+    if wait_s is None:
+        wait_s = max(1, int(SCAN_BROWSER_WAIT or 6))
     if not _yt_pywebview_available():
         print("[ERROR] --scan-browser needs pywebview. Install it with:  pip install pywebview")
         return [], None
@@ -8777,6 +8821,48 @@ def _browser_collect_media(page_url, verbose, wait_s=6):
     except (ValueError, TypeError):
         return [], None
     return list(dict.fromkeys(data.get('urls') or [])), (data.get('title') or None)
+
+
+def _direct_label(url):
+    """Label for a plain video file, flagging the short teaser clips many sites embed next to the
+    real (player-loaded) stream, so they aren't mistaken for the episode."""
+    if re.search(r'(?:^|[/_-])(?:preview|trailer|teaser|sample)', urlparse(url).path, re.I):
+        return 'Direct video file (preview clip?)'
+    return 'Direct video file'
+
+
+def _scan_diagnose(page_url, html, found=None):
+    """Explain an empty --scan: show what was actually fetched and where (if anywhere) the source
+    mentions a manifest, so a JavaScript-built player or a login wall is easy to tell apart."""
+    found = found or []
+    if found:
+        print(f"[INFO] --scan: only {len(found)} non-stream file(s) found here (no .mpd/.m3u8) — "
+              "a short preview clip usually means the real stream is loaded by the player.")
+    print(f"[INFO] --scan: fetched {len(html)} character(s) from {page_url}")
+    low = html.lower()
+    if any(k in low for k in ('name="password"', "name='password'", 'type="password"',
+                              'sign in', 'log in', 'prihlaseni', 'prihlasit')):
+        print("[INFO] --scan: that looks like a login page — pass your cookies with --cookies "
+              "(or drop a cookie .json next to the script) so the real page is fetched.")
+    hits, seen_ctx = [], set()
+    for m in re.finditer(r'(?i)(\.mpd|\.m3u8|\.ism|manifest|dash|playlist)', html):
+        s = max(0, m.start() - 90)
+        ctx = ' '.join(html[s:m.start() + 110].split())
+        if ctx in seen_ctx:
+            continue
+        seen_ctx.add(ctx)
+        hits.append(ctx)
+        if len(hits) >= 6:
+            break
+    if hits:
+        print("[INFO] --scan: the source mentions a stream here, but not as a URL the scanner "
+              "could use:")
+        for h in hits:
+            print(f"        ...{h[:170]}...")
+        print("[INFO] --scan: if the address is assembled in JavaScript, retry with --scan-browser.")
+    else:
+        print("[INFO] --scan: the source contains no stream reference at all, so the player builds "
+              "it at runtime — retry the same URL with --scan-browser.")
 
 
 def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follow_links=False,
@@ -8815,6 +8901,26 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follo
         found.append({'kind': kind, 'url': url, 'label': label, 'name': name,
                       'page': page or page_url})
 
+    # The URL may BE the stream: pointing --scan straight at a .mpd/.m3u8 fetches the manifest
+    # itself, so scanning it as a web page finds nothing. Detect that (by URL shape, or because the
+    # body starts with an MPD/HLS manifest) and hand the manifest back as the one item.
+    _self = _classify_media_url(page_url)
+    if not _self:
+        _head = html[:800].lstrip()
+        if _head.startswith('#EXTM3U'):
+            _self = ('hls', page_url, 'HLS stream (.m3u8)')
+        elif '<MPD' in _head:
+            _self = ('mpd', page_url, 'DASH stream (.mpd)')
+    if _self and _self[0] in ('mpd', 'hls', 'direct'):
+        _kind, _url, _label = _self
+        _base = os.path.basename(urlparse(page_url).path.rstrip('/')) or ''
+        if _base in ('', '.mpd', '.m3u8', 'manifest', 'Manifest') or _base.startswith('manifest('):
+            # '<asset>.ism/.mpd' -> use the asset name, not the bare extension
+            _parts = [p for p in urlparse(page_url).path.split('/') if p]
+            _base = re.sub(r'\.isml?$', '', _parts[-2], flags=re.I) if len(_parts) > 1 else 'video'
+        add(_kind, _url, _label, name=safe_filename(title or _base or 'video', 'video'))
+        return found
+
     for m in re.finditer(r'(?:youtube(?:-nocookie)?\.com/(?:watch\?v=|embed/|v/|shorts/|live/)'
                          r'|youtu\.be/)([0-9A-Za-z_-]{11})', text):
         add('url', f'https://www.youtube.com/watch?v={m.group(1)}', f'YouTube {m.group(1)}')
@@ -8834,7 +8940,18 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follo
     for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.mpd[^\s"\'<>\\]*', text):
         add('mpd', m.group(0), 'DASH stream (.mpd)', name=title)
     for m in re.finditer(r'https?://[^\s"\'<>\\]+?\.(?:mp4|webm|mov|m4v)(?:\?[^\s"\'<>\\]*)?', text):
-        add('direct', m.group(0), 'Direct video file', name=title)
+        add('direct', m.group(0), _direct_label(m.group(0)), name=title)
+    # Relative and protocol-relative sources: pages served by a local/origin server usually embed
+    # src="/0366/3671/movie.ism/.mpd" instead of a full URL, so resolve those against the page.
+    for m in re.finditer(r'''["']\s*((?://|/|\.{1,2}/)[^\s"'<>\\]{3,}?)\s*["']''', text):
+        cand = m.group(1).replace('&amp;', '&')
+        if not _MEDIA_PATH_RE.search(cand):
+            continue
+        full = urljoin(page_url, cand)
+        hit = _classify_media_url(full)
+        if hit:
+            kind, url_, label = hit
+            add(kind, url_, label, name=title)
 
     # Follow unknown player iframes one level deep (known hosts are already captured above).
     if _depth < 1:
@@ -8925,6 +9042,9 @@ def scan_page_for_media(page_url, session, verbose, _depth=0, _title=None, follo
                     with lock:
                         bar.update(1)
             bar.close()
+    if (_depth == 0 and not _is_sub
+            and not any(f['kind'] in ('mpd', 'hls', 'url') for f in found)):
+        _scan_diagnose(page_url, html, found)
     return found
 
 
@@ -9033,6 +9153,14 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
         _log_source("Viki", "subtitle API (auth_subtitles) -> .srt")
         _with_out_dir(lambda: _download_viki_subs(id_or_url, session, None, verbose))
         return
+
+    if not scan_mode and _classify_media_url(id_or_url) and \
+            _classify_media_url(id_or_url)[0] in ('mpd', 'hls'):
+        # A manifest URL passed on its own: treat it like --scan so it is downloaded as a stream
+        # (otherwise it would be saved as the few-KB manifest file itself).
+        scan_mode = True
+        if verbose:
+            print("[INFO] That URL is a stream manifest — handling it as --scan.")
 
     if scan_mode:
         # --follow-links forces link crawling; otherwise --subs-only auto-crawls when the given
