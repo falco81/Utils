@@ -17,7 +17,11 @@ const CACHE_FILE = '/var/lib/plex-status/smart-cache.json'; // not web-served
 const SMARTCTL   = '/usr/sbin/smartctl';
 const HDPARM     = '/usr/sbin/hdparm';
 const PLEX_URL   = 'http://127.0.0.1:32400';
+const PLEX_HOST  = '127.0.0.1';   // used by the latency probe (raw socket)
+const PLEX_PORT  = 32400;
 const PLEX_PREFS = '/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml';
+const PLEX_DB_DIR = '/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Plug-in Support/Databases';
+const LIB_DB     = PLEX_DB_DIR . '/com.plexapp.plugins.library.db';
 
 // Plex has TWO versions: the Media Server (from /identity, e.g. 1.43.x) and the
 // bundled Web App (what Settings shows, e.g. 4.160.0). We try to auto-detect the
@@ -34,6 +38,23 @@ const PLEX_WEB_VERSION = '';
 const TEMP_WARN  = 50;   // °C — worth a look
 const TEMP_CRIT  = 58;   // °C — act now; just under the drives' own 60 °C alarm
 const IO_SAMPLE  = 1.0;  // seconds to sample disk I/O activity
+
+// PERFORMANCE PROBING
+// Times the Plex API the way a browser sees it, keeps a rolling history so
+// slow-downs are visible as a trend, and compares against the reverse proxy so
+// you can tell nginx-side problems from Plex-side ones.
+const PERF_ENABLED      = true;
+const PERF_RUNS         = 5;      // requests per endpoint (one reused connection)
+// Reverse proxy to compare against. Empty string disables the comparison.
+const PERF_PROXY_URL    = 'https://plex.falco81.net';
+
+// HISTORY
+// One rolling file holds every trended metric: API latency, CPU/load/memory and
+// per-disk temperature and fill level. It lives outside the web root and is
+// down-sampled before being embedded in data.json, so the page stays small.
+const HISTORY_FILE   = '/var/lib/plex-status/history.json';
+const HISTORY_KEEP   = 2016;   // samples retained ≈ 7 days at one run / 5 min
+const HISTORY_POINTS = 140;    // points handed to the page per series
 
 // If false: a disk in standby/sleeping is NOT woken for SMART (last-known cache is
 // shown instead) — this preserves spindown. Set true to always read SMART, which
@@ -291,6 +312,350 @@ function plex_web_version($ctx): ?string {
     return null;
 }
 
+// ---- performance probing --------------------------------------------------
+/**
+ * Timing helper: issues several GETs over ONE reused connection, the way a
+ * browser does, and returns per-endpoint medians in milliseconds.
+ * Kept in its own file so it can be unit-tested against a mock server.
+ */
+
+function perf_median(array $v): float {
+    sort($v);
+    $n = count($v);
+    $m = intdiv($n, 2);
+    return $n % 2 ? $v[$m] : ($v[$m - 1] + $v[$m]) / 2;
+}
+
+/** Read exactly one HTTP response body off the socket. Returns bytes read, or null on error. */
+function perf_drain($fp, string $hdr): ?int {
+    if (preg_match('/Content-Length:\s*(\d+)/i', $hdr, $m)) {
+        $len = (int) $m[1];
+        $read = 0;
+        while ($read < $len) {
+            $chunk = @fread($fp, min(16384, $len - $read));
+            if ($chunk === false || $chunk === '') return null;
+            $read += strlen($chunk);
+        }
+        return $read;
+    }
+    if (preg_match('/Transfer-Encoding:\s*chunked/i', $hdr)) {
+        $total = 0;
+        while (true) {
+            $line = @fgets($fp);
+            if ($line === false) return null;
+            $sz = hexdec(trim($line));
+            if ($sz === 0) { @fgets($fp); return $total; }   // trailing CRLF
+            $read = 0;
+            while ($read < $sz) {
+                $c = @fread($fp, min(16384, $sz - $read));
+                if ($c === false || $c === '') return null;
+                $read += strlen($c);
+            }
+            @fgets($fp);                                      // CRLF after chunk
+            $total += $sz;
+        }
+    }
+    return 0;   // no body (e.g. 204)
+}
+
+/**
+ * @param array  $paths   endpoints to time
+ * @return array  path => ['median_ms','min_ms','max_ms','bytes','status','n']
+ */
+function perf_probe(string $host, int $port, bool $tls, array $paths,
+                    ?string $token, int $runs = 5, float $timeout = 5.0): array {
+    $ctx = stream_context_create([
+        'ssl' => ['verify_peer' => false, 'verify_peer_name' => false],
+    ]);
+    $target = ($tls ? 'ssl://' : 'tcp://') . $host . ':' . $port;
+    $errno = 0; $errstr = '';
+    $fp = @stream_socket_client($target, $errno, $errstr, $timeout,
+                                STREAM_CLIENT_CONNECT, $ctx);
+    if (!$fp) return [];
+    stream_set_timeout($fp, (int) $timeout);
+
+    $out = [];
+    foreach ($paths as $path) {
+        $url = $path;
+        if ($token) $url .= (str_contains($path, '?') ? '&' : '?') . 'X-Plex-Token=' . urlencode($token);
+        $times = []; $status = null; $bytes = 0; $failed = false;
+
+        for ($i = 0; $i < $runs; $i++) {
+            $t0 = microtime(true);
+            $req = "GET $url HTTP/1.1\r\nHost: $host\r\n"
+                 . "Connection: keep-alive\r\nAccept: application/json\r\n"
+                 . "User-Agent: plex-status/1.0\r\n\r\n";
+            if (@fwrite($fp, $req) === false) { $failed = true; break; }
+
+            $hdr = '';
+            while (($line = @fgets($fp)) !== false) {
+                $hdr .= $line;
+                if ($line === "\r\n" || $line === "\n") break;
+            }
+            if ($hdr === '') { $failed = true; break; }
+            if (preg_match('#^HTTP/\d\.\d (\d+)#', $hdr, $m)) $status = (int) $m[1];
+
+            $n = perf_drain($fp, $hdr);
+            if ($n === null) { $failed = true; break; }
+            $bytes = $n;
+            $times[] = (microtime(true) - $t0) * 1000;
+
+            if (preg_match('/Connection:\s*close/i', $hdr)) { $failed = true; break; }
+        }
+
+        if ($times) {
+            // drop the first sample: it carries connection warm-up
+            $warm = count($times) > 2 ? array_slice($times, 1) : $times;
+            $out[$path] = [
+                'median_ms' => round(perf_median($warm), 2),
+                'min_ms'    => round(min($warm), 2),
+                'max_ms'    => round(max($warm), 2),
+                'bytes'     => $bytes,
+                'status'    => $status,
+                'n'         => count($times),
+            ];
+        }
+        if ($failed) break;
+    }
+    @fclose($fp);
+    return $out;
+}
+
+/**
+ * Measure Plex API latency, the proxy's share of it, and database health.
+ * Cheap: a handful of requests over one connection, no disk access.
+ */
+function collect_perf(?string $token): array {
+    $paths = ['/identity', '/library/sections', '/hubs'];
+    $out = ['direct' => [], 'proxy' => null, 'db' => [], 'history' => []];
+
+    $out['direct'] = perf_probe(PLEX_HOST, PLEX_PORT, false, $paths, $token, PERF_RUNS);
+    foreach ($out['direct'] as $p => $v) {
+        dbg(sprintf("    %-20s %7.2f ms  (%d B)", $p, $v['median_ms'], $v['bytes']));
+    }
+
+    // same endpoints through the reverse proxy -> the difference is nginx's cost
+    if (PERF_PROXY_URL !== '') {
+        $u = parse_url(PERF_PROXY_URL);
+        $tls = ($u['scheme'] ?? 'https') === 'https';
+        $host = $u['host'] ?? '';
+        $port = $u['port'] ?? ($tls ? 443 : 80);
+        $via = perf_probe($host, $port, $tls, $paths, $token, PERF_RUNS);
+        if ($via) {
+            $deltas = [];
+            foreach ($via as $p => $v) {
+                if (isset($out['direct'][$p])) $deltas[] = $v['median_ms'] - $out['direct'][$p]['median_ms'];
+            }
+            $out['proxy'] = [
+                'url' => PERF_PROXY_URL,
+                'endpoints' => $via,
+                'overhead_ms' => $deltas ? round(array_sum($deltas) / count($deltas), 2) : null,
+            ];
+            dbg("    proxy overhead: " . ($out['proxy']['overhead_ms'] ?? '-') . " ms/request via " . PERF_PROXY_URL);
+        } else {
+            $out['proxy'] = ['url' => PERF_PROXY_URL, 'endpoints' => [], 'overhead_ms' => null,
+                             'error' => 'unreachable'];
+            dbg("    proxy unreachable: " . PERF_PROXY_URL);
+        }
+    }
+
+    // database health
+    $db = LIB_DB;
+    if (is_file($db)) {
+        $wal = $db . '-wal';
+        $out['db'] = [
+            'bytes'     => filesize($db) ?: 0,
+            'wal_bytes' => is_file($wal) ? (filesize($wal) ?: 0) : 0,
+        ];
+        $plexsql = '/usr/lib/plexmediaserver/Plex SQLite';
+        if (is_file($plexsql)) {
+            $free = (int) trim(sh(escapeshellarg($plexsql) . ' ' . escapeshellarg($db) . ' "PRAGMA freelist_count;"'));
+            $page = (int) trim(sh(escapeshellarg($plexsql) . ' ' . escapeshellarg($db) . ' "PRAGMA page_count;"'));
+            if ($page > 0) $out['db']['free_pct'] = round($free / $page * 100, 1);
+        }
+        // stale copies Plex leaves behind
+        $bk = glob(dirname($db) . '/com.plexapp.plugins.library.db-20*') ?: [];
+        $out['db']['backup_count'] = count($bk);
+        $out['db']['backup_bytes'] = array_sum(array_map(fn($f) => filesize($f) ?: 0, $bk));
+        dbg("    db " . round($out['db']['bytes'] / 1048576) . " MB, wal "
+            . round($out['db']['wal_bytes'] / 1048576, 1) . " MB, free "
+            . ($out['db']['free_pct'] ?? '-') . "%");
+    }
+    return $out;
+}
+
+/**
+ * Append this run to the rolling history and return the full sample list.
+ *
+ * Temperature is recorded only when it was freshly read. Repeating a cached
+ * value for a sleeping disk would draw a flat line that never happened — a gap
+ * is the honest representation, and the chart simply skips it.
+ */
+function history_update(array $direct, array $sys, array $disks, bool $write): array {
+    $h = json_decode((string) @file_get_contents(HISTORY_FILE), true) ?: [];
+    $samples = $h['samples'] ?? [];
+
+    $d = [];
+    foreach ($disks as $disk) {
+        $key = ($disk['serial'] !== '—' && $disk['serial'] !== '') ? $disk['serial'] : $disk['dev'];
+        $d[$key] = [
+            $disk['from_cache'] ? null : $disk['temp'],   // fresh readings only
+            $disk['fs_pct'],                              // statfs, always fresh
+            $disk['fs_used_b'] ?? null,                   // raw bytes, for real-unit charts
+        ];
+    }
+
+    $samples[] = [
+        't' => time(),
+        'p' => [
+            $direct['/identity']['median_ms'] ?? null,
+            $direct['/library/sections']['median_ms'] ?? null,
+            $direct['/hubs']['median_ms'] ?? null,
+        ],
+        's' => [
+            $sys['cpu_temp'],
+            round((float) ($sys['load'][0] ?? 0), 2),
+            $sys['mem_total'] ? (int) round($sys['mem_used'] / $sys['mem_total'] * 100) : null,
+        ],
+        'd' => $d,
+    ];
+    if (count($samples) > HISTORY_KEEP) $samples = array_slice($samples, -HISTORY_KEEP);
+
+    if ($write) {
+        @mkdir(dirname(HISTORY_FILE), 0755, true);
+        @file_put_contents(HISTORY_FILE, json_encode(['v' => 2, 'samples' => $samples]), LOCK_EX);
+    }
+    return $samples;
+}
+
+/** Down-sample the history into parallel arrays the page can chart directly. */
+function history_series(array $samples, array $disks): array {
+    $n = count($samples);
+    if ($n > HISTORY_POINTS) {
+        $step = (int) ceil($n / HISTORY_POINTS);
+        $sel = [];
+        for ($i = 0; $i < $n; $i += $step) $sel[] = $samples[$i];
+        if ($sel[count($sel) - 1]['t'] !== $samples[$n - 1]['t']) $sel[] = $samples[$n - 1];
+        $samples = $sel;
+    }
+
+    $out = [
+        't'     => [],
+        'perf'  => ['id' => [], 'ls' => [], 'hb' => []],
+        'sys'   => ['cpu' => [], 'load' => [], 'mem' => []],
+        'disks' => [],
+    ];
+    foreach ($disks as $disk) {
+        $key = ($disk['serial'] !== '—' && $disk['serial'] !== '') ? $disk['serial'] : $disk['dev'];
+        $out['disks'][$key] = [
+            'label'   => $disk['mount'] ?: $disk['dev'],
+            'dev'     => $disk['dev'],
+            'tran'    => $disk['tran'],
+            'total_b' => $disk['fs_size_b'] ?? null,
+            'temp'    => [],
+            'fs'      => [],
+            'used'    => [],
+        ];
+    }
+    foreach ($samples as $s) {
+        $out['t'][] = $s['t'];
+        $out['perf']['id'][] = $s['p'][0] ?? null;
+        $out['perf']['ls'][] = $s['p'][1] ?? null;
+        $out['perf']['hb'][] = $s['p'][2] ?? null;
+        $out['sys']['cpu'][]  = $s['s'][0] ?? null;
+        $out['sys']['load'][] = $s['s'][1] ?? null;
+        $out['sys']['mem'][]  = $s['s'][2] ?? null;
+        foreach ($out['disks'] as $k => &$dd) {
+            $dd['temp'][] = $s['d'][$k][0] ?? null;
+            $dd['fs'][]   = $s['d'][$k][1] ?? null;
+            $dd['used'][] = $s['d'][$k][2] ?? null;   // null on samples predating v2.1
+        }
+        unset($dd);
+    }
+    return $out;
+}
+
+/**
+ * What is Plex actually doing right now?
+ *
+ * Works it out from the transcoder/scanner command lines, so a "Plex Transcoder"
+ * burning a core is identifiable as preview generation for a specific file
+ * rather than an anonymous CPU hog. Reads only /proc via ps — touches no disks.
+ */
+function classify_job(string $args): array {
+    $media = null;
+    if (preg_match('/\s-i\s+(.+?)(?=\s+-[a-zA-Z])/', $args, $m)) $media = trim($m[1]);
+
+    if (str_contains($args, '/bif/') || str_contains($args, 'Indexes/tmp') || str_contains($args, 'img-%06d')) {
+        return ['bif', 'Preview thumbnails', 'generating scrubbing previews for a recently added video', $media];
+    }
+    if (str_contains($args, 'thumb-%05d') || (str_contains($args, '-f image2') && str_contains($args, '-ss '))) {
+        return ['chapter', 'Chapter thumbnails', 'generating chapter images for a recently added video', $media];
+    }
+    if (stripos($args, 'ebur128') !== false || stripos($args, 'loudness') !== false) {
+        return ['loudness', 'Loudness analysis', 'analysing audio levels of a recently added track', $media];
+    }
+    if (str_contains($args, 'transcode/session')) {
+        return ['playback', 'Playback transcode', 'someone is watching — this is a live stream', $media];
+    }
+    if (str_contains($args, '-f null') || str_contains($args, 'showinfo')) {
+        return ['analysis', 'Media analysis', 'reading codecs and duration of a recently added file', $media];
+    }
+    return ['other', 'Transcoder', 'background transcoder task', $media];
+}
+
+/** Map library folders to library names so a job can say which library it belongs to. */
+function library_roots(?string $token, $ctx): array {
+    if (!$token) return [];
+    $raw = @file_get_contents(PLEX_URL . '/library/sections?X-Plex-Token=' . urlencode($token), false, $ctx);
+    if ($raw === false) return [];
+    $roots = [];
+    if (preg_match_all('#<Directory\b.*?</Directory>#s', $raw, $blocks)) {
+        foreach ($blocks[0] as $b) {
+            if (!preg_match('/\btitle="([^"]*)"/', $b, $t)) continue;
+            if (preg_match_all('/<Location\b[^>]*\bpath="([^"]*)"/', $b, $locs)) {
+                foreach ($locs[1] as $p) $roots[$p] = $t[1];
+            }
+        }
+    }
+    return $roots;
+}
+
+function collect_activity(array $roots): array {
+    $raw = sh("ps -eo etimes,pcpu,args --sort=-etimes");
+    $jobs = [];
+    foreach (explode("\n", $raw) as $line) {
+        if (!str_contains($line, 'Plex Transcoder') && !str_contains($line, 'Plex Media Scanner')) continue;
+        if (str_contains($line, 'grep')) continue;
+        $parts = preg_split('/\s+/', trim($line), 3);
+        if (count($parts) < 3) continue;
+        [$etimes, $pcpu, $args] = $parts;
+
+        if (str_contains($args, 'Plex Media Scanner')) {
+            $kind = 'scan'; $label = 'Library scan';
+            $why = 'looking for newly added files'; $media = null;
+        } else {
+            [$kind, $label, $why, $media] = classify_job($args);
+        }
+
+        $lib = null;
+        if ($media !== null) {
+            foreach ($roots as $path => $name) {
+                if (str_starts_with($media, $path)) { $lib = $name; break; }
+            }
+        }
+        $jobs[] = [
+            'kind' => $kind, 'label' => $label, 'why' => $why,
+            'file' => $media !== null ? basename($media) : null,
+            'dir'  => $media !== null ? dirname($media) : null,
+            'library' => $lib,
+            'runtime_s' => (int) $etimes,
+            'cpu' => (float) $pcpu,
+        ];
+    }
+    return $jobs;
+}
+
 // ---- disk enumeration ----------------------------------------------------
 dbg("=== plex-status collector " . ($DRYRUN ? "(dry-run)" : "(debug)") . " @ " . date('Y-m-d H:i:s') . " ===");
 $lsblk = json_decode(sh(
@@ -467,6 +832,22 @@ foreach ($devs as $dev) {
         $temp ?? '-', $health ?? '-', $poh ?? '-', $realloc ?? '-', $pending ?? '-', $uncorr ?? '-',
         $from_cache ? ' [cached]' : ''));
 
+    // A chart of "0, 0, 0, …" tells you nothing. What matters is whether these
+    // counters have EVER moved — so remember when they last changed.
+    $counters = [$realloc, $pending, $uncorr];
+    $prev_counters = $prev['counters'] ?? null;
+    $counters_ts = (int) ($prev['counters_ts'] ?? time());
+    if ($prev_counters !== null && $counters !== $prev_counters
+        && !in_array(null, $counters, true)) {
+        $counters_ts = time();
+        dbg("    NOTE: SMART error counters changed since last read!");
+    }
+    if ($prev_counters === null) $counters_ts = (int) ($prev['counters_ts'] ?? time());
+    if (!in_array(null, $counters, true)) {
+        $cache[$key]['counters']    = $counters;
+        $cache[$key]['counters_ts'] = $counters_ts;
+    }
+
     $disks[] = [
         'dev'        => $name,
         'path'       => $path,
@@ -493,6 +874,7 @@ foreach ($devs as $dev) {
         'realloc'    => $realloc,
         'pending'    => $pending,
         'uncorrect'  => $uncorr,
+        'stable_since' => $counters_ts,   // when the error counters last moved
         'nvme_used'      => $nvme_used,      // % of rated write endurance consumed
         'nvme_spare'     => $nvme_spare,     // % spare capacity remaining
         'nvme_media_err' => $nvme_media_err, // media & data integrity errors
@@ -502,6 +884,8 @@ foreach ($devs as $dev) {
         'mount'      => $mount,
         'fs_size'    => $fssize ? round($fssize / 1e12, 2) . ' TB' : null,
         'fs_used'    => $fsused ? round($fsused / 1e12, 2) . ' TB' : null,
+        'fs_size_b'  => $fssize !== null ? (int) $fssize : null,
+        'fs_used_b'  => $fsused !== null ? (int) $fsused : null,
         'fs_pct'     => $fsuse !== null ? (int) rtrim((string) $fsuse, '%') : null,
     ];
 }
@@ -562,6 +946,26 @@ if ($token) {
     dbg("plex: sessions=" . ($plex['sessions'] ?? '(query failed)'));
 }
 
+// ---- what Plex is doing right now ----------------------------------------
+$activity = collect_activity(library_roots($token, $ctx));
+if ($activity) {
+    dbg("\nactivity: " . count($activity) . " job(s)");
+    foreach ($activity as $j) {
+        dbg(sprintf("    %-22s %5.0f%% CPU, %s%s", $j['label'], $j['cpu'],
+            fmt_dur($j['runtime_s']), $j['file'] ? '  ' . $j['file'] : ''));
+    }
+} else {
+    dbg("\nactivity: idle");
+}
+
+// ---- performance ---------------------------------------------------------
+$perf = [];
+if (PERF_ENABLED) {
+    dbg("\nperformance:");
+    $perf = collect_perf($token);
+    unset($perf['history']);
+}
+
 // ---- overall status ------------------------------------------------------
 // Collect the concrete reasons so the page can explain the badge instead of
 // just colouring it.
@@ -616,23 +1020,35 @@ foreach ($reasons as $r) {
 }
 
 // ---- write ---------------------------------------------------------------
+$system = [
+    'uptime_s'  => $uptime_s,
+    'load'      => array_map(fn($x) => round($x, 2), $load),
+    'ncpu'      => (int) trim(sh('nproc')),
+    'mem_total' => $mem_total,
+    'mem_used'  => $mem_used,
+    'cpu_temp'  => $cpu_temp,
+    'kernel'    => trim(sh('uname -r')),
+];
+
+// ---- history -------------------------------------------------------------
+$samples = history_update($perf['direct'] ?? [], $system, $disks, !$DRYRUN);
+$history = history_series($samples, $disks);
+dbg("\nhistory: " . count($samples) . " samples stored, "
+    . count($history['t']) . " points handed to the page"
+    . ($DRYRUN ? " (dry-run: file not written)" : ""));
+
 $payload = [
     'generated' => time(),
     'hostname'  => trim(sh('hostname')),
     'overall'   => $overall,
     'reasons'   => array_map(fn($r) => ['level' => $r[0], 'text' => $r[1]], $reasons),
     'thresholds'=> ['temp_warn' => TEMP_WARN, 'temp_crit' => TEMP_CRIT],
-    'system'    => [
-        'uptime_s'  => $uptime_s,
-        'load'      => array_map(fn($x) => round($x, 2), $load),
-        'ncpu'      => (int) trim(sh('nproc')),
-        'mem_total' => $mem_total,
-        'mem_used'  => $mem_used,
-        'cpu_temp'  => $cpu_temp,
-        'kernel'    => trim(sh('uname -r')),
-    ],
-    'plex'  => $plex,
-    'disks' => $disks,
+    'system'    => $system,
+    'plex'    => $plex,
+    'activity' => $activity,
+    'perf'    => $perf,
+    'history' => $history,
+    'disks'   => $disks,
 ];
 
 $json = json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);

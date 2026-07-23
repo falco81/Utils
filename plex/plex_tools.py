@@ -405,8 +405,7 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
     def visible_order():
         if not filt:
             return list(range(n))
-        f = filt.lower()
-        return [i for i in range(n) if f in plain[i].lower()]
+        return [i for i in range(n) if _match_filter(plain[i], filt)]
 
     def term_size():
         try:
@@ -552,6 +551,56 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
             page_rows = render(order, sel_pos)
 
 
+def _match_filter(text, filt):
+    """Case-insensitive match. Supports '*' and '?' wildcards; a plain string is a
+    substring match (so 'roman' still works like before)."""
+    if not filt:
+        return True
+    t, f = text.lower(), filt.lower()
+    if any(c in f for c in "*?["):
+        import fnmatch
+        pat = f if f.startswith("*") or f.startswith("?") else f
+        return fnmatch.fnmatch(t, pat) or fnmatch.fnmatch(t, f"*{pat}")
+    return f in t
+
+
+def ask_line(prompt, default="", allow_empty=False):
+    """One-line text input with Esc = cancel (returns None). Handles Unicode."""
+    if not _tui_supported():
+        try:
+            raw = input(f"{strip_ansi(prompt)}{f' [{default}]' if default else ''}: ").strip()
+        except EOFError:
+            return None
+        return raw or (default if default else (None if not allow_empty else ""))
+    buf = default
+    sys.stdout.write(f"{Fore.YELLOW}{prompt}{Style.RESET_ALL} "
+                     f"{Style.DIM}(Enter = ok · Esc = back){Style.RESET_ALL}\r\n")
+    sys.stdout.flush()
+    with _RawMode():
+        while True:
+            sys.stdout.write(f"\r\x1b[K> {buf}")
+            sys.stdout.flush()
+            k = _read_key()
+            if k == "esc":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                return None
+            if k == "enter":
+                sys.stdout.write("\r\n")
+                sys.stdout.flush()
+                if buf.strip() or allow_empty:
+                    return buf.strip()
+                return None
+            if k == "backspace":
+                buf = buf[:-1]
+            elif isinstance(k, tuple) and k[0] == "char" and k[1].isprintable():
+                buf += k[1]
+
+
+def strip_ansi_len(s):
+    return len(strip_ansi(s))
+
+
 def _checkbox_classic(prompt, rows, header=None):
     """Fallback multi-select for non-TTY: number toggles, a/n/w/u group selects."""
     for h in (header or []):
@@ -588,8 +637,12 @@ def _checkbox_classic(prompt, rows, header=None):
             r["selected"] = not r.get("selected")
 
 
-def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
+def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate=False,
+                  ui_state=None, scope_picker=None):
     """Smart app-like multi-select with [x]/[ ] checkboxes.
+    tristate=True: rows carry 'state' ("on"/"off"/"mixed") instead of 'selected';
+    Space cycles on -> off -> (mixed, if that was the original state) and the box
+    shows [x]/[ ]/[~]. Used for "which labels should these items have".
     rows: dicts with 'label', 'selected', optional 'watched' (bool status tag) and
     optional 'season' (int, enables season filtering). Group-select actions act on
     the CURRENTLY VISIBLE rows (respecting the active season/search filter):
@@ -597,7 +650,12 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
       [ / ]=previous/next season, /=search (type, Enter/Esc exit), Enter=confirm,
       Esc=clear filter or cancel. Returns rows (with 'selected' set) or None.
     start_pos restores the highlighted row; if pos_out is a list, the final
-    highlighted row index is written to pos_out[0] (so a caller can come back to it)."""
+    highlighted row index is written to pos_out[0] (so a caller can come back to it).
+    ui_state (dict): remembers the view across calls - active search filter, season
+    scope and highlighted row - so stepping back into this menu looks exactly as it
+    was left (not reset to defaults).
+    scope_picker: callable() -> (name, set_of_row_keys) or None. Bound to 'l' and
+    used to narrow the list to a group (e.g. every show carrying one label)."""
     if not _tui_supported():
         return _checkbox_classic(prompt, rows, header)
 
@@ -607,14 +665,30 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
     scopes = [None] + seasons            # None = all seasons
     scope_idx = 0
     filt = ""
-    search_mode = False
-    sel_pos = max(0, min(start_pos, len(rows) - 1)) if rows else 0
+    search_mode = False      # typing a view filter after '/'
+    mark_mode = None         # "+" / "-": typing a pattern to check / uncheck
+    mark_buf = ""            # the pattern being typed for +/-
+    ext_scope = None         # ("label X", {rk, ...}) from scope_picker, or None
+    want_row = max(0, min(start_pos, len(rows) - 1)) if rows else 0
+    if isinstance(ui_state, dict):     # restore the view exactly as it was left
+        filt = ui_state.get("filt", "")
+        if ui_state.get("scope", None) in scopes:
+            scope_idx = scopes.index(ui_state.get("scope"))
+        want_row = ui_state.get("row", want_row)
+        ext_scope = ui_state.get("ext_scope")
+    sel_pos = 0
     prev_lines = 0
     first = True
 
     def _remember():
+        row = order[sel_pos] if order else 0
         if pos_out is not None:
-            pos_out[:] = [order[sel_pos] if order else 0]  # remember the ROW index
+            pos_out[:] = [row]  # remember the ROW index
+        if isinstance(ui_state, dict):
+            ui_state["filt"] = filt
+            ui_state["scope"] = cur_season()
+            ui_state["row"] = row
+            ui_state["ext_scope"] = ext_scope
 
 
     def cur_season():
@@ -633,15 +707,36 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
 
     def visible_order():
         s = cur_season()
-        f = filt.lower()
+        pat = filt
         out = []
         for i, r in enumerate(rows):
             if s is not None and r.get("season") != s:
                 continue
-            if f and f not in plain[i].lower():
+            if ext_scope is not None and not is_header(r) and str(r.get("rk")) not in ext_scope[1]:
+                continue
+            if pat and not (is_header(r) or _match_filter(plain[i], pat)):
                 continue
             out.append(i)
         return out
+
+    def mark_matches(order):
+        """Row indices (of the visible ones) matching the +/- pattern."""
+        if not mark_buf:
+            return []
+        return [i for i in order
+                if not is_header(rows[i]) and not rows[i].get("action")
+                and _match_filter(plain[i], mark_buf)]
+
+    def apply_mark(order):
+        """Apply the +/- pattern once (on Enter), like the file picker does."""
+        on = mark_mode == "+"
+        hits = mark_matches(order)
+        for i in hits:
+            if tristate:
+                rows[i]["state"] = "on" if on else "off"
+            else:
+                rows[i]["selected"] = on
+        return len(hits)
 
     def term_size():
         try:
@@ -657,7 +752,9 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
         nonlocal prev_lines, first
         cols, rows_total = term_size()
         maxw = max(10, cols - 2)
-        page_rows = max(3, rows_total - (8 + len(header)))
+        page_rows = max(3, rows_total - (8 + len(header)
+                                        + (1 if ext_scope is not None else 0)
+                                        + (1 if mark_mode else 0)))
         buf = []
         if first:
             buf.append("\x1b[2J\x1b[H")
@@ -670,17 +767,38 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
             sp = strip_ansi(h)
             vis.append(h if len(sp) <= maxw else trunc(sp, maxw))
         n_eps = sum(1 for r in rows if not is_header(r))
-        n_sel = sum(1 for r in rows if not is_header(r) and r.get("selected"))
+        if tristate:
+            n_sel = sum(1 for r in rows if not is_header(r) and r.get("state") == "on")
+        else:
+            n_sel = sum(1 for r in rows if not is_header(r) and r.get("selected"))
         vis.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
-        vis.append(f"{Fore.CYAN}{trunc('Space toggle · a all · n none · w watched · u unwatched · i invert', maxw)}{Style.RESET_ALL}")
+        if tristate:
+            hint_line = "Space cycle [x]/[ ]/[~] · a all on · n all off · r reset"
+        else:
+            hint_line = "Space toggle · a all · n none · w watched · u unwatched · i invert"
+        # note: '/' search accepts +pattern / -pattern to check/uncheck matches
+        vis.append(f"{Fore.CYAN}{trunc(hint_line, maxw)}{Style.RESET_ALL}")
         s = cur_season()
         scope_txt = "all seasons" if s is None else f"S{int(s):02d}"
         has_seasons = len(scopes) > 1
         line2 = ((f"[ / ] change season ({scope_txt}) · " if has_seasons else "") +
-                 "/ search · Enter apply · Esc " + ("clear" if (filt or s is not None) else "cancel"))
+                 "/ search · +/- check/uncheck by pattern"
+                 + (" · l label" if scope_picker is not None else "")
+                 + " · Enter apply · Esc "
+                 + ("clear" if (filt or s is not None or ext_scope is not None) else "cancel"))
         vis.append(f"{Fore.CYAN}{trunc(line2, maxw)}{Style.RESET_ALL}")
+        if ext_scope is not None:
+            vis.append(f"{Fore.GREEN}{trunc('label: ' + ext_scope[0] + '   (Esc clears)', maxw)}{Style.RESET_ALL}")
+        if mark_mode:
+            verb = "check" if mark_mode == "+" else "uncheck"
+            nmatch = len(mark_matches(order))
+            prompt_txt = (f"{verb} matching: {mark_buf}\u2588   ({nmatch} match)  "
+                          f"Enter = apply · Esc = cancel")
+            vis.append(f"{Fore.MAGENTA}{trunc(prompt_txt, maxw)}{Style.RESET_ALL}")
         if search_mode or filt:
-            vis.append(f"{Fore.MAGENTA}{trunc('search: ' + filt + ('_' if search_mode else ''), maxw)}{Style.RESET_ALL}")
+            vis.append(f"{Fore.MAGENTA}"
+                       f"{trunc('search: ' + filt + ('_' if search_mode else ''), maxw)}"
+                       f"{Style.RESET_ALL}")
         if not order:
             vis.append(f"  {Fore.RED}(no match){Style.RESET_ALL}")
         else:
@@ -712,7 +830,14 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
                     else:
                         line = f"  {Fore.CYAN}{Style.BRIGHT}{box} {text}{Style.RESET_ALL}"
                 else:
-                    box = "[x]" if r.get("selected") else "[ ]"
+                    if tristate:
+                        st_ = r.get("state", "off")
+                        if r.get("action"):      # action rows aren't states -> no checkbox
+                            box = " » "
+                        else:
+                            box = {"on": "[x]", "off": "[ ]", "mixed": "[~]"}[st_]
+                    else:
+                        box = "[x]" if r.get("selected") else "[ ]"
                     if "watched" in r:
                         word = "watched" if r["watched"] else "unwatched"
                         color = Fore.GREEN if r["watched"] else Style.DIM
@@ -721,10 +846,14 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
                         tag = (" " * (statgap + statw)) if status_col else ""
                     textw = max(6, maxw - 8 - (statgap + statw if status_col else 0))
                     text = fit(plain[i], textw)  # pad/truncate so the status column aligns
-                    if cursor:
+                    hit = bool(mark_mode and mark_buf and _match_filter(plain[i], mark_buf))
+                    if hit:      # show what the +/- pattern will affect
+                        line = f"    {Fore.MAGENTA}{box} {text}{Style.RESET_ALL}{tag}"
+                    elif cursor:
                         line = f"{Fore.GREEN}{Style.BRIGHT}›   {box} {text}{Style.RESET_ALL}{tag}"
                     else:
-                        boxc = f"{Fore.GREEN}{box}{Style.RESET_ALL}" if r.get("selected") else box
+                        on_ = (r.get("state") == "on") if tristate else r.get("selected")
+                        boxc = f"{Fore.GREEN}{box}{Style.RESET_ALL}" if on_ else box
                         line = f"    {boxc} {text}{tag}"
                 vis.append(_with_scrollbar(line, cols, pos - start, sbr))
             rest = len(order) - (start + len(window))
@@ -739,9 +868,23 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
 
     with _RawMode():
         order = visible_order()
+        sel_pos = order.index(want_row) if want_row in order else 0
         render(order, sel_pos)
         while True:
             key = _read_key()
+            if mark_mode:                      # typing a +/- pattern (list stays put)
+                if key == "esc":
+                    mark_mode, mark_buf = None, ""
+                elif key == "enter":
+                    if mark_buf.strip():
+                        apply_mark(order)
+                    mark_mode, mark_buf = None, ""
+                elif key == "backspace":
+                    mark_buf = mark_buf[:-1]
+                elif isinstance(key, tuple) and key[0] == "char" and key[1].isprintable():
+                    mark_buf += key[1]
+                render(order, sel_pos)
+                continue
             if search_mode:
                 if key in ("enter", "esc"):
                     if key == "esc":
@@ -779,17 +922,33 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
                     all_on = bool(eps) and all(rows[j].get("selected") for j in eps)
                     for j in eps:
                         rows[j]["selected"] = not all_on
+                elif tristate:
+                    cur = r.get("state", "off")
+                    orig = r.get("orig", "off")
+                    cycle = ["on", "off", "mixed"] if orig == "mixed" else ["on", "off"]
+                    r["state"] = cycle[(cycle.index(cur) + 1) % len(cycle)] if cur in cycle else cycle[0]
                 else:
                     r["selected"] = not r.get("selected")
-                sel_pos = min(sel_pos + 1, len(order) - 1)  # advance for fast selecting
+                if not tristate:  # advance for fast multi-select; tri-state cycles in place
+                    sel_pos = min(sel_pos + 1, len(order) - 1)
             elif key == ("char", "a"):
                 for i in order:
                     if not is_header(rows[i]):
-                        rows[i]["selected"] = True
+                        if tristate:
+                            rows[i]["state"] = "on"
+                        else:
+                            rows[i]["selected"] = True
             elif key == ("char", "n"):
                 for i in order:
                     if not is_header(rows[i]):
-                        rows[i]["selected"] = False
+                        if tristate:
+                            rows[i]["state"] = "off"
+                        else:
+                            rows[i]["selected"] = False
+            elif key == ("char", "r") and tristate:
+                for i in order:  # reset to the original state
+                    if not is_header(rows[i]):
+                        rows[i]["state"] = rows[i].get("orig", "off")
             elif key == ("char", "w"):
                 for i in order:
                     if rows[i].get("watched"):
@@ -806,17 +965,32 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None):
                 scope_idx = (scope_idx + (1 if key == ("char", "]") else -1)) % len(scopes)
                 order = visible_order()
                 sel_pos = 0
+            elif key == ("char", "l") and scope_picker is not None:
+                picked_scope = scope_picker()
+                if picked_scope is not None:
+                    ext_scope = picked_scope
+                    order = visible_order()
+                    sel_pos = 0
+                first = True   # the picker drew over the screen -> full redraw
             elif key == ("char", "/"):
                 search_mode = True
+                filt = ""
+                order = visible_order()
+                sel_pos = 0
+            elif key in (("char", "+"), ("char", "-")):
+                mark_mode, mark_buf = key[1], ""
             elif key == "enter":
+                if tristate and order and rows[order[sel_pos]].get("action"):
+                    rows[order[sel_pos]]["state"] = "on"   # Enter on a » row runs it
                 _remember()
                 sys.stdout.write("\r\n")
                 sys.stdout.flush()
                 return rows
             elif key == "esc":
-                if filt or cur_season() is not None:
+                if filt or cur_season() is not None or ext_scope is not None:
                     filt = ""
                     scope_idx = 0
+                    ext_scope = None
                     order = visible_order()
                     sel_pos = 0
                 else:
@@ -1315,6 +1489,61 @@ class PlexClient:
         if st >= 400:
             raise RuntimeError(f"HTTP {st}")
         return st
+
+    def section_labels(self, section_key):
+        """All label names that exist in a library."""
+        return [e["title"] for e in self.section_label_entries(section_key)]
+
+    def section_label_entries(self, section_key):
+        """Labels of a library as [{'id': filterKey, 'title': name}, ...]
+        (GET /library/sections/{key}/label). Labels are shared tag objects."""
+        try:
+            j = self.get_json(f"/library/sections/{section_key}/label")
+        except Exception:
+            return []
+        out = []
+        for d in j.get("MediaContainer", {}).get("Directory", []) or []:
+            title = d.get("title")
+            if title:
+                out.append({"id": d.get("key"), "title": title})
+        return out
+
+    def items_with_label(self, section_key, sec_type, label_id, type_num=None):
+        """ratingKeys of items carrying a label (server-side filter:
+        /library/sections/{key}/all?type=N&label=<id>). type_num overrides the
+        section type, so seasons (3), episodes (4) and collections (18) can be
+        checked too - a label left on those keeps the tag alive in Plex."""
+        params = {"label": label_id}
+        num = type_num if type_num is not None else SECTION_TYPE_NUM.get(sec_type)
+        if num:
+            params["type"] = num
+        j = self.get_json(f"/library/sections/{section_key}/all", params)
+        return [str(m.get("ratingKey"))
+                for m in j.get("MediaContainer", {}).get("Metadata", []) or []]
+
+    def edit_labels(self, section_key, sec_type, rating_keys, add=(), remove=(), type_num=None):
+        """Add/remove labels on one or more items in a single request:
+        PUT /library/sections/{key}/all?type=..&id=rk1,rk2&label[i].tag.tag=..
+            &label[].tag.tag-=..&label.locked=1
+        Labels are per-item tags; the same name is the same tag object server-side."""
+        if not rating_keys or (not add and not remove):
+            return 0
+        params = {"type": type_num if type_num is not None else SECTION_TYPE_NUM.get(sec_type, 2),
+                  "id": ",".join(str(k) for k in rating_keys),
+                  "label.locked": 1}
+        for i, tag in enumerate(add):
+            params[f"label[{i}].tag.tag"] = tag
+        if remove:
+            # Plex takes a comma-separated removal list; send commas-containing
+            # labels separately so they can't be split apart.
+            simple = [t for t in remove if "," not in t]
+            if simple:
+                params["label[].tag.tag-"] = ",".join(simple)
+            for tag in [t for t in remove if "," in t]:
+                self.put(f"/library/sections/{section_key}/all",
+                         {"type": params["type"], "id": params["id"],
+                          "label.locked": 1, "label[].tag.tag-": tag})
+        return self.put(f"/library/sections/{section_key}/all", params)
 
 
 # ---------------------------------------------------------------------------
@@ -2416,13 +2645,15 @@ def _watched_for_item(client, args, item, preset):
     action_idx = 0
     confirm_default = True
     sel_cursor = [0]
+    sel_view = {}    # keeps the search filter / season / cursor across step-backs
     picked = []
     action = None
     stage = "select"
     while True:
         if stage == "select":
             res = checkbox_menu("Select episodes:", rows, header=header,
-                                start_pos=sel_cursor[0], pos_out=sel_cursor)
+                                start_pos=sel_cursor[0], pos_out=sel_cursor,
+                                ui_state=sel_view)
             if res is None:
                 return "back"  # Esc on the selection -> back to the item picker
             picked = [r for r in rows if r.get("rk") and r["selected"]]
@@ -2512,6 +2743,391 @@ def mark_watched_flow(client, args):
                 return False  # --show: nothing to step back to -> main menu
             continue          # back to the library/item picker
         return outcome        # True (applied)
+
+
+# ---------------------------------------------------------------------------
+# Labels flow (custom labels on shows/movies)
+# ---------------------------------------------------------------------------
+def _pick_library(client, default=0):
+    """Pick a video library. Returns (section, index, single) where `single` means
+    there was nothing to choose from (so Esc one level up should leave the tool)."""
+    secs = client.sections()
+    vid = [s for s in secs if s["type"] in ("show", "movie")] or secs
+    if not vid:
+        die("The server has no libraries.")
+    if len(vid) == 1:
+        return vid[0], 0, True
+
+    def scan_lib(i):
+        try:
+            client.refresh_section(vid[i]["key"])
+            return f"{Fore.GREEN}» Scan Library Files started on '{vid[i]['title']}'.{Style.RESET_ALL}"
+        except Exception as ex:
+            return f"{Fore.RED}Scan Library Files failed: {ex}{Style.RESET_ALL}"
+
+    labels = [f"{s['title']}  [{s['type']}]" for s in vid]
+    i = interactive_menu("Select a library:", labels, default=default,
+                         allow_cancel=True, refresh_cb=scan_lib)
+    if i is None:
+        return None, default, False
+    return vid[i], i, False
+
+
+def _labels_of(md):
+    return [t.get("tag") for t in (md.get("Label") or []) if t.get("tag")]
+
+
+def labels_flow(client, args):
+    """Manage custom labels: pick a library, check off several shows/movies
+    (search supports * and ? wildcards), then set which labels they should have.
+    Returns True if something was changed, False otherwise."""
+    lib_idx = 0
+    item_cursor = [0]
+    item_view = {}   # keeps search filter + cursor when stepping back into the list
+    while True:  # library level
+        sec, lib_idx, single_lib = _pick_library(client, default=lib_idx)
+        if sec is None:
+            return False
+
+        items = client.items_in_section(sec["key"], sec["type"])
+        if not items:
+            log_warn("The library is empty.")
+            if single_lib:
+                return False
+            continue
+        items.sort(key=lambda x: (x["title"] or "").lower())
+        rows = [{"rk": it["ratingKey"],
+                 "label": f"{it['title']} ({it['year']})" if it.get("year") else it["title"],
+                 "selected": False, "title": it["title"]} for it in items]
+
+        label_cache = {}
+
+        def pick_label_scope():
+            """'l' - list every label in this library and narrow the view to the
+            shows/movies carrying it (or to the ones with no label at all).
+            Case variants of the same name are merged into one entry."""
+            entries = client.section_label_entries(sec["key"])
+            if not entries:
+                log_warn("This library has no labels yet.")
+                return None
+            grouped = {}   # casefolded -> {"title": display, "ids": [...]}
+            for e in entries:
+                g = grouped.setdefault(e["title"].casefold(),
+                                       {"title": e["title"], "ids": []})
+                g["ids"].append(e["id"])
+            groups = [grouped[k] for k in sorted(grouped, key=lambda c: grouped[c]["title"].lower())]
+            names = [g["title"] + (f"   {Style.DIM}({len(g['ids'])} spellings){Style.RESET_ALL}"
+                                   if len(g["ids"]) > 1 else "") for g in groups]
+            names.append(f"{Style.DIM}(items with no label){Style.RESET_ALL}")
+            i = interactive_menu("Show only items with label:", names, allow_cancel=True)
+            if i is None:
+                return None
+
+            def members(g):
+                out = set()
+                for lid in g["ids"]:
+                    if lid not in label_cache:
+                        try:
+                            label_cache[lid] = set(client.items_with_label(
+                                sec["key"], sec["type"], lid))
+                        except Exception as ex:
+                            log_warn(f"Could not list items for '{g['title']}': {ex}")
+                            label_cache[lid] = set()
+                    out |= label_cache[lid]
+                return out
+
+            if i == len(groups):  # no label at all
+                labelled = set()
+                for g in groups:
+                    labelled |= members(g)
+                return ("(no label)", {str(r["rk"]) for r in rows} - labelled)
+            g = groups[i]
+            rks = members(g)
+            if not rks:
+                log_warn(f"No items carry '{g['title']}'.")
+                return None
+            return (g["title"], rks)
+
+        while True:  # item selection level
+            header = [
+                f"{Fore.CYAN}Library:{Style.RESET_ALL} {sec['title']}   ({len(rows)} items)",
+                f"{Style.DIM}/ = filter (e.g. *romance*) · + = check by pattern · "
+                f"- = uncheck by pattern · l = show only one label · a = all shown · "
+                f"n = none · i = invert{Style.RESET_ALL}",
+                "",
+            ]
+            res = checkbox_menu("Select shows/movies to label:", rows, header=header,
+                                start_pos=item_cursor[0], pos_out=item_cursor,
+                                ui_state=item_view, scope_picker=pick_label_scope)
+            if res is None:
+                if single_lib:
+                    return False  # nothing to step back to
+                break  # back to the library picker
+            picked = [r for r in rows if r["selected"]]
+            if not picked:
+                log_info("Nothing selected.")
+                continue
+
+            if _labels_editor(client, sec, picked, args):
+                return True
+            # editor cancelled -> back to the item selection (keeps checkboxes)
+
+
+def _label_groups(client, section_key):
+    """Labels of a library grouped case-insensitively:
+    [{'title': display, 'ids': [filter ids]}, ...]"""
+    grouped = {}
+    for e in client.section_label_entries(section_key):
+        g = grouped.setdefault(e["title"].casefold(), {"title": e["title"], "ids": []})
+        g["ids"].append(e["id"])
+        if e["title"] not in g.setdefault("names", [e["title"]]):
+            g["names"].append(e["title"])
+    for g in grouped.values():
+        g.setdefault("names", [g["title"]])
+    return [grouped[k] for k in sorted(grouped, key=lambda c: grouped[c]["title"].lower())]
+
+
+# Plex metadata types a label can sit on. A label left on a season, an episode or
+# a collection keeps the tag alive even after you cleared it from every show.
+_LABEL_TYPES = [("item", None), ("season", 3), ("episode", 4), ("collection", 18)]
+
+
+def _purge_label_everywhere(client, sec, group):
+    """Strip a label (all case variants) from every object in the library: items,
+    seasons, episodes and collections. Returns the number of objects touched."""
+    touched = 0
+    for kind, tnum in _LABEL_TYPES:
+        type_num = SECTION_TYPE_NUM.get(sec["type"], 2) if tnum is None else tnum
+        rks = set()
+        for lid in group["ids"]:
+            try:
+                rks |= set(client.items_with_label(sec["key"], sec["type"], lid,
+                                                   type_num=type_num))
+            except Exception:
+                pass          # some types don't exist in every library
+        if not rks:
+            continue
+        try:
+            client.edit_labels(sec["key"], sec["type"], sorted(rks),
+                               remove=group["names"], type_num=type_num)
+            touched += len(rks)
+            log_done(f"Removed from {len(rks)} {kind}(s).")
+        except Exception as ex:
+            log_warn(f"Could not clear {kind}s: {ex}")
+    if not touched:
+        log_info("Nothing carries this label any more.")
+    log_info("Plex has no API to delete a tag itself. If it still shows up: it may be "
+             "used in a managed user's restrictions, and the empty tag disappears after "
+             "Settings > Manage > Troubleshooting > Optimize database.")
+    return touched
+
+
+def _labels_editor(client, sec, picked, args):
+    """Tri-state label editor for the picked items. Returns True if applied.
+    Labels are matched case-insensitively: Plex can hold the same tag in several
+    letter cases ('iPrima' / 'IPrima'), so they are shown as one row and removal
+    sends every case variant that is actually present on the items."""
+    while True:
+        clear_screen()
+        log_info(f"Loading labels for {len(picked)} item(s)…")
+        md_map = client.get_metadata_many([r["rk"] for r in picked])
+        raw_per_item = {}          # rk -> set of raw label strings on that item
+        for r in picked:
+            raw_per_item[r["rk"]] = set(_labels_of(md_map.get(str(r["rk"])) or {}))
+        try:
+            known = client.section_labels(sec["key"])
+        except Exception:
+            known = []
+
+        # group by casefolded name. Plex capitalises the first letter when it returns
+        # a label inside item metadata ('iPrima' -> 'IPrima'), so the library's own
+        # label list is the canonical spelling and wins for display.
+        variants = {}              # cf -> list of raw spellings seen on items
+        for s in raw_per_item.values():
+            for lab in s:
+                variants.setdefault(lab.casefold(), []).append(lab)
+        known_cf = {}
+        for lab in known:
+            known_cf.setdefault(lab.casefold(), lab)
+            variants.setdefault(lab.casefold(), []).append(lab)
+        display = {cf: known_cf.get(cf) or max(set(v), key=v.count)
+                   for cf, v in variants.items()}
+        cf_per_item = {rk: {l.casefold() for l in s} for rk, s in raw_per_item.items()}
+
+        n = len(picked)
+        rows = []
+        for cf in sorted(display, key=lambda c: display[c].lower()):
+            cnt = sum(1 for s in cf_per_item.values() if cf in s)
+            state = "on" if cnt == n else ("off" if cnt == 0 else "mixed")
+            suffix = "" if cnt in (0, n) else f"   {Style.DIM}({cnt}/{n}){Style.RESET_ALL}"
+            rows.append({"cf": cf, "lab": display[cf], "label": display[cf] + suffix,
+                         "state": state, "orig": state})
+
+        def raw_variants(cf):
+            """Every spelling of this label that is really present on the items."""
+            out = []
+            for s in raw_per_item.values():
+                for lab in s:
+                    if lab.casefold() == cf and lab not in out:
+                        out.append(lab)
+            return out or [display[cf]]
+
+        header = [
+            f"{Fore.CYAN}Items:{Style.RESET_ALL} " +
+            ", ".join(r["title"] for r in picked[:6]) +
+            (f" … (+{len(picked) - 6} more)" if len(picked) > 6 else ""),
+            f"{Style.DIM}[x] = all items get it · [ ] = removed from all · "
+            f"[~] = leave as it is · Enter on a » row runs it · Enter = apply{Style.RESET_ALL}",
+            "",
+        ]
+        extra_rows = [
+            {"action": "new", "label": f"{Fore.GREEN}+ New label…{Style.RESET_ALL}",
+             "state": "mixed", "orig": "mixed"},
+            {"action": "rename", "label": f"{Fore.CYAN}» Rename a label (on these items)…{Style.RESET_ALL}",
+             "state": "mixed", "orig": "mixed"},
+            {"action": "purge", "label": f"{Fore.YELLOW}» Clean a label out of the whole library "
+                                         f"(items, seasons, episodes, collections)…{Style.RESET_ALL}",
+             "state": "mixed", "orig": "mixed"},
+            {"action": "raw", "label": f"{Style.DIM}» Show the exact label values the server "
+                                       f"returns (diagnostics)…{Style.RESET_ALL}",
+             "state": "mixed", "orig": "mixed"},
+        ]
+        menu_rows = rows + extra_rows
+        if not rows:
+            log_info("No labels exist yet — use '+ New label…' to create one.")
+
+        res = checkbox_menu(f"Labels for {n} item(s):", menu_rows, header=header, tristate=True)
+        if res is None:
+            return False  # back to item selection
+
+        # an action row left "on" means: run that action
+        act = next((r for r in extra_rows if r.get("state") == "on"), None)
+        if act:
+            act["state"] = act["orig"]
+            if act["action"] == "new":
+                name = ask_line("New label name")
+                if name:
+                    client.edit_labels(sec["key"], sec["type"], [r["rk"] for r in picked],
+                                       add=[name])
+                    log_done(f"Label '{name}' added to {n} item(s).")
+                    return True
+                continue
+            elif act["action"] == "raw":
+                clear_screen()
+                log_info("Exact strings returned by the Plex API (quoted, so letter case "
+                         "is unambiguous). Plex Web may display them capitalised even when "
+                         "they are stored differently.")
+                print()
+                print(f"  {Fore.CYAN}Library labels ({sec['title']}):{Style.RESET_ALL}")
+                lib_entries = client.section_label_entries(sec["key"])
+                if lib_entries:
+                    for e in lib_entries:
+                        print(f"      id={e['id']!s:<8} {e['title']!r}")
+                else:
+                    print("      (none)")
+                print()
+                print(f"  {Fore.CYAN}On the selected items:{Style.RESET_ALL}")
+                for r in picked[:20]:
+                    labs = sorted(raw_per_item[r["rk"]])
+                    print(f"      {r['title'][:40]:<40} {[l for l in labs]!r}")
+                if len(picked) > 20:
+                    print(f"      … (+{len(picked) - 20} more)")
+                print()
+                _pause_to_menu()
+                continue
+            elif act["action"] == "purge":
+                groups = _label_groups(client, sec["key"])
+                if not groups:
+                    log_warn("This library has no labels.")
+                    continue
+                names = [g["title"] + (f"   {Style.DIM}({len(g['names'])} spellings){Style.RESET_ALL}"
+                                       if len(g["names"]) > 1 else "") for g in groups]
+                i = interactive_menu("Clean which label out of the whole library?",
+                                     names, allow_cancel=True)
+                if i is None:
+                    continue
+                g = groups[i]
+                clear_screen()
+                log_info(f"This removes '{g['title']}' from every item, season, episode "
+                         f"and collection in '{sec['title']}'.")
+                print()
+                if not args.yes:
+                    a2 = ask_yes_back("Proceed?", default=False)
+                    if not a2:
+                        continue
+                print()
+                _purge_label_everywhere(client, sec, g)
+                return True
+            else:  # rename
+                if not rows:
+                    log_warn("There is no label to rename.")
+                    continue
+                i = interactive_menu("Rename which label?", [r["lab"] for r in rows],
+                                     allow_cancel=True)
+                if i is None:
+                    continue
+                cf = rows[i]["cf"]
+                old = rows[i]["lab"]
+                new = ask_line(f"Rename '{old}' to", default=old)
+                if not new or new == old:
+                    continue
+                targets = [r["rk"] for r in picked if cf in cf_per_item[r["rk"]]]
+                if not targets:
+                    log_warn(f"None of the selected items has '{old}'.")
+                    continue
+                log_info("Plex has no rename API for tags, so this removes the old "
+                         "label and adds the new one on the affected items.")
+                if old.casefold() == new.casefold():
+                    # case-only rename: do it in two steps, otherwise Plex can fold
+                    # the add back onto the existing tag and nothing changes
+                    client.edit_labels(sec["key"], sec["type"], targets,
+                                       remove=raw_variants(cf))
+                    client.edit_labels(sec["key"], sec["type"], targets, add=[new])
+                    log_info("This only changed letter case; Plex may keep the old "
+                             "spelling in filter lists until you run Optimize database.")
+                else:
+                    client.edit_labels(sec["key"], sec["type"], targets,
+                                       add=[new], remove=raw_variants(cf))
+                log_done(f"Renamed '{old}' -> '{new}' on {len(targets)} item(s).")
+                return True
+
+        # compute add/remove from the tri-state result
+        to_add = [r["lab"] for r in rows if r["state"] == "on" and r["orig"] != "on"]
+        to_remove = []
+        for r in rows:
+            if r["state"] == "off" and r["orig"] != "off":
+                to_remove.extend(raw_variants(r["cf"]))   # drop every case variant
+        if not to_add and not to_remove:
+            log_info("Nothing to change.")
+            continue
+
+        clear_screen()
+        log_info(f"On {n} item(s):")
+        if to_add:
+            print(f"    {Fore.GREEN}add:{Style.RESET_ALL}    " + ", ".join(to_add))
+        if to_remove:
+            print(f"    {Fore.RED}remove:{Style.RESET_ALL} " + ", ".join(to_remove))
+        print()
+        for r in picked[:20]:
+            print(f"    {r['title']}")
+        if len(picked) > 20:
+            print(f"    … (+{len(picked) - 20} more)")
+        print()
+        if not args.yes:
+            ans = ask_yes_back("Apply these label changes?", default=True)
+            if ans is None:
+                continue  # Esc -> back to the label editor (keeps the tri-states)
+            if not ans:
+                continue
+        try:
+            client.edit_labels(sec["key"], sec["type"], [r["rk"] for r in picked],
+                               add=to_add, remove=to_remove)
+        except Exception as ex:
+            log_warn(f"Failed: {ex}")
+            return False
+        log_done(f"Labels updated on {n} item(s).")
+        log_info("The change shows in the client after a refresh.")
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -2616,6 +3232,7 @@ def top_menu(client, args):
     tools = [
         ("Default audio & subtitles  —  set the default audio/subtitle track", langsubs_flow),
         ("Watched / unwatched  —  mark episodes or a whole show", mark_watched_flow),
+        ("Labels  —  add / remove / rename custom labels on shows & movies", labels_flow),
     ]
     last = 0
     while True:

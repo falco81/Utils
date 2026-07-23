@@ -179,6 +179,43 @@ which device type a USB bridge actually answers. Example:
 
 ## Notes
 
+- **Two tabs.** *Overview* holds the live state — status, activity, performance and the
+  disk cards. *Trends* holds the charts. The chosen tab is kept in the URL fragment, so
+  the 60-second auto-refresh leaves you where you were.
+- **Charts are interactive.** Range buttons (6 h / 24 h / 3 d / 7 d / All) zoom the time
+  axis, and hovering — or tapping, on a tablet — shows a crosshair with every series'
+  value at that moment. Everything is drawn client-side from data already in the page;
+  no chart library and no extra requests.
+- **Activity tile.** Shows what Plex is doing right now, worked out from the transcoder
+  and scanner command lines: preview (BIF) generation, chapter thumbnails, loudness
+  analysis, library scans and real playback transcodes — each with the file, the library
+  it belongs to, how long it has been running and its CPU share. Reads `/proc` via `ps`
+  only, so it touches no disks.
+
+- **Trends.** Every run records API latency, CPU temperature, load, memory and each
+  disk's temperature and fill level into `/var/lib/plex-status/history.json` (7 days by
+  default, `HISTORY_KEEP`). The page charts them, down-sampled to `HISTORY_POINTS` so
+  `data.json` stays around 20 KB. The capacity chart also projects when each volume
+  will fill up, once there is enough of a trend to fit a line to.
+- **Temperature gaps are deliberate.** A sleeping disk reports no temperature, and the
+  collector will not wake it, so those periods are drawn as breaks rather than joined
+  up. Points appear whenever a disk happens to be awake — the daily `--wake` timer
+  guarantees at least one reading per day.
+- **SMART error counters aren't charted.** A line of zeros says nothing; instead each
+  card shows how long the reallocated / pending / uncorrectable counters have gone
+  without moving, and the collector logs a warning the moment one changes.
+
+- **Performance section.** Each run times the Plex API (`/identity`,
+  `/library/sections`, `/hubs`) over a single reused connection — the way a browser
+  sees it — and keeps a rolling history (`/var/lib/plex-status/perf-history.json`,
+  48 h by default) that the page draws as a trend line. A slow climb on the
+  home-screen chart is the early warning that the database wants a
+  `REINDEX; VACUUM; ANALYZE;` pass. Set `PERF_ENABLED = false` to skip it.
+- **Proxy comparison.** `PERF_PROXY_URL` points at your nginx vhost; the same
+  endpoints are timed through it, so the difference is exactly what the proxy costs
+  per request. Under ~3 ms means nginx is not your bottleneck and anything slow is
+  Plex-side. Empty the constant to disable.
+
 - **Disk cards are sorted by mountpoint** (natural order, so `disk2` comes before
   `disk10`); unmounted disks go last.
 - **Power state** (top-right badge on each card): `Idle` = spinning, ready; `Reading` /

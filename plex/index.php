@@ -2,32 +2,24 @@
 /**
  * index.php — Plex server status page.
  * Reads data.json produced by the collector (runs as root via a systemd timer).
- * Does nothing privileged itself.
+ * Does nothing privileged itself: no shell, no SMART, no disk access.
  */
 declare(strict_types=1);
 
 /**
  * PHP falls back to UTC when date.timezone isn't set in php.ini, which makes
  * every timestamp here disagree with the server's own clock. Follow the system
- * zone instead, so "12:50:09" means what the shell would say.
+ * zone instead, so the clock shown means what the shell would say.
  */
 function use_system_timezone(): void {
-    if (ini_get('date.timezone')) {
-        // php.ini has an explicit setting — but if it's a bare UTC while the
-        // host is on something else, prefer the host's zone.
-        if (strcasecmp((string) ini_get('date.timezone'), 'UTC') !== 0) return;
-    }
+    if (ini_get('date.timezone') && strcasecmp((string) ini_get('date.timezone'), 'UTC') !== 0) return;
     $tz = '';
-    if (is_readable('/etc/timezone')) {
-        $tz = trim((string) @file_get_contents('/etc/timezone'));
-    }
+    if (is_readable('/etc/timezone')) $tz = trim((string) @file_get_contents('/etc/timezone'));
     if ($tz === '' && is_link('/etc/localtime')) {
         $target = (string) @readlink('/etc/localtime');
         if (preg_match('#zoneinfo/(.+)$#', $target, $m)) $tz = $m[1];
     }
-    if ($tz !== '' && in_array($tz, timezone_identifiers_list(), true)) {
-        date_default_timezone_set($tz);
-    }
+    if ($tz !== '' && in_array($tz, timezone_identifiers_list(), true)) date_default_timezone_set($tz);
 }
 use_system_timezone();
 
@@ -44,21 +36,28 @@ function human_uptime(int $s): string {
     $out = [];
     if ($d)  $out[] = "{$d}d";
     if ($hh) $out[] = "{$hh}h";
-    $out[] = "{$mm}m";
+    if (!$d) $out[] = "{$mm}m";
     return implode(' ', $out);
 }
 
 function bytes(int $b): string {
     $u = ['B', 'KB', 'MB', 'GB', 'TB']; $i = 0; $v = (float) $b;
     while ($v >= 1024 && $i < count($u) - 1) { $v /= 1024; $i++; }
-    return round($v, 1) . ' ' . $u[$i];
+    return round($v, $i >= 2 ? 1 : 0) . ' ' . $u[$i];
 }
 
 function temp_class(?int $t, array $thr): string {
     if ($t === null) return 'muted';
-    if ($t >= ($thr['temp_crit'] ?? 55)) return 'crit';
-    if ($t >= ($thr['temp_warn'] ?? 45)) return 'warn';
+    if ($t >= ($thr['temp_crit'] ?? 58)) return 'crit';
+    if ($t >= ($thr['temp_warn'] ?? 50)) return 'warn';
     return 'ok';
+}
+
+function lat_class(?float $ms): string {
+    if ($ms === null) return '';
+    if ($ms < 100) return 'good';
+    if ($ms < 500) return 'slow';
+    return 'bad';
 }
 
 /** Resolve power + I/O into one human state: [label, css-class, is_asleep]. */
@@ -77,13 +76,13 @@ function disk_state(array $d): array {
 function state_help(string $cls): array {
     return [
         'write'   => ['The disk was being written to when this was sampled.',
-                      'Normal activity, not a problem. The system disk shows this most of the time because Plex writes its database, logs and metadata continuously.'],
+                      'Normal activity. The system disk shows this most of the time because Plex writes its database, logs and metadata continuously.'],
         'read'    => ['The disk was being read from when this was sampled.',
                       'Normal activity — playback, a library scan or thumbnail generation.'],
         'idle'    => ['Spinning and ready, with no I/O during the sample.',
                       'The healthy resting state for a disk that is in use.'],
         'standby' => ['Spun down to save power.',
-                      'SMART values shown here come from the last time the disk was awake, so it is not woken just to draw this page.'],
+                      'SMART values shown here are from the last time the disk was awake — it is never woken just to draw this page.'],
         'sleep'   => ['In a deeper sleep state than standby.',
                       'SMART values shown here are cached from when the disk was last awake.'],
         'unknown' => ['Power state could not be read from this device.',
@@ -91,13 +90,14 @@ function state_help(string $cls): array {
     ][$cls] ?? ['', ''];
 }
 
-$thr = $data['thresholds'] ?? ['temp_warn' => 45, 'temp_crit' => 55];
-$cpuThr = ['temp_warn' => 70, 'temp_crit' => 85]; // CPUs run hotter than disks
+const PALETTE = ['#58a6ff', '#3fb950', '#d29922', '#a371f7', '#f85149', '#2dd4bf', '#f0883e'];
+
+$thr    = $data['thresholds'] ?? ['temp_warn' => 50, 'temp_crit' => 58];
+$cpuThr = ['temp_warn' => 70, 'temp_crit' => 85];   // CPUs run hotter than disks
 $overall = $data['overall'] ?? 'unknown';
 $overallLabel = ['ok' => 'All healthy', 'warn' => 'Warning', 'crit' => 'Problem', 'unknown' => 'Unknown'][$overall] ?? 'Unknown';
 $age = $data ? time() - ($data['generated'] ?? time()) : null;
 
-// sort disk cards by mountpoint (natural order); unmounted last
 if ($data && !empty($data['disks'])) {
     usort($data['disks'], function ($a, $b) {
         $am = $a['mount'] ?? null; $bm = $b['mount'] ?? null;
@@ -107,40 +107,138 @@ if ($data && !empty($data['disks'])) {
         return strnatcmp($am, $bm);
     });
 }
+
+// Build the chart definitions here so the browser only has to draw them.
+$hist = $data['history'] ?? [];
+$ht   = $hist['t'] ?? [];
+$charts = [];
+if (count($ht) >= 2) {
+    $charts[] = [
+        'id' => 'api', 'title' => 'API response time', 'unit' => ' ms', 'min' => 0,
+        'note' => 'A steady climb is the early sign the database wants a REINDEX / VACUUM / ANALYZE pass.',
+        'series' => [
+            ['label' => '/hubs (home screen)', 'color' => '#58a6ff', 'data' => $hist['perf']['hb'] ?? []],
+            ['label' => '/library/sections',   'color' => '#3fb950', 'data' => $hist['perf']['ls'] ?? []],
+            ['label' => '/identity',           'color' => '#8b94a3', 'data' => $hist['perf']['id'] ?? []],
+        ],
+    ];
+
+    $tempS = []; $capS = []; $ci = 0;
+    foreach (($hist['disks'] ?? []) as $dh) {
+        $col = PALETTE[$ci % count(PALETTE)];
+        if (array_filter($dh['temp'], fn($v) => $v !== null)) {
+            $tempS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $dh['temp']];
+        }
+        // Real units, not percent: 94% of an 8 TB disk and 94% of a 1 TB disk
+        // are very different amounts of space, and only TB tells you how much
+        // you can still put there.
+        $used = $dh['used'] ?? [];
+        if (array_filter($used, fn($v) => $v !== null)) {
+            $capS[] = [
+                'label'   => $dh['label'],
+                'color'   => $col,
+                'data'    => array_map(fn($v) => $v === null ? null : round($v / 1e12, 3), $used),
+                'total_b' => $dh['total_b'] ?? null,
+            ];
+        }
+        $ci++;
+    }
+    if ($tempS) {
+        $charts[] = [
+            'id' => 'temp', 'title' => 'Disk temperatures', 'unit' => ' °C',
+            'note' => 'Gaps are periods a disk was asleep — it is never woken just to read a temperature.',
+            'bands' => [
+                ['at' => $thr['temp_warn'], 'color' => '#d29922', 'label' => 'warn ' . $thr['temp_warn'] . '°'],
+                ['at' => $thr['temp_crit'], 'color' => '#f85149', 'label' => 'crit ' . $thr['temp_crit'] . '°'],
+            ],
+            'series' => $tempS,
+        ];
+    }
+    if ($capS) {
+        $charts[] = [
+            'id' => 'cap', 'title' => 'Capacity used', 'unit' => ' TB', 'min' => 0,
+            'series' => $capS,
+        ];
+    }
+    if (array_filter($hist['sys']['cpu'] ?? [], fn($v) => $v !== null)) {
+        $charts[] = [
+            'id' => 'cpu', 'title' => 'CPU temperature', 'unit' => ' °C',
+            'bands' => [['at' => $cpuThr['temp_warn'], 'color' => '#d29922', 'label' => 'warn ' . $cpuThr['temp_warn'] . '°']],
+            'series' => [['label' => 'CPU', 'color' => '#f0883e', 'data' => $hist['sys']['cpu']]],
+        ];
+    }
+    $charts[] = [
+        'id' => 'load', 'title' => 'Load average', 'unit' => '', 'min' => 0,
+        'note' => 'Above the core count means tasks are queuing for CPU.',
+        'bands' => [['at' => (float) ($data['system']['ncpu'] ?: 1), 'color' => '#d29922',
+                     'label' => $data['system']['ncpu'] . ' cores']],
+        'series' => [['label' => '1 min', 'color' => '#2dd4bf', 'data' => $hist['sys']['load'] ?? []]],
+    ];
+    $charts[] = [
+        'id' => 'mem', 'title' => 'Memory used', 'unit' => ' %', 'min' => 0, 'max' => 100,
+        'series' => [['label' => 'RAM', 'color' => '#a371f7', 'data' => $hist['sys']['mem'] ?? []]],
+    ];
+}
+
+/** Least-squares slope per day; used to project when a disk fills up. */
+function trend_per_day(array $times, array $vals): ?float {
+    $pts = [];
+    foreach ($vals as $i => $v) if ($v !== null && isset($times[$i])) $pts[] = [(float) $times[$i], (float) $v];
+    if (count($pts) < 8) return null;
+    if ($pts[count($pts) - 1][0] - $pts[0][0] < 6 * 3600) return null;
+    $n = count($pts); $sx = $sy = $sxy = $sxx = 0.0;
+    foreach ($pts as [$t, $v]) { $sx += $t; $sy += $v; $sxy += $t * $v; $sxx += $t * $t; }
+    $den = $n * $sxx - $sx * $sx;
+    if (abs($den) < 1e-9) return null;
+    return (($n * $sxy - $sx * $sy) / $den) * 86400;
+}
 ?>
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="refresh" content="60">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="dark">
 <title>Plex — server status<?= isset($data['hostname']) ? ' · ' . h($data['hostname']) : '' ?></title>
 <style>
   :root{
-    --bg:#0e1116; --panel:#171b22; --panel2:#1d222b; --line:#262c37;
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c222b; --line:#262c37;
     --tx:#e6e9ef; --tx-dim:#8b94a3; --tx-mut:#5b6472;
     --ok:#3fb950; --warn:#d29922; --crit:#f85149; --info:#58a6ff; --write:#a371f7; --sleep:#6e7681;
     --ok-bg:rgba(63,185,80,.12); --warn-bg:rgba(210,153,34,.12);
     --crit-bg:rgba(248,81,73,.13); --info-bg:rgba(88,166,255,.12);
     --write-bg:rgba(163,113,247,.14); --sleep-bg:rgba(110,118,129,.14);
-    --radius:14px;
+    --r:14px;
   }
   *{box-sizing:border-box}
+  html{-webkit-text-size-adjust:100%}
   body{margin:0;background:var(--bg);color:var(--tx);
     font:15px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-    -webkit-font-smoothing:antialiased;padding:28px 20px 60px}
-  .wrap{max-width:1100px;margin:0 auto}
+    -webkit-font-smoothing:antialiased;padding:26px max(16px,env(safe-area-inset-left)) 56px}
+  .wrap{max-width:1240px;margin:0 auto}
   .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
 
-  header{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin-bottom:24px}
+  header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:16px}
   header h1{font-size:20px;margin:0;font-weight:650;letter-spacing:.2px}
   header .host{color:var(--tx-dim);font-weight:400}
   .spacer{flex:1}
-  .updated{color:var(--tx-mut);font-size:13px;text-align:right}
+  .updated{color:var(--tx-mut);font-size:13px;text-align:right;line-height:1.35}
+
+  /* tabs */
+  .tabs{display:flex;gap:4px;margin-bottom:20px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .tabs button{appearance:none;background:none;border:0;border-bottom:2px solid transparent;
+    color:var(--tx-dim);font:inherit;font-weight:600;font-size:14px;padding:9px 15px;
+    cursor:pointer;border-radius:8px 8px 0 0;transition:color .15s,border-color .15s}
+  .tabs button:hover{color:var(--tx)}
+  .tabs button[aria-selected="true"]{color:var(--info);border-bottom-color:var(--info)}
+  .panel[hidden]{display:none}
+
+  h3.sec{font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;
+         color:var(--tx-mut);margin:24px 0 12px}
 
   .pill{display:inline-flex;align-items:center;gap:8px;padding:7px 14px;border-radius:999px;
         font-weight:600;font-size:14px;border:1px solid transparent}
-  .pill .dot{width:9px;height:9px;border-radius:50%}
+  .pill .dot{width:9px;height:9px;border-radius:50%;flex:0 0 auto}
   .pill.ok{background:var(--ok-bg);color:var(--ok);border-color:rgba(63,185,80,.3)}
   .pill.warn{background:var(--warn-bg);color:var(--warn);border-color:rgba(210,153,34,.3)}
   .pill.crit{background:var(--crit-bg);color:var(--crit);border-color:rgba(248,81,73,.3)}
@@ -151,34 +249,81 @@ if ($data && !empty($data['disks'])) {
   @keyframes blink{0%,100%{opacity:1}50%{opacity:.45}}
 
   .grid{display:grid;gap:14px}
-  .top{grid-template-columns:repeat(auto-fit,minmax(230px,1fr));margin-bottom:14px}
+  .top{grid-template-columns:repeat(auto-fit,minmax(215px,1fr))}
+  .perf{grid-template-columns:repeat(auto-fit,minmax(230px,1fr))}
+  .charts{grid-template-columns:repeat(auto-fit,minmax(520px,1fr))}
   .disks{grid-template-columns:repeat(auto-fill,minmax(320px,1fr))}
+  .full{grid-column:1/-1}
 
-  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:18px 20px}
-  .card h2{margin:0 0 14px;font-size:12px;font-weight:700;letter-spacing:.8px;text-transform:uppercase;color:var(--tx-mut)}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);padding:17px 19px}
+  .card h2{margin:0 0 13px;font-size:12px;font-weight:700;letter-spacing:.7px;
+           text-transform:uppercase;color:var(--tx-mut)}
 
-  .kv{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;font-size:14px}
-  .kv .k{color:var(--tx-dim)} .kv .v{font-weight:600}
+  .kv{display:flex;justify-content:space-between;align-items:baseline;padding:5px 0;font-size:14px;gap:12px}
+  .kv .k{color:var(--tx-dim)} .kv .v{font-weight:600;text-align:right}
   .kv+.kv{border-top:1px solid rgba(38,44,55,.6)}
-  .big{font-size:30px;font-weight:700;line-height:1.1;margin:2px 0 2px}
+  .big{font-size:29px;font-weight:700;line-height:1.1;margin:2px 0}
   .sub{color:var(--tx-mut);font-size:13px}
+  .flag{color:var(--ok)} .flag.warn{color:var(--warn)} .flag.crit{color:var(--crit)} .flag.muted{color:var(--tx-mut)}
 
-  /* disk card */
-  .disk{position:relative;transition:opacity .3s}
-  .disk.asleep{opacity:.62}
-  .disk .dhead{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+  /* activity */
+  .job{display:flex;gap:11px;padding:11px 0;align-items:flex-start}
+  .job+.job{border-top:1px solid rgba(38,44,55,.7)}
+  .job .ico{width:9px;height:9px;border-radius:50%;margin-top:7px;flex:0 0 auto;animation:blink 1.6s infinite}
+  .job.bif .ico,.job.chapter .ico{background:var(--write)}
+  .job.playback .ico{background:var(--warn)}
+  .job.scan .ico{background:var(--info)}
+  .job.loudness .ico,.job.analysis .ico,.job.other .ico{background:var(--tx-dim)}
+  .job .jb{min-width:0;flex:1}
+  .job .jt{font-weight:650;font-size:14px}
+  .job.playback .jt{color:var(--warn)}
+  .job .jw{color:var(--tx-mut);font-size:12.5px}
+  .job .jf{font-size:13px;margin-top:4px;word-break:break-word}
+  .job .jm{color:var(--tx-mut);font-size:12px;white-space:nowrap;text-align:right}
+  .idle-note{color:var(--ok);font-size:14px;font-weight:600}
+
+  /* charts */
+  .crangewrap{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:14px}
+  .crange{display:flex;gap:6px;flex-wrap:wrap}
+  .crange button:disabled{opacity:.38;cursor:not-allowed}
+  .crange button{appearance:none;background:var(--panel);border:1px solid var(--line);color:var(--tx-dim);
+    font:inherit;font-size:13px;font-weight:600;padding:6px 13px;border-radius:9px;cursor:pointer}
+  .crange button[aria-pressed="true"]{background:var(--info-bg);border-color:rgba(88,166,255,.4);color:var(--info)}
+  .cwrap{position:relative}
+  .cwrap svg{display:block;width:100%;height:auto;touch-action:pan-y}
+  .legend{display:flex;flex-wrap:wrap;gap:6px 14px;margin-top:10px;font-size:12.5px;color:var(--tx-dim)}
+  .legend .li{display:inline-flex;align-items:center;gap:6px;white-space:nowrap}
+  .legend i{width:9px;height:9px;border-radius:2px;display:inline-block;flex:0 0 auto}
+  .legend b{color:var(--tx);font-weight:600}
+  .ctip{position:absolute;pointer-events:none;z-index:20;background:var(--panel2);
+    border:1px solid var(--line);border-radius:9px;padding:8px 10px;font-size:12.5px;
+    box-shadow:0 8px 24px rgba(0,0,0,.5);opacity:0;transition:opacity .1s;white-space:nowrap}
+  .ctip .ct{color:var(--tx-mut);margin-bottom:5px}
+  .ctip .cr{display:flex;align-items:center;gap:7px;line-height:1.5}
+  .ctip .cr i{width:8px;height:8px;border-radius:2px;flex:0 0 auto}
+  .ctip .cr b{margin-left:auto;padding-left:12px}
+  .nodata{color:var(--tx-mut);font-size:13px;padding:26px 0;text-align:center}
+
+  .lat{display:flex;justify-content:space-between;align-items:baseline;padding:6px 0;gap:10px}
+  .lat+.lat{border-top:1px solid rgba(38,44,55,.6)}
+  .lat .ep{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;color:var(--tx-dim)}
+  .lat .ms{font-weight:700;white-space:nowrap}
+  .lat .ms.good{color:var(--ok)} .lat .ms.slow{color:var(--warn)} .lat .ms.bad{color:var(--crit)}
+
+  .disk{transition:opacity .3s}
+  .disk.asleep{opacity:.66}
+  .disk .dhead{display:flex;align-items:center;gap:9px;margin-bottom:4px;flex-wrap:wrap}
   .disk .dname{font-size:17px;font-weight:700}
   .badge{font-size:11px;font-weight:700;padding:2px 8px;border-radius:6px;letter-spacing:.4px;text-transform:uppercase}
   .badge.usb{background:var(--info-bg);color:var(--info)}
   .badge.nvme{background:rgba(163,113,247,.14);color:#a371f7}
   .badge.sata{background:var(--panel2);color:var(--tx-dim)}
-  .disk .model{color:var(--tx-dim);font-size:13px;margin-bottom:14px;word-break:break-word}
+  .disk .model{color:var(--tx-dim);font-size:12.5px;margin-bottom:13px;word-break:break-word}
   .disk .mnt{color:var(--info);font-weight:600}
 
-  /* prominent state badge */
   .state{display:inline-flex;align-items:center;gap:7px;padding:5px 12px;border-radius:999px;
          font-size:13px;font-weight:700;letter-spacing:.3px;border:1px solid transparent}
-  .state .sdot{width:8px;height:8px;border-radius:50%}
+  .state .sdot{width:8px;height:8px;border-radius:50%;flex:0 0 auto}
   .state.idle{background:var(--ok-bg);color:var(--ok);border-color:rgba(63,185,80,.3)}
   .state.idle .sdot{background:var(--ok)}
   .state.read{background:var(--info-bg);color:var(--info);border-color:rgba(88,166,255,.35)}
@@ -190,42 +335,34 @@ if ($data && !empty($data['disks'])) {
   .state.unknown{background:var(--panel2);color:var(--tx-dim)}
   .state.unknown .sdot{background:var(--tx-mut)}
 
-  .temp{display:flex;align-items:baseline;gap:8px;margin:14px 0}
-  .temp .t{font-size:34px;font-weight:800;line-height:1}
+  .temp{display:flex;align-items:baseline;gap:8px;margin:13px 0;flex-wrap:wrap}
+  .temp .t{font-size:33px;font-weight:800;line-height:1}
   .temp .t.ok{color:var(--ok)} .temp .t.warn{color:var(--warn)}
   .temp .t.crit{color:var(--crit)} .temp .t.muted{color:var(--tx-mut)}
   .temp .health{margin-left:auto}
 
   .bar{height:8px;border-radius:6px;background:var(--panel2);overflow:hidden;margin:6px 0 4px}
-  .bar > i{display:block;height:100%;border-radius:6px;background:var(--info)}
-  .bar.warn > i{background:var(--warn)} .bar.crit > i{background:var(--crit)}
+  .bar>i{display:block;height:100%;border-radius:6px;background:var(--info)}
+  .bar.warn>i{background:var(--warn)} .bar.crit>i{background:var(--crit)}
 
-  .attrs{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;margin-top:14px;
-         padding-top:14px;border-top:1px solid var(--line);font-size:13px}
-  .attrs .a{display:flex;justify-content:space-between}
+  .attrs{display:grid;grid-template-columns:1fr 1fr;gap:6px 16px;margin-top:13px;
+         padding-top:13px;border-top:1px solid var(--line);font-size:13px}
+  .attrs .a{display:flex;justify-content:space-between;gap:8px}
   .attrs .a .an{color:var(--tx-mut)} .attrs .a .av{font-weight:600}
   .attrs .a .av.bad{color:var(--crit)}
+  .cachenote{font-size:11px;color:var(--tx-mut)}
 
-  .flag{color:var(--ok)} .flag.warn{color:var(--warn)} .flag.crit{color:var(--crit)} .flag.muted{color:var(--tx-mut)}
-  .cachenote{font-size:11px;color:var(--tx-mut);margin-left:6px}
-
-  /* status badge tooltip */
   .tip{position:relative;display:inline-flex}
-  .tip .pill{cursor:help}
-  .tip .why{
-    position:absolute;top:calc(100% + 10px);left:0;z-index:50;
-    min-width:300px;max-width:480px;padding:12px 14px;
-    background:var(--panel2);border:1px solid var(--line);border-radius:10px;
-    box-shadow:0 10px 30px rgba(0,0,0,.5);
+  .tip .pill,.tip .state{cursor:help}
+  .tip .why{position:absolute;top:calc(100% + 10px);left:0;z-index:60;
+    min-width:290px;max-width:430px;padding:12px 14px;
+    background:var(--panel2);border:1px solid var(--line);border-radius:11px;
+    box-shadow:0 12px 34px rgba(0,0,0,.55);
     opacity:0;visibility:hidden;transform:translateY(-4px);
-    transition:opacity .15s,transform .15s,visibility .15s;
-    text-align:left;font-weight:400;
-  }
+    transition:opacity .15s,transform .15s,visibility .15s;text-align:left;font-weight:400}
   .tip:hover .why,.tip:focus-within .why{opacity:1;visibility:visible;transform:translateY(0)}
-  .tip .why::before{
-    content:"";position:absolute;bottom:100%;left:18px;
-    border:7px solid transparent;border-bottom-color:var(--line);
-  }
+  .tip .why::before{content:"";position:absolute;bottom:100%;left:18px;
+    border:7px solid transparent;border-bottom-color:var(--line)}
   .why h4{margin:0 0 8px;font-size:11px;letter-spacing:.6px;text-transform:uppercase;color:var(--tx-mut);font-weight:700}
   .why ul{margin:0;padding:0;list-style:none}
   .why li{display:flex;gap:8px;padding:4px 0;font-size:13px;line-height:1.45;color:var(--tx)}
@@ -234,18 +371,26 @@ if ($data && !empty($data['disks'])) {
   .why li.crit .lv{background:var(--crit)}
   .why li.warn .lv{background:var(--warn)}
   .why .allgood{font-size:13px;color:var(--ok)}
-  @media (max-width:640px){ .tip .why{min-width:0;width:min(88vw,420px)} }
-
-  /* compact tooltip for badges inside a disk card (right-aligned) */
-  .tip-sm .why{min-width:250px;max-width:330px;left:auto;right:0;padding:10px 12px}
+  .tip-sm .why{min-width:250px;max-width:320px;left:auto;right:0;padding:10px 12px}
   .tip-sm .why::before{left:auto;right:16px}
   .tip-sm .why p{margin:0;font-size:12.5px;line-height:1.5;color:var(--tx)}
   .tip-sm .why p+p{margin-top:7px;color:var(--tx-dim)}
-  .tip-sm .state,.tip-sm .pill{cursor:help}
 
   .empty{background:var(--crit-bg);border:1px solid rgba(248,81,73,.3);color:#ffb3ae;
-         padding:20px;border-radius:var(--radius);text-align:center}
+         padding:20px;border-radius:var(--r);text-align:center}
   footer{margin-top:26px;text-align:center;color:var(--tx-mut);font-size:12px}
+
+  @media (max-width:1100px){ .charts{grid-template-columns:1fr} }
+  @media (max-width:900px){
+    .tip .why{min-width:0;width:min(86vw,400px)}
+    header h1{font-size:18px}
+  }
+  @media (max-width:560px){
+    body{padding:18px 12px 40px}
+    .disks{grid-template-columns:1fr}
+    .updated{text-align:left}
+    .tabs button{padding:9px 12px;font-size:13px}
+  }
 </style>
 </head>
 <body>
@@ -258,12 +403,14 @@ if ($data && !empty($data['disks'])) {
     and check that <span class="mono"><?= h(DATA_FILE) ?></span> was created.
   </div>
 <?php else:
-  $sys = $data['system']; $plex = $data['plex'];
+  $sys  = $data['system'];
+  $plex = $data['plex'];
+  $reasons = $data['reasons'] ?? [];
+  $activity = $data['activity'] ?? [];
 ?>
 
   <header>
     <h1>Plex server <span class="host">· <?= h($data['hostname']) ?></span></h1>
-    <?php $reasons = $data['reasons'] ?? []; ?>
     <span class="tip" tabindex="0">
       <span class="pill <?= h($overall) ?>"><span class="dot"></span><?= h($overallLabel) ?><?= $reasons ? ' · ' . count($reasons) : '' ?></span>
       <span class="why">
@@ -275,8 +422,7 @@ if ($data && !empty($data['disks'])) {
           <?php endforeach; ?>
           </ul>
         <?php elseif ($overall !== 'ok'): ?>
-          <div class="sub">No details available — run the collector again to record
-            the reasons behind this status.</div>
+          <div class="sub">No details recorded — run the collector again.</div>
         <?php else: ?>
           <div class="allgood">All checks passed — no warnings.</div>
         <?php endif; ?>
@@ -284,134 +430,543 @@ if ($data && !empty($data['disks'])) {
     </span>
     <div class="spacer"></div>
     <div class="updated">
-      updated <?= $age < 90 ? "{$age}s ago" : human_uptime((int)$age) . ' ago' ?><br>
+      updated <?= $age < 90 ? "{$age}s ago" : human_uptime((int) $age) . ' ago' ?><br>
       <span class="mono"><?= h(date('H:i:s', $data['generated'])) ?></span>
     </div>
   </header>
 
-  <div class="grid top">
-    <div class="card">
-      <h2>Plex</h2>
-      <div class="big flag <?= $plex['active'] ? 'ok' : 'crit' ?>"><?= $plex['active'] ? 'Running' : 'Stopped' ?></div>
-      <div class="sub">web <?= h($plex['web_version'] ?? '—') ?> · server <?= h($plex['version'] ?? '—') ?></div>
-      <?php if ($plex['sessions'] !== null): ?>
-        <div class="kv" style="margin-top:10px"><span class="k">Active streams</span><span class="v"><?= (int) $plex['sessions'] ?></span></div>
-      <?php endif; ?>
-    </div>
-    <div class="card">
-      <h2>Load</h2>
-      <div class="big"><?= h($sys['load'][0]) ?></div>
-      <div class="sub"><?= h($sys['load'][1]) ?> / <?= h($sys['load'][2]) ?> · <?= (int) $sys['ncpu'] ?> CPU</div>
-      <?php if ($sys['cpu_temp'] !== null): ?>
-        <div class="kv" style="margin-top:10px"><span class="k">CPU temp</span>
-          <span class="v flag <?= temp_class($sys['cpu_temp'], $cpuThr) ?>"><?= (int) $sys['cpu_temp'] ?> °C</span></div>
-      <?php endif; ?>
-    </div>
-    <div class="card">
-      <h2>Memory</h2>
-      <?php $mp = $sys['mem_total'] ? (int) round($sys['mem_used'] / $sys['mem_total'] * 100) : 0; ?>
-      <div class="big"><?= $mp ?><span style="font-size:16px;color:var(--tx-mut)"> %</span></div>
-      <div class="sub"><?= bytes($sys['mem_used']) ?> / <?= bytes($sys['mem_total']) ?></div>
-      <div class="bar <?= $mp >= 90 ? 'crit' : ($mp >= 75 ? 'warn' : '') ?>" style="margin-top:12px"><i style="width:<?= $mp ?>%"></i></div>
-    </div>
-    <div class="card">
-      <h2>System</h2>
-      <div class="big" style="font-size:22px"><?= human_uptime($sys['uptime_s']) ?></div>
-      <div class="sub">uptime</div>
-      <div style="margin-top:12px">
-        <div class="sub" style="margin-bottom:2px">Kernel</div>
-        <div class="mono" style="font-size:12px;word-break:break-all"><?= h($sys['kernel']) ?></div>
-      </div>
-    </div>
+  <div class="tabs" role="tablist">
+    <button role="tab" data-tab="overview" aria-selected="true">Overview</button>
+    <button role="tab" data-tab="trends" aria-selected="false">Trends<?= $charts ? '' : ' (no data yet)' ?></button>
   </div>
 
-  <div class="grid disks">
-  <?php foreach ($data['disks'] as $d):
-      $tran = strtolower($d['tran']);
-      $tclass = temp_class($d['temp'], $thr);
-      $pct = $d['fs_pct'];
-      // Only the OS disk gets warning colours: media drives are expected to be
-      // nearly full, so a red bar there would be misleading.
-      $barcls = ($pct === null || $d['mount'] !== '/') ? ''
-                : ($pct >= 95 ? 'crit' : ($pct >= 90 ? 'warn' : ''));
-      [$stLabel, $stClass, $asleep] = disk_state($d);
+  <!-- ============ OVERVIEW ============ -->
+  <section class="panel" id="tab-overview">
 
-      if ($d['smart_ok'] === true)      { $hlabel = 'SMART OK';     $hcls = 'ok'; }
-      elseif ($d['smart_ok'] === false) { $hlabel = 'SMART FAILED'; $hcls = 'crit'; }
-      else                              { $hlabel = 'SMART N/A';    $hcls = 'muted'; }
-  ?>
-    <div class="card disk<?= $asleep ? ' asleep' : '' ?>">
-      <div class="dhead">
-        <span class="dname mono"><?= h($d['dev']) ?></span>
-        <span class="badge <?= $tran === 'usb' ? 'usb' : ($tran === 'nvme' ? 'nvme' : 'sata') ?>"><?= h($d['tran']) ?></span>
-        <?php
-          [$h1, $h2] = state_help($stClass);
-          $psrc = $d['power_src'] ?? '';
-          $inferred = str_starts_with($psrc, 'inferred') || ($d['power_reliable'] ?? true) === false;
-          $idle = $d['idle_for_s'] ?? null;
-        ?>
-        <span class="tip tip-sm" tabindex="0" style="margin-left:auto">
-          <span class="state <?= $stClass ?>"><span class="sdot"></span><?= $stLabel ?></span>
-          <span class="why">
-            <p><?= h($h1) ?></p>
-            <p><?= h($h2) ?></p>
-            <?php if ($inferred): ?>
-              <p>This USB bridge does not report power state, so it is worked out from
-                 disk activity<?= $idle !== null ? ' (idle for ' . h(human_uptime((int) $idle)) . ')' : '' ?>.</p>
-            <?php endif; ?>
+    <div class="grid top">
+      <div class="card">
+        <h2>Plex</h2>
+        <div class="big flag <?= $plex['active'] ? 'ok' : 'crit' ?>"><?= $plex['active'] ? 'Running' : 'Stopped' ?></div>
+        <div class="sub">web <?= h($plex['web_version'] ?? '—') ?> · server <?= h($plex['version'] ?? '—') ?></div>
+        <?php if (($plex['sessions'] ?? null) !== null): ?>
+          <div class="kv" style="margin-top:9px"><span class="k">Active streams</span><span class="v"><?= (int) $plex['sessions'] ?></span></div>
+        <?php endif; ?>
+      </div>
+
+      <div class="card">
+        <h2>Load</h2>
+        <div class="big"><?= h($sys['load'][0]) ?></div>
+        <div class="sub"><?= h($sys['load'][1]) ?> / <?= h($sys['load'][2]) ?> · <?= (int) $sys['ncpu'] ?> CPU</div>
+        <?php if ($sys['cpu_temp'] !== null): ?>
+          <div class="kv" style="margin-top:9px"><span class="k">CPU temp</span>
+            <span class="v flag <?= temp_class($sys['cpu_temp'], $cpuThr) ?>"><?= (int) $sys['cpu_temp'] ?> °C</span></div>
+        <?php endif; ?>
+      </div>
+
+      <div class="card">
+        <h2>Memory</h2>
+        <?php $mp = $sys['mem_total'] ? (int) round($sys['mem_used'] / $sys['mem_total'] * 100) : 0; ?>
+        <div class="big"><?= $mp ?><span style="font-size:16px;color:var(--tx-mut)"> %</span></div>
+        <div class="sub"><?= bytes((int) $sys['mem_used']) ?> / <?= bytes((int) $sys['mem_total']) ?></div>
+        <div class="bar <?= $mp >= 90 ? 'crit' : ($mp >= 75 ? 'warn' : '') ?>" style="margin-top:11px"><i style="width:<?= $mp ?>%"></i></div>
+      </div>
+
+      <div class="card">
+        <h2>System</h2>
+        <div class="big" style="font-size:22px"><?= human_uptime((int) $sys['uptime_s']) ?></div>
+        <div class="sub">uptime</div>
+        <div style="margin-top:11px">
+          <div class="sub" style="margin-bottom:2px">Kernel</div>
+          <div class="mono" style="font-size:12px;word-break:break-all"><?= h($sys['kernel']) ?></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- what Plex is doing right now -->
+    <h3 class="sec">Activity</h3>
+    <div class="card">
+      <?php if (!$activity): ?>
+        <div class="idle-note">Idle</div>
+        <div class="sub" style="margin-top:4px">No transcoding, analysis or library scan running.</div>
+      <?php else:
+        $tcpu = 0.0; foreach ($activity as $j) $tcpu += $j['cpu']; ?>
+        <?php foreach ($activity as $j): ?>
+          <div class="job <?= h($j['kind']) ?>">
+            <span class="ico"></span>
+            <span class="jb">
+              <span class="jt"><?= h($j['label']) ?></span>
+              <div class="jw"><?= h($j['why']) ?></div>
+              <?php if ($j['file']): ?>
+                <div class="jf"><?= h($j['file']) ?>
+                  <?php if ($j['library']): ?><span class="sub">· <?= h($j['library']) ?></span><?php endif; ?>
+                </div>
+                <div class="sub mono" style="font-size:11.5px"><?= h($j['dir']) ?></div>
+              <?php endif; ?>
+            </span>
+            <span class="jm"><?= h(human_uptime((int) $j['runtime_s'])) ?><br><?= round($j['cpu']) ?> % CPU</span>
+          </div>
+        <?php endforeach; ?>
+        <div class="sub" style="margin-top:11px">
+          <?= count($activity) ?> process(es) · <?= round($tcpu) ?> % CPU total.
+          Background jobs are triggered by your "asap" settings whenever new media is added.
+        </div>
+      <?php endif; ?>
+    </div>
+
+    <?php
+      $perf   = $data['perf'] ?? [];
+      $direct = $perf['direct'] ?? [];
+      $pxy    = $perf['proxy'] ?? null;
+      $pdb    = $perf['db'] ?? [];
+    if ($direct || $pdb): ?>
+    <h3 class="sec">Performance</h3>
+    <div class="grid perf">
+      <div class="card">
+        <h2>API response</h2>
+        <?php foreach (['/identity' => 'baseline, no DB access', '/library/sections' => 'library list',
+                        '/hubs' => 'home screen — the heavy one'] as $ep => $desc):
+                $v = $direct[$ep] ?? null; if (!$v) continue; ?>
+          <div class="lat">
+            <span><span class="ep"><?= h($ep) ?></span><br><span class="sub"><?= h($desc) ?></span></span>
+            <span class="ms <?= lat_class((float) $v['median_ms']) ?>"><?= number_format((float) $v['median_ms'], 1) ?> ms</span>
+          </div>
+        <?php endforeach; ?>
+        <div class="sub" style="margin-top:8px">median over one reused connection</div>
+      </div>
+
+      <?php if ($pxy): ?>
+      <div class="card">
+        <h2>Reverse proxy</h2>
+        <?php if (!empty($pxy['error'])): ?>
+          <div class="big flag crit" style="font-size:20px">unreachable</div>
+          <div class="sub"><?= h($pxy['url']) ?></div>
+          <div class="sub" style="margin-top:8px">Plex answers locally, so the fault is in
+            nginx / TLS / DNS rather than in Plex.</div>
+        <?php else:
+          $ov = $pxy['overhead_ms'];
+          $ovc = $ov === null ? '' : ($ov < 3 ? 'ok' : ($ov < 15 ? 'warn' : 'crit')); ?>
+          <div class="big flag <?= $ovc ?>"><?= $ov === null ? '—' : sprintf('%+.1f', $ov) ?><span style="font-size:15px"> ms</span></div>
+          <div class="sub">added per request vs. reaching Plex directly</div>
+          <div class="sub" style="margin-top:8px">
+            <?php if ($ov !== null && $ov < 3): ?>Negligible — the proxy is not a bottleneck,
+              so anything slow is Plex-side.
+            <?php elseif ($ov !== null && $ov < 15): ?>Noticeable but minor.
+            <?php else: ?>High — check upstream keepalive in nginx.<?php endif; ?>
+          </div>
+        <?php endif; ?>
+      </div>
+      <?php endif; ?>
+
+      <?php if ($pdb): ?>
+      <div class="card">
+        <h2>Database</h2>
+        <div class="big" style="font-size:24px"><?= bytes((int) ($pdb['bytes'] ?? 0)) ?></div>
+        <div class="sub">library.db</div>
+        <div class="kv" style="margin-top:9px"><span class="k">WAL</span>
+          <span class="v"><?= bytes((int) ($pdb['wal_bytes'] ?? 0)) ?></span></div>
+        <?php if (isset($pdb['free_pct'])): ?>
+          <div class="kv"><span class="k">Free pages</span>
+            <span class="v flag <?= $pdb['free_pct'] >= 25 ? 'warn' : '' ?>"><?= h($pdb['free_pct']) ?> %</span></div>
+        <?php endif; ?>
+        <?php if (!empty($pdb['backup_count'])): ?>
+          <div class="kv"><span class="k">Plex backups</span>
+            <span class="v"><?= (int) $pdb['backup_count'] ?> · <?= bytes((int) $pdb['backup_bytes']) ?></span></div>
+        <?php endif; ?>
+      </div>
+      <?php endif; ?>
+    </div>
+    <?php endif; ?>
+
+    <h3 class="sec">Disks</h3>
+    <div class="grid disks">
+    <?php foreach ($data['disks'] as $d):
+        $tran = strtolower($d['tran']);
+        $tclass = temp_class($d['temp'], $thr);
+        $pct = $d['fs_pct'];
+        $barcls = ($pct === null || $d['mount'] !== '/') ? ''
+                  : ($pct >= 95 ? 'crit' : ($pct >= 90 ? 'warn' : ''));
+        [$stLabel, $stClass, $asleep] = disk_state($d);
+
+        if ($d['smart_ok'] === true)      { $hlabel = 'SMART OK';     $hcls = 'ok'; }
+        elseif ($d['smart_ok'] === false) { $hlabel = 'SMART FAILED'; $hcls = 'crit'; }
+        else                              { $hlabel = 'SMART N/A';    $hcls = 'muted'; }
+    ?>
+      <div class="card disk<?= $asleep ? ' asleep' : '' ?>">
+        <div class="dhead">
+          <span class="dname mono"><?= h($d['dev']) ?></span>
+          <span class="badge <?= $tran === 'usb' ? 'usb' : ($tran === 'nvme' ? 'nvme' : 'sata') ?>"><?= h($d['tran']) ?></span>
+          <?php
+            [$hh1, $hh2] = state_help($stClass);
+            $psrc = $d['power_src'] ?? '';
+            $inferred = str_starts_with((string) $psrc, 'inferred') || ($d['power_reliable'] ?? true) === false;
+            $idle = $d['idle_for_s'] ?? null;
+          ?>
+          <span class="tip tip-sm" tabindex="0" style="margin-left:auto">
+            <span class="state <?= $stClass ?>"><span class="sdot"></span><?= $stLabel ?></span>
+            <span class="why">
+              <p><?= h($hh1) ?></p>
+              <p><?= h($hh2) ?></p>
+              <?php if ($inferred): ?>
+                <p>This USB bridge does not report power state, so it is worked out from disk
+                   activity<?= $idle !== null ? ' (idle for ' . h(human_uptime((int) $idle)) . ')' : '' ?>.</p>
+              <?php endif; ?>
+            </span>
           </span>
-        </span>
-      </div>
-      <div class="model">
-        <?php if ($d['mount'] !== null): ?><span class="mnt mono"><?= h($d['mount']) ?></span> · <?php endif; ?>
-        <?= h($d['size']) ?> · <?= h($d['model']) ?> · <span class="mono"><?= h($d['serial']) ?></span>
-      </div>
+        </div>
+        <div class="model">
+          <?php if ($d['mount'] !== null): ?><span class="mnt mono"><?= h($d['mount']) ?></span> · <?php endif; ?>
+          <?= h($d['size']) ?> · <?= h($d['model']) ?> · <span class="mono"><?= h($d['serial']) ?></span>
+        </div>
 
-      <div class="temp">
-        <span class="t <?= $tclass ?>"><?= $d['temp'] !== null ? (int) $d['temp'] : '—' ?><?php if ($d['temp'] !== null): ?><span style="font-size:16px;font-weight:600"> °C</span><?php endif; ?></span>
-        <?php if ($d['from_cache']): ?><span class="cachenote">cached<?= $d['cache_age'] !== null ? ' ' . human_uptime((int)$d['cache_age']) . ' ago' : '' ?></span>
-        <?php elseif (!empty($d['smart_limited'])): ?><span class="cachenote">bridge exposes health only</span><?php endif; ?>
-        <span class="pill <?= $hcls === 'muted' ? 'unknown' : $hcls ?> health"><span class="dot"></span><?= $hlabel ?></span>
-      </div>
+        <div class="temp">
+          <span class="t <?= $tclass ?>"><?= $d['temp'] !== null ? (int) $d['temp'] : '—' ?><?php if ($d['temp'] !== null): ?><span style="font-size:16px;font-weight:600"> °C</span><?php endif; ?></span>
+          <?php if (!empty($d['from_cache'])): ?><span class="cachenote">cached<?= ($d['cache_age'] ?? null) !== null ? ' ' . h(human_uptime((int) $d['cache_age'])) . ' ago' : '' ?></span>
+          <?php elseif (!empty($d['smart_limited'])): ?><span class="cachenote">bridge exposes health only</span><?php endif; ?>
+          <span class="pill <?= $hcls === 'muted' ? 'unknown' : $hcls ?> health"><span class="dot"></span><?= $hlabel ?></span>
+        </div>
 
-      <?php if ($d['mount'] !== null): ?>
-        <div class="kv" style="padding-top:0"><span class="k">Usage</span><span class="v"><?= $pct !== null ? $pct.' %' : '—' ?></span></div>
-        <div class="bar <?= $barcls ?>"><i style="width:<?= (int) $pct ?>%"></i></div>
-        <div class="sub"><?= h($d['fs_used'] ?? '?') ?> / <?= h($d['fs_size'] ?? '?') ?></div>
-      <?php else: ?>
-        <div class="sub flag muted">not mounted</div>
-      <?php endif; ?>
+        <?php if ($d['mount'] !== null): ?>
+          <div class="kv" style="padding-top:0"><span class="k">Usage</span><span class="v"><?= $pct !== null ? $pct . ' %' : '—' ?></span></div>
+          <div class="bar <?= $barcls ?>"><i style="width:<?= (int) $pct ?>%"></i></div>
+          <div class="sub"><?= h($d['fs_used'] ?? '?') ?> / <?= h($d['fs_size'] ?? '?') ?></div>
+        <?php else: ?>
+          <div class="sub flag muted">not mounted</div>
+        <?php endif; ?>
 
-      <div class="attrs">
-      <?php if ($tran === 'nvme'): ?>
-        <div class="a"><span class="an">Endurance used</span>
-          <span class="av"><?= $d['nvme_used'] !== null ? (int) $d['nvme_used'].' %' : '—' ?></span></div>
-        <div class="a"><span class="an">Spare left</span>
-          <span class="av <?= $d['nvme_spare'] !== null && $d['nvme_spare'] < 20 ? 'bad' : '' ?>"><?= $d['nvme_spare'] !== null ? (int) $d['nvme_spare'].' %' : '—' ?></span></div>
-        <div class="a"><span class="an">Media errors</span>
-          <span class="av <?= (int) $d['nvme_media_err'] > 0 ? 'bad' : '' ?>"><?= $d['nvme_media_err'] ?? '—' ?></span></div>
-        <div class="a"><span class="an">Power-on</span>
-          <span class="av"><?= $d['poh'] !== null ? number_format((int)$d['poh'], 0, '.', ' ').' h' : '—' ?></span></div>
-      <?php else: ?>
-        <div class="a"><span class="an">Reallocated</span>
-          <span class="av <?= (int) $d['realloc'] > 0 ? 'bad' : '' ?>"><?= $d['realloc'] ?? '—' ?></span></div>
-        <div class="a"><span class="an">Pending</span>
-          <span class="av <?= (int) $d['pending'] > 0 ? 'bad' : '' ?>"><?= $d['pending'] ?? '—' ?></span></div>
-        <div class="a"><span class="an">Uncorrectable</span>
-          <span class="av <?= (int) $d['uncorrect'] > 0 ? 'bad' : '' ?>"><?= $d['uncorrect'] ?? '—' ?></span></div>
-        <div class="a"><span class="an">Power-on</span>
-          <span class="av"><?= $d['poh'] !== null ? number_format((int)$d['poh'], 0, '.', ' ').' h' : '—' ?></span></div>
-      <?php endif; ?>
+        <div class="attrs">
+        <?php if ($tran === 'nvme'): ?>
+          <div class="a"><span class="an">Endurance used</span>
+            <span class="av"><?= $d['nvme_used'] !== null ? (int) $d['nvme_used'] . ' %' : '—' ?></span></div>
+          <div class="a"><span class="an">Spare left</span>
+            <span class="av <?= ($d['nvme_spare'] !== null && $d['nvme_spare'] < 20) ? 'bad' : '' ?>"><?= $d['nvme_spare'] !== null ? (int) $d['nvme_spare'] . ' %' : '—' ?></span></div>
+          <div class="a"><span class="an">Media errors</span>
+            <span class="av <?= (int) $d['nvme_media_err'] > 0 ? 'bad' : '' ?>"><?= $d['nvme_media_err'] ?? '—' ?></span></div>
+          <div class="a"><span class="an">Power-on</span>
+            <span class="av"><?= $d['poh'] !== null ? number_format((int) $d['poh'], 0, '.', ' ') . ' h' : '—' ?></span></div>
+        <?php else: ?>
+          <div class="a"><span class="an">Reallocated</span>
+            <span class="av <?= (int) $d['realloc'] > 0 ? 'bad' : '' ?>"><?= $d['realloc'] ?? '—' ?></span></div>
+          <div class="a"><span class="an">Pending</span>
+            <span class="av <?= (int) $d['pending'] > 0 ? 'bad' : '' ?>"><?= $d['pending'] ?? '—' ?></span></div>
+          <div class="a"><span class="an">Uncorrectable</span>
+            <span class="av <?= (int) $d['uncorrect'] > 0 ? 'bad' : '' ?>"><?= $d['uncorrect'] ?? '—' ?></span></div>
+          <div class="a"><span class="an">Power-on</span>
+            <span class="av"><?= $d['poh'] !== null ? number_format((int) $d['poh'], 0, '.', ' ') . ' h' : '—' ?></span></div>
+        <?php endif; ?>
+        </div>
+
+        <?php if (!empty($d['stable_since']) && $d['smart_ok'] === true):
+                $stable = time() - (int) $d['stable_since']; ?>
+          <div class="sub" style="margin-top:9px">No error-counter change in
+            <?= h(human_uptime($stable)) ?> of monitoring.</div>
+        <?php endif; ?>
       </div>
+    <?php endforeach; ?>
     </div>
-  <?php endforeach; ?>
-  </div>
+  </section>
+
+  <!-- ============ TRENDS ============ -->
+  <section class="panel" id="tab-trends" hidden>
+    <?php if (!$charts): ?>
+      <div class="card"><div class="nodata">
+        History is still being collected — charts appear once the collector has run at
+        least twice.
+      </div></div>
+    <?php else: ?>
+      <div class="crangewrap">
+        <div class="crange" id="ranges">
+          <button data-h="6">6 h</button>
+          <button data-h="24" aria-pressed="true">24 h</button>
+          <button data-h="72">3 d</button>
+          <button data-h="168">7 d</button>
+          <button data-h="0">All</button>
+        </div>
+        <span class="sub" id="rangenote"></span>
+      </div>
+      <div class="grid charts">
+        <?php foreach ($charts as $c): ?>
+          <div class="card <?= $c['id'] === 'api' ? 'full' : '' ?>">
+            <h2><?= h($c['title']) ?></h2>
+            <div class="cwrap" data-chart="<?= h($c['id']) ?>"></div>
+            <?php if (!empty($c['note'])): ?>
+              <div class="sub" style="margin-top:9px"><?= h($c['note']) ?></div>
+            <?php endif; ?>
+            <?php if ($c['id'] === 'cap'):
+              $proj = [];
+              foreach ($c['series'] as $s) {
+                  $rate = trend_per_day($ht, $s['data']);       // TB per day
+                  $last = null;
+                  for ($k = count($s['data']) - 1; $k >= 0; $k--) {
+                      if ($s['data'][$k] !== null) { $last = (float) $s['data'][$k]; break; }
+                  }
+                  if ($last === null) continue;
+                  $totalTb = ($s['total_b'] ?? null) ? $s['total_b'] / 1e12 : null;
+                  // below ~1 GB/day the slope is indistinguishable from noise
+                  if ($rate === null || $rate < 0.001) continue;
+                  $gbDay = $rate * 1000;
+                  $txt = $s['label'] . ' +' . ($gbDay >= 10 ? round($gbDay) : round($gbDay, 1)) . ' GB/day';
+                  if ($totalTb !== null && $last < $totalTb) {
+                      $days = ($totalTb - $last) / $rate;
+                      if ($days < 3650) {
+                          $txt .= ', full in ~' . ($days < 60 ? round($days) . ' d'
+                                : ($days < 730 ? round($days / 30) . ' mo' : round($days / 365, 1) . ' y'));
+                      }
+                  }
+                  $proj[] = $txt;
+              } ?>
+              <div class="sub" style="margin-top:9px">
+                <?= $proj ? h(implode(' · ', $proj)) : 'No measurable growth yet — projections appear once a trend forms.' ?>
+              </div>
+            <?php endif; ?>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endif; ?>
+  </section>
 
   <footer>
-    data.json age <?= (int) $age ?>s · collector runs as root via systemd timer · page auto-refreshes every 60s
+    data.json age <?= (int) $age ?>s · collector runs as root via systemd timer ·
+    disks are never woken to draw this page · auto-refresh 60s
   </footer>
 
 <?php endif; ?>
 </div>
+
+<script>
+(function () {
+  "use strict";
+
+  // ---- chart data ----
+  // Declared FIRST: show() below can trigger a draw straight away when the page
+  // is loaded on #trends, and reaching these as `undefined` would throw and take
+  // the rest of this script (button handlers included) down with it.
+  var HIST = <?= json_encode($ht ? ['t' => $ht] : ['t' => []], JSON_UNESCAPED_SLASHES) ?>;
+  var CHARTS = <?= json_encode(array_map(function ($c) {
+      return ['id' => $c['id'], 'unit' => $c['unit'] ?? '', 'min' => $c['min'] ?? null,
+              'max' => $c['max'] ?? null, 'bands' => $c['bands'] ?? [],
+              'series' => array_map(fn($s) => ['label' => $s['label'], 'color' => $s['color'], 'data' => $s['data']], $c['series'])];
+  }, $charts), JSON_UNESCAPED_SLASHES) ?>;
+
+  // ---- tabs (state kept in the URL so the auto-refresh doesn't lose it) ----
+  var tabs = document.querySelectorAll('.tabs button');
+  function show(name) {
+    document.querySelectorAll('.panel').forEach(function (p) {
+      p.hidden = (p.id !== 'tab-' + name);
+    });
+    tabs.forEach(function (b) { b.setAttribute('aria-selected', b.dataset.tab === name ? 'true' : 'false'); });
+    if (name === 'trends') drawAll();
+  }
+  tabs.forEach(function (b) {
+    b.addEventListener('click', function () {
+      location.hash = b.dataset.tab;
+      show(b.dataset.tab);
+    });
+  });
+  var initial = (location.hash || '').replace('#', '') || 'overview';
+  if (initial !== 'trends' && initial !== 'overview') initial = 'overview';
+  show(initial);
+
+  // reload keeps the hash, so you stay on the tab you were reading
+  setTimeout(function () { location.reload(); }, 60000);
+
+  var rangeH = 24;
+  var rb = document.getElementById('ranges');
+
+  /**
+   * A range button is only meaningful once the history is longer than the
+   * window it selects — otherwise every button shows the same full series and
+   * clicking them looks broken. Lock the ones that cannot crop anything yet and
+   * say how much history there actually is.
+   */
+  function syncRanges() {
+    if (!rb) return;
+    var T = HIST.t || [];
+    var spanH = T.length > 1 ? (T[T.length - 1] - T[0]) / 3600 : 0;
+    var usable = null;
+    rb.querySelectorAll('button').forEach(function (b) {
+      var hrs = parseInt(b.dataset.h, 10);
+      var ok = hrs === 0 || spanH > hrs * 1.02;     // must actually cut something
+      b.disabled = !ok;
+      b.title = ok ? '' : 'Needs more than ' + b.textContent.trim() + ' of history';
+      if (ok && hrs > 0 && usable === null) usable = hrs;
+    });
+    // if the active range is locked, fall back to showing everything
+    var active = rb.querySelector('button[aria-pressed="true"]');
+    if (!active || active.disabled) {
+      var target = rb.querySelector('button[data-h="' + (usable === null ? 0 : usable) + '"]')
+                || rb.querySelector('button[data-h="0"]');
+      rb.querySelectorAll('button').forEach(function (x) {
+        x.setAttribute('aria-pressed', x === target ? 'true' : 'false');
+      });
+      if (target) rangeH = parseInt(target.dataset.h, 10);
+    }
+    var note = document.getElementById('rangenote');
+    if (note) {
+      var txt;
+      if (spanH < 1)       txt = Math.max(1, Math.round(spanH * 60)) + ' min of history so far';
+      else if (spanH < 48) txt = spanH.toFixed(1) + ' h of history so far';
+      else                 txt = Math.round(spanH / 24) + ' d of history';
+      note.textContent = txt + (usable === null ? ' — longer ranges unlock as it builds up' : '');
+    }
+  }
+
+  if (rb) {
+    rb.addEventListener('click', function (e) {
+      var b = e.target.closest('button');
+      if (!b || b.disabled) return;
+      rangeH = parseInt(b.dataset.h, 10);
+      rb.querySelectorAll('button').forEach(function (x) {
+        x.setAttribute('aria-pressed', x === b ? 'true' : 'false');
+      });
+      drawAll();
+    });
+  }
+
+  function fmtTime(ts, span) {
+    var d = new Date(ts * 1000);
+    var t = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+    if (span > 172800) return d.toLocaleDateString([], { day: 'numeric', month: 'numeric' }) + ' ' + t;
+    return t;
+  }
+
+  function draw(wrap, cfg) {
+    var T = HIST.t || [];
+    if (T.length < 2) { wrap.innerHTML = '<div class="nodata">Not enough history yet.</div>'; return; }
+
+    // range filter
+    var from = 0;
+    if (rangeH > 0) from = T[T.length - 1] - rangeH * 3600;
+    var idx = [];
+    for (var i = 0; i < T.length; i++) if (T[i] >= from) idx.push(i);
+    if (idx.length < 2) idx = T.map(function (_, i) { return i; });
+    var times = idx.map(function (i) { return T[i]; });
+    var series = cfg.series.map(function (s) {
+      return { label: s.label, color: s.color, data: idx.map(function (i) { return s.data[i]; }) };
+    });
+
+    var W = 900, H = 260, padL = 48, padR = 14, padT = 14, padB = 26;
+    var all = [];
+    series.forEach(function (s) { s.data.forEach(function (v) { if (v !== null && v !== undefined) all.push(+v); }); });
+    if (!all.length) { wrap.innerHTML = '<div class="nodata">No data in this range.</div>'; return; }
+
+    var lo = Math.min.apply(null, all), hi = Math.max.apply(null, all);
+    (cfg.bands || []).forEach(function (b) { hi = Math.max(hi, +b.at); });
+    if (hi - lo < 0.5) hi = lo + 1;
+    var pad = (hi - lo) * 0.12;
+    var min = cfg.min !== null && cfg.min !== undefined ? cfg.min : Math.max(0, lo - pad);
+    var max = cfg.max !== null && cfg.max !== undefined ? cfg.max : hi + pad;
+    if (max - min < 0.001) max = min + 1;
+
+    var n = times.length;
+    var X = function (i) { return padL + (i / (n - 1)) * (W - padL - padR); };
+    var Y = function (v) { return padT + (1 - ((v - min) / (max - min))) * (H - padT - padB); };
+
+    var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">';
+    for (var g = 0; g <= 3; g++) {
+      var val = min + (max - min) * g / 3, yy = Y(val).toFixed(1);
+      svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + yy + '" y2="' + yy + '" stroke="#262c37"/>'
+           + '<text x="' + (padL - 8) + '" y="' + (+yy + 4) + '" text-anchor="end" font-size="12" fill="#5b6472">'
+           + (Math.abs(max - min) < 5 ? val.toFixed(1) : Math.round(val)) + '</text>';
+    }
+    (cfg.bands || []).forEach(function (b) {
+      if (b.at < min || b.at > max) return;
+      var yy = Y(+b.at).toFixed(1);
+      svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + yy + '" y2="' + yy
+           + '" stroke="' + b.color + '" stroke-dasharray="4 4" opacity=".55"/>'
+           + '<text x="' + (W - padR) + '" y="' + (+yy - 5) + '" text-anchor="end" font-size="11" fill="'
+           + b.color + '" opacity=".85">' + b.label + '</text>';
+    });
+    var span = times[n - 1] - times[0];
+    [0, Math.floor((n - 1) / 2), n - 1].forEach(function (i) {
+      var a = i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle');
+      svg += '<text x="' + X(i).toFixed(1) + '" y="' + (H - 7) + '" text-anchor="' + a
+           + '" font-size="12" fill="#5b6472">' + fmtTime(times[i], span) + '</text>';
+    });
+
+    series.forEach(function (s) {
+      var seg = [];
+      var flush = function () {
+        if (seg.length > 1) svg += '<polyline points="' + seg.join(' ') + '" fill="none" stroke="' + s.color
+          + '" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>';
+        else if (seg.length === 1) { var p = seg[0].split(','); svg += '<circle cx="' + p[0] + '" cy="' + p[1] + '" r="2.4" fill="' + s.color + '"/>'; }
+        seg = [];
+      };
+      s.data.forEach(function (v, i) {
+        if (v === null || v === undefined) { flush(); return; }
+        seg.push(X(i).toFixed(1) + ',' + Y(+v).toFixed(1));
+      });
+      flush();
+    });
+    svg += '<line class="cross" x1="0" x2="0" y1="' + padT + '" y2="' + (H - padB)
+         + '" stroke="#8b94a3" stroke-width="1" opacity="0"/>';
+    svg += '</svg>';
+
+    var leg = '<div class="legend">';
+    series.forEach(function (s) {
+      var last = null;
+      for (var i = s.data.length - 1; i >= 0; i--) if (s.data[i] !== null && s.data[i] !== undefined) { last = s.data[i]; break; }
+      leg += '<span class="li"><i style="background:' + s.color + '"></i>' + s.label
+           + (last !== null ? ' <b>' + (Math.round(last * 10) / 10) + cfg.unit + '</b>' : '') + '</span>';
+    });
+    leg += '</div>';
+
+    wrap.innerHTML = svg + leg + '<div class="ctip"></div>';
+
+    // hover / touch readout
+    var el = wrap.querySelector('svg'), tip = wrap.querySelector('.ctip'),
+        cross = wrap.querySelector('.cross');
+    function move(ev) {
+      var r = el.getBoundingClientRect();
+      var cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
+      var rel = (cx / r.width) * W;
+      var i = Math.round(((rel - padL) / (W - padL - padR)) * (n - 1));
+      if (i < 0) i = 0; if (i > n - 1) i = n - 1;
+      cross.setAttribute('x1', X(i)); cross.setAttribute('x2', X(i)); cross.setAttribute('opacity', '.5');
+      var html = '<div class="ct">' + fmtTime(times[i], span) + '</div>';
+      var any = false;
+      series.forEach(function (s) {
+        var v = s.data[i];
+        html += '<div class="cr"><i style="background:' + s.color + '"></i>' + s.label
+              + '<b>' + (v === null || v === undefined ? '—' : (Math.round(v * 10) / 10) + cfg.unit) + '</b></div>';
+        if (v !== null && v !== undefined) any = true;
+      });
+      tip.innerHTML = html;
+      tip.style.opacity = any ? '1' : '.75';
+      var px = (X(i) / W) * r.width;
+      tip.style.left = Math.min(Math.max(px - tip.offsetWidth / 2, 0), r.width - tip.offsetWidth) + 'px';
+      tip.style.top = '4px';
+    }
+    el.addEventListener('mousemove', move);
+    el.addEventListener('touchstart', move, { passive: true });
+    el.addEventListener('touchmove', move, { passive: true });
+    el.addEventListener('mouseleave', function () { tip.style.opacity = '0'; cross.setAttribute('opacity', '0'); });
+  }
+
+  function drawAll() {
+    // Drawing into a hidden panel would size every chart against a zero-width
+    // container and produce empty SVGs, so wait until Trends is actually shown.
+    var panel = document.getElementById('tab-trends');
+    if (!panel || panel.hidden) return;
+    syncRanges();
+    CHARTS.forEach(function (cfg) {
+      var wrap = document.querySelector('[data-chart="' + cfg.id + '"]');
+      if (wrap) draw(wrap, cfg);
+    });
+  }
+
+  // Draw once the DOM is ready, and again after a resize so the SVG geometry
+  // matches the new width (rotating an iPad, or dragging a window narrower).
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', drawAll);
+  } else {
+    drawAll();
+  }
+  var rzT;
+  window.addEventListener('resize', function () {
+    clearTimeout(rzT);
+    rzT = setTimeout(drawAll, 150);
+  });
+})();
+</script>
 </body>
 </html>
