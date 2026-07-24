@@ -179,6 +179,73 @@ which device type a USB bridge actually answers. Example:
 
 ## Notes
 
+- **Now playing.** The overview shows what each stream is doing: title, season and
+  episode, who is watching, on what, direct play vs transcode per track, bandwidth,
+  and which volume the file is being read from. The panel refreshes itself every few
+  seconds **without any extra service** — `index.php?sessions=1` asks Plex directly
+  and `index.php?art=…` proxies the poster, so the token never reaches the browser.
+
+  For that the page needs a token it can read, which the collector mirrors for it:
+
+  ```php
+  const SESSION_TOKEN_FILE  = '/etc/plex-status/token';   // '' disables this
+  const SESSION_TOKEN_OWNER = 'nginx';
+  ```
+
+  The file is written 0400 and owned by the web user. The trade-off: anything able
+  to run code as that user could read the token. On a LAN-only server that is
+  normally acceptable; set the constant to `''` if you would rather not, and the
+  panel falls back to the snapshot the collector writes on its normal run (so it
+  updates every few minutes instead of every few seconds). Everything else keeps
+  working either way.
+
+  Note that the page never reads anything off the media disks — a single read from a
+  spun-down disk would wake it, and the page reloads every 60 s. All disk data comes
+  from `data.json`, which the collector prepares.
+
+- **"Wake all disks" button.** No helper service and no privileges involved: the
+  page reads a small probe file off each data volume, and *that read is what spins
+  the disk up*. It only ever happens on a click — never on a page load, which would
+  defeat the whole point of letting the disks sleep.
+
+  The read uses `O_DIRECT` so it bypasses the page cache; a cached read would be
+  answered from memory and would leave the disk asleep.
+
+  Verification is direct rather than inferred: `?wakecheck=1` gives each disk one
+  second to answer a probe. A spinning disk answers in milliseconds, a sleeping one
+  can't answer at all, so the bar fills as disks come up and only says "all awake"
+  when they really are.
+
+  The probe files (`<mount>/.wake-probe`, 1 MiB) are created by the collector during
+  a `--wake` run, when the disks are spinning anyway — so just run it once:
+
+  ```bash
+  php /usr/local/sbin/plex-status-collect.php --wake
+  ```
+
+  Until they exist the button says so instead of failing silently.
+
+  **Refreshing SMART straight away (optional).** Spinning the disks up needs no
+  privileges, but reading SMART does. Grant the web user permission to run this
+  one command and the button will also re-read temperatures and attributes while
+  the disks are up, instead of leaving them until the next collector pass:
+
+  ```bash
+  # use the user php-fpm actually runs as — on AlmaLinux that is usually apache
+  ps -o user= -C php-fpm | sort -u
+
+  cat > /etc/sudoers.d/plex-status <<'EOF'
+  apache ALL=(root) NOPASSWD: /usr/bin/php /usr/local/sbin/plex-status-collect.php --wake
+  EOF
+  chmod 440 /etc/sudoers.d/plex-status
+  visudo -c
+  ```
+
+  The rule matches that exact command line and nothing else, and the collector
+  itself is root-owned mode 700, so the web user can run it but cannot alter what
+  it does. Skip this and the button still works — it simply reports "SMART
+  refreshes on the next collector pass" once the disks are awake.
+
 - **Zoom and pan.** Scroll the mouse wheel over a chart to zoom, or pinch with two
   fingers on a tablet; whatever moment sits under the pointer stays put while the
   window widens or narrows. Drag with one finger (or the mouse) to move through

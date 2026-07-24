@@ -29,14 +29,15 @@ const LIB_DB     = PLEX_DB_DIR . '/com.plexapp.plugins.library.db';
 const PLEX_WEB_VERSION = '';
 
 // Temperature thresholds (°C).
-// These Seagate drives raise their own alarm at 60 °C: SMART attribute 190
-// (Airflow_Temperature_Cel) carries THRESH 040, and Seagate normalises that
-// attribute as 100 − temperature. Keeping CRIT under 60 means the dashboard
-// turns red *before* the drive itself starts complaining, not after.
-// WARN sits above the 43–45 °C these disks reach under load, so it flags a real
-// cooling problem without crying wolf during normal work.
-const TEMP_WARN  = 50;   // °C — worth a look
-const TEMP_CRIT  = 58;   // °C — act now; just under the drives' own 60 °C alarm
+// For reference: these Seagate drives raise their own airflow-temperature alarm
+// at 60 °C — SMART attribute 190 carries THRESH 040 and Seagate normalises that
+// attribute as 100 − temperature — and 70 °C is the top of their rated operating
+// range. WARN therefore fires exactly when the drive starts complaining, and
+// CRIT at the edge of spec, so nothing here shouts at you during normal summer
+// operation. Lower them (50 / 58 is a cautious pair) if you would rather hear
+// about a cooling problem well before the drive itself flags one.
+const TEMP_WARN  = 60;   // °C — the drive's own alarm point
+const TEMP_CRIT  = 70;   // °C — top of the rated operating range
 const IO_SAMPLE  = 1.0;  // seconds to sample disk I/O activity
 
 // PERFORMANCE PROBING
@@ -94,6 +95,161 @@ const USE_HDPARM = false;
 // "almost": with it false, only --wake can ever cause a spin-up.
 const SMART_WHEN_RECENT_IO = false;
 
+// ---- Plex API helpers ----------------------------------------------------
+// Inlined deliberately: keeping this in a shared include would mean a third
+// file that both scripts must have in place, and a missing one takes the page
+// down with a fatal error. The trade-off is that the copy below and the one in
+// the other script must be kept in step if the session format ever changes.
+
+if (!defined('PLEX_URL')) define('PLEX_URL', 'http://127.0.0.1:32400');
+
+/**
+ * Where the page can find the Plex token.
+ *
+ * The collector reads the real one from Preferences.xml, which only root can
+ * read. To let the (unprivileged) page query Plex directly, the collector can
+ * mirror the token into this file with tight permissions — see
+ * SESSION_TOKEN_FILE in the collector. Leave it absent and the page falls back
+ * to the sessions.json snapshot instead.
+ */
+if (!defined('PLEX_TOKEN_FILE')) define('PLEX_TOKEN_FILE', '/etc/plex-status/token');
+
+/** Token from Preferences.xml (root) or the mirrored file (web user). */
+function plex_token(?string $prefs = null): ?string {
+    if ($prefs !== null && is_readable($prefs)) {
+        $x = (string) @file_get_contents($prefs);
+        if (preg_match('/PlexOnlineToken="([^"]+)"/', $x, $m)) return $m[1];
+    }
+    if (is_readable(PLEX_TOKEN_FILE)) {
+        $t = trim((string) @file_get_contents(PLEX_TOKEN_FILE));
+        if ($t !== '') return $t;
+    }
+    return null;
+}
+
+/** GET a Plex endpoint and decode the JSON reply. */
+function plex_json(string $path, ?string $token, float $timeout = 5.0): ?array {
+    if (!$token) return null;
+    $ctx = stream_context_create(['http' => [
+        'timeout' => $timeout,
+        'header'  => "Accept: application/json\r\n",
+    ]]);
+    $sep = str_contains($path, '?') ? '&' : '?';
+    $raw = @file_get_contents(PLEX_URL . $path . $sep . 'X-Plex-Token=' . urlencode($token), false, $ctx);
+    if ($raw === false) return null;
+    $j = json_decode($raw, true);
+    return is_array($j) ? $j : null;
+}
+
+/** Mount points of real filesystems, straight from /proc — costs nothing. */
+function mount_list(): array {
+    $out = [];
+    foreach (explode("\n", (string) @file_get_contents('/proc/self/mounts')) as $line) {
+        $f = preg_split('/\s+/', trim($line));
+        if (count($f) < 3) continue;
+        if (!in_array($f[2], ['ext4', 'xfs', 'btrfs', 'ext3', 'zfs'], true)) continue;
+        $out[] = str_replace('\\040', ' ', $f[1]);
+    }
+    usort($out, fn($x, $y) => strlen($y) - strlen($x));   // longest prefix wins
+    return $out;
+}
+
+/**
+ * Everything worth showing about what is playing right now.
+ *
+ * Asks for JSON rather than Plex's default XML — the session structure is
+ * deeply nested and JSON survives that far better than regex over XML would.
+ */
+function collect_sessions(?string $token, array $mounts = []): array {
+    $j = plex_json('/status/sessions', $token);
+    $items = $j['MediaContainer']['Metadata'] ?? [];
+    if (!$items) return [];
+
+    $out = [];
+    foreach (array_values($items) as $m) {
+        $media  = $m['Media'][0] ?? [];
+        $part   = $media['Part'][0] ?? [];
+        $player = $m['Player'] ?? [];
+        $sess   = $m['Session'] ?? [];
+        $user   = $m['User'] ?? [];
+
+        // Stream decisions: 1 = video, 2 = audio, 3 = subtitles.
+        // Plex only puts `decision` on the individual streams while a transcode
+        // session exists; on a straight direct play it lives on the Part, and
+        // with neither present nothing is being converted at all.
+        $partDec = $part['decision'] ?? ($media['decision'] ?? null);
+        $fallbackDec = $partDec ?? (isset($m['TranscodeSession']) ? null : 'directplay');
+        $streams = ['1' => null, '2' => null, '3' => null];
+        foreach (($part['Stream'] ?? []) as $s) {
+            $t = (string) ($s['streamType'] ?? '');
+            // array_key_exists, not isset: the slots start out null and isset()
+            // reports null as "not set", which would discard every stream
+            if (!array_key_exists($t, $streams) || $streams[$t] !== null) continue;
+            if ($t !== '1' && empty($s['selected'])) continue;   // only the chosen track
+            $streams[$t] = [
+                'title'    => $s['displayTitle'] ?? ($s['extendedDisplayTitle'] ?? null),
+                'decision' => $s['decision'] ?? $fallbackDec,
+            ];
+        }
+
+        // which volume is this file on? tells you why a given disk is awake
+        $file = $part['file'] ?? null;
+        $vol = null;
+        if ($file) {
+            foreach ($mounts as $mp) {
+                if ($mp !== '/' && str_starts_with($file, rtrim($mp, '/') . '/')) { $vol = $mp; break; }
+            }
+            if ($vol === null && str_starts_with($file, '/')) $vol = '/';
+        }
+
+        $out[] = [
+            'type'        => $m['type'] ?? null,
+            'title'       => $m['title'] ?? null,
+            'show'        => $m['grandparentTitle'] ?? ($m['parentTitle'] ?? null),
+            'season'      => isset($m['parentIndex']) ? (int) $m['parentIndex'] : null,
+            'episode'     => isset($m['index']) ? (int) $m['index'] : null,
+            'year'        => isset($m['year']) ? (int) $m['year'] : null,
+            'duration_ms' => isset($m['duration']) ? (int) $m['duration'] : null,
+            'offset_ms'   => isset($m['viewOffset']) ? (int) $m['viewOffset'] : 0,
+            'state'       => $player['state'] ?? null,
+            'user'        => $user['title'] ?? null,
+            'product'     => $player['product'] ?? null,
+            'player'      => $player['title'] ?? null,
+            'address'     => $player['address'] ?? null,
+            'local'       => !empty($player['local']),
+            'bandwidth'   => isset($sess['bandwidth']) ? (int) $sess['bandwidth'] : null,
+            'video'       => $streams['1']['title'] ?? null,
+            'video_dec'   => $streams['1']['decision'] ?? null,
+            'audio'       => $streams['2']['title'] ?? null,
+            'audio_dec'   => $streams['2']['decision'] ?? null,
+            'subs'        => $streams['3']['title'] ?? null,
+            'subs_dec'    => $streams['3']['decision'] ?? null,
+            'volume'      => $vol,
+            'art'         => $m['grandparentThumb'] ?? ($m['parentThumb'] ?? ($m['thumb'] ?? null)),
+        ];
+    }
+    return $out;
+}
+
+
+// LIVE NOW-PLAYING PANEL
+// The page runs as the web user and cannot read Preferences.xml, so by default
+// it can only show the snapshot this collector writes every few minutes. Point
+// this at a file and the collector mirrors the token there (owner below,
+// mode 0400) — the page can then ask Plex itself on every poll, which makes the
+// panel live without adding a second systemd timer.
+//
+// The trade-off is that anything able to run code as the web user could read
+// the token. On a LAN-only box that's usually fine; set it to '' to opt out and
+// live with the slower snapshot instead.
+const SESSION_TOKEN_FILE  = '/etc/plex-status/token';
+// Leave empty to auto-detect the user php-fpm actually runs as, which is the
+// safer default: on AlmaLinux php-fpm ships with `user = apache` even when
+// nginx serves the site, and changing listen.owner only moves the socket's
+// ownership, not the process's. Guessing wrong is silent — the page simply
+// can't read the token and quietly falls back to the slow snapshot.
+const SESSION_TOKEN_OWNER = '';
+
 // ---- CLI flags (for manual debugging) ------------------------------------
 // Usage: php plex-status-collect.php [--debug] [--dry-run]
 //   --debug/-v    verbose per-disk diagnostics printed to the console
@@ -101,19 +257,22 @@ const SMART_WHEN_RECENT_IO = false;
 //                 (implies --debug)
 $DEBUG = false;
 $DRYRUN = false;
-$WAKE = WAKE_STANDBY;   // runtime; --wake overrides the config default for one run
+$WAKE = WAKE_STANDBY;
+$SESSIONS_ONLY = false;  // refresh only the now-playing panel
 if (PHP_SAPI === 'cli') {
     foreach (array_slice($argv ?? [], 1) as $a) {
         switch ($a) {
             case '-v': case '--debug': case '--verbose': $DEBUG = true; break;
             case '-n': case '--dry-run': $DRYRUN = true; $DEBUG = true; break;
             case '-w': case '--wake': $WAKE = true; break;
+            case '-s': case '--sessions-only': $SESSIONS_ONLY = true; break;
             case '-h': case '--help':
                 fwrite(STDOUT,
                     "Usage: php " . basename(__FILE__) . " [--debug] [--dry-run] [--wake]\n" .
                     "  --debug,   -v   verbose per-disk diagnostics to the console\n" .
                     "  --dry-run, -n   don't write data.json / cache, print JSON (implies --debug)\n" .
-                    "  --wake,    -w   read SMART even from standby/sleeping disks (spins them up)\n");
+                    "  --wake,    -w   read SMART even from standby/sleeping disks (spins them up)\n" .
+                    "  --sessions-only, -s  refresh only what is playing now (fast, never touches disks)\n");
                 exit(0);
             default:
                 fwrite(STDERR, "unknown option: $a  (try --help)\n");
@@ -256,6 +415,8 @@ function parse_selftest(string $out): ?array {
         'passed' => stripos($m[2], 'without error') !== false,
     ];
 }
+
+
 
 /**
  * Read SMART trying several -d types and MERGE the best value of each field.
@@ -839,6 +1000,107 @@ function collect_activity(array $roots): array {
     return $jobs;
 }
 
+
+
+/**
+ * User lookups that don't assume ext-posix is installed.
+ *
+ * Without it posix_getpwuid() simply isn't there, fileowner() gives a bare UID,
+ * and comparing that against a user *name* always fails — which reports a
+ * perfectly correct file as broken. Compare UIDs and fall back to getent.
+ */
+function uid_of(string $name): ?int {
+    if (function_exists('posix_getpwnam')) {
+        $p = @posix_getpwnam($name);
+        if (is_array($p)) return (int) $p['uid'];
+    }
+    $x = trim(sh('id -u ' . escapeshellarg($name)));
+    return ctype_digit($x) ? (int) $x : null;
+}
+
+function name_of_uid(int $uid): string {
+    if (function_exists('posix_getpwuid')) {
+        $p = @posix_getpwuid($uid);
+        if (is_array($p)) return (string) $p['name'];
+    }
+    $x = trim(sh('getent passwd ' . $uid . ' | cut -d: -f1'));
+    return $x !== '' ? $x : "uid $uid";
+}
+
+/** Which user does the web server actually run as? */
+function web_user(): string {
+    if (SESSION_TOKEN_OWNER !== '') return SESSION_TOKEN_OWNER;
+    foreach (['php-fpm', 'php-fpm8.3', 'php-fpm8.2', 'php-fpm8.1', 'nginx', 'httpd'] as $proc) {
+        $u = trim(sh('ps -o user= -C ' . escapeshellarg($proc) . " | sort -u | grep -v '^root$' | head -1"));
+        if ($u !== '') return $u;
+    }
+    return 'nginx';
+}
+
+/** Write the now-playing panel to its own small file. */
+function write_sessions(array $np): void {
+    $f = dirname(OUT_FILE) . '/sessions.json';
+    $payload = json_encode(['generated' => time(), 'sessions' => $np],
+                           JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if (@file_put_contents($f . '.tmp', $payload, LOCK_EX) !== false) {
+        @chmod($f . '.tmp', 0644);
+        @rename($f . '.tmp', $f);
+        sh('restorecon -F ' . escapeshellarg($f));
+    }
+}
+
+/**
+ * Cache each session's poster in the web directory.
+ *
+ * The page can also proxy artwork live (index.php?art=…), but only if it has a
+ * token to use. Caching here means the posters show up either way. Files are
+ * named after the artwork key, so a cached image stays correct no matter how
+ * the session list is ordered.
+ */
+function cache_art(array &$sessions, ?string $token, string $dir): void {
+    $keep = [];
+    foreach ($sessions as &$s) {
+        $key = $s['art'] ?? null;
+        if (!$key) continue;
+        $name = 'art-' . substr(md5($key), 0, 16) . '.jpg';
+        $path = $dir . '/' . $name;
+        $keep[$name] = true;
+        if (!is_file($path) && $token) {
+            $ctx = stream_context_create(['http' => ['timeout' => 5]]);
+            $img = @file_get_contents(PLEX_URL . $key . '?X-Plex-Token=' . urlencode($token), false, $ctx);
+            if ($img === false || strlen($img) < 200) continue;
+            if (@file_put_contents($path, $img, LOCK_EX) === false) continue;
+            @chmod($path, 0644);
+            sh('restorecon -F ' . escapeshellarg($path));
+        }
+        if (is_file($path)) $s['thumb'] = $name;
+    }
+    unset($s);
+    // drop posters for anything no longer playing
+    foreach (glob($dir . '/art-*.jpg') ?: [] as $old) {
+        if (!isset($keep[basename($old)])) @unlink($old);
+    }
+}
+
+// ---- sessions-only mode --------------------------------------------------
+// Runs on a much shorter timer than the full collector so the now-playing
+// panel stays current. Touches nothing but the Plex API: no lsblk, no SMART,
+// no hdparm — there is no path from here to a sleeping disk.
+if ($SESSIONS_ONLY) {
+    $tok = plex_token(PLEX_PREFS);
+    $np  = collect_sessions($tok, mount_list());
+    if (!$DRYRUN) cache_art($np, $tok, dirname(OUT_FILE));
+    if (!$DRYRUN) write_sessions($np);
+    dbg("sessions-only: " . count($np) . " stream(s)");
+    foreach ($np as $x) {
+        dbg(sprintf("    %s — %s (%s)", $x['user'] ?? '?',
+            $x['show'] ?? $x['title'] ?? '?', $x['state'] ?? '?'));
+    }
+    if ($DRYRUN) echo json_encode(['sessions' => $np], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n";
+    else fwrite(STDOUT, "OK " . count($np) . " session(s)\n");
+    exit(0);
+}
+
 // ---- disk enumeration ----------------------------------------------------
 dbg("=== plex-status collector " . ($DRYRUN ? "(dry-run)" : "(debug)") . " @ " . date('Y-m-d H:i:s') . " ===");
 $lsblk = json_decode(sh(
@@ -1147,18 +1409,48 @@ dbg("plex: active=" . ($plex['active'] ? 'yes' : 'no')
     . " server=" . ($plex['version'] ?? '(identity unreachable)')
     . " web=" . ($plex['web_version'] ?? '(not detected)'));
 
-$token = null; // used only for sessions, NEVER stored
-if (is_readable(PLEX_PREFS)) {
-    $prefs = (string) file_get_contents(PLEX_PREFS);
-    if (preg_match('/PlexOnlineToken="([^"]+)"/', $prefs, $m)) $token = $m[1];
-}
-dbg("plex: token " . ($token ? 'found in Preferences.xml (not stored)' : 'NOT found — sessions unavailable'));
-if ($token) {
-    $sess = @file_get_contents(PLEX_URL . '/status/sessions?X-Plex-Token=' . urlencode($token), false, $ctx);
-    if ($sess !== false && preg_match('/<MediaContainer[^>]*\bsize="(\d+)"/', $sess, $m)) {
-        $plex['sessions'] = (int) $m[1];
+$token = plex_token(PLEX_PREFS); // used for API calls only, never written to data.json
+
+// Mirror it for the page. Ownership and mode are re-applied on every run, not
+// just when the value changes: a file created once with the wrong owner would
+// otherwise stay wrong forever, silently, because its contents still match.
+if ($token && SESSION_TOKEN_FILE !== '' && !$DRYRUN) {
+    $tf = SESSION_TOKEN_FILE;
+    @mkdir(dirname($tf), 0755, true);
+    $cur = is_file($tf) ? trim((string) @file_get_contents($tf)) : null;
+    if ($cur !== $token && @file_put_contents($tf, $token, LOCK_EX) === false) {
+        dbg("token mirror: could NOT write $tf — the page falls back to sessions.json");
+    } elseif (!is_file($tf)) {
+        dbg("token mirror: $tf missing after write");
+    } else {
+        $wu = web_user();
+        @chmod($tf, 0400);
+        @chown($tf, $wu);
+        clearstatcache(true, $tf);
+        $want = uid_of($wu);
+        $have = (int) fileowner($tf);
+        $mode = substr(sprintf('%o', fileperms($tf)), -4);
+        $ok   = ($want !== null && $have === $want);
+        dbg("token mirror: $tf owner=" . name_of_uid($have) . " ($have) mode=$mode"
+            . " (php-fpm runs as $wu" . ($want !== null ? " = $want" : '') . ")"
+            . ($ok ? ' — OK, the page can read it'
+                   : ' — MISMATCH, the page cannot read it; set SESSION_TOKEN_OWNER manually'));
     }
-    dbg("plex: sessions=" . ($plex['sessions'] ?? '(query failed)'));
+}
+dbg("plex: token " . ($token ? 'found in Preferences.xml' : 'NOT found — sessions unavailable'));
+// What is playing right now, with enough detail to show it on the page.
+$mountList = [];
+foreach ($disks as $dd) if (!empty($dd['mount'])) $mountList[] = $dd['mount'];
+usort($mountList, fn($x, $y) => strlen($y) - strlen($x));   // longest prefix wins
+$nowPlaying = collect_sessions($token, $mountList);
+if (!$DRYRUN) cache_art($nowPlaying, $token, dirname(OUT_FILE));
+$plex['sessions'] = count($nowPlaying);
+if (!$DRYRUN) write_sessions($nowPlaying);
+dbg("plex: sessions=" . $plex['sessions']);
+foreach ($nowPlaying as $np) {
+    dbg(sprintf("    %s — %s (%s) %s %s",
+        $np['user'] ?? '?', $np['show'] ?? $np['title'] ?? '?',
+        $np['state'] ?? '?', $np['product'] ?? '', $np['volume'] ?? ''));
 }
 
 // ---- what Plex is doing right now ----------------------------------------
@@ -1299,6 +1591,25 @@ if (!$DRYRUN) {
     }
 }
 
+// Record when SMART was last genuinely read. The page needs this because a
+// regular run following a --wake run rewrites data.json from cache seconds
+// later, wiping the per-disk from_cache=false flag — a timestamp survives that,
+// a flag doesn't.
+if (!$DRYRUN) {
+    $readCount = 0;
+    foreach ($disks as $dx) {
+        if (empty($dx['from_cache']) && ($dx['smart_type'] ?? 'n/a') !== 'n/a'
+            && strtolower($dx['tran'] ?? '') !== 'nvme') $readCount++;
+    }
+    if ($readCount > 0) {
+        $cache['__meta']['last_smart_read'] = time();
+        $cache['__meta']['last_smart_disks'] = $readCount;
+        @file_put_contents(CACHE_FILE, json_encode($cache), LOCK_EX);
+        dbg("recorded SMART read of $readCount disk(s) at " . date('H:i:s'));
+    }
+}
+$lastSmart = (int) ($cache['__meta']['last_smart_read'] ?? 0);
+
 $payload = [
     'generated' => time(),
     'hostname'  => trim(sh('hostname')),
@@ -1306,7 +1617,9 @@ $payload = [
     'reasons'   => array_map(fn($r) => ['level' => $r[0], 'text' => $r[1]], $reasons),
     'thresholds'=> ['temp_warn' => TEMP_WARN, 'temp_crit' => TEMP_CRIT],
     'system'    => $system,
+    'last_smart_read' => $lastSmart,
     'plex'    => $plex,
+    'now_playing' => $nowPlaying,
     'activity' => $activity,
     'perf'    => $perf,
     'history' => $history,
@@ -1327,6 +1640,31 @@ if ($DRYRUN) {
     rename($tmp, OUT_FILE);
     sh('restorecon -F ' . escapeshellarg(OUT_FILE)); // fix SELinux context
     dbg("wrote " . OUT_FILE . " (" . strlen($json) . " bytes)");
+}
+
+
+// A wake requested from the web page leaves a marker file; removing it is what
+// tells the page the request has been served.
+if ($WAKE && !$DRYRUN) {
+    $req = dirname(OUT_FILE) . '/wake.request';
+    if (is_file($req)) { @unlink($req); dbg("cleared the web page's wake request"); }
+
+    // Probe files for the page's "Wake all disks" button. Reading one of these
+    // with O_DIRECT is what spins a disk up, so one has to exist on every data
+    // volume. Created here because a --wake run already has them spinning.
+    foreach ($disks as $dp) {
+        $mp = $dp['mount'] ?? null;
+        if ($mp === null || $mp === '/' || strtolower($dp['tran'] ?? '') === 'nvme') continue;
+        $probe = rtrim($mp, '/') . '/.wake-probe';
+        if (is_file($probe) && filesize($probe) >= 65536) continue;
+        // 1 MiB is plenty: the button only ever reads the first 4 KiB of it
+        if (@file_put_contents($probe, str_repeat("\0", 1024 * 1024), LOCK_EX) !== false) {
+            @chmod($probe, 0644);
+            dbg("created wake probe $probe");
+        } else {
+            dbg("could not create $probe — the wake button will skip this volume");
+        }
+    }
 }
 
 echo "OK " . count($disks) . " disks, status=$overall" . ($DRYRUN ? " [dry-run]" : "") . "\n";

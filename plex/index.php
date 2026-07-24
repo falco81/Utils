@@ -24,6 +24,404 @@ function use_system_timezone(): void {
 use_system_timezone();
 
 const DATA_FILE = __DIR__ . '/data.json';
+// ---- live activity -------------------------------------------------------
+// Serving this from the page rather than the collector's snapshot makes the
+// panel current instead of up to five minutes stale. It is safe to do on every
+// poll: `ps` reads /proc, and the library lookup is a Plex API call — neither
+// goes anywhere near a media disk.
+
+/** sh() equivalent for the page: the collector defines its own. */
+function sh(string $cmd): string {
+    if (!function_exists('shell_exec')) return '';
+    return (string) @shell_exec($cmd . ' 2>/dev/null');
+}
+
+/**
+ * What is Plex actually doing right now?
+ *
+ * Works it out from the transcoder/scanner command lines, so a "Plex Transcoder"
+ * burning a core is identifiable as preview generation for a specific file
+ * rather than an anonymous CPU hog. Reads only /proc via ps — touches no disks.
+ */
+function classify_job(string $args): array {
+    $media = null;
+    if (preg_match('/\s-i\s+(.+?)(?=\s+-[a-zA-Z])/', $args, $m)) $media = trim($m[1]);
+
+    if (str_contains($args, '/bif/') || str_contains($args, 'Indexes/tmp') || str_contains($args, 'img-%06d')) {
+        return ['bif', 'Preview thumbnails', 'generating scrubbing previews for a recently added video', $media];
+    }
+    if (str_contains($args, 'thumb-%05d') || (str_contains($args, '-f image2') && str_contains($args, '-ss '))) {
+        return ['chapter', 'Chapter thumbnails', 'generating chapter images for a recently added video', $media];
+    }
+    if (stripos($args, 'ebur128') !== false || stripos($args, 'loudness') !== false) {
+        return ['loudness', 'Loudness analysis', 'analysing audio levels of a recently added track', $media];
+    }
+    if (str_contains($args, 'transcode/session')) {
+        return ['playback', 'Playback transcode', 'someone is watching — this is a live stream', $media];
+    }
+    if (str_contains($args, '-f null') || str_contains($args, 'showinfo')) {
+        return ['analysis', 'Media analysis', 'reading codecs and duration of a recently added file', $media];
+    }
+    return ['other', 'Transcoder', 'background transcoder task', $media];
+}
+
+/** Map library folders to library names so a job can say which library it belongs to. */
+function library_roots(?string $token, $ctx = null): array {
+    if (!$token) return [];
+    if ($ctx === null) $ctx = stream_context_create(['http' => ['timeout' => 5]]);
+    $raw = @file_get_contents(PLEX_URL . '/library/sections?X-Plex-Token=' . urlencode($token), false, $ctx);
+    if ($raw === false) return [];
+    $roots = [];
+    if (preg_match_all('#<Directory\b.*?</Directory>#s', $raw, $blocks)) {
+        foreach ($blocks[0] as $b) {
+            if (!preg_match('/\btitle="([^"]*)"/', $b, $t)) continue;
+            if (preg_match_all('/<Location\b[^>]*\bpath="([^"]*)"/', $b, $locs)) {
+                foreach ($locs[1] as $p) $roots[$p] = $t[1];
+            }
+        }
+    }
+    return $roots;
+}
+
+function collect_activity(array $roots): array {
+    $raw = sh("ps -eo etimes,pcpu,args --sort=-etimes");
+    $jobs = [];
+    foreach (explode("\n", $raw) as $line) {
+        if (!str_contains($line, 'Plex Transcoder') && !str_contains($line, 'Plex Media Scanner')) continue;
+        if (str_contains($line, 'grep')) continue;
+        $parts = preg_split('/\s+/', trim($line), 3);
+        if (count($parts) < 3) continue;
+        [$etimes, $pcpu, $args] = $parts;
+
+        if (str_contains($args, 'Plex Media Scanner')) {
+            $kind = 'scan'; $label = 'Library scan';
+            $why = 'looking for newly added files'; $media = null;
+        } else {
+            [$kind, $label, $why, $media] = classify_job($args);
+        }
+
+        $lib = null;
+        if ($media !== null) {
+            foreach ($roots as $path => $name) {
+                if (str_starts_with($media, $path)) { $lib = $name; break; }
+            }
+        }
+        $jobs[] = [
+            'kind' => $kind, 'label' => $label, 'why' => $why,
+            'file' => $media !== null ? basename($media) : null,
+            'dir'  => $media !== null ? dirname($media) : null,
+            'library' => $lib,
+            'runtime_s' => (int) $etimes,
+            'cpu' => (float) $pcpu,
+        ];
+    }
+    return $jobs;
+}
+
+// ---- Plex API helpers ----------------------------------------------------
+// Inlined deliberately: keeping this in a shared include would mean a third
+// file that both scripts must have in place, and a missing one takes the page
+// down with a fatal error. The trade-off is that the copy below and the one in
+// the other script must be kept in step if the session format ever changes.
+
+if (!defined('PLEX_URL')) define('PLEX_URL', 'http://127.0.0.1:32400');
+
+/**
+ * Where the page can find the Plex token.
+ *
+ * The collector reads the real one from Preferences.xml, which only root can
+ * read. To let the (unprivileged) page query Plex directly, the collector can
+ * mirror the token into this file with tight permissions — see
+ * SESSION_TOKEN_FILE in the collector. Leave it absent and the page falls back
+ * to the sessions.json snapshot instead.
+ */
+if (!defined('PLEX_TOKEN_FILE')) define('PLEX_TOKEN_FILE', '/etc/plex-status/token');
+
+/** Token from Preferences.xml (root) or the mirrored file (web user). */
+function plex_token(?string $prefs = null): ?string {
+    if ($prefs !== null && is_readable($prefs)) {
+        $x = (string) @file_get_contents($prefs);
+        if (preg_match('/PlexOnlineToken="([^"]+)"/', $x, $m)) return $m[1];
+    }
+    if (is_readable(PLEX_TOKEN_FILE)) {
+        $t = trim((string) @file_get_contents(PLEX_TOKEN_FILE));
+        if ($t !== '') return $t;
+    }
+    return null;
+}
+
+/** GET a Plex endpoint and decode the JSON reply. */
+function plex_json(string $path, ?string $token, float $timeout = 5.0): ?array {
+    if (!$token) return null;
+    $ctx = stream_context_create(['http' => [
+        'timeout' => $timeout,
+        'header'  => "Accept: application/json\r\n",
+    ]]);
+    $sep = str_contains($path, '?') ? '&' : '?';
+    $raw = @file_get_contents(PLEX_URL . $path . $sep . 'X-Plex-Token=' . urlencode($token), false, $ctx);
+    if ($raw === false) return null;
+    $j = json_decode($raw, true);
+    return is_array($j) ? $j : null;
+}
+
+/** Mount points of real filesystems, straight from /proc — costs nothing. */
+function mount_list(): array {
+    $out = [];
+    foreach (explode("\n", (string) @file_get_contents('/proc/self/mounts')) as $line) {
+        $f = preg_split('/\s+/', trim($line));
+        if (count($f) < 3) continue;
+        if (!in_array($f[2], ['ext4', 'xfs', 'btrfs', 'ext3', 'zfs'], true)) continue;
+        $out[] = str_replace('\\040', ' ', $f[1]);
+    }
+    usort($out, fn($x, $y) => strlen($y) - strlen($x));   // longest prefix wins
+    return $out;
+}
+
+/**
+ * Everything worth showing about what is playing right now.
+ *
+ * Asks for JSON rather than Plex's default XML — the session structure is
+ * deeply nested and JSON survives that far better than regex over XML would.
+ */
+function collect_sessions(?string $token, array $mounts = []): array {
+    $j = plex_json('/status/sessions', $token);
+    $items = $j['MediaContainer']['Metadata'] ?? [];
+    if (!$items) return [];
+
+    $out = [];
+    foreach (array_values($items) as $m) {
+        $media  = $m['Media'][0] ?? [];
+        $part   = $media['Part'][0] ?? [];
+        $player = $m['Player'] ?? [];
+        $sess   = $m['Session'] ?? [];
+        $user   = $m['User'] ?? [];
+
+        // Stream decisions: 1 = video, 2 = audio, 3 = subtitles.
+        // Plex only puts `decision` on the individual streams while a transcode
+        // session exists; on a straight direct play it lives on the Part, and
+        // with neither present nothing is being converted at all.
+        $partDec = $part['decision'] ?? ($media['decision'] ?? null);
+        $fallbackDec = $partDec ?? (isset($m['TranscodeSession']) ? null : 'directplay');
+        $streams = ['1' => null, '2' => null, '3' => null];
+        foreach (($part['Stream'] ?? []) as $s) {
+            $t = (string) ($s['streamType'] ?? '');
+            // array_key_exists, not isset: the slots start out null and isset()
+            // reports null as "not set", which would discard every stream
+            if (!array_key_exists($t, $streams) || $streams[$t] !== null) continue;
+            if ($t !== '1' && empty($s['selected'])) continue;   // only the chosen track
+            $streams[$t] = [
+                'title'    => $s['displayTitle'] ?? ($s['extendedDisplayTitle'] ?? null),
+                'decision' => $s['decision'] ?? $fallbackDec,
+            ];
+        }
+
+        // which volume is this file on? tells you why a given disk is awake
+        $file = $part['file'] ?? null;
+        $vol = null;
+        if ($file) {
+            foreach ($mounts as $mp) {
+                if ($mp !== '/' && str_starts_with($file, rtrim($mp, '/') . '/')) { $vol = $mp; break; }
+            }
+            if ($vol === null && str_starts_with($file, '/')) $vol = '/';
+        }
+
+        $out[] = [
+            'type'        => $m['type'] ?? null,
+            'title'       => $m['title'] ?? null,
+            'show'        => $m['grandparentTitle'] ?? ($m['parentTitle'] ?? null),
+            'season'      => isset($m['parentIndex']) ? (int) $m['parentIndex'] : null,
+            'episode'     => isset($m['index']) ? (int) $m['index'] : null,
+            'year'        => isset($m['year']) ? (int) $m['year'] : null,
+            'duration_ms' => isset($m['duration']) ? (int) $m['duration'] : null,
+            'offset_ms'   => isset($m['viewOffset']) ? (int) $m['viewOffset'] : 0,
+            'state'       => $player['state'] ?? null,
+            'user'        => $user['title'] ?? null,
+            'product'     => $player['product'] ?? null,
+            'player'      => $player['title'] ?? null,
+            'address'     => $player['address'] ?? null,
+            'local'       => !empty($player['local']),
+            'bandwidth'   => isset($sess['bandwidth']) ? (int) $sess['bandwidth'] : null,
+            'video'       => $streams['1']['title'] ?? null,
+            'video_dec'   => $streams['1']['decision'] ?? null,
+            'audio'       => $streams['2']['title'] ?? null,
+            'audio_dec'   => $streams['2']['decision'] ?? null,
+            'subs'        => $streams['3']['title'] ?? null,
+            'subs_dec'    => $streams['3']['decision'] ?? null,
+            'volume'      => $vol,
+            'art'         => $m['grandparentThumb'] ?? ($m['parentThumb'] ?? ($m['thumb'] ?? null)),
+        ];
+    }
+    return $out;
+}
+
+
+/**
+ * Live now-playing, straight from Plex.
+ *
+ * Works whenever the collector has mirrored the token (SESSION_TOKEN_FILE);
+ * otherwise it serves the snapshot the collector last wrote, so the panel keeps
+ * working either way — just less often. Either path talks only to the Plex API
+ * and the system SSD, never to a media disk.
+ */
+if (isset($_GET['live']) || isset($_GET['sessions'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+    $tok = plex_token();
+    if ($tok) {
+        $live = collect_sessions($tok, mount_list());
+        // the collector caches posters next to data.json; point at one when it
+        // exists so artwork survives even if the art proxy can't be used
+        foreach ($live as &$ls) {
+            if (empty($ls['art'])) continue;
+            $cached = 'art-' . substr(md5($ls['art']), 0, 16) . '.jpg';
+            if (is_file(__DIR__ . '/' . $cached)) $ls['thumb'] = $cached;
+        }
+        unset($ls);
+        echo json_encode(['generated' => time(), 'live' => true, 'sessions' => $live,
+                          'activity' => collect_activity(library_roots($tok))],
+                         JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    } else {
+        // Say why rather than silently serving stale data: without a readable
+        // token the panel can only be as fresh as the collector's last run.
+        $tf = PLEX_TOKEN_FILE;
+        if (!file_exists($tf)) {
+            $why = "token file $tf does not exist — run the collector once";
+        } elseif (!is_readable($tf)) {
+            // report the user PHP actually runs as; ext-posix may not be installed
+            $me = function_exists('posix_geteuid') ? @posix_getpwuid(posix_geteuid()) : null;
+            $who = is_array($me) ? $me['name'] : trim(sh('id -un'));
+            $why = "token file $tf is not readable by " . ($who !== '' ? $who : 'the web user');
+        } else {
+            $why = 'token file is empty';
+        }
+
+        $snap = @json_decode((string) @file_get_contents(__DIR__ . '/sessions.json'), true);
+        echo json_encode([
+            'generated' => time(),
+            'live'      => false,
+            'why'       => $why,
+            'sessions'  => $snap['sessions'] ?? [],
+            // this part needs no token — it comes from ps
+            'activity'  => collect_activity([]),
+        ], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    }
+    exit;
+}
+
+// Poster art, fetched server-side. Keeping it behind this proxy is what stops
+// the Plex token from ever reaching the browser.
+if (isset($_GET['art'])) {
+    $key = (string) $_GET['art'];
+    // only Plex's own metadata paths, so this can't be pointed anywhere else
+    if (!preg_match('#^/library/[A-Za-z0-9/_.\-]+$#', $key)) { http_response_code(400); exit; }
+    $tok = plex_token();
+    if (!$tok) { http_response_code(404); exit; }
+    $ctx = stream_context_create(['http' => ['timeout' => 5]]);
+    $img = @file_get_contents(PLEX_URL . $key . '?X-Plex-Token=' . urlencode($tok), false, $ctx);
+    if ($img === false || strlen($img) < 100) { http_response_code(404); exit; }
+    header('Content-Type: image/jpeg');
+    header('Cache-Control: private, max-age=600');
+    echo $img;
+    exit;
+}
+/**
+ * Waking the disks, without any privileges or helper services.
+ *
+ * Reading a file off a spun-down disk is what wakes it, so that is all this
+ * does — and it only ever happens when the button is pressed, never on a normal
+ * page load. The read must bypass the page cache (O_DIRECT), otherwise the
+ * kernel would answer from memory and the disk would stay asleep.
+ *
+ * The probe file is created on each data volume by the collector during a
+ * --wake run, when the disk is spinning anyway.
+ */
+const WAKE_PROBE = '.wake-probe';
+// Waking the disks is unprivileged, but reading SMART afterwards is not. If the
+// sudoers rule from INSTALL.md is in place, the page can also kick off a full
+// collector pass so temperatures and attributes refresh straight away instead
+// of on the next timer. Without the rule everything still works — the SMART
+// values just arrive with the next scheduled run.
+const COLLECTOR_BIN = '/usr/local/sbin/plex-status-collect.php';
+const PHP_BIN       = '/usr/bin/php';
+
+/** Data volumes to wake, taken from what the collector last saw. */
+function wake_mounts(): array {
+    $d = @json_decode((string) @file_get_contents(DATA_FILE), true);
+    $out = [];
+    foreach (($d['disks'] ?? []) as $x) {
+        $m = $x['mount'] ?? null;
+        if ($m === null || $m === '/' || strtolower($x['tran'] ?? '') === 'nvme') continue;
+        if (is_file(rtrim($m, '/') . '/' . WAKE_PROBE)) $out[$m] = $x['dev'];
+    }
+    return $out;
+}
+
+if (isset($_GET['wake']) || isset($_GET['wakecheck'])) {
+    header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store');
+
+    if (!function_exists('shell_exec')) {
+        http_response_code(503);
+        echo json_encode(['ok' => false, 'error' => 'shell_exec is disabled in PHP']);
+        exit;
+    }
+    $mounts = wake_mounts();
+    if (!$mounts) {
+        http_response_code(503);
+        echo json_encode(['ok' => false,
+            'error' => 'no probe files found — run the collector once with --wake to create them']);
+        exit;
+    }
+
+    if (isset($_GET['wake'])) {
+        // Fire the reads and return at once: a sleeping disk takes many seconds
+        // to answer and we must not hold the request open that long.
+        foreach ($mounts as $m => $dev) {
+            $f = escapeshellarg(rtrim($m, '/') . '/' . WAKE_PROBE);
+            @shell_exec("nohup dd if=$f of=/dev/null bs=4096 count=1 iflag=direct >/dev/null 2>&1 &");
+        }
+        // …and, if permitted, a full collector pass so SMART is re-read while
+        // the disks are up. Ask sudo whether it is allowed *before* claiming so:
+        // otherwise the page would wait two minutes for a refresh that was never
+        // going to happen, instead of saying so immediately.
+        $refresh = false;
+        if (is_file(COLLECTOR_BIN)) {
+            $rule = trim((string) @shell_exec(
+                'sudo -n -l ' . escapeshellarg(PHP_BIN) . ' ' .
+                escapeshellarg(COLLECTOR_BIN) . ' --wake 2>/dev/null'));
+            if ($rule !== '') {
+                @shell_exec('nohup sudo -n ' . escapeshellarg(PHP_BIN) . ' ' .
+                            escapeshellarg(COLLECTOR_BIN) . ' --wake >/dev/null 2>&1 &');
+                $refresh = true;
+            }
+        }
+        echo json_encode(['ok' => true, 'at' => time(), 'disks' => array_values($mounts),
+                          'refresh' => $refresh]);
+        exit;
+    }
+
+    // wakecheck: a spinning disk answers in milliseconds, a sleeping one can't
+    // answer within a second. Run them in parallel so the whole check is ~1 s.
+    $cmd = '';
+    foreach ($mounts as $m => $dev) {
+        $f = escapeshellarg(rtrim($m, '/') . '/' . WAKE_PROBE);
+        // device names are plain [a-z0-9]; sanitise rather than shell-quote so
+        // the tag comes back out of echo without quotes around it
+        $tag = preg_replace('/[^A-Za-z0-9_-]/', '', (string) $dev);
+        $cmd .= "( if timeout 1 dd if=$f of=/dev/null bs=4096 count=1 iflag=direct >/dev/null 2>&1;"
+              . " then echo '$tag awake'; else echo '$tag asleep'; fi ) & ";
+    }
+    $out = (string) @shell_exec($cmd . 'wait');
+    $state = [];
+    foreach (explode("\n", trim($out)) as $line) {
+        $p = preg_split('/\s+/', trim($line));
+        if (count($p) === 2) $state[$p[0]] = $p[1] === 'awake';
+    }
+    $awake = count(array_filter($state));
+    echo json_encode(['ok' => true, 'disks' => $state,
+                      'awake' => $awake, 'total' => count($mounts)]);
+    exit;
+}
 
 $data = is_readable(DATA_FILE) ? json_decode((string) file_get_contents(DATA_FILE), true) : null;
 
@@ -92,7 +490,8 @@ function state_help(string $cls): array {
 
 const PALETTE = ['#58a6ff', '#3fb950', '#d29922', '#a371f7', '#f85149', '#2dd4bf', '#f0883e'];
 
-$thr    = $data['thresholds'] ?? ['temp_warn' => 50, 'temp_crit' => 58];
+// only used if data.json predates the thresholds field; the collector normally supplies them
+$thr    = $data['thresholds'] ?? ['temp_warn' => 60, 'temp_crit' => 70];
 $cpuThr = ['temp_warn' => 70, 'temp_crit' => 85];   // CPUs run hotter than disks
 $overall = $data['overall'] ?? 'unknown';
 $overallLabel = ['ok' => 'All healthy', 'warn' => 'Warning', 'crit' => 'Problem', 'unknown' => 'Unknown'][$overall] ?? 'Unknown';
@@ -494,6 +893,60 @@ function trend_per_day(array $times, array $vals): ?float {
   .attrs .a .an{color:var(--tx-mut)} .attrs .a .av{font-weight:600}
   .attrs .a .av.bad{color:var(--crit)}
   .cachenote{font-size:11px;color:var(--tx-mut)}
+
+  /* now playing */
+  .now{grid-template-columns:repeat(auto-fit,minmax(340px,1fr))}
+  .idlecard{color:var(--tx-mut);text-align:center;padding:22px}
+  .livewarn{margin-left:10px;font-weight:400;text-transform:none;letter-spacing:0;
+    color:var(--warn);font-size:11.5px}
+  .np{display:flex;gap:14px;padding:14px}
+  /* The frame simply takes the shape of the artwork: fixed width, height from
+     the image itself. No aspect-ratio to crop against and no max-height to
+     letterbox against — whatever Plex hands us is shown whole.
+     align-self keeps flexbox from stretching the frame to the card's height,
+     which would show its background as bands above and below the image. */
+  .np .art{width:132px;flex:0 0 auto;align-self:flex-start;
+    border-radius:8px;overflow:hidden;background:var(--panel2)}
+  .np .art img{width:100%;height:auto;display:block}
+  .np .art span{display:block;text-align:center;padding:56px 0;color:var(--tx-mut);font-size:24px}
+  .np .meta{flex:1;min-width:0}
+  .np .t1{font-weight:700;font-size:15px;line-height:1.3;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .np .t2{color:var(--tx-dim);font-size:13px;margin-top:2px}
+  .np .who{display:flex;align-items:center;gap:7px;margin-top:8px;font-size:12.5px;color:var(--tx-dim);flex-wrap:wrap}
+  .np .st{display:inline-flex;align-items:center;gap:5px;font-weight:700;font-size:12px;
+    padding:2px 8px;border-radius:999px}
+  .np .st.playing{background:var(--ok-bg);color:var(--ok)}
+  .np .st.paused{background:var(--sleep-bg);color:var(--sleep)}
+  .np .st.buffering{background:var(--warn-bg);color:var(--warn)}
+  .np .pbar{height:5px;border-radius:4px;background:var(--panel2);overflow:hidden;margin:9px 0 4px}
+  .np .pbar i{display:block;height:100%;background:var(--info);border-radius:4px;transition:width 1s linear}
+  .np .times{display:flex;justify-content:space-between;font-size:11.5px;color:var(--tx-mut)}
+  .np .rows{margin-top:10px;padding-top:9px;border-top:1px solid var(--line);
+    display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:12.5px}
+  .np .rk{color:var(--tx-mut)}
+  .np .rv{color:var(--tx)}
+  .np .dec{font-size:11px;font-weight:700;padding:1px 6px;border-radius:5px;margin-left:6px}
+  .np .dec.direct{background:var(--ok-bg);color:var(--ok)}
+  .np .dec.transcode{background:var(--warn-bg);color:var(--warn)}
+  .np .dec.copy{background:var(--info-bg);color:var(--info)}
+  .np .vol{font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--info)}
+
+  /* wake control */
+  .sechead{display:flex;align-items:center;gap:14px;flex-wrap:wrap}
+  .sechead .sec{margin-bottom:12px}
+  .wakebox{margin:26px 0 12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+  #wakebtn{appearance:none;background:var(--panel);border:1px solid var(--line);color:var(--tx-dim);
+    padding:6px 14px;border-radius:9px;font-size:12.5px;font-weight:600;cursor:pointer}
+  #wakebtn:hover:not(:disabled){color:var(--tx);border-color:var(--info)}
+  #wakebtn:disabled{opacity:.5;cursor:default}
+  .wakeprog{display:flex;align-items:center;gap:10px;font-size:12.5px;color:var(--tx-dim)}
+  .wakeprog .wbar{width:140px;height:6px;border-radius:4px;background:var(--panel2);overflow:hidden}
+  .wakeprog .wbar i{display:block;height:100%;width:0;background:var(--info);border-radius:4px;
+    transition:width .4s linear}
+  .wakeprog.done .wbar i{background:var(--ok)}
+  .wakeprog.fail .wbar i{background:var(--crit)}
+  .wakeprog.done .wtxt{color:var(--ok)}
+  .wakeprog.fail .wtxt{color:var(--crit)}
   .recent{display:flex;gap:14px;flex-wrap:wrap;margin-top:7px;font-size:12.5px;color:var(--tx-mut)}
   .recent b{color:var(--tx);font-weight:700;font-size:13.5px}
 
@@ -645,7 +1098,7 @@ function trend_per_day(array $times, array $vals): ?float {
 
     <!-- what Plex is doing right now -->
     <h3 class="sec">Activity</h3>
-    <div class="card">
+    <div class="card" id="activitycard">
       <?php if (!$activity): ?>
         <div class="idle-note">Idle</div>
         <div class="sub" style="margin-top:4px">No transcoding, analysis or library scan running.</div>
@@ -673,6 +1126,16 @@ function trend_per_day(array $times, array $vals): ?float {
         </div>
       <?php endif; ?>
     </div>
+
+    <?php $np = $data['now_playing'] ?? []; ?>
+    <h3 class="sec">Now playing<span id="npcount"><?= $np ? ' · ' . count($np) : '' ?></span>
+      <span class="livewarn" id="livewarn" hidden></span></h3>
+    <div class="grid now" id="nowplaying">
+      <?php if (!$np): ?>
+        <div class="card idlecard" id="npidle">Nothing is playing right now.</div>
+      <?php endif; ?>
+    </div>
+
 
     <?php
       $perf   = $data['perf'] ?? [];
@@ -738,7 +1201,16 @@ function trend_per_day(array $times, array $vals): ?float {
     </div>
     <?php endif; ?>
 
-    <h3 class="sec">Disks</h3>
+    <div class="sechead">
+      <h3 class="sec">Disks</h3>
+      <div class="wakebox">
+        <button type="button" id="wakebtn">Wake all disks</button>
+        <div class="wakeprog" id="wakeprog" hidden>
+          <div class="wbar"><i></i></div>
+          <span class="wtxt"></span>
+        </div>
+      </div>
+    </div>
     <div class="grid disks">
     <?php foreach ($data['disks'] as $d):
         $tran = strtolower($d['tran']);
@@ -1327,6 +1799,335 @@ function trend_per_day(array $times, array $vals): ?float {
     el.addEventListener('touchmove', move, { passive: true });
     el.addEventListener('mouseleave', function () { tip.style.opacity = '0'; cross.setAttribute('opacity', '0'); });
   }
+
+  // ---- now playing ----------------------------------------------------
+  var NP = <?= json_encode($data['now_playing'] ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>;
+  var NP_AT = <?= (int) ($data['generated'] ?? time()) ?>;
+  var DISKS = <?= json_encode(array_map(fn($d) => ['dev' => $d['dev'], 'tran' => $d['tran']],
+                                        $data['disks'] ?? []), JSON_UNESCAPED_SLASHES) ?>;
+
+  function hms(ms) {
+    var s = Math.max(0, Math.floor(ms / 1000));
+    var h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), x = s % 60;
+    return (h ? h + ':' + String(m).padStart(2, '0') : m) + ':' + String(x).padStart(2, '0');
+  }
+  // Plex reports 'burn' when it renders subtitles into the picture — that is a
+  // full transcode of the video, so it must not be mistaken for direct play.
+  function decClass(d) {
+    if (!d) return '';
+    d = String(d).toLowerCase();
+    if (d.indexOf('transcode') >= 0 || d.indexOf('burn') >= 0) return 'transcode';
+    if (d.indexOf('copy') >= 0) return 'copy';
+    return 'direct';
+  }
+  function decLabel(d) {
+    if (!d) return '';
+    d = String(d).toLowerCase();
+    if (d.indexOf('burn') >= 0) return 'Burned in';
+    if (d.indexOf('transcode') >= 0) return 'Transcode';
+    if (d.indexOf('copy') >= 0) return 'Stream copy';
+    return 'Direct Play';
+  }
+  // Prefer the live proxy, fall back to the collector's cached copy, then to a
+  // plain glyph — a broken image icon would just look like a bug.
+  function art(s) {
+    var cached = s.thumb ? esc(s.thumb) : '';
+    var onerr = cached
+      ? "this.onerror=null;this.src='" + cached + "'"
+      : "this.onerror=null;this.parentNode.innerHTML='<span>&#9835;</span>'";
+    if (s.art) {
+      return '<img src="?art=' + encodeURIComponent(s.art) + '" alt="" loading="lazy" onerror="'
+           + onerr + '">';
+    }
+    return cached ? '<img src="' + cached + '" alt="">' : '<span>&#9835;</span>';
+  }
+
+  function esc(x) {
+    return String(x == null ? '' : x).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c];
+    });
+  }
+
+  // What the rendered card actually depends on. Rebuilding the DOM every second
+  // would throw the poster away and re-insert it each tick, which is exactly
+  // what makes the image flicker — so the markup is only regenerated when one
+  // of these changes, and the moving parts are updated in place instead.
+  var npSig = null;
+  function npSignature() {
+    return JSON.stringify(NP.map(function (s) {
+      return [s.show, s.title, s.season, s.episode, s.state, s.user, s.product, s.player,
+              s.video, s.video_dec, s.audio, s.audio_dec, s.subs, s.subs_dec,
+              s.volume, s.bandwidth, s.duration_ms, s.art, s.thumb];
+    }));
+  }
+
+  /** Advance just the progress bar and elapsed time — no DOM replacement. */
+  function tickNP() {
+    var box = document.getElementById('nowplaying');
+    if (!box || !NP.length) return;
+    NP.forEach(function (s, i) {
+      var card = box.children[i];
+      if (!card) return;
+      var off = s.offset_ms || 0;
+      if (s.state === 'playing') off += (Date.now() / 1000 - NP_AT) * 1000;
+      var dur = s.duration_ms || 0;
+      if (dur) off = Math.min(off, dur);
+      var bar = card.querySelector('.pbar i');
+      if (bar) bar.style.width = (dur ? off / dur * 100 : 0).toFixed(2) + '%';
+      var t = card.querySelector('.times span');
+      if (t) t.textContent = hms(off);
+    });
+  }
+
+  function renderNP() {
+    var box = document.getElementById('nowplaying');
+    if (!box) return;
+    var cnt = document.getElementById('npcount');
+    if (cnt) cnt.textContent = NP.length ? ' · ' + NP.length : '';
+    if (!NP.length) {
+      if (npSig !== 'idle') {
+        box.innerHTML = '<div class="card idlecard">Nothing is playing right now.</div>';
+        npSig = 'idle';
+      }
+      return;
+    }
+    var sig = npSignature();
+    if (sig === npSig) { tickNP(); return; }   // same content: just move the bar
+    npSig = sig;
+    box.innerHTML = NP.map(function (s, i) {
+      // The collector only samples every so often, so advance the position
+      // ourselves while something is actually playing — otherwise the bar would
+      // sit still and look broken between refreshes.
+      var off = s.offset_ms || 0;
+      if (s.state === 'playing') off += (Date.now() / 1000 - NP_AT) * 1000;
+      var dur = s.duration_ms || 0;
+      if (dur) off = Math.min(off, dur);
+      var pct = dur ? (off / dur * 100) : 0;
+
+      var head = s.show || s.title || 'Unknown';
+      var sub = '';
+      if (s.show && (s.season != null || s.episode != null)) {
+        sub = 'S' + (s.season != null ? s.season : '?') +
+              ' · E' + (s.episode != null ? s.episode : '?') +
+              (s.title ? ' — ' + s.title : '');
+      } else if (s.year) { sub = String(s.year); }
+
+      var rows = '';
+      function row(k, v, dec) {
+        if (!v) return;
+        rows += '<div class="rk">' + k + '</div><div class="rv">' + esc(v) +
+                (dec ? '<span class="dec ' + decClass(dec) + '">' + decLabel(dec) + '</span>' : '') +
+                '</div>';
+      }
+      row('Video', s.video, s.video_dec);
+      row('Audio', s.audio, s.audio_dec);
+      row('Subtitles', s.subs, s.subs_dec);
+      if (s.volume) rows += '<div class="rk">Reading from</div><div class="rv vol">' + esc(s.volume) + '</div>';
+
+      var st = (s.state || '').toLowerCase();
+      return '<div class="card np">' +
+        '<div class="art">' + art(s) + '</div>' +
+        '<div class="meta">' +
+          '<div class="t1">' + esc(head) + '</div>' +
+          (sub ? '<div class="t2">' + esc(sub) + '</div>' : '') +
+          '<div class="pbar"><i style="width:' + pct.toFixed(1) + '%"></i></div>' +
+          '<div class="times"><span>' + hms(off) + '</span><span>' + hms(dur) + '</span></div>' +
+          '<div class="who">' +
+            '<span class="st ' + st + '">' + esc(s.state || '?') + '</span>' +
+            (s.user ? '<span>' + esc(s.user) + '</span>' : '') +
+            (s.product ? '<span>' + esc(s.product) + (s.player ? ' — ' + esc(s.player) : '') + '</span>' : '') +
+            (s.bandwidth ? '<span>' + (s.bandwidth / 1000).toFixed(1) + ' Mbps' +
+                           (s.local ? ' local' : ' remote') + '</span>' : '') +
+          '</div>' +
+          (rows ? '<div class="rows">' + rows + '</div>' : '') +
+        '</div></div>';
+    }).join('');
+  }
+
+  // ---- activity -------------------------------------------------------
+  var ACT = <?= json_encode($activity ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>;
+  var actSig = null;
+
+  function dur(s) {
+    s = Math.max(0, Math.floor(s));
+    var d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+    var out = [];
+    if (d) out.push(d + 'd');
+    if (h) out.push(h + 'h');
+    if (!d) out.push(m + 'm');
+    return out.join(' ');
+  }
+
+  function renderACT() {
+    var card = document.getElementById('activitycard');
+    if (!card) return;
+    var sig = JSON.stringify(ACT.map(function (j) {
+      return [j.kind, j.label, j.file, j.library, Math.round(j.cpu), Math.round(j.runtime_s / 5)];
+    }));
+    if (sig === actSig) return;      // nothing changed: leave the DOM alone
+    actSig = sig;
+
+    if (!ACT.length) {
+      card.innerHTML = '<div class="idle-note">Idle</div>' +
+        '<div class="sub" style="margin-top:4px">No transcoding, analysis or library scan running.</div>';
+      return;
+    }
+    var tcpu = 0;
+    var html = ACT.map(function (j) {
+      tcpu += j.cpu || 0;
+      return '<div class="job ' + esc(j.kind) + '">' +
+        '<span class="ico"></span>' +
+        '<span class="jb">' +
+          '<span class="jt">' + esc(j.label) + '</span>' +
+          '<div class="jw">' + esc(j.why) + '</div>' +
+          (j.file ? '<div class="jf">' + esc(j.file) +
+                    (j.library ? '<span class="sub">· ' + esc(j.library) + '</span>' : '') + '</div>' +
+                    '<div class="sub mono" style="font-size:11.5px">' + esc(j.dir) + '</div>' : '') +
+        '</span>' +
+        '<span class="jm">' + dur(j.runtime_s) + '<br>' + Math.round(j.cpu) + ' % CPU</span>' +
+      '</div>';
+    }).join('');
+    card.innerHTML = html +
+      '<div class="sub" style="margin-top:11px">' + ACT.length + ' process(es) · ' +
+      Math.round(tcpu) + ' % CPU total. Background jobs are triggered by your "asap" ' +
+      'settings whenever new media is added.</div>';
+  }
+
+  // One request refreshes both live panels, so poll it for a
+  // near-live panel without reloading the whole page
+  function pollSessions() {
+    if (typeof fetch !== 'function') return;
+    try {
+      fetch('?live=1&_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (j) {
+          if (!j) return;
+          if (j.sessions) { NP = j.sessions; NP_AT = j.generated || NP_AT; renderNP(); }
+          if (j.activity) { ACT = j.activity; renderACT(); }
+          var warn = document.getElementById('livewarn');
+          if (warn) {
+            if (j.live === false && j.why) {
+              warn.textContent = 'not live: ' + j.why;
+              warn.hidden = false;
+            } else {
+              warn.hidden = true;
+            }
+          }
+        })
+        .catch(function () {});
+    } catch (e) {}
+  }
+  renderNP();
+  setInterval(tickNP, 1000);        // moves the bar without touching the poster
+  setInterval(pollSessions, 10000);   // both live panels come from one request
+  pollSessions();
+
+  // ---- wake all disks -------------------------------------------------
+  // No helper service and no privileges: the button asks the page to read a
+  // probe file off each data volume, and that read is what spins the disk up.
+  // Verification is direct — a woken disk answers a 1 s probe, a sleeping one
+  // cannot — so this reports what the disks are actually doing, not just that
+  // a request was sent.
+  (function () {
+    var btn = document.getElementById('wakebtn');
+    var box = document.getElementById('wakeprog');
+    if (!btn || !box) return;
+    var bar = box.querySelector('.wbar i'), txt = box.querySelector('.wtxt');
+    var LIMIT = 120;      // spin-up plus a full SMART pass over five disks
+    var awakeSeen = false;
+
+    function fail(msg) {
+      box.className = 'wakeprog fail';
+      bar.style.width = '100%';
+      txt.textContent = msg;
+      btn.disabled = false;
+    }
+
+    btn.addEventListener('click', function () {
+      if (typeof fetch !== 'function') { alert('This browser cannot send the request.'); return; }
+      btn.disabled = true;
+      box.hidden = false;
+      box.className = 'wakeprog';
+      bar.style.width = '3%';
+      txt.textContent = 'spinning up…';
+      var t0 = Date.now() / 1000;
+
+      fetch('?wake=1', { cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          if (!j || !j.ok) throw new Error(j && j.error ? j.error : 'request refused');
+          txt.textContent = 'spinning up ' + j.disks.length + ' disks…' +
+                            (j.refresh ? '' : ' (SMART refresh not permitted)');
+          setTimeout(function () { poll(t0, j.disks.length, !!j.refresh); }, 2500);
+        })
+        .catch(function (e) { fail('failed: ' + e.message); });
+    });
+
+    /**
+     * Two things have to land: every disk answering a probe (proof they woke),
+     * and a data.json newer than the click in which no disk is serving cached
+     * SMART (proof the values on screen are fresh). If the collector refresh
+     * wasn't permitted, the first alone finishes the job and we say so.
+     */
+    function poll(t0, total, wantFresh) {
+      var elapsed = Date.now() / 1000 - t0;
+      if (elapsed > LIMIT) {
+        if (awakeSeen) {
+          box.className = 'wakeprog done';
+          bar.style.width = '100%';
+          txt.textContent = 'disks awake — SMART refreshes on the next collector pass';
+          btn.disabled = false;
+        } else {
+          fail('timed out — the disks did not answer');
+        }
+        return;
+      }
+
+      Promise.all([
+        fetch('?wakecheck=1&_=' + Date.now(), { cache: 'no-store' }).then(function (r) { return r.json(); }),
+        wantFresh ? fetch('data.json?_=' + Date.now(), { cache: 'no-store' })
+                      .then(function (r) { return r.ok ? r.json() : null; })
+                      .catch(function () { return null; })
+                  : Promise.resolve(null),
+      ]).then(function (res) {
+        var chk = res[0], data = res[1];
+        if (!chk || !chk.ok) throw new Error(chk && chk.error ? chk.error : 'check failed');
+
+        var awake = chk.awake >= chk.total;
+        if (awake) awakeSeen = true;
+        // last_smart_read is a timestamp the collector persists, so it stays
+        // true even when the regular five-minute run rewrites data.json from
+        // cache moments later and clears every from_cache flag.
+        var fresh = !wantFresh || (data && (data.last_smart_read || 0) >= Math.floor(t0));
+
+        var pct = (chk.total ? chk.awake / chk.total : 0) * (wantFresh ? 70 : 100);
+        if (awake && wantFresh) pct = fresh ? 100 : 85;
+        bar.style.width = Math.max(5, pct).toFixed(0) + '%';
+
+        if (awake && fresh) {
+          box.className = 'wakeprog done';
+          bar.style.width = '100%';
+          var temps = data ? (data.disks || []).filter(function (d) {
+              return d.temp != null && (d.tran || '').toLowerCase() !== 'nvme';
+            }).map(function (d) { return d.temp; }) : [];
+          txt.textContent = 'all ' + chk.total + ' disks awake' +
+            (wantFresh ? ', SMART refreshed' : '') +
+            (temps.length ? ' (' + Math.min.apply(null, temps) + '–' +
+                            Math.max.apply(null, temps) + ' °C)' : '');
+          if (wantFresh) setTimeout(function () { location.reload(); }, 1500);
+          else setTimeout(function () { btn.disabled = false; }, 3000);
+          return;
+        }
+
+        txt.textContent = !awake
+          ? chk.awake + ' of ' + chk.total + ' awake… ' + Math.max(0, Math.round(LIMIT - elapsed)) + 's'
+          : 'reading SMART… ' + Math.max(0, Math.round(LIMIT - elapsed)) + 's';
+        setTimeout(function () { poll(t0, total, wantFresh); }, 2000);
+      }).catch(function () {
+        setTimeout(function () { poll(t0, total, wantFresh); }, 2500);
+      });
+    }
+  })();
 
   function drawAll() {
     // Drawing into a hidden panel would size every chart against a zero-width
