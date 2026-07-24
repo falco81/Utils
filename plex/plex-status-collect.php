@@ -75,6 +75,19 @@ const WAKE_STANDBY = false;
 // Set it to roughly your enclosure's / drive's own spindown timer.
 const SPINDOWN_AFTER_S = 900;   // 15 minutes
 
+// `hdparm -C` is the only per-disk command that used to run unconditionally on
+// every poll. It *should* be harmless — checking the power mode must never spin
+// a drive up — but that depends on the USB bridge translating the command
+// correctly, and the JMS567 demonstrably does not: with polling enabled the
+// disks never manage to stay asleep, and with the collector stopped they sleep
+// fine. That observation is the whole verdict.
+//
+// Leave this false. Nothing is lost: the power state is worked out from the
+// kernel's I/O counters, which are read from memory and cannot touch the disk.
+// Only enable it if your drives sit behind a bridge that is known to pass
+// CHECK POWER MODE through properly.
+const USE_HDPARM = false;
+
 // SMART is only read when the disk is KNOWN to be awake, so a normal run never
 // spins anything up. Set this true to also refresh SMART for disks that served
 // I/O since the previous run — they are almost certainly still spinning, but
@@ -341,6 +354,7 @@ function smart_collect(string $devpath, string $tran): array {
  */
 function power_state_raw(string $devpath, string $tran): string {
     if ($tran === 'nvme') return 'active';
+    if (!USE_HDPARM) return 'unknown';   // fall through to I/O inference
     $out = sh(HDPARM . ' -C ' . escapeshellarg($devpath));
     dbg("    hdparm -C: " . trim(str_replace("\n", ' | ', $out) ?: '(no output)'));
     if (preg_match('/drive state is:\s*(.+)/i', $out, $m)) {
@@ -932,6 +946,11 @@ foreach ($devs as $dev) {
         $power = 'active';                 $psrc = "inferred: idle only {$idle_for}s";
     } elseif (in_array($hd, ['standby', 'sleeping'], true)) {
         $power = $hd;                      $psrc = 'hdparm + no I/O for ' . fmt_dur($idle_for);
+    } elseif ($idle_for >= SPINDOWN_AFTER_S) {
+        // no usable answer from the bridge: go purely by how long it has been quiet
+        $power = 'standby';                $psrc = 'inferred: no I/O for ' . fmt_dur($idle_for);
+    } elseif ($prev_tot !== null) {
+        $power = 'active';                 $psrc = "inferred: idle only {$idle_for}s";
     } else {
         $power = 'unknown';                $psrc = 'not reported';
     }
@@ -982,12 +1001,11 @@ foreach ($devs as $dev) {
         $real_model = $sm['real_model']; $real_serial = $sm['real_serial'];
         $stype = $sm['type'];
         if ($real_serial) dbg("    drive identity: {$real_model} / {$real_serial}");
-        // we just spun it up — re-read power so the card doesn't still say "standby"
+        // we just read SMART, which spins the disk up — no need to ask anything
         if ($woke) {
-            $hd2 = power_state_raw($path, $tran);
-            $power = ($hd2 === 'active') ? 'active' : 'active';   // it is awake now by definition
+            $power = 'active';
             $psrc = 'after forced wake';
-            dbg("    power after wake: $power (hdparm says '$hd2')");
+            dbg("    power after wake: active");
         }
         // refresh cache
         $cache[$key] = [

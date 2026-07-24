@@ -287,10 +287,12 @@ def _read_key(timeout=None):
             c2 = msvcrt.getwch()
             return {"H": "up", "P": "down", "K": "left", "M": "right",
                     "G": "home", "O": "end", "I": "pgup", "Q": "pgdn",
-                    "?": "f5", "C": "f9"}.get(c2, "other")  # F5 = 0x3F '?', F9 = 0x43 'C'
+                    "?": "f5", "C": "f9", "S": "delete"}.get(c2, "other")  # F5 = 0x3F '?', F9 = 0x43 'C'
 
         if ch in ("\r", "\n"):
             return "enter"
+        if ch == "\t":
+            return "tab"
         if ch == "\x08":
             return "backspace"
         if ch == "\x1b":
@@ -328,10 +330,12 @@ def _read_key(timeout=None):
                     break
             return {"A": "up", "B": "down", "C": "right", "D": "left",
                     "H": "home", "F": "end", "1~": "home", "4~": "end",
-                    "5~": "pgup", "6~": "pgdn", "15~": "f5",
+                    "3~": "delete", "5~": "pgup", "6~": "pgdn", "15~": "f5",
                     "20~": "f9"}.get(seq, "esc")
         if c in (0x0d, 0x0a):
             return "enter"
+        if c == 0x09:
+            return "tab"
         if c in (0x7f, 0x08):
             return "backspace"
         if c == 0x03:
@@ -652,7 +656,7 @@ def _checkbox_classic(prompt, rows, header=None):
 
 def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate=False,
                   ui_state=None, scope_picker=None, action_cb=None, f9_cb=None,
-                  edit_cb=None):
+                  edit_cb=None, editable=None, on_edit=None, find_cb=None):
     """Smart app-like multi-select with [x]/[ ] checkboxes.
     tristate=True: rows carry 'state' ("on"/"off"/"mixed") instead of 'selected';
     Space cycles on -> off -> (mixed, if that was the original state) and the box
@@ -692,6 +696,11 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
     search_mode = False      # typing a view filter after '/'
     mark_mode = None         # "+" / "-": typing a pattern to check / uncheck
     mark_buf = ""            # the pattern being typed for +/-
+    edit_i = None            # index into `editable` while editing a row in place
+    edit_buf = ""            # the text being typed
+    edit_pos = 0             # caret position inside edit_buf
+    edit_row = None          # the row being edited
+    edit_undo = None         # its values before the edit, for Esc
     ext_scope = None         # ("label X", {rk, ...}) from scope_picker, or None
     want_row = max(0, min(start_pos, len(rows) - 1)) if rows else 0
     if isinstance(ui_state, dict):     # restore the view exactly as it was left
@@ -780,7 +789,8 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         maxw = max(10, cols - 2)
         page_rows = max(3, rows_total - (8 + len(header)
                                         + (1 if ext_scope is not None else 0)
-                                        + (1 if mark_mode else 0)))
+                                        + (1 if mark_mode else 0)
+                                        + (1 if edit_i is not None else 0)))
         buf = []
         if first:
             buf.append("\x1b[2J\x1b[H")
@@ -811,12 +821,19 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
                  "/ search · +/- check/uncheck by pattern"
                  + (" · l label" if scope_picker is not None else "")
                  + (" · F9 refresh checked" if f9_cb is not None else "")
-                 + (" · e edit" if edit_cb is not None else "")
+                 + (" · e edit" if (edit_cb is not None or editable) else "")
+                 + (" · f find match" if find_cb is not None else "")
                  + " · Enter apply · Esc "
                  + ("clear" if (filt or s is not None or ext_scope is not None) else "cancel"))
         vis.append(f"{Fore.CYAN}{trunc(line2, maxw)}{Style.RESET_ALL}")
         if ext_scope is not None:
             vis.append(f"{Fore.GREEN}{trunc('label: ' + ext_scope[0] + '   (Esc clears)', maxw)}{Style.RESET_ALL}")
+        if edit_i is not None and editable:
+            fname = editable[edit_i][1]
+            vis.append(f"{Fore.MAGENTA}{trunc(f'editing {fname} - type to change · '
+                                             f'←/→ Home/End move · Backspace/Del erase · '
+                                             f'Tab/↑↓ switch field · Enter keep · '
+                                             f'Esc cancel', maxw)}{Style.RESET_ALL}")
         if mark_mode:
             verb = "check" if mark_mode == "+" else "uncheck"
             nmatch = len(mark_matches(order))
@@ -938,6 +955,64 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         render(order, sel_pos)
         while True:
             key = _read_key()
+            if edit_i is not None:             # editing a value right in the list
+                fields = editable or []
+
+                def _sync(done=False):
+                    """Push the buffer (and caret) into the row so the caller can
+                    draw the value with a cursor inside it."""
+                    edit_row[fields[edit_i][0]] = edit_buf
+                    if done:
+                        edit_row.pop("_edit_field", None)
+                        edit_row.pop("_edit_pos", None)
+                    else:
+                        edit_row["_edit_field"] = fields[edit_i][0]
+                        edit_row["_edit_pos"] = edit_pos
+                    if on_edit:
+                        on_edit(edit_row)
+
+                if key == "esc":
+                    if edit_undo:
+                        for k, v in edit_undo.items():
+                            edit_row[k] = v
+                    edit_row.pop("_edit_field", None)
+                    edit_row.pop("_edit_pos", None)
+                    if on_edit:
+                        on_edit(edit_row)
+                    edit_i, edit_buf, edit_row, edit_undo = None, "", None, None
+                elif key == "enter":
+                    _sync(done=True)
+                    edit_i, edit_buf, edit_row, edit_undo = None, "", None, None
+                elif key in ("tab", "down", "up") and len(fields) > 1:
+                    _sync()                       # keep what was typed
+                    step = -1 if key == "up" else 1
+                    edit_i = (edit_i + step) % len(fields)     # cycle both ways
+                    edit_buf = str(edit_row.get(fields[edit_i][0]) or "")
+                    edit_pos = len(edit_buf)
+                    _sync()
+                elif key == "left":
+                    edit_pos = max(0, edit_pos - 1); _sync()
+                elif key == "right":
+                    edit_pos = min(len(edit_buf), edit_pos + 1); _sync()
+                elif key == "home":
+                    edit_pos = 0; _sync()
+                elif key == "end":
+                    edit_pos = len(edit_buf); _sync()
+                elif key == "backspace":
+                    if edit_pos > 0:
+                        edit_buf = edit_buf[:edit_pos - 1] + edit_buf[edit_pos:]
+                        edit_pos -= 1
+                    _sync()
+                elif key == "delete":
+                    edit_buf = edit_buf[:edit_pos] + edit_buf[edit_pos + 1:]
+                    _sync()
+                elif isinstance(key, tuple) and key[0] == "char" and key[1].isprintable():
+                    edit_buf = edit_buf[:edit_pos] + key[1] + edit_buf[edit_pos:]
+                    edit_pos += 1
+                    _sync()
+                order = visible_order()
+                render(order, sel_pos)
+                continue
             if mark_mode:                      # typing a +/- pattern (list stays put)
                 if key == "esc":
                     mark_mode, mark_buf = None, ""
@@ -1031,6 +1106,28 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
                 scope_idx = (scope_idx + (1 if key == ("char", "]") else -1)) % len(scopes)
                 order = visible_order()
                 sel_pos = 0
+            elif key == ("char", "e") and editable and order:
+                r = rows[order[sel_pos]]
+                if not is_header(r) and not r.get("action"):
+                    edit_row = r
+                    edit_undo = {k: r.get(k) for k, _ in editable}
+                    edit_i = 0
+                    edit_buf = str(r.get(editable[0][0]) or "")
+                    edit_pos = len(edit_buf)
+                    r["_edit_field"] = editable[0][0]
+                    r["_edit_pos"] = edit_pos
+                    if on_edit:
+                        on_edit(r)
+            elif key == ("char", "f") and find_cb is not None and order:
+                r = rows[order[sel_pos]]
+                if not is_header(r) and not r.get("action"):
+                    try:
+                        find_cb(r)
+                    except Exception as ex:
+                        log_warn(f"Failed: {ex}")
+                    order = visible_order()
+                    sel_pos = min(sel_pos, max(0, len(order) - 1))
+                    first = True
             elif key == ("char", "e") and edit_cb is not None:
                 if order:
                     try:
@@ -1043,6 +1140,10 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
             elif key == "f9" and f9_cb is not None:
                 checked = [r for r in rows if (r.get("state") == "on") if tristate] \
                           if tristate else [r for r in rows if r.get("selected")]
+                if order:      # plus the row under the cursor
+                    cur_row = rows[order[sel_pos]]
+                    if not is_header(cur_row) and cur_row not in checked:
+                        checked = checked + [cur_row]
                 try:
                     f9_cb(checked)
                 except Exception as ex:
@@ -1051,8 +1152,16 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
                 sel_pos = min(sel_pos, max(0, len(order) - 1))
                 first = True          # the progress screen overwrote everything
             elif key == ("char", "m") and action_cb is not None:
+                # the checked rows plus the one under the cursor (deduped, in order)
+                picked_now = [r for r in rows
+                              if (r.get("state") == "on") if tristate] if tristate \
+                             else [r for r in rows if r.get("selected")]
+                if order:
+                    cur_row = rows[order[sel_pos]]
+                    if not is_header(cur_row) and cur_row not in picked_now:
+                        picked_now = picked_now + [cur_row]
                 try:
-                    action_cb()
+                    action_cb(picked_now)
                 except Exception as ex:
                     log_warn(f"Failed: {ex}")
                 order = visible_order()
@@ -1609,13 +1718,17 @@ class PlexClient:
             return []
         return j.get("MediaContainer", {}).get("Activity", []) or []
 
-    def matches(self, rating_key, language=None, manual=1):
+    def matches(self, rating_key, language=None, manual=1, title=None, year=None):
         """Agent search results for an item (GET /library/metadata/{id}/matches).
-        Returns [{'name','guid','year','score'}]. With language='en' the names come
-        back in English - used to look up an English title without re-matching."""
+        Returns [{'name','guid','year','score'}]. language= picks the language of the
+        names; title=/year= run a manual search instead of the automatic one."""
         params = {"manual": manual}
         if language:
             params["language"] = language
+        if title:
+            params["title"] = title
+        if year:
+            params["year"] = year
         st, text = http_raw("GET", self._url(f"/library/metadata/{rating_key}/matches", params),
                             headers={"X-Plex-Token": self.token,
                                      "X-Plex-Client-Identifier": self.client_id},
@@ -2930,6 +3043,17 @@ def mark_watched_flow(client, args):
 # ---------------------------------------------------------------------------
 # Labels flow (custom labels on shows/movies)
 # ---------------------------------------------------------------------------
+def print_wrapped(text, indent="  ", color=""):
+    """Print a paragraph wrapped to the terminal width instead of one long line."""
+    import textwrap
+    try:
+        width = max(40, os.get_terminal_size().columns - 2)
+    except Exception:
+        width = 100
+    for line in textwrap.wrap(text, width=width - len(indent)) or [""]:
+        print(f"{color}{indent}{line}{Style.RESET_ALL}" if color else f"{indent}{line}")
+
+
 def _progress_bar(pct, width=40):
     filled = max(0, min(width, round(width * pct / 100)))
     return "[" + "#" * filled + "-" * (width - filled) + f"] {pct:3d}%"
@@ -3622,11 +3746,19 @@ def titles_flow(client, args):
         # the reliable source: each item's Metadata language (Library default -> the
         # library's own language). Costs one request per item, so it is offered, not forced.
         if not lang_read_done[0]:
-            ans = ask_yes_back(f"Read the real Metadata language of {len(rows)} item(s) "
-                               f"from the server? (accurate, but one request per item)",
-                               default=len(rows) <= 400)
+            clear_screen()
+            log_info(f"Library '{sec['title']}' has {len(rows)} item(s).")
+            print()
+            print_wrapped("The exact Metadata language comes from the server and needs "
+                          "one request per item; the locked fields come along in the same "
+                          "pass (batched, so they are cheap).", color=Style.DIM)
+            print_wrapped("You can skip this and do it later with 'm' for just the items "
+                          "you pick, or from the 'l' menu.", color=Style.DIM)
+            print()
+            ans = ask_yes_back("Read it for all items now?", default=False)
             if ans:
                 read_metadata_languages(client, rows, sec)
+                read_locked_fields(client, rows)
             lang_read_done[0] = True
 
         def relabel():
@@ -3664,8 +3796,15 @@ def titles_flow(client, args):
                 r["tag"] = tag
         relabel()
 
-        def do_reread():
-            read_metadata_languages(client, rows, sec)
+        def do_reread(subset=None):
+            """Read the exact Metadata language - only for the rows handed over
+            (checked ones plus the row under the cursor), not the whole library."""
+            targets = [r for r in (subset or rows) if r.get("rk")]
+            if not targets:
+                log_warn("Nothing is checked - check items or move the cursor onto one.")
+                _pause_to_menu()
+                return
+            read_metadata_languages(client, targets, sec)
             relabel()
         guid_n = {}
         for r in rows:
@@ -3679,11 +3818,20 @@ def titles_flow(client, args):
         for r in rows:
             counts[r["lang"]] = counts.get(r["lang"], 0) + 1
 
+        def _with_exact_lang(tag, rks):
+            """Whatever a filter picked, read its real Metadata language right away -
+            these sets are small, so it costs a handful of requests."""
+            subset = [r for r in rows if str(r["rk"]) in rks and not r.get("certain")]
+            if subset:
+                read_metadata_languages(client, subset, sec)
+                relabel()
+            return (tag, rks)
+
         def pick_lang_scope():
             order_names = sorted(counts, key=lambda s: (-counts[s], s))
             names = [f"{s}   ({counts[s]})" for s in order_names]
             names.append(f"{Style.DIM}(everything that isn't {lang_name}){Style.RESET_ALL}")
-            names.append(f"{Fore.CYAN}» Re-read the Metadata language from the server"
+            names.append(f"{Fore.CYAN}» Read the Metadata language of ALL items (slow)"
                          f"{Style.RESET_ALL}")
             names.append(f"{Fore.YELLOW}» Items with a LOCKED title or sort title"
                          f"{Style.RESET_ALL}")
@@ -3714,17 +3862,16 @@ def titles_flow(client, args):
                     if not rks:
                         log_warn("Every item's sort title matches its title.")
                         return None
-                    return ("title != sort title", rks)
+                    return (_with_exact_lang("title != sort title", rks))
                 rks = {str(r["rk"]) for r in rows
                        if (r.get("locked") or set()) and
                           (want is None or (r["locked"] & want))}
                 if not rks:
                     log_warn(f"No item matches '{tag}'.")
                     return None
-                return (tag, rks)
+                return _with_exact_lang(tag, rks)
             if i == len(order_names) + 1:
-                read_metadata_languages(client, rows, sec)
-                relabel()
+                do_reread(rows)
                 return ("re-read", {str(r["rk"]) for r in rows})   # keeps every row visible
             if i == len(order_names):
                 return (f"not {lang_name}", {str(r["rk"]) for r in rows
@@ -3739,9 +3886,9 @@ def titles_flow(client, args):
             f"  {Fore.GREEN}target: {lang_name} [{lang_code}]{Style.RESET_ALL}",
             f"{Style.DIM}l = filter by detected language · / = search · +/- = check/uncheck "
             f"by pattern · a = all shown{Style.RESET_ALL}",
-            f"{Style.DIM}m = re-read the Metadata language · F9 = refresh metadata of "
-            f"the checked items · a trailing '?' means the language was only guessed."
-            f"{Style.RESET_ALL}",
+            f"{Style.DIM}m = read the exact Metadata language of the checked items "
+            f"(+ the one under the cursor) · F9 = refresh their metadata · a trailing "
+            f"'?' means the language was only guessed.{Style.RESET_ALL}",
             "",
         ]
         while True:
@@ -3758,9 +3905,19 @@ def titles_flow(client, args):
             if not picked:
                 log_info("Nothing selected.")
                 continue
+            # read the exact Metadata language of exactly these items before going on,
+            # so the next screens work with facts instead of a guess from the title
+            unknown = [r for r in picked if not r.get("certain")]
+            if unknown:
+                read_metadata_languages(client, unknown, sec)
+                relabel()
             clear_screen()
             log_info(f"{len(picked)} item(s) selected. How should the {lang_name} "
                      f"title be applied?")
+            same = [r for r in picked if _is_target_lang(r["lang"], lang_name)]
+            if same:
+                log_info(f"{len(same)} of them already have {lang_name} metadata "
+                         f"(only the text may be off).")
             print()
             print(f"  {Fore.CYAN}1){Style.RESET_ALL} Rewrite just the title text — the "
                   f"item keeps everything else exactly as it is.")
@@ -4144,9 +4301,13 @@ def _titles_apply(client, sec, picked, args, lang="en", lang_name="English"):
                 best["name"] = best["name"] + sfx      # keep the manual "- Viki" marker
             md = md_now.get(str(r["rk"])) or {}
             old_sort = md.get("titleSort") or ""
+            # Plex only reports titleSort when it is set explicitly; otherwise it is
+            # derived from the title and will follow the new title by itself
+            derived = not old_sort
             props.append({"rk": r["rk"], "old": r["title"], "new": best["name"],
                           "old_sort": old_sort, "new_sort": best["name"],
-                          "do_sort": True,     # both fields are fixed by default
+                          "derived_sort": derived,
+                          "do_sort": not derived,   # only touch an explicit sort title
                           "exact": best["exact"],
                           "selected": bool(best["exact"])})  # uncertain start unchecked
         print(f"\r  {Fore.CYAN}looking up: {i * 100 // len(picked):3d}%{Style.RESET_ALL} "
@@ -4163,7 +4324,8 @@ def _titles_apply(client, sec, picked, args, lang="en", lang_name="English"):
 
     def _col_width():
         """Common width of the 'current value' column, so the arrows line up."""
-        vals = [p["old"] for p in props] + [(p["old_sort"] or "(none)") for p in props]
+        vals = ([p["old"] for p in props]
+                + [(p["old_sort"] or "(derived from the title)") for p in props])
         return min(max([len(v) for v in vals] or [0]), 60)
 
     def prop_label(p, w=None):
@@ -4174,15 +4336,28 @@ def _titles_apply(client, sec, picked, args, lang="en", lang_name="English"):
             s = s if len(s) <= w else s[:w - 1] + "…"
             return s + " " * (w - len(s))
 
+        def val(field, text):
+            """The new value; while this field is being edited the caret is drawn
+            right inside the text (reverse video on the character under it)."""
+            if p.get("_edit_field") != field:
+                return f"{Fore.GREEN}{text}{Style.RESET_ALL}"
+            i = max(0, min(int(p.get("_edit_pos") or 0), len(text)))
+            here = text[i] if i < len(text) else " "
+            return (f"{Fore.GREEN}{text[:i]}\x1b[7m{here}\x1b[27m{text[i + 1:]}"
+                    f"{Style.RESET_ALL}")
+
         warn = "" if p["exact"] else f"   {Fore.YELLOW}[different match - check!]{Style.RESET_ALL}"
         p["label"] = f"{Style.BRIGHT}{p['old']}{Style.RESET_ALL}{warn}"
         arrow = f"{Fore.CYAN}->{Style.RESET_ALL}"
         sub = [f"{Style.DIM}title:{Style.RESET_ALL} {col(p['old'])}   {arrow}   "
-               f"{Fore.GREEN}{p['new']}{Style.RESET_ALL}"]
+               f"{val('new', p['new'])}"]
         if p["do_sort"]:
             sub.append(f"{Style.DIM}sort :{Style.RESET_ALL} "
                        f"{col(p['old_sort'] or '(none)')}   {arrow}   "
-                       f"{Fore.GREEN}{p['new_sort']}{Style.RESET_ALL}")
+                       f"{val('new_sort', p['new_sort'])}")
+        elif p.get("derived_sort"):
+            sub.append(f"{Style.DIM}sort : {col('(derived from the title)')}   "
+                       f"follows the new title by itself{Style.RESET_ALL}")
         else:
             sub.append(f"{Style.DIM}sort : {col(p['old_sort'] or '(none)')}   "
                        f"(kept unchanged){Style.RESET_ALL}")
@@ -4195,45 +4370,69 @@ def _titles_apply(client, sec, picked, args, lang="en", lang_name="English"):
 
     relabel_all()
 
-    def edit_prop(p):
-        """Hand-edit one proposal: title, then sort title."""
-        if not p:
-            return
-        clear_screen()
-        log_info("Editing one item. Enter keeps the value, Esc leaves it unchanged.")
-        print(f"    {Style.DIM}current title:{Style.RESET_ALL} {p['old']}")
-        print(f"    {Style.DIM}current sort :{Style.RESET_ALL} {p['old_sort'] or '(none)'}")
-        print()
-        nt = ask_line("New title", default=p["new"])
-        if nt:
-            if p["do_sort"] and p["new_sort"] == p["new"]:
-                p["new_sort"] = nt          # the sort title was following the title
-            p["new"] = nt
-        ns = ask_line("New sort title", default=p["new_sort"] if p["do_sort"] else p["new"])
-        if ns:
-            p["do_sort"], p["new_sort"] = True, ns
-        else:
-            idx = interactive_menu("Sort title:", [
-                f"Set it to the new title  ({p['new']})",
-                f"Keep the current one  ({p['old_sort'] or '(none)'})",
-            ], default=0 if p["do_sort"] else 1, allow_cancel=True)
-            if idx == 0:
-                p["do_sort"], p["new_sort"] = True, p["new"]
-            elif idx == 1:
-                p["do_sort"] = False
-        relabel_all()
-
     n_exact = sum(1 for p in props if p["exact"])
     header = [
         f"{Style.DIM}Only title (and sort title, where shown) is written and locked. "
         f"No re-match - streams, subtitles, watched state and artwork stay untouched."
         f"{Style.RESET_ALL}",
         f"{Style.DIM}{n_exact}/{len(props)} come from the item's own match (same guid); "
-        f"the rest are pre-unchecked. Press 'e' to edit the highlighted row."
-        f"{Style.RESET_ALL}",
+        f"the rest are pre-unchecked. 'e' edits the row in place, 'f' searches for "
+        f"the right entry online.{Style.RESET_ALL}",
         "",
     ]
-    res = checkbox_menu("Confirm the new titles:", props, header=header, edit_cb=edit_prop)
+    def find_match(p):
+        """'f' - ask the agent again and pick the right entry by hand."""
+        term = p["old"]
+        while True:
+            clear_screen()
+            log_info(f"Searching {lang_name} matches for: {Fore.CYAN}{term}{Style.RESET_ALL}")
+            try:
+                cands = client.matches(p["rk"], language=lang,
+                                       title=None if term == p["old"] else term)
+            except Exception as ex:
+                log_warn(f"Search failed: {ex}")
+                cands = []
+            labels = []
+            for c in cands:
+                yr = f" ({c['year']})" if c.get("year") else ""
+                same = (f"  {Fore.GREEN}[this item's own match]{Style.RESET_ALL}"
+                        if p.get("guid") and c.get("guid") == p.get("guid") else "")
+                labels.append(f"{c['name']}{yr}   {Style.DIM}score {c['score']}"
+                              f"{Style.RESET_ALL}{same}")
+            labels.append(f"{Fore.CYAN}» Search for a different title…{Style.RESET_ALL}")
+            if not cands:
+                log_warn("Nothing found.")
+            i = interactive_menu("Pick the right entry:", labels, allow_cancel=True,
+                                 header=[f"{Style.DIM}Only the title text is taken from "
+                                         f"the pick - no re-match happens."
+                                         f"{Style.RESET_ALL}", ""])
+            if i is None:
+                return
+            if i == len(cands):
+                nt = ask_line("Search title", default=term)
+                if not nt:
+                    return
+                term = nt
+                continue
+            c = cands[i]
+            p["new"] = c["name"]
+            if p["do_sort"]:
+                p["new_sort"] = c["name"]
+            p["exact"] = True          # picked by hand -> no warning any more
+            p["selected"] = True
+            relabel_all()
+            return
+
+    def after_edit(r):
+        # touching the sort title by hand means the user wants it written
+        if r.get("_edit_field") == "new_sort":
+            r["do_sort"] = True
+            r["derived_sort"] = False
+        relabel_all()
+
+    res = checkbox_menu("Confirm the new titles:", props, header=header,
+                        editable=[("new", "title"), ("new_sort", "sort title")],
+                        on_edit=after_edit, find_cb=find_match)
     if res is None:
         return False
     todo = [p for p in props if p["selected"]]
@@ -4259,6 +4458,9 @@ def _titles_apply(client, sec, picked, args, lang="en", lang_name="English"):
             print(f"    {Style.DIM}sort :{Style.RESET_ALL} {col(p['old_sort'] or '(none)')}"
                   f"   {Fore.CYAN}->{Style.RESET_ALL}   {Fore.GREEN}{p['new_sort']}"
                   f"{Style.RESET_ALL}")
+        elif p.get("derived_sort"):
+            print(f"    {Style.DIM}sort : {col('(derived from the title)')}   "
+                  f"follows the new title by itself{Style.RESET_ALL}")
         else:
             print(f"    {Style.DIM}sort : {col(p['old_sort'] or '(none)')}   "
                   f"(kept unchanged){Style.RESET_ALL}")
