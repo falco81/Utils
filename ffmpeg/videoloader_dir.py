@@ -528,7 +528,7 @@ def _config_fetch(url):
         return (sess.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
                          headers={'User-Agent': USER_AGENT}),
                 False, 'plain http')
-    if _INSECURE_TLS_ACTIVE and not pin and not CONFIG_CA_BUNDLE:
+    if (_INSECURE_TLS_ACTIVE or INSECURE_TLS) and not pin and not CONFIG_CA_BUNDLE:
         # Global bypass is on: fetch it, no matter what the certificate looks like.
         return (sess.get(url, timeout=(CONFIG_FETCH_TIMEOUT, CONFIG_FETCH_TIMEOUT),
                          headers={'User-Agent': USER_AGENT}),
@@ -568,6 +568,10 @@ def _apply_remote_config():
     url = (CONFIG_URL or "").strip()
     if not url:
         return
+    # Honour the setting even when the script was entered some other way than __main__ (imported,
+    # or a future entry point) — otherwise the constant would say True while nothing acted on it.
+    if INSECURE_TLS and not _INSECURE_TLS_ACTIVE:
+        _apply_insecure_tls(announce=False)
     authenticated, tls_note = False, ''
     try:
         r, authenticated, tls_note = _config_fetch(url)
@@ -1130,6 +1134,150 @@ def load_cookies_from_file(cookies_file: str) -> RequestsCookieJar:
         )
 
     return requests_jar
+
+class _ColorHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """argparse help with colour, and with the description/epilog printed exactly as written.
+
+    Colour comes from the same palette as the rest of the script, so --no-color and a redirected
+    stdout switch it off here too (setup_console() decides, and it runs before --help is handled)."""
+
+    def __init__(self, prog, **kw):
+        kw.setdefault('max_help_position', 34)
+        kw.setdefault('width', min(shutil.get_terminal_size((100, 24)).columns - 2, 108))
+        super().__init__(prog, **kw)
+
+    def start_section(self, heading):
+        if heading:
+            heading = f"{CLR.BRIGHT}{CLR.CYAN}{heading.upper()}{CLR.RESET}"
+        return super().start_section(heading)
+
+    def _format_action(self, action):
+        # Colour is applied AFTER argparse has done its layout. Colouring inside
+        # _format_action_invocation would make len() count the escape sequences as visible
+        # characters, and every help column would line up wrongly.
+        text = super()._format_action(action)
+        if not CLR.RESET:
+            return text
+        inv = self._format_action_invocation(action)
+        lines = text.split('\n')
+        if inv and lines and inv in lines[0]:
+            painted = re.sub(r'(--?[A-Za-z][\w-]*)', f'{CLR.GREEN}\\1{CLR.RESET}', inv)
+            lines[0] = lines[0].replace(inv, painted, 1)
+        return '\n'.join(lines)
+
+    def _get_help_string(self, action):
+        return action.help
+
+
+def _help_text_blocks():
+    """The prose parts of --help: what the tool does, how a session usually goes, and the exact
+    layout of every file it reads. Returned as (description, epilog)."""
+    B, R, C, D, Y = CLR.BRIGHT, CLR.RESET, CLR.CYAN, CLR.DIM, CLR.YELLOW
+
+    def h(t):
+        return f"{B}{C}{t}{R}"
+
+    description = f"""
+{B}videoloader_dir.py v{SCRIPT_VERSION}{R} — one downloader for Google Drive, Dropbox, Patreon,
+YouTube, Twitch, Vimeo, Streamable, Vidyard, muse.ai, Viki and any page carrying an
+HLS/DASH stream.
+
+{h('HOW A SESSION USUALLY GOES')}
+  {B}1.{R} {B}Point it at something.{R} A Drive folder, a Dropbox link, a Patreon post, a YouTube
+     playlist — just paste the address. Nothing else is needed for the common cases:
+       {D}videoloader_dir.py https://drive.google.com/drive/folders/XXXX{R}
+
+  {B}2.{R} {B}If the page is an ordinary web page{R}, add --scan so it looks inside for video:
+       {D}videoloader_dir.py --scan https://web.cz/serial/dil-1{R}
+     Nothing found? The player probably builds the address in JavaScript — use --scan-browser,
+     which opens a real browser, presses play and watches what the player fetches.
+
+  {B}3.{R} {B}Locked behind a login?{R} Export your cookies and pass them with --cookies, or run
+     --browser-login once and sign in by hand; the session is remembered afterwards.
+
+  {B}4.{R} {B}Encrypted (DRM) stream?{R} Supply the key you already hold with --key KID:KEY.
+
+  {B}5.{R} {B}Many videos at once?{R} Put them in a list and use --davka (each line group names the
+     file, its stream and its key) or --url-list (one address per line). Both can be re-run
+     safely: anything already downloaded is skipped, so an interrupted batch just continues.
+
+  {B}6.{R} {B}When it finishes{R} it offers to tidy the episode names, writes a report next to the
+     files, and can push a notification (--test-notify to check that side works).
+"""
+
+    epilog = f"""
+{h('FILE FORMATS')}
+
+{B}--davka FILE{R} / {B}--davka-browser FILE{R}
+  Blocks of up to three lines per video. Blank lines and lines starting with # are ignored.
+  Lines are recognised by their SHAPE, not their position, so a stray blank line cannot shift
+  the file, and the key may be left out for an unencrypted stream.
+
+    {D}# name the finished file should get{R}
+    Serial S01E01
+    {D}# the stream (--davka) or the PAGE holding it (--davka-browser){R}
+    https://cdn.example/asset.ism/.mpd
+    {D}# the key you already hold — optional, and several may follow one address{R}
+    26dc8baa20b557a47c9f10b43f0a6fad:4ad13f26045246112815b49c6da3ed0f
+
+    Serial S01E02
+    https://cdn.example/asset2.ism/.mpd
+
+  With --davka-browser the middle line is a normal page address: it is opened in a real
+  browser, the stream its player fetches is discovered, and that is what gets downloaded.
+  An address that already points at a .mpd/.m3u8/file is used as-is, so a list may mix both.
+
+{B}--url-list FILE{R}
+  One address per line; # comments and blank lines ignored. Finished entries are commented
+  out in place as the run goes, so re-running continues where it stopped.
+  A .json file is accepted too: a list of strings, or of objects with a "url" field.
+
+{B}--keys FILE{R}
+  One key per line, {D}KID:KEY{R} or a bare 32-character KEY. # comments allowed.
+
+{B}--cookies FILE{R}
+  Either a Netscape cookies.txt or a browser-extension JSON export. Both keep their Secure
+  and HttpOnly flags. Without --cookies the script looks for a cookie file next to itself.
+
+{B}CONFIG_URL{R} {D}(a JSON file served on your network){R}
+  Central settings for every machine running this script. Generate the template with
+  {D}--dump-config{R}, delete whatever you do not want to manage centrally, and serve the rest.
+  Missing keys simply keep their local value.
+
+{h('EXAMPLES')}
+  {D}# a whole Drive folder into a chosen directory, 1080p at most{R}
+  videoloader_dir.py https://drive.google.com/drive/folders/XXXX -d D:\\Video -q 1080
+
+  {D}# find the video on an ordinary page, letting its JavaScript run{R}
+  videoloader_dir.py --scan-browser https://web.cz/serial/dil-1
+
+  {D}# see what is on the page without downloading anything{R}
+  videoloader_dir.py --scan https://web.cz/serial/dil-1 --list
+
+  {D}# a batch of episodes, each with its own decryption key{R}
+  videoloader_dir.py --davka serial.txt -d D:\\Serialy
+
+  {D}# sign in once; later --scan-browser runs on that site stay logged in{R}
+  videoloader_dir.py --browser-login https://web.cz/
+
+  {D}# retry whatever failed in the previous run{R}
+  videoloader_dir.py --resume
+
+{h('GOOD TO KNOW')}
+  {Y}Interrupting is safe.{R} Work in progress lives in .temp/ and the final name only appears
+  once a file is complete, so Ctrl+C never leaves a half file looking finished. Run the same
+  command again and it picks up where it stopped.
+
+  {Y}Speed{R} is governed by -m (total connections), not by -t or -w: all files share one pool
+  and a freed connection moves straight to whatever is still downloading.
+
+  {Y}ffmpeg{R} is fetched automatically if it is missing. DRM also needs mp4decrypt (Bento4).
+
+  {Y}Certificates{R} are not verified by default (INSECURE_TLS), so a self-signed server on your
+  own network just works. Set it to False at the top of the script for strict checking.
+"""
+    return description, epilog
+
 
 def _looks_like_cookies_json(path: str) -> bool:
     """Cheaply check whether a .json file looks like a browser cookie export."""
@@ -11617,8 +11765,13 @@ if __name__ == "__main__":
     args_insecure = any(a in ('--insecure', '--no-check-certificate', '--no-check-certificates')
                         for a in sys.argv[1:])
 
+    # --help is handled inside parse_args(), so the console (and therefore the palette) has to be
+    # ready before the parser is even built.
+    setup_console(USE_COLOR and '--no-color' not in sys.argv[1:])
+
     if args_insecure or INSECURE_TLS:
-        _apply_insecure_tls()
+        _apply_insecure_tls(announce=not any(
+            a in ('-h', '--help', '--version') for a in sys.argv[1:]))
 
     # Purely local commands don't need the remote config, and waiting CONFIG_FETCH_TIMEOUT
     # seconds (plus printing a warning) just to show --help or --version is pointless.
@@ -11637,7 +11790,13 @@ if __name__ == "__main__":
             raise argparse.ArgumentTypeError("must be >= 0")
         return iv
 
-    parser = argparse.ArgumentParser(description="Download videos from Google Drive (single file or whole folder), Dropbox, Vimeo, or a Patreon collection. A Patreon collection is fully mined: Google Drive links, Dropbox links, AND native Patreon/Vimeo/Mux videos are all downloaded.")
+    _desc, _epilog = _help_text_blocks()
+    parser = argparse.ArgumentParser(
+        formatter_class=_ColorHelpFormatter, description=_desc, epilog=_epilog,
+        add_help=False)
+    parser.add_argument("-h", "--help", action="help",
+                        help="Show this help — including the workflow, every option, and the exact "
+                             "layout of the files this script reads — and exit.")
     parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL. Folders, collections and playlists download every video found. Omit when using --url-list.")
     parser.add_argument("--url-list", type=str, default=None, help="Path to a TEXT file with ONE URL per line, or a JSON file ([\"url\", ...] / [{\"url\": ..., \"done\": false}] / {\"urls\": [...]}); finished entries are marked done with the collection name, file count and any warning (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
     parser.add_argument("--davka", "--batch", dest="davka", type=str, default=None, metavar="FILE", help="Batch list: a TEXT file describing one video per block - NAME line, then the video URL (.mpd/.m3u8 or a direct file), then optionally the KID:KEY decryption key you already hold (several key lines are allowed, and unencrypted streams simply have none). Blank lines and '#' comments are ignored. Each video is saved under its NAME. Re-running skips videos whose file is already there, so an interrupted batch just continues. Add -l to only list what was parsed.")
@@ -11671,6 +11830,7 @@ if __name__ == "__main__":
     parser.add_argument("--cookies", type=str, help="Path to a Netscape cookies.txt file or JSON cookie export (Google Drive / Patreon session).")
     parser.add_argument("--ffmpeg", type=str, default=None, help="Path to the ffmpeg executable or a folder containing it (for native HLS videos).")
     parser.add_argument("--ffmpeg-url", type=str, default=None, help="URL of an ffmpeg archive to auto-download if ffmpeg is missing. Empty string disables auto-download.")
+    parser.add_argument("--resume", action="store_true", help="Retry only what failed in earlier runs (from resume.json) and stop. Running with no arguments at all does the same thing, then asks for a URL if there was nothing to retry; --resume never asks.")
     parser.add_argument("--no-rename", action="store_true", help="After downloading, do NOT offer the intelligent --strict rename of the new files.")
     parser.add_argument("--follow-links", action="store_true", help="With --scan: treat the given URL as an index/listing page — visit every same-site link (episode pages) and scan each for media too, instead of only the given page. Combines with --subs-only.")
     parser.add_argument("--password", type=str, default=None, help="Password for a single password-protected video (muse.ai). In Patreon collections the password is found automatically in the post text, so you rarely need this.")
@@ -11806,7 +11966,10 @@ if __name__ == "__main__":
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.
-    if not args.url_list and not args.video_id and not args.davka and not args.davka_browser:
+    if args.resume and (args.video_id or args.url_list or args.davka or args.davka_browser):
+        parser.error("--resume retries the previous run, so it takes no URL or list.")
+
+    if args.resume or not (args.url_list or args.video_id or args.davka or args.davka_browser):
         with _failed_lock:
             _failed_jobs.clear()
             _session_failed.clear()
@@ -11816,6 +11979,9 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             print("\n[WARN] Interrupted. resume.json kept — re-run with no arguments to continue.")
             sys.exit(130)
+        if args.resume:
+            print("[INFO] --resume: nothing left to retry.")
+            sys.exit(0)
         # Nothing to resume and no URL on the command line. Ask for one interactively — pasting
         # here is immune to cmd.exe splitting a URL at '&' (e.g. watch?v=...&list=...).
         if getattr(sys.stdin, 'isatty', lambda: False)():
