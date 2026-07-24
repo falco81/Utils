@@ -1,4 +1,4 @@
-from urllib.parse import (unquote, unquote_plus, urlencode, urljoin, urlparse,
+from urllib.parse import (parse_qs, unquote, unquote_plus, urlencode, urljoin, urlparse,
                           parse_qsl, quote, urlunparse)
 import requests
 import argparse
@@ -1197,11 +1197,16 @@ HLS/DASH stream.
 
   {B}4.{R} {B}Encrypted (DRM) stream?{R} Supply the key you already hold with --key KID:KEY.
 
-  {B}5.{R} {B}Many videos at once?{R} Put them in a list and use --davka (each line group names the
+  {B}5.{R} {B}A Patreon tag?{R} Click a tag on the creator's page and paste the resulting address —
+     every post carrying that tag is downloaded:
+       {D}videoloader_dir.py "https://www.patreon.com/creator?filters%5Btag%5D=Season+2"{R}
+     Quote it in the shell, or & and = will be eaten.
+
+  {B}6.{R} {B}Many videos at once?{R} Put them in a list and use --davka (each line group names the
      file, its stream and its key) or --url-list (one address per line). Both can be re-run
      safely: anything already downloaded is skipped, so an interrupted batch just continues.
 
-  {B}6.{R} {B}When it finishes{R} it offers to tidy the episode names, writes a report next to the
+  {B}7.{R} {B}When it finishes{R} it offers to tidy the episode names, writes a report next to the
      files, and can push a notification (--test-notify to check that side works).
 """
 
@@ -1253,6 +1258,9 @@ HLS/DASH stream.
 
   {D}# see what is on the page without downloading anything{R}
   videoloader_dir.py --scan https://web.cz/serial/dil-1 --list
+
+  {D}# every Patreon post tagged "Crash Course in Romance"{R}
+  videoloader_dir.py "https://www.patreon.com/ohmygeona?filters%5Btag%5D=Crash+Course+in+Romance"
 
   {D}# a batch of episodes, each with its own decryption key{R}
   videoloader_dir.py --davka serial.txt -d D:\\Serialy
@@ -1505,27 +1513,83 @@ def get_collection_info(collection_id: str, session: requests.Session, verbose: 
     return title, campaign_id
 
 
-def list_collection_posts(collection_id: str, campaign_id, session: requests.Session,
-                          verbose: bool) -> list:
-    """Return all post objects of a collection, following cursor pagination."""
-    posts = []
-    cursor = None
-    page = 0
+def extract_patreon_tag_filter(input_str: str):
+    """Return (creator_slug, tag) for a creator page filtered by tag, else None.
+
+    Patreon's own UI produces these when you click a tag on a creator's page:
+        https://www.patreon.com/ohmygeona?filters%5Btag%5D=Crash+Course+in+Romance
+    which is filters[tag]=... once decoded. Collection and single-post URLs are left alone so
+    they keep taking their existing, more specific paths."""
+    if 'patreon.com' not in input_str:
+        return None
+    pu = urlparse(input_str)
+    q = parse_qs(pu.query or '')
+    tag = None
+    for key in ('filters[tag]', 'filter[tag]', 'tag'):
+        if q.get(key):
+            tag = q[key][0]
+            break
+    if not tag:
+        return None
+    parts = [p for p in (pu.path or '').split('/') if p]
+    if parts and parts[0] == 'c':          # /c/<creator> is the newer form
+        parts = parts[1:]
+    if not parts or parts[0] in ('posts', 'collection', 'api'):
+        return None
+    return parts[0], unquote(tag.replace('+', ' ')).strip()
+
+
+# The creator's own campaign id shows up in these image paths; the visitor's own campaign never
+# does, which is what makes them a reliable discriminator on a page that mentions both.
+_CAMPAIGN_ID_PATTERNS = (
+    re.compile(r'card-teaser-image/creator/(\d+)'),
+    re.compile(r'patreon-media/p/campaign/(\d+)/'),
+)
+
+
+def get_campaign_id_for_creator(slug: str, session: requests.Session, verbose: bool = False):
+    """Best-effort campaign id for a creator page, or None."""
+    try:
+        r = session.get(f"https://www.patreon.com/{slug}",
+                        headers={'Referer': PATREON_REFERER, 'User-Agent': USER_AGENT},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        html = r.text or ''
+    except requests.RequestException as e:
+        if verbose:
+            print(f"[WARN] Patreon: could not open the creator page ({type(e).__name__}).")
+        html = ''
+    if html:
+        counts = Counter()
+        for pat in _CAMPAIGN_ID_PATTERNS:
+            counts.update(pat.findall(html))
+        if counts:
+            cid = counts.most_common(1)[0][0]
+            if verbose:
+                print(f"[INFO] Patreon: creator '{slug}' is campaign {cid}.")
+            return cid
+    # Fallback: the vanity lookup endpoint.
+    try:
+        r = session.get("https://www.patreon.com/api/campaigns",
+                        params={'filter[vanity]': slug, 'json-api-version': '1.0'},
+                        headers={'Referer': PATREON_REFERER, 'Accept': 'application/json'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        data = (r.json() or {}).get('data') or []
+        if data and isinstance(data[0], dict) and data[0].get('id'):
+            return str(data[0]['id'])
+    except (requests.RequestException, ValueError):
+        pass
+    return None
+
+
+def _patreon_paged_posts(base_params: dict, session: requests.Session, verbose: bool,
+                         label: str = "posts") -> list:
+    """Walk Patreon's /api/posts cursor pagination and return every post object.
+
+    Shared by the collection walker and the tag filter: only the filter parameters differ, while
+    the paging, the 'included' merge and the safety valve are identical."""
+    posts, cursor, page = [], None, 0
     while True:
-        params = {
-            'include': 'collections,drop,primary_image,audio,video,embed',
-            'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
-            'sort': 'collection_order',
-            'filter[collection_id]': collection_id,
-            'filter[is_suspended]': 'false',
-            'filter[include_drops]': 'true',
-            'filter[is_published]': 'true',
-            'page[size]': '100',
-            'json-api-version': '1.0',
-            'json-api-use-default-includes': 'false',
-        }
-        if campaign_id:
-            params['filter[campaign_id]'] = campaign_id
+        params = dict(base_params)
         if cursor:
             params['page[cursor]'] = cursor
         url = "https://www.patreon.com/api/posts?" + urlencode(params)
@@ -1540,33 +1604,78 @@ def list_collection_posts(collection_id: str, campaign_id, session: requests.Ses
         batch = d.get('data', []) or []
         included = d.get('included', []) or []
         if included:
-            inc_by_key = {(r.get('type'), r.get('id')): r
-                          for r in included if isinstance(r, dict)}
-            for p in batch:
-                if not isinstance(p, dict):
+            # Patreon returns media/video/embed objects separately; attach the ones each post
+            # points at so link and stream extraction can see them.
+            inc_by_key = {(x.get('type'), x.get('id')): x
+                          for x in included if isinstance(x, dict)}
+            for post in batch:
+                if not isinstance(post, dict):
                     continue
-                rels = p.get('relationships') or {}
+                rels = post.get('relationships') or {}
                 mine = []
-                for relname in ('video', 'embed', 'audio', 'post_file', 'images', 'attachments_media'):
+                for relname in ('video', 'embed', 'audio', 'post_file', 'images',
+                                'attachments_media'):
                     rd = (rels.get(relname) or {}).get('data')
                     items = rd if isinstance(rd, list) else ([rd] if isinstance(rd, dict) else [])
                     for one in items:
-                        r = inc_by_key.get((one.get('type'), one.get('id')))
-                        if r:
-                            mine.append(r)
+                        got = inc_by_key.get((one.get('type'), one.get('id')))
+                        if got:
+                            mine.append(got)
                 if mine:
-                    p['_included'] = mine
+                    post['_included'] = mine
         posts.extend(batch)
         page += 1
         cursor = (((d.get('meta') or {}).get('pagination') or {}).get('cursors') or {}).get('next')
         if verbose:
-            print(f"[INFO] Patreon posts page {page}: +{len(batch)} (total {len(posts)})")
+            print(f"[INFO] Patreon {label} page {page}: +{len(batch)} (total {len(posts)})")
         if not cursor or not batch:
             break
         if page > 500:  # safety valve
             print("[WARN] Stopping Patreon pagination after 500 pages.")
             break
     return posts
+
+
+def list_collection_posts(collection_id: str, campaign_id, session: requests.Session,
+                          verbose: bool) -> list:
+    """Return all post objects of a collection, following cursor pagination."""
+    params = {
+        'include': 'collections,drop,primary_image,audio,video,embed',
+        'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
+        'sort': 'collection_order',
+        'filter[collection_id]': collection_id,
+        'filter[is_suspended]': 'false',
+        'filter[include_drops]': 'true',
+        'filter[is_published]': 'true',
+        'page[size]': '100',
+        'json-api-version': '1.0',
+        'json-api-use-default-includes': 'false',
+    }
+    if campaign_id:
+        params['filter[campaign_id]'] = campaign_id
+    return _patreon_paged_posts(params, session, verbose, "posts")
+
+
+def list_tag_posts(campaign_id: str, tag: str, session: requests.Session,
+                   verbose: bool) -> list:
+    """Return every post of a campaign carrying `tag`, newest first.
+
+    Mirrors what the site itself requests when you click a tag on a creator's page."""
+    params = {
+        'include': 'collections,drop,primary_image,audio,video,embed',
+        'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
+        'fields[post_tag]': 'tag_type,value',
+        'sort': '-published_at',
+        'filter[campaign_id]': campaign_id,
+        'filter[tag]': tag,
+        'filter[is_draft]': 'false',
+        'filter[contains_exclusive_posts]': 'true',
+        'filter[include_drops]': 'true',
+        'page[count]': '50',
+        'json-api-version': '1.0',
+        'json-api-use-default-includes': 'false',
+    }
+    return _patreon_paged_posts(params, session, verbose, f"tag '{tag}'")
 
 
 def _walk_strings(obj):
@@ -2078,6 +2187,47 @@ def process_patreon_collection(collection_id: str, session: requests.Session, ch
         print(f"[INFO] Creator '{_patreon_creator}'")
     print(f"[INFO] Collection '{title or collection_id}': scanning {len(posts)} post(s) "
           f"for Drive / Dropbox links and native videos ...")
+
+    _download_from_posts(posts, session, chunk_size, num_threads, folder_workers, recursive,
+                         verbose, select, out_dir, max_connections, max_height, list_only)
+
+
+def process_patreon_tag(target, session: requests.Session, chunk_size: int,
+                        num_threads: int, folder_workers: int, recursive: bool,
+                        verbose: bool, select: bool = False, out_dir: str = None,
+                        max_connections: int = None, max_height: int = DEFAULT_MAX_HEIGHT,
+                        list_only: bool = False) -> None:
+    """Download every post a creator has tagged with a given tag.
+
+    `target` is the (creator_slug, tag) pair taken from a filtered creator URL. Everything after
+    the post list is the same machinery a collection uses, so Drive links, Dropbox links and
+    native videos all behave identically here."""
+    slug, tag = target
+    print(f"[INFO] Reading Patreon posts of '{slug}' tagged '{tag}' ...")
+    campaign_id = get_campaign_id_for_creator(slug, session, verbose)
+    if not campaign_id:
+        print(f"[ERROR] Could not work out the campaign id for creator '{slug}'.")
+        print("        The page may need your Patreon cookies (--cookies), or the creator name")
+        print("        in the URL is wrong.")
+        return
+
+    global _patreon_creator, _active_collection_title
+    _patreon_creator = get_creator_name(campaign_id, session, verbose)
+    # Name the run after the tag: that is what the files belong to, and the rename step uses it.
+    _active_collection_title = tag or None
+
+    posts = list_tag_posts(campaign_id, tag, session, verbose)
+    if not posts:
+        print(f"[ERROR] No posts found with the tag '{tag}'.")
+        print("        Check the spelling (tags are case- and space-sensitive), or whether the")
+        print("        posts are behind a tier your account does not have. A tag with no posts")
+        print("        you can see looks exactly the same as a tag that does not exist.")
+        return
+
+    if _patreon_creator:
+        print(f"[INFO] Creator '{_patreon_creator}'")
+    print(f"[INFO] Tag '{tag}': scanning {len(posts)} post(s) for Drive / Dropbox links "
+          f"and native videos ...")
 
     _download_from_posts(posts, session, chunk_size, num_threads, folder_workers, recursive,
                          verbose, select, out_dir, max_connections, max_height, list_only)
@@ -9183,6 +9333,11 @@ def process_twitch(vod_id, session, max_connections, max_height, verbose, list_o
 
 def _classify_input(id_or_url: str):
     """Return (kind, target) for any supported input."""
+    # A creator page narrowed by a tag. Checked first: the URL is otherwise just a creator page,
+    # which would fall through to 'patreon_bad'.
+    tagged = extract_patreon_tag_filter(id_or_url)
+    if tagged:
+        return 'patreon_tag', tagged
     pid = extract_patreon_collection_id(id_or_url)
     if pid:
         return 'patreon', pid
@@ -10551,6 +10706,15 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                                        recursive, verbose, select=select, out_dir=out_dir,
                                        max_connections=max_connections, max_height=max_height,
                                        list_only=list_only)
+        elif kind == 'patreon_tag':
+            _log_source(f"Patreon tag '{target_id[1]}'",
+                        "Drive + Dropbox + Streamable + native Vimeo/Mux HLS")
+            if output_file:
+                print("[WARN] -o/--output is ignored for a Patreon tag; names come from the posts.")
+            process_patreon_tag(target_id, session, chunk_size, num_threads, folder_workers,
+                                recursive, verbose, select=select, out_dir=out_dir,
+                                max_connections=max_connections, max_height=max_height,
+                                list_only=list_only)
         elif kind == 'patreon_post':
             _log_source("Patreon post", "Drive + Dropbox + Streamable + native Vimeo/Mux HLS")
             if output_file:
@@ -11797,7 +11961,7 @@ if __name__ == "__main__":
     parser.add_argument("-h", "--help", action="help",
                         help="Show this help — including the workflow, every option, and the exact "
                              "layout of the files this script reads — and exit.")
-    parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL. Folders, collections and playlists download every video found. Omit when using --url-list.")
+    parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL, or a Patreon creator page narrowed by a tag (the ?filters[tag]=... address you get by clicking a tag - quote it in the shell). Folders, collections and playlists download every video found. Omit when using --url-list.")
     parser.add_argument("--url-list", type=str, default=None, help="Path to a TEXT file with ONE URL per line, or a JSON file ([\"url\", ...] / [{\"url\": ..., \"done\": false}] / {\"urls\": [...]}); finished entries are marked done with the collection name, file count and any warning (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
     parser.add_argument("--davka", "--batch", dest="davka", type=str, default=None, metavar="FILE", help="Batch list: a TEXT file describing one video per block - NAME line, then the video URL (.mpd/.m3u8 or a direct file), then optionally the KID:KEY decryption key you already hold (several key lines are allowed, and unencrypted streams simply have none). Blank lines and '#' comments are ignored. Each video is saved under its NAME. Re-running skips videos whose file is already there, so an interrupted batch just continues. Add -l to only list what was parsed.")
     parser.add_argument("--davka-browser", "--batch-browser", dest="davka_browser", type=str, default=None, metavar="FILE", help="Same list format and behaviour as --davka, except the middle line is a normal PAGE address instead of a stream: each one is opened in a real browser (as --scan-browser does), the stream its player fetches is discovered, and THAT is downloaded under the block's name with the block's key. Addresses that already point straight at a .mpd/.m3u8/file are used as-is, so a list may mix both.")
