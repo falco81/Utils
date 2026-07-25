@@ -266,8 +266,10 @@ if (count($ht) >= 2) {
     if ($cycS) {
         $charts[] = [
             'id' => 'cyc', 'title' => 'Spin-ups per day', 'unit' => '/d', 'min' => 0,
-            'note' => 'How hard the spin-down policy works the motors. Readings only land '
-                    . 'while a disk is awake, so the line is sparse by design.',
+            'note' => 'How hard the spin-down policy works the motors. Averaged over a '
+                    . 'six-hour window: a single spin-up seen across a few minutes would '
+                    . 'otherwise read as hundreds a day. Needs an hour of readings before '
+                    . 'the first point appears, and only lands while a disk is awake.',
             'series' => $cycS,
         ];
     }
@@ -365,13 +367,16 @@ if ($wantFull) {
  * policy costs the drive. Readings are sparse (a sleeping disk isn't polled),
  * so each rate is derived from the gap to the previous real reading.
  */
-function rate_per_day(array $times, array $counts, int $window = 3600,
-                     int $minWin = 1800): array {
-    // A per-day figure from a counter that ticks a handful of times a day has to
-    // be averaged over a decent stretch, or it turns into noise: one spin-up
-    // inside a five-minute sample extrapolates to 288 a day. So each reading is
-    // compared against the oldest reading still inside a trailing window, which
-    // gives a rolling average rather than an instantaneous guess.
+function rate_per_day(array $times, array $counts, int $window = 21600,
+                     int $minWin = 3600): array {
+    // A per-day figure from a counter that ticks a handful of times a day only
+    // means something averaged over hours. One spin-up seen across five minutes
+    // extrapolates to 288 a day; across nineteen minutes, to 76 — both nonsense
+    // for a drive that really spins up three times a day. So each reading is
+    // compared against the oldest one still inside a six-hour trailing window,
+    // and nothing is reported until that window is at least an hour wide.
+    // The cost is an empty chart for the first hour after the history is reset,
+    // which is the honest answer: we cannot yet say what the daily rate is.
     $out = array_fill(0, count($counts), null);
     $pts = [];
     foreach ($counts as $i => $v) if ($v !== null && isset($times[$i])) $pts[] = $i;
@@ -1410,7 +1415,11 @@ function trend_per_day(array $times, array $vals): ?float {
     for (var gi = 1; gi < n; gi++) stepGaps.push(times[gi] - times[gi - 1]);
     stepGaps.sort(function (a, b) { return a - b; });
     var medGap = stepGaps.length ? stepGaps[Math.floor(stepGaps.length / 2)] : 0;
-    var gapLimit = Math.max(medGap * 3, 60);
+    // Generous, because the sampling is not perfectly regular: a wake adds
+    // extra samples close together, which drags the median down until ordinary
+    // five-minute gaps look like outages and the line falls apart into dots.
+    // Only a genuine interruption should break it.
+    var gapLimit = Math.max(medGap * 4, 900);
     var Y = function (v) { return padT + (1 - ((v - min) / (max - min))) * (H - padT - padB); };
 
     var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">';
@@ -1742,7 +1751,7 @@ function trend_per_day(array $times, array $vals): ?float {
     var box = document.getElementById('wakeprog');
     if (!btn || !box) return;
     var bar = box.querySelector('.wbar i'), txt = box.querySelector('.wtxt');
-    var LIMIT = 120;      // spin-up plus a full SMART pass over five disks
+    var LIMIT = 240;      // spin-up plus a full SMART pass over five disks
     var awakeSeen = false;
 
     function fail(msg) {
@@ -1761,13 +1770,24 @@ function trend_per_day(array $times, array $vals): ?float {
       txt.textContent = 'spinning up…';
       var t0 = Date.now() / 1000;
 
-      fetch('?wake=1', { cache: 'no-store' })
-        .then(function (r) { return r.json(); })
-        .then(function (j) {
-          if (!j || !j.ok) throw new Error(j && j.error ? j.error : 'request refused');
-          txt.textContent = 'spinning up ' + j.disks.length + ' disks…' +
-                            (j.refresh ? '' : ' (SMART refresh not permitted)');
-          setTimeout(function () { poll(t0, j.disks.length, !!j.refresh); }, 2500);
+      // Take the collector's own last-read timestamp first and wait for that
+      // number to CHANGE. Comparing it against the browser's clock instead —
+      // which is what this used to do — fails whenever the two machines are a
+      // few seconds apart, and the first press then always looked like it
+      // never refreshed SMART.
+      fetch('data.json?_=' + Date.now(), { cache: 'no-store' })
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .catch(function () { return null; })
+        .then(function (d0) {
+          var base = (d0 && d0.last_smart_read) || 0;
+          return fetch('?wake=1', { cache: 'no-store' })
+            .then(function (r) { return r.json(); })
+            .then(function (j) {
+              if (!j || !j.ok) throw new Error(j && j.error ? j.error : 'request refused');
+              txt.textContent = 'spinning up ' + j.disks.length + ' disks…' +
+                                (j.refresh ? '' : ' (SMART refresh not permitted)');
+              setTimeout(function () { poll(t0, j.disks.length, !!j.refresh, base); }, 2500);
+            });
         })
         .catch(function (e) { fail('failed: ' + e.message); });
     });
@@ -1778,7 +1798,7 @@ function trend_per_day(array $times, array $vals): ?float {
      * SMART (proof the values on screen are fresh). If the collector refresh
      * wasn't permitted, the first alone finishes the job and we say so.
      */
-    function poll(t0, total, wantFresh) {
+    function poll(t0, total, wantFresh, base) {
       var elapsed = Date.now() / 1000 - t0;
       if (elapsed > LIMIT) {
         if (awakeSeen) {
@@ -1807,7 +1827,9 @@ function trend_per_day(array $times, array $vals): ?float {
         // last_smart_read is a timestamp the collector persists, so it stays
         // true even when the regular five-minute run rewrites data.json from
         // cache moments later and clears every from_cache flag.
-        var fresh = !wantFresh || (data && (data.last_smart_read || 0) >= Math.floor(t0));
+        // A change in the collector's own timestamp, not a comparison against
+        // this browser's clock — no dependency on the two agreeing.
+        var fresh = !wantFresh || (data && (data.last_smart_read || 0) > base);
 
         var pct = (chk.total ? chk.awake / chk.total : 0) * (wantFresh ? 70 : 100);
         if (awake && wantFresh) pct = fresh ? 100 : 85;
@@ -1831,9 +1853,11 @@ function trend_per_day(array $times, array $vals): ?float {
         txt.textContent = !awake
           ? chk.awake + ' of ' + chk.total + ' awake… ' + Math.max(0, Math.round(LIMIT - elapsed)) + 's'
           : 'reading SMART… ' + Math.max(0, Math.round(LIMIT - elapsed)) + 's';
-        setTimeout(function () { poll(t0, total, wantFresh); }, 2000);
+        setTimeout(function () { poll(t0, total, wantFresh, base); }, 2000);
       }).catch(function () {
-        setTimeout(function () { poll(t0, total, wantFresh); }, 2500);
+        // A hiccup in one poll must not lose the baseline, or the next poll
+        // would compare against zero and declare success immediately.
+        setTimeout(function () { poll(t0, total, wantFresh, base); }, 2500);
       });
     }
   })();

@@ -2311,7 +2311,14 @@ class Daemon:
         read_smart = not (self._spinning_up and not force_smart)
         # Is this the pass that records a history sample? Decide before
         # collecting, so the SMART read can be aligned with it.
-        do_slow = force or (now - self._last_slow >= SLOW_INTERVAL)
+        # A forced pass (wake, daily sweep) should land a sample too — its SMART
+        # reading is the freshest we get. But every tick inside the two-minute
+        # wake window is "forced", and recording each of them filled the history
+        # with samples seconds apart. That wrecks the spacing the charts rely on:
+        # the median gap collapses, and normal five-minute gaps then look like
+        # outages. So a forced pass may add a sample, but no more than once a
+        # minute.
+        do_slow = now - self._last_slow >= (60 if force else SLOW_INTERVAL)
         # `refresh` bypasses the read throttle but not the sleep rule: disks that
         # are already turning get re-read now, sleeping ones are left alone.
         disks = self.mon.collect(force=force, read_smart=read_smart,
