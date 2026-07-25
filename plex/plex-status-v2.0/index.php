@@ -70,10 +70,15 @@ if (isset($_GET['atv'])) {
         exit;
     }
     $q = [];
-    foreach (['id', 'c', 'pin'] as $k) {
+    foreach (['id', 'c', 'pin', 'kind', 'playing'] as $k) {
         if (isset($_GET[$k])) $q[$k] = (string) $_GET[$k];
     }
-    plexmon_relay('/atv/' . $action . ($q ? '?' . http_build_query($q) : ''), 'POST', true);
+    // Pairing waits for a person to pick up the remote and accept a prompt on
+    // the television. The default eight seconds is the shortest link in the
+    // chain — the daemon would still be waiting patiently while this gave up.
+    $wait = ($action === 'pair') ? 200.0 : 20.0;
+    plexmon_relay('/atv/' . $action . ($q ? '?' . http_build_query($q) : ''),
+                  'POST', true, $wait);
     exit;
 }
 
@@ -1746,6 +1751,7 @@ function trend_per_day(array $times, array $vals): ?float {
       // buttons: forgetting a pairing should take deliberate aim.
       var unpair = (s.atv && s.atv.paired)
         ? '<a href="#" class="atvunpair" data-atv-unpair="' + esc(s.atv.ident) + '" ' +
+          'data-kind="' + esc(s.atv.kind || 'appletv') + '" ' +
           'title="forget the credentials stored for this TV">unpair</a>' : '';
       return '<div class="card np">' + unpair +
         '<div class="art">' + art(s) + '</div>' +
@@ -1866,20 +1872,27 @@ function trend_per_day(array $times, array $vals): ?float {
   // stream we can actually match to a paired device.
   function atvControls(s) {
     if (!s.atv) return '';
-    var id = esc(s.atv.ident), name = esc(s.atv.name || 'Apple TV');
+    var id = esc(s.atv.ident), name = esc(s.atv.name || 'TV');
+    var kind = esc(s.atv.kind || 'appletv');
     if (!s.atv.paired) {
       return '<div class="atv">' +
                '<span class="atvname">' + name + '</span>' +
-               '<button class="atvbtn pair" data-atv-pair="' + id + '">Pair this TV</button>' +
+               '<button class="atvbtn pair" data-atv-pair="' + id + '" ' +
+                 'data-kind="' + kind + '">Pair this TV</button>' +
                '<span class="atvmsg"></span>' +
              '</div>';
     }
+    var btn = function (cmd, glyph, title, cls) {
+      return '<button class="atvbtn' + (cls || '') + '" data-atv="' + id + '" ' +
+             'data-kind="' + kind + '" data-cmd="' + cmd + '" title="' + title + '">' +
+             glyph + '</button>';
+    };
     return '<div class="atv">' +
       '<span class="atvname">' + name + '</span>' +
       '<div class="atvrow">' +
-        '<button class="atvbtn" data-atv="' + id + '" data-cmd="skip_backward" title="back 10 seconds">&#9198;</button>' +
-        '<button class="atvbtn big" data-atv="' + id + '" data-cmd="play_pause" title="play / pause">&#9199;</button>' +
-        '<button class="atvbtn" data-atv="' + id + '" data-cmd="skip_forward" title="forward 10 seconds">&#9197;</button>' +
+        btn('skip_backward', '&#9198;', 'back') +
+        btn('play_pause', '&#9199;', 'play / pause', ' big') +
+        btn('skip_forward', '&#9197;', 'forward') +
       '</div>' +
       '<span class="atvmsg"></span></div>';
   }
@@ -1904,7 +1917,8 @@ function trend_per_day(array $times, array $vals): ?float {
       }
       clearTimeout(u._t);
       u.textContent = 'forgetting…';
-      fetch('?atv=unpair&id=' + encodeURIComponent(u.getAttribute('data-atv-unpair')),
+      fetch('?atv=unpair&id=' + encodeURIComponent(u.getAttribute('data-atv-unpair')) +
+            '&kind=' + encodeURIComponent(u.getAttribute('data-kind') || 'appletv'),
             { method: 'POST', cache: 'no-store' })
         .then(function (r) { return r.json(); })
         .then(function (j) {
@@ -1939,13 +1953,22 @@ function trend_per_day(array $times, array $vals): ?float {
       b.disabled = true; say('starting…');
       var tvName = box.querySelector('.atvname');
       tvName = tvName ? tvName.textContent : 'the TV';
-      fetch('?atv=pair&id=' + encodeURIComponent(id), { method: 'POST', cache: 'no-store' })
+      var kind = b.getAttribute('data-kind') || 'appletv';
+      say(kind === 'appletv' ? 'starting…' : 'accept the prompt on the TV…');
+      fetch('?atv=pair&id=' + encodeURIComponent(id) + '&kind=' + encodeURIComponent(kind),
+            { method: 'POST', cache: 'no-store' })
         .then(function (r) { return r.json(); })
         .then(function (j) {
           b.disabled = false;
           if (!j.ok) { say(j.message || 'failed', true); return; }
+          // LG and Samsung ask on their own screen and are done once accepted;
+          // only an Apple TV shows a code that has to be typed back.
+          if (j.needs_pin === false) {
+            say('paired — reloading');
+            setTimeout(function () { location.reload(); }, 900);
+            return;
+          }
           say('');
-          // The television is showing its code by now, so ask for it.
           return askPin(tvName).then(function (pin) {
             if (!pin) { say('cancelled'); return; }
             pinError('pairing…');
@@ -1986,7 +2009,16 @@ function trend_per_day(array $times, array $vals): ?float {
       });
       tickNP();          // in place — the buttons stay exactly where they are
     }
-    fetch('?atv=cmd&id=' + encodeURIComponent(id2) + '&c=' + encodeURIComponent(cmd),
+    // LG has no play/pause toggle, so it needs to know which way to go; the
+    // state we already display is exactly that answer.
+    var nowPlaying = '1';
+    NP.forEach(function (sn) {
+      if (sn.atv && sn.atv.ident === id2 && sn.state !== 'playing') nowPlaying = '0';
+    });
+    fetch('?atv=cmd&id=' + encodeURIComponent(id2) +
+          '&kind=' + encodeURIComponent(b.getAttribute('data-kind') || 'appletv') +
+          '&playing=' + nowPlaying +
+          '&c=' + encodeURIComponent(cmd),
           { method: 'POST', cache: 'no-store' })
       .then(function (r) { return r.json(); })
       .then(function (j) { if (!j.ok) say(j.message || 'failed', true); })

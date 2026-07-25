@@ -156,27 +156,32 @@ none of them wakes a disk by accident.
 | `diag-art.sh` | Traces the now-playing poster from the Plex API to the file the page serves. |
 | `hist-check.py` | Why a chart looks wrong: reports the keys the history is stored under, how much of each series is actually filled, and any gaps in the recording. |
 
-## Apple TV remote
+## Television remote
 
-Optional playback control for Apple TV clients, off by default. Plex cannot do
-this itself — its Apple TV app advertises no remote-control capability — so the
-daemon speaks Apple's Companion protocol directly, over a connection it keeps
-open so a press lands in milliseconds rather than seconds.
+Optional playback control for Apple TV, LG and Samsung sets, off by default.
+Plex cannot do this itself — its client apps advertise no remote-control
+capability — so the daemon speaks each maker's own protocol, over a connection
+it keeps open so a press lands in milliseconds rather than seconds.
 
-It needs [pyatv](https://pyatv.dev) available to the interpreter running the
-daemon, which in turn needs Python 3.10 or newer, and a more generous memory
-limit than the monitoring alone requires. **`CONFIG.md` has the full setup**;
-the short version:
+Apple TV and LG get real playback control. Samsung offers only remote-key
+presses, which the foreground app interprets, so it works but is less certain.
+
+Each make needs its library available to the interpreter running the daemon,
+which in turn needs Python 3.10 or newer, plus a more generous memory limit than
+the monitoring alone requires. **`CONFIG.md` has the full setup**; the short
+version:
 
 ```bash
-dnf install -y python3.12 && python3.12 -m pip install pyatv
+dnf install -y python3.12
+python3.12 -m pip install pyatv aiowebostv samsungtvws   # only what you own
 # ExecStart=/usr/bin/python3.12 /usr/local/lib/plexmon/plexmon.py
 echo '{"atv_enable": true}' >> /etc/plex-status/config.json   # merge, one object
-plexmon --atv-pair "living room"
+plexmon --atv-probe 192.168.1.50    # LG and Samsung are named by address
+plexmon --atv-pair 192.168.1.50
 ```
 
-If pyatv is missing or fails to load, remote control switches itself off and
-disk monitoring carries on untouched.
+A missing or broken library disables that make only; disk monitoring carries on
+untouched.
 
 ## The no-wake guarantee
 

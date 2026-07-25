@@ -135,45 +135,143 @@ uprav ho i nahoře v `plexmon-api.php`.
 | `plex_url` | `"http://127.0.0.1:32400"` | Plex Media Server |
 | `plex_prefs` | cesta k `Preferences.xml` | odsud se čte token |
 
-## Ovládání Apple TV
+## Ovládání televizí
 
 | volba | výchozí | význam |
 |---|---|---|
-| `atv_enable` | `false` | zapne ovládání přehrávání na Apple TV |
+| `atv_enable` | `false` | zapne ovládání přehrávání (platí pro všechny značky) |
 | `atv_remote` | `""` | cesta k `atvremote`; prázdné = najde si ho sám |
-| `atv_storage` | `/var/lib/plex-status/atv-creds.json` | kam se ukládají údaje z párování |
+| `atv_storage` | `/var/lib/plex-status/atv-creds.json` | údaje z párování Apple TV |
+| `tv_creds` | `/var/lib/plex-status/tv-creds.json` | údaje z párování LG a Samsung |
+| `tv_samsung_keys` | viz níže | které klávesy posílat na Samsung |
+| `tv_pair_timeout` | `90` | kolik sekund čekat, než potvrdíš dotaz na televizi |
 
-Plex vlastní Apple TV aplikaci ovládat neumí — klient se serveru jako
-ovladatelný nehlásí a `/clients` vrací prázdno. Démon proto mluví s televizí
-přímo Applovým protokolem Companion přes knihovnu [pyatv](https://pyatv.dev).
+Podporované jsou tři značky. Plex vlastní klienty ovládat neumí — jeho aplikace
+se serveru jako ovladatelné nehlásí a `/clients` vrací prázdno — takže démon
+mluví s televizí přímo jejím vlastním protokolem.
 
-### Jak to funguje uvnitř
+| značka | knihovna | co umí |
+|---|---|---|
+| Apple TV | [pyatv](https://pyatv.dev) | skutečné ovládání přehrávání, skok o 10 s |
+| LG (webOS) | [aiowebostv](https://pypi.org/project/aiowebostv/) | skutečné ovládání přehrávání |
+| Samsung (Tizen) | [samsungtvws](https://pypi.org/project/samsungtvws/) | jen stisky kláves dálkového ovladače |
 
-Příkazy jdou přes spojení, které démon **drží otevřené**. Navázání šifrovaného
-sezení trvá tři až pět sekund, takže kdyby se dělalo při každém stisku, tlačítko
-pauzy by reagovalo za pět sekund a bylo by k ničemu. Spojení se otevře na pozadí,
-jakmile se objeví přehrávání na spárované televizi, takže i první stisk je
-okamžitý — pod deset milisekund.
+### Rozdíl mezi značkami
 
-Když spojení spadne (televize usnula, změnila adresu), démon se jednou pokusí
-připojit znovu. Kdyby ani to nevyšlo, sáhne po `atvremote` jako po záloze:
-pomalejší, řádově sekundy, ale tlačítka fungují dál.
+U **Apple TV a LG** jde o opravdové ovládání přehrávání: řekneš „pauza" a
+televize pauzne, bez ohledu na to, co je zrovna na obrazovce zaostřené.
 
-Kvůli tomu **démon pyatv importuje** — jinak by rychlé spojení nešlo. Import je
-odložený na první použití, běží na pozadí a je ošetřený: když knihovna chybí
-nebo se nenačte, ovládání se samo vypne a hlídání disků tím není dotčené. Je to
-ale slabší záruka než u zbytku démona, který vystačí se standardní knihovnou.
+U **Samsungu** taková možnost neexistuje. Jeho rozhraní umí jen posílat kódy
+kláves dálkového ovladače a co s nimi udělá, rozhoduje aplikace na popředí.
+V praxi to funguje, protože Plex na Tizenu na tyhle klávesy reaguje, ale je
+to křehčí: když je na obrazovce menu nebo dialog, stisk se použije tam.
 
-### Instalace
+Které klávesy se posílají, jde změnit — ne každý ovladač posílá stejné kódy:
 
-pyatv potřebuje **Python 3.10 nebo novější** — pro starší nejsou hotové balíčky
-a `miniaudio` by se muselo kompilovat. Zároveň musí být dostupný tomu Pythonu,
-pod kterým běží démon:
+```json
+{
+  "tv_samsung_keys": {
+    "play_pause": "KEY_PLAY_BACK",
+    "skip_forward": "KEY_FF",
+    "skip_backward": "KEY_REWIND"
+  },
+  "tv_samsung_key_delay": 0.4
+}
+```
+
+Hodnotou může být **jedna klávesa nebo posloupnost**. Výchozí je jedna, protože
+dvě jsou nepředvídatelné: jestli šipka přetočí, nebo jen probudí ovládací lištu,
+záleží na tom, jestli je lišta zrovna vidět — dvojstisk tak přeskočil deset
+sekund, dvacet, nebo nic. Posloupnost použij jen tehdy, když ji tvoje televize
+opravdu potřebuje; `tv_samsung_key_delay` je prodleva mezi klávesami v sekundách.
+
+### Když tlačítko nic nedělá
+
+Který kód co udělá, není nikde dané — rozhoduje aplikace na popředí. Proto je
+lepší to vyzkoušet než hádat:
+
+```bash
+plexmon --atv-key "Obývák" KEY_FF
+```
+
+Pošle jednu klávesu a ty se podíváš, jestli televize zareagovala. Kandidáti na
+přetáčení, seřazení podle toho, jak často fungují:
+
+| kód | co to bývá | jak daleko skočí |
+|---|---|---|
+| `KEY_FF`, `KEY_REWIND` | rychlé přetáčení — výchozí | v Plexu 30 s |
+| `KEY_RIGHT`, `KEY_LEFT` | šipky | v Plexu 10 s, ale často až po probuzení lišty |
+| `KEY_ENTER` | probudí ovládací lištu | — |
+
+**O kolik se skočí, neurčuje démon, ale aplikace na televizi.** My posíláme jen
+stisk klávesy. Chceš-li místo třiceti sekund deset, přepni na šipky:
+
+```json
+{
+  "tv_samsung_keys": {
+    "play_pause": "KEY_PLAY_BACK",
+    "skip_forward": "KEY_RIGHT",
+    "skip_backward": "KEY_LEFT"
+  }
+}
+```
+
+Nevýhoda šipek je, že první stisk po chvíli nečinnosti může jen vyvolat ovládací
+lištu a nepřetočit. Lišta pak ale zůstává viditelná několik sekund, takže při
+opakovaném mačkání to sedí — nazmar přijde jen ten úplně první stisk.
+
+Ověřuj to vždy **jedním stiskem**. Když se ti zdá, že klávesa „funguje jen
+někdy", bývá to tím, že jich posíláš víc za sebou a aplikace na ně reaguje
+pokaždé jinak podle toho, co je na obrazovce.
+
+Až najdeš, co funguje, zapiš to do `tv_samsung_keys`. Když je potřeba nejdřív
+probudit lištu, použij posloupnost, třeba `["KEY_ENTER", "KEY_RIGHT"]`.
+
+Starší modely mohou chtít `KEY_PLAY` a `KEY_PAUSE` zvlášť; pak nastav
+`play_pause` na jednu z nich a druhou nechej být, nebo použij `KEY_ENTER`.
+
+Poznámka k párování: některé modely (třeba řada Q60) posílají hned po připojení
+zprávu `ms.remote.touchDisable`, kterou knihovna považuje za selhání spojení.
+Démon proto seznam tolerovaných zpráv rozšiřuje — kdyby ti párování hlásilo
+`the television refused` s nějakou jinou zprávou `ms.*`, pošli ji a doplním ji
+mezi tolerované.
+
+### Hledání televizí
+
+Apple TV se hledají po síti (mDNS). LG a Samsung ne — nemá to smysl, protože
+adresu televize, na které se zrovna hraje, **hlásí sám Plex**. Démon tedy jen
+ověří tu jednu adresu:
+
+- Samsung odpoví na `http://<ip>:8001/api/v2/` popisem zařízení
+- LG má otevřený WebSocket na portu 3000
+
+Výsledek se pamatuje, takže se to neopakuje při každém dotazu.
+
+### Párování
+
+**Apple TV** ukáže na obrazovce čtyřmístný kód, který zadáš do okna na stránce.
+
+**LG a Samsung** se místo toho zeptají přímo na televizi — objeví se dotaz,
+který potvrdíš fyzickým ovladačem. Žádný kód se nezadává, takže je to jeden
+krok. Stránka to pozná sama a okno na PIN nenabídne.
+
+Na potvrzení máš `tv_pair_timeout` sekund, výchozí 90. Když nestíháš dojít
+k ovladači, zvyš to — čeká se na člověka, ne na stroj.
+
+### Instalace knihoven
+
+Všechny potřebují **Python 3.10 nebo novější** a musí být dostupné tomu
+Pythonu, pod kterým běží démon:
 
 ```bash
 dnf install -y python3.12
-python3.12 -m pip install pyatv
+python3.12 -m pip install pyatv          # Apple TV
+python3.12 -m pip install aiowebostv     # LG
+python3.12 -m pip install samsungtvws    # Samsung
 ```
+
+Stačí nainstalovat jen ty, které opravdu máš. Když knihovna chybí, vypne se
+jen ta jedna značka — ostatní i hlídání disků běží dál.
 
 Pokud démon dosud běžel pod systémovým Pythonem, přepni ho v unit souboru:
 
@@ -181,13 +279,32 @@ Pokud démon dosud běžel pod systémovým Pythonem, přepni ho v unit souboru:
 ExecStart=/usr/bin/python3.12 /usr/local/lib/plexmon/plexmon.py
 ```
 
-Do systémového Pythonu spravovaného RPM pyatv **neinstaluj** — `pip` se pokusí
-přepsat balíčky patřící `dnf` a skončí chybou.
+Do systémového Pythonu spravovaného RPM nic z toho **neinstaluj** — `pip` se
+pokusí přepsat balíčky patřící `dnf` a skončí chybou.
+
+### Jak to funguje uvnitř
+
+U Apple TV a LG démon **drží spojení otevřené**. Navázání šifrovaného sezení
+trvá tři až pět sekund, takže kdyby se dělalo při každém stisku, tlačítko pauzy
+by reagovalo za pět sekund a bylo by k ničemu. Spojení se otevře na pozadí,
+jakmile se objeví přehrávání, takže i první stisk je okamžitý.
+
+Když spojení spadne (televize usnula, změnila adresu), démon se jednou pokusí
+připojit znovu. U Apple TV navíc existuje záloha přes `atvremote` — pomalejší,
+řádově sekundy, ale tlačítka fungují dál.
+
+Samsung spojení nedrží: jeho knihovna je synchronní a jedno spojení na příkaz
+je tam levné.
+
+Kvůli rychlému spojení démon knihovny **importuje**. Import je odložený na
+první použití, běží na pozadí a je ošetřený: když se knihovna nenačte, ta
+značka se vypne a hlídání disků tím není dotčené. Je to ale slabší záruka než
+u zbytku démona, který vystačí se standardní knihovnou.
 
 ### Limity služby
 
-S načteným pyatv sedí démon kolem 90–110 MB, a kdyby k tomu spustil `atvremote`
-jako zálohu, dalších 80 MB. Výchozí strop 200 MB je na to málo:
+S načtenými knihovnami sedí démon kolem 90–110 MB. Výchozí strop 200 MB je na
+to málo:
 
 ```ini
 # /etc/systemd/system/plex-status.service.d/atv.conf
@@ -196,43 +313,48 @@ MemoryMax=400M
 CPUQuota=60%
 ```
 
-Podle spotřeby se dá poznat, která cesta zrovna jede:
+Podle spotřeby se dá poznat, jestli je rychlá cesta aktivní:
 
 ```bash
 systemctl show plex-status.service -p MemoryCurrent
 ```
 
-Pod 30 MB znamená, že pyatv ještě není načtený a jelo by se pomalou cestou;
-kolem 90–110 MB je rychlé spojení aktivní.
+Pod 30 MB = knihovna ještě není načtená; kolem 90–110 MB = spojení běží.
 
 ### Používání
 
 Zapni `atv_enable`, restartuj démona a v panelu Now Playing se u přehrávajícího
-streamu objeví tlačítko **Pair this TV**. Na obrazovce se ukáže čtyřmístný kód,
-který zadáš do okna na stránce. Pak se z tlačítka stanou ovládací prvky: zpět
-10 s, přehrát/pauza, vpřed 10 s. Skoky používají vlastní krok Plexu.
+streamu objeví tlačítko **Pair this TV**. Po spárování se z něj stanou ovládací
+prvky: zpět, přehrát/pauza, vpřed.
 
 Totéž jde z příkazové řádky:
 
 ```bash
-plexmon --atv                 # co je vidět a co je spárované
-plexmon --atv-scan            # projít síť znovu
-plexmon --atv-pair "Ložnice"  # spárovat, zeptá se na PIN
-plexmon --atv-unpair "Ložnice"
+plexmon --atv                      # co je známé a co je spárované, včetně značky
+plexmon --atv-scan                 # projít síť znovu (najde jen Apple TV)
+plexmon --atv-probe 192.168.40.55  # co je za televize na téhle adrese
+plexmon --atv-pair 192.168.40.55   # spárovat LG nebo Samsung podle adresy
+plexmon --atv-pair "Obývák"        # nebo podle názvu, když už je známá
+plexmon --atv-key "Obývák" KEY_FF   # vyzkoušet jednu klávesu (jen Samsung)
+plexmon --atv-unpair "Obývák"
 plexmon --atv-unpair-all
 ```
+
+Apple TV se hlásí po síti, takže je ve výpisu hned. **LG a Samsung ne** — dokud
+nejsou spárované, nikdo o nich neví, a proto se zadávají **IP adresou**. Tu
+najdeš buď v nastavení televize, nebo v panelu Now Playing, kde ji hlásí Plex.
 
 Stream se s televizí páruje podle **IP adresy**, kterou Plex u přehrávače
 hlásí — ne podle názvu, který nemusí být jedinečný.
 
 V pravém horním rohu karty je tlumený odkaz **unpair** (první klik se zeptá,
 druhý provede). Zruší to jen *náš* přístup — televize si server dál vede mezi
-spárovanými ovladači a odebrat ho tam jde jen v nastavení tvOS.
+spárovanými ovladači a odebrat ho tam jde jen v jejím nastavení.
 
 Když něco nefunguje, důvod je v logu:
 
 ```bash
-journalctl -u plex-status.service -f | grep -i "apple tv"
+journalctl -u plex-status.service -f | grep -iE "apple tv|samsung|lg |television"
 ```
 
 ## Cesty
@@ -332,6 +454,12 @@ Ber ji spíš jako referenci než jako soubor k nasazení.
   "atv_enable": false,
   "atv_remote": "",
   "atv_storage": "/var/lib/plex-status/atv-creds.json",
+  "tv_creds": "/var/lib/plex-status/tv-creds.json",
+  "tv_samsung_keys": {
+    "play_pause": "KEY_PLAY_BACK",
+    "skip_forward": "KEY_RIGHT",
+    "skip_backward": "KEY_LEFT"
+  },
 
   "smartctl": "/usr/sbin/smartctl",
   "hdparm": "/usr/sbin/hdparm",

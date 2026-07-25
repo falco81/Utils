@@ -30,6 +30,7 @@ import re
 import secrets
 import subprocess
 import shutil
+import socket
 import sys
 import tempfile
 import threading
@@ -115,7 +116,7 @@ HISTORY_POINTS = 140           # down-sampled points embedded in data.json
 # remote-control capability), so this drives Apple's Companion protocol through
 # pyatv's CLI, which lives in its own virtualenv and is called like any other
 # external tool. Off by default; disk monitoring never depends on it.
-ATV_ENABLE  = False
+ATV_ENABLE  = False          # also covers LG and Samsung
 # Empty means "find it": whatever pyatv installed for the interpreter running
 # this daemon, then the usual places, then PATH. Set it explicitly to pin one.
 ATV_REMOTE  = ""
@@ -189,7 +190,8 @@ CONFIGURABLE = (
     "HISTORY_DAYS", "HISTORY_MAX", "HISTORY_POINTS",
     "PERF_ENDPOINTS", "PERF_SAMPLES", "PERF_PROXY_URL",
     "PLEX_URL", "PLEX_PREFS", "SMARTCTL", "HDPARM",
-    "ATV_ENABLE", "ATV_REMOTE", "ATV_STORAGE",
+    "ATV_ENABLE", "ATV_REMOTE", "ATV_STORAGE", "TV_CREDS", "TV_SAMSUNG_KEYS",
+    "TV_PAIR_TIMEOUT", "TV_SAMSUNG_KEY_DELAY",
     "STATE_DIR", "WEB_DIR", "RUN_DIR",
     "DATA_FILE", "SESSIONS_WEB", "HISTORY_WEB",
     "CACHE_FILE", "HISTORY_FILE", "TOKEN_FILE",
@@ -1617,14 +1619,21 @@ def attach_atv(sessions_list: list) -> None:
     if not ok:
         return
     for s in sessions_list:
-        dev = atv_for_address(s.get("address"))
+        addr = s.get("address")
+        dev = atv_for_address(addr)
         if dev:
             s["atv"] = {"ident": dev["ident"], "name": dev["name"],
-                        "paired": dev["paired"]}
+                        "paired": dev["paired"], "kind": "appletv"}
             # Open the session now, in the background. Otherwise the first press
             # still waits out a full handshake and only later presses feel quick.
             if dev["paired"]:
                 atv_warm(dev["ident"], dev.get("address"))
+            continue
+        # Not an Apple TV — try the other makes at the same address.
+        other = tv_for_address(addr)
+        if other:
+            s["atv"] = {"ident": addr, "name": other["name"],
+                        "paired": other["paired"], "kind": other["kind"]}
 
 
 def cache_art(sessions_list: list[dict], token: Optional[str]) -> None:
@@ -2701,7 +2710,7 @@ def atv_pair_pin(ident: str, pin: str) -> tuple:
     if proc is None:
         return False, "no pairing in progress — start it again"
     try:
-        out, _ = proc.communicate(input=pin + "\n", timeout=45)
+        out, _ = proc.communicate(input=pin + "\n", timeout=TV_PAIR_TIMEOUT)
     except subprocess.TimeoutExpired:
         try:
             proc.kill()
@@ -2731,6 +2740,467 @@ def _atv_safe_message(out: str) -> str:
     keep = [l for l in lines if "credential" not in l.lower()]
     text = (keep[-1] if keep else "")[:200]
     return re.sub(r"[0-9a-f:]{40,}", "…", text, flags=re.I)
+
+
+
+
+# ==========================================================================
+# lg and samsung televisions
+# ==========================================================================
+
+# The same idea as the Apple TV support, for the other two makes worth having.
+# Discovery is deliberately not a network sweep: Plex already tells us which
+# address a stream is playing to, and that is the only television we care
+# about, so the address is simply probed.
+#
+#   Samsung  http://<ip>:8001/api/v2/   answers with device info
+#   LG       a WebSocket listening on port 3000
+#
+# Neither library is imported unless a television of that make is actually
+# found, and a failed import only disables that make.
+
+TV_CREDS = "/var/lib/plex-status/tv-creds.json"
+
+# How long to wait for someone to walk over and accept the prompt on the
+# television. Ten seconds was the socket default and nowhere near enough — the
+# set asks, and by the time the remote is in hand the connection has gone.
+TV_PAIR_TIMEOUT = 90
+
+# Which remote-control key each button maps to on a Samsung. There is no media
+# API there — only the codes the physical remote sends — so the television's
+# foreground app decides what they mean. These match a modern Samsung remote:
+# a dedicated play/pause key, and left/right for stepping through playback.
+# A value may be one key or a list of them sent in order.
+#
+# One key by default, because two is unpredictable: whether an arrow seeks or
+# merely wakes the playback bar depends on whether that bar is already showing,
+# so a double press skipped ten seconds, twenty, or nothing at all depending on
+# what the screen happened to be doing. Predictable beats clever. Use a sequence
+# only if your set genuinely needs waking first — and see `--atv-key` for
+# finding out which code it listens to.
+TV_SAMSUNG_KEYS = {
+    "play_pause": "KEY_PLAY_BACK",
+    "skip_forward": "KEY_FF",
+    "skip_backward": "KEY_REWIND",
+}
+
+# Between the keys of a sequence, so the set has time to react to the first.
+TV_SAMSUNG_KEY_DELAY = 0.4
+
+_TV_PROBED: dict = {}            # address -> kind or None, so we probe once
+_TV_CONN: dict = {}              # address -> live LG client
+_TV_LOCK = threading.Lock()
+_TV_IMPORT_FAILED: dict = {"lg": False, "samsung": False}
+
+
+def _tv_load() -> dict:
+    """Stored pairings, keyed by address: {kind, name, key}."""
+    data = read_json(Path(TV_CREDS), {})
+    return data if isinstance(data, dict) else {}
+
+
+def _tv_save(data: dict) -> bool:
+    return write_json(Path(TV_CREDS), data, mode=0o600)
+
+
+def _tv_lib(kind: str):
+    """Import a make's library on first use; None if it isn't usable."""
+    if _TV_IMPORT_FAILED.get(kind):
+        return None
+    try:
+        if kind == "samsung":
+            import samsungtvws
+            return samsungtvws
+        if kind == "lg":
+            import aiowebostv
+            return aiowebostv
+    except Exception as e:
+        _TV_IMPORT_FAILED[kind] = True
+        log(f"{kind} library unavailable ({e}) — that make is disabled")
+    return None
+
+
+def tv_probe(address: str) -> Optional[str]:
+    """
+    Which make, if any, answers at this address. Cached: a television that is
+    not a Samsung will not become one, and probing on every poll would put a
+    pointless connection attempt on the network every few seconds.
+    """
+    if not address:
+        return None
+    with _TV_LOCK:
+        if address in _TV_PROBED:
+            return _TV_PROBED[address]
+    kind = None
+    # Samsung answers a plain HTTP request with its device description.
+    try:
+        req = urllib.request.Request(f"http://{address}:8001/api/v2/")
+        with urllib.request.urlopen(req, timeout=2.0) as r:
+            info = json.loads(r.read().decode())
+        if isinstance(info, dict) and info.get("device"):
+            kind = "samsung"
+    except Exception:
+        pass
+    # LG has no such endpoint; the open WebSocket port is the giveaway.
+    if kind is None:
+        for port in (3000, 3001):
+            try:
+                with socket.create_connection((address, port), timeout=1.5):
+                    kind = "lg"
+                    break
+            except OSError:
+                continue
+    with _TV_LOCK:
+        _TV_PROBED[address] = kind
+    if kind:
+        log(f"found a {kind} television at {address}")
+    return kind
+
+
+def tv_name(address: str, kind: str) -> str:
+    """A friendly name, asked of the television itself where that is cheap."""
+    if kind == "samsung":
+        try:
+            req = urllib.request.Request(f"http://{address}:8001/api/v2/")
+            with urllib.request.urlopen(req, timeout=2.0) as r:
+                info = json.loads(r.read().decode())
+            dev = info.get("device") or {}
+            return dev.get("name") or dev.get("modelName") or f"Samsung {address}"
+        except Exception:
+            return f"Samsung {address}"
+    return f"LG {address}"
+
+
+def tv_for_address(address: str) -> Optional[dict]:
+    """The television at this address: stored pairing, or a fresh probe."""
+    if not address:
+        return None
+    stored = _tv_load().get(address)
+    if stored:
+        return {"kind": stored.get("kind"), "address": address,
+                "name": stored.get("name") or address,
+                "paired": bool(stored.get("key") or stored.get("kind") == "samsung_open")}
+    kind = tv_probe(address)
+    if not kind:
+        return None
+    return {"kind": kind, "address": address,
+            "name": tv_name(address, kind), "paired": False}
+
+
+# ---- Samsung -------------------------------------------------------------
+# The library is synchronous, so its calls run on a worker thread rather than
+# on the asyncio loop the other backends share.
+
+# Sets differ in which chatter they emit right after a WebSocket opens, and the
+# library only tolerates two such messages before deciding the connection has
+# failed. A Q60, for one, announces `ms.remote.touchDisable` first and the
+# handshake was rejected over a message that means nothing to us. These are all
+# harmless notifications, so they are added to the list the library skips past
+# while waiting for the real "connected" event.
+_SAMSUNG_EXTRA_STARTUP_EVENTS = (
+    "ms.remote.touchDisable", "ms.remote.touchEnable",
+    "ms.channel.ready", "ms.channel.clientConnect",
+    "ms.remote.imeStart", "ms.remote.imeEnd",
+)
+
+
+def _samsung_patch_startup() -> None:
+    try:
+        import samsungtvws.connection as conn
+    except Exception:
+        return
+    current = tuple(getattr(conn, "IGNORE_EVENTS_AT_STARTUP", ()))
+    missing = tuple(e for e in _SAMSUNG_EXTRA_STARTUP_EVENTS if e not in current)
+    if missing:
+        conn.IGNORE_EVENTS_AT_STARTUP = current + missing
+
+
+def _samsung_client(address: str, token: Optional[str], token_file: Optional[str] = None,
+                    timeout: float = 10.0):
+    lib = _tv_lib("samsung")
+    if lib is None:
+        raise RuntimeError("samsungtvws is not installed")
+    _samsung_patch_startup()
+    from samsungtvws import SamsungTVWS
+    # Port 8002 is the encrypted, token-authenticated channel modern sets use;
+    # 8001 is the older plain one. Try the modern one first.
+    last = None
+    for port in (8002, 8001):
+        try:
+            tv = SamsungTVWS(host=address, port=port, token=token,
+                             token_file=token_file, timeout=timeout, name="plexmon")
+            tv.open()          # the handshake happens here, so failures surface now
+            return tv
+        except Exception as e:
+            last = e
+    raise RuntimeError(str(last) if last else "could not reach the television")
+
+
+def _samsung_command(address: str, cmd: str, token: Optional[str]) -> tuple:
+    keys = TV_SAMSUNG_KEYS.get(cmd)
+    if not keys:
+        return False, f"{cmd} is not mapped to a key on Samsung"
+    if isinstance(keys, str):
+        keys = [keys]
+    tv = _samsung_client(address, token)      # tolerates the startup chatter too
+    try:
+        for i, key in enumerate(keys):
+            if i:
+                time.sleep(TV_SAMSUNG_KEY_DELAY)
+            tv.send_key(key)
+    finally:
+        try:
+            tv.close()
+        except Exception:
+            pass
+    return True, ""
+
+
+def samsung_send_key(address: str, key: str) -> tuple:
+    """
+    Send one raw key, for working out which code a set actually listens to.
+    Which key does what is a matter of the app on screen, not of any standard,
+    so this exists to be tried rather than guessed at.
+    """
+    rec = _tv_load().get(address)
+    if not rec or rec.get("kind") != "samsung":
+        return False, "that address is not a paired Samsung"
+    if not re.fullmatch(r"KEY_[A-Z0-9_]+", key or ""):
+        return False, "keys look like KEY_PLAY or KEY_FF"
+    box: list = []
+    def go():
+        try:
+            tv = _samsung_client(address, rec.get("key"))
+            tv.send_key(key)
+            try:
+                tv.close()
+            except Exception:
+                pass
+            box.append((True, ""))
+        except Exception as e:
+            box.append((False, str(e) or e.__class__.__name__))
+    t = threading.Thread(target=go, daemon=True)
+    t.start()
+    t.join(timeout=20)
+    return box[0] if box else (False, "the television did not answer")
+
+
+def _samsung_pair(address: str) -> tuple:
+    """
+    Ask the television for permission. Opening the connection is enough to make
+    it show its prompt — no key needs sending, and sending one would have been
+    actively rude: an earlier version pressed Home, which would jump the set away
+    from whatever was playing. Accepting the prompt hands back a token, which the
+    library writes to the token file for us.
+
+    Two attempts, because the first connection is what raises the prompt and the
+    set usually closes it while the viewer is still reaching for the remote; by
+    the second the answer is known.
+    """
+    tmp = str(Path(TV_CREDS).with_name(f".samsung-{address}.token"))
+    last = None
+    for attempt in (1, 2):
+        try:
+            # The socket has to stay open while the prompt is on screen.
+            tv = _samsung_client(address, None, token_file=tmp,
+                                 timeout=TV_PAIR_TIMEOUT)
+            token = getattr(tv, "token", None)
+            try:
+                tv.close()
+            except Exception:
+                pass
+            if not token:
+                try:
+                    token = Path(tmp).read_text().strip()
+                except OSError:
+                    token = None
+            if token:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                return token
+            last = "no token returned"
+        except Exception as e:
+            last = str(e) or e.__class__.__name__
+        if attempt == 1:
+            time.sleep(3)
+    raise RuntimeError(f"the television refused: {last} — was the prompt accepted?")
+
+
+# ---- LG ------------------------------------------------------------------
+# Async, so it shares the asyncio loop already running for the Apple TV work,
+# and its connection is kept open for the same reason: speed.
+
+async def _lg_client(address: str, key: Optional[str]):
+    existing = _TV_CONN.get(address)
+    if existing is not None:
+        return existing
+    if _tv_lib("lg") is None:
+        raise RuntimeError("aiowebostv is not installed")
+    from aiowebostv import WebOsClient
+    client = WebOsClient(address, client_key=key)
+    await client.connect()
+    _TV_CONN[address] = client
+    return client
+
+
+async def _lg_drop(address: str) -> None:
+    client = _TV_CONN.pop(address, None)
+    if client is None:
+        return
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+
+
+async def _lg_do(address: str, key: Optional[str], cmd: str,
+                 playing: bool) -> None:
+    """
+    LG exposes proper media controls rather than key presses, but no play/pause
+    toggle — so the current state, which Plex already reports, decides which of
+    the two to send.
+    """
+    for attempt in (1, 2):
+        client = await _lg_client(address, key)
+        try:
+            if cmd == "play_pause":
+                await (client.pause() if playing else client.play())
+            elif cmd == "skip_forward":
+                await client.button("RIGHT")
+            elif cmd == "skip_backward":
+                await client.button("LEFT")
+            else:
+                raise RuntimeError(f"unknown command {cmd}")
+            return
+        except Exception:
+            await _lg_drop(address)
+            if attempt == 2:
+                raise
+
+
+async def _lg_pair(address: str) -> str:
+    """Connecting without a key makes the television ask; accepting returns one."""
+    if _tv_lib("lg") is None:
+        raise RuntimeError("aiowebostv is not installed")
+    from aiowebostv import WebOsClient
+    client = WebOsClient(address, client_key=None,
+                         connect_timeout=float(TV_PAIR_TIMEOUT))
+    await client.connect()
+    key = getattr(client, "client_key", None)
+    try:
+        await client.disconnect()
+    except Exception:
+        pass
+    if not key:
+        raise RuntimeError("no key returned — was the prompt accepted?")
+    return key
+
+
+# ---- shared entry points -------------------------------------------------
+
+def tv_command(address: str, cmd: str, playing: bool = True) -> tuple:
+    """Send a playback command to an LG or Samsung television."""
+    rec = _tv_load().get(address)
+    if not rec:
+        return False, "that television is not paired"
+    kind = rec.get("kind")
+    try:
+        if kind == "samsung":
+            fut: list = []
+            def go():
+                try:
+                    fut.append(_samsung_command(address, cmd, rec.get("key")))
+                except Exception as e:
+                    fut.append((False, str(e)))
+            t = threading.Thread(target=go, daemon=True)
+            t.start()
+            t.join(timeout=12)
+            if not fut:
+                return False, "the television did not answer in time"
+            return fut[0]
+        if kind == "lg":
+            _atv_submit(_lg_do(address, rec.get("key"), cmd, playing), timeout=10)
+            return True, ""
+    except Exception as e:
+        msg = str(e) or e.__class__.__name__
+        log(f"{kind} command {cmd} to {address} failed: {msg}")
+        return False, msg[:160]
+    return False, f"unknown television type {kind!r}"
+
+
+def tv_pair(address: str) -> tuple:
+    """
+    Pair with an LG or Samsung. Both show a prompt that must be accepted with
+    the physical remote — there is no code to type, so unlike the Apple TV this
+    is a single step.
+    """
+    kind = tv_probe(address)
+    if not kind:
+        return False, "no LG or Samsung television answers at that address"
+    try:
+        if kind == "samsung":
+            box: list = []
+            def go():
+                try:
+                    box.append(("ok", _samsung_pair(address)))
+                except Exception as e:
+                    box.append(("err", str(e)))
+            t = threading.Thread(target=go, daemon=True)
+            t.start()
+            t.join(timeout=TV_PAIR_TIMEOUT * 2 + 10)
+            if not box:
+                return False, "timed out waiting for the television"
+            tag, val = box[0]
+            if tag == "err":
+                return False, val[:160]
+            key = val
+        else:
+            key = _atv_submit(_lg_pair(address), timeout=TV_PAIR_TIMEOUT)
+    except Exception as e:
+        return False, (str(e) or e.__class__.__name__)[:160]
+    data = _tv_load()
+    data[address] = {"kind": kind, "name": tv_name(address, kind), "key": key}
+    if not _tv_save(data):
+        return False, "could not save the pairing"
+    log(f"paired with the {kind} television at {address}")
+    return True, "paired"
+
+
+def tv_unpair(address: str) -> tuple:
+    """Forget one television, and close any session held to it."""
+    data = _tv_load()
+    if address not in data:
+        return False, "that television is not paired here"
+    kind = data[address].get("kind")
+    del data[address]
+    if not _tv_save(data):
+        return False, "could not write the pairing store"
+    if kind == "lg" and address in _TV_CONN:
+        try:
+            _atv_submit(_lg_drop(address), timeout=5)
+        except Exception:
+            pass
+    log(f"forgot the {kind} television at {address}")
+    return True, "unpaired"
+
+
+def tv_unpair_all() -> tuple:
+    data = _tv_load()
+    if not data:
+        return True, "nothing was paired"
+    n = len(data)
+    for address in list(data):
+        if data[address].get("kind") == "lg" and address in _TV_CONN:
+            try:
+                _atv_submit(_lg_drop(address), timeout=5)
+            except Exception:
+                pass
+    if not _tv_save({}):
+        return False, "could not write the pairing store"
+    log(f"forgot {n} television(s)")
+    return True, f"forgot {n} television(s)"
 
 
 # ==========================================================================
@@ -3234,8 +3704,18 @@ class Daemon:
                             self._send(404, {"error": "no poster"})
                 elif path == "/atv":
                     ok, why = atv_ready()
-                    self._send(200, {"ok": ok, "reason": why,
-                                     "devices": atv_devices() if ok else []})
+                    devs = []
+                    if ok:
+                        for d in atv_devices():
+                            devs.append({**d, "kind": "appletv"})
+                        # The other makes are only known once seen, so they come
+                        # from what has been paired rather than from a scan.
+                        for addr, rec in _tv_load().items():
+                            devs.append({"kind": rec.get("kind"), "address": addr,
+                                         "ident": addr,
+                                         "name": rec.get("name") or addr,
+                                         "paired": True})
+                    self._send(200, {"ok": ok, "reason": why, "devices": devs})
                 elif path == "/health":
                     self._send(200, {"ok": True, "uptime": int(time.time() - START)})
                 else:
@@ -3253,22 +3733,52 @@ class Daemon:
                     action = path[len("/atv/"):]
                     if action == "rescan":
                         self._send(200, {"ok": True, "devices": atv_scan(force=True)})
-                    elif action == "unpair-all":
-                        ok, msg = atv_unpair_all()
+                    elif action == "key":
+                        ok, msg = samsung_send_key(ident, (q.get("k") or [""])[0])
                         self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                    elif action == "probe":
+                        kind = tv_probe(ident)
+                        self._send(200, {"ok": bool(kind), "kind": kind,
+                                         "name": tv_name(ident, kind) if kind else None,
+                                         "message": ("found" if kind else
+                                                     "nothing answers at that address")})
+                    elif action == "unpair-all":
+                        ok1, m1 = atv_unpair_all()
+                        ok2, m2 = tv_unpair_all()
+                        self._send(200 if (ok1 or ok2) else 409,
+                                   {"ok": ok1 or ok2, "message": f"{m1}; {m2}"})
                     elif not ident:
                         self._send(400, {"ok": False, "error": "no device id"})
                     elif action == "pair":
-                        ok, msg = atv_pair_start(ident)
-                        self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                        kind = (q.get("kind") or ["appletv"])[0]
+                        if kind == "appletv":
+                            ok, msg = atv_pair_start(ident)
+                            # Apple TVs show a code that has to be typed back;
+                            # the others just want the prompt accepted on screen.
+                            self._send(200 if ok else 409,
+                                       {"ok": ok, "message": msg, "needs_pin": True})
+                        else:
+                            ok, msg = tv_pair(ident)
+                            self._send(200 if ok else 409,
+                                       {"ok": ok, "message": msg, "needs_pin": False})
                     elif action == "pin":
                         ok, msg = atv_pair_pin(ident, (q.get("pin") or [""])[0])
                         self._send(200 if ok else 409, {"ok": ok, "message": msg})
                     elif action == "unpair":
-                        ok, msg = atv_unpair(ident)
+                        kind = (q.get("kind") or ["appletv"])[0]
+                        ok, msg = (atv_unpair(ident) if kind == "appletv"
+                                   else tv_unpair(ident))
                         self._send(200 if ok else 409, {"ok": ok, "message": msg})
                     elif action == "cmd":
-                        ok, msg = atv_command(ident, (q.get("c") or [""])[0])
+                        kind = (q.get("kind") or ["appletv"])[0]
+                        cmdname = (q.get("c") or [""])[0]
+                        if kind == "appletv":
+                            ok, msg = atv_command(ident, cmdname)
+                        else:
+                            # For the other makes the identifier is the address,
+                            # and LG needs to know which way to toggle.
+                            playing = (q.get("playing") or ["1"])[0] != "0"
+                            ok, msg = tv_command(ident, cmdname, playing)
                         self._send(200 if ok else 409, {"ok": ok, "message": msg})
                     else:
                         self._send(404, {"ok": False, "error": "unknown action"})
@@ -3307,7 +3817,10 @@ class Daemon:
 
 
 
-def _atv_api(path: str, method: str = "GET", timeout: float = 60.0):
+def _atv_api(path: str, method: str = "GET", timeout: float = 0.0):
+    if not timeout:
+        # Pairing waits on a person, not a machine.
+        timeout = TV_PAIR_TIMEOUT * 2 + 20 if "/pair" in path else 60.0
     """
     Talk to the running daemon rather than to the credential file. The daemon
     owns the store and the open sessions; a second process writing the same file
@@ -3334,6 +3847,12 @@ def _atv_api(path: str, method: str = "GET", timeout: float = 60.0):
             raise RuntimeError(f"HTTP {e.code}")
 
 
+def _looks_like_address(text: str) -> bool:
+    """A dotted quad, so an unknown television can be named by where it is."""
+    parts = (text or "").split(".")
+    return len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
+
+
 def _atv_pick(devices: list, want: str) -> Optional[dict]:
     """Find a television by identifier or by name, however the user typed it."""
     w = (want or "").strip().lower()
@@ -3358,7 +3877,9 @@ def _atv_print(devices: list) -> None:
         return
     for d in devices:
         mark = f"{G}paired{N}" if d.get("paired") else f"{D}not paired{N}"
-        print(f"  {d.get('name', '?'):22} {str(d.get('address', '?')):16} {mark}")
+        kind = d.get("kind", "appletv")
+        print(f"  {d.get('name', '?'):22} {str(d.get('address', '?')):16} "
+              f"{D}{kind:8}{N} {mark}")
         print(f"      {D}{d.get('ident', '')}{N}")
         if d.get("model"):
             print(f"      {D}{d['model']}{N}")
@@ -3385,6 +3906,19 @@ def _atv_cli(args) -> int:
         _atv_print(res.get("devices") or [])
         return 0
 
+    if args.atv_probe:
+        try:
+            res = _atv_api(f"/atv/probe?id={urllib.parse.quote(args.atv_probe)}", "POST")
+        except Exception as e:
+            print(f"failed: {e}")
+            return 1
+        if res.get("ok"):
+            print(f"  {G}{res.get('kind')}{N} — {res.get('name')}")
+            print(f"  {D}pair it with: plexmon --atv-pair {args.atv_probe}{N}")
+            return 0
+        print(f"  {res.get('message')}")
+        return 1
+
     if args.atv_unpair_all:
         try:
             res = _atv_api("/atv/unpair-all", "POST")
@@ -3404,20 +3938,65 @@ def _atv_cli(args) -> int:
             print(f"\n  {D}pair one with: plexmon --atv-pair \"name\"{N}")
         return 0
 
+    if args.atv_key:
+        target, key = args.atv_key
+        try:
+            dev = _atv_pick(devices, target)
+        except RuntimeError as e:
+            print(f"  {e}")
+            return 1
+        addr = (dev or {}).get("address") or (target if _looks_like_address(target) else None)
+        if not addr:
+            print(f"  no television matches {target!r}")
+            return 1
+        try:
+            res = _atv_api(f"/atv/key?id={urllib.parse.quote(addr)}"
+                           f"&k={urllib.parse.quote(key)}", "POST")
+        except Exception as e:
+            print(f"failed: {e}")
+            return 1
+        if res.get("ok"):
+            print(f"  sent {key} to {addr} — did the television do anything?")
+            return 0
+        print(f"  {res.get('message')}")
+        return 1
+
     want = args.atv_pair or args.atv_unpair
     try:
         dev = _atv_pick(devices, want)
     except RuntimeError as e:
         print(f"  {e}")
         return 1
+
+    # An LG or Samsung that has never been paired is in no list yet — only Apple
+    # TVs announce themselves on the network. Given an address, ask what is there.
+    if dev is None and args.atv_pair and _looks_like_address(want):
+        try:
+            res = _atv_api(f"/atv/probe?id={urllib.parse.quote(want)}", "POST")
+        except Exception as e:
+            print(f"  could not reach that address: {e}")
+            return 1
+        if res.get("ok"):
+            dev = {"ident": want, "address": want, "kind": res.get("kind"),
+                   "name": res.get("name") or want, "paired": False}
+        else:
+            print(f"  {res.get('message')}")
+            return 1
+
     if dev is None:
         print(f"  no television matches {want!r}. Known:")
         _atv_print(devices)
+        if args.atv_pair:
+            print(f"\n  {D}an LG or Samsung that has never been paired will not be"
+                  f" listed — give its IP address instead{N}")
         return 1
+
+    kind = dev.get("kind", "appletv")
 
     if args.atv_unpair:
         try:
-            res = _atv_api(f"/atv/unpair?id={urllib.parse.quote(dev['ident'])}", "POST")
+            res = _atv_api(f"/atv/unpair?id={urllib.parse.quote(dev['ident'])}"
+                           f"&kind={kind}", "POST")
         except Exception as e:
             print(f"failed: {e}")
             return 1
@@ -3426,14 +4005,20 @@ def _atv_cli(args) -> int:
 
     # pairing: ask the device for a code, then hand back what the screen shows
     print(f"  pairing with {dev['name']} ({dev['address']})…")
+    if kind != "appletv":
+        print(f"  {D}accept the prompt that appears on the television{N}")
     try:
-        res = _atv_api(f"/atv/pair?id={urllib.parse.quote(dev['ident'])}", "POST")
+        res = _atv_api(f"/atv/pair?id={urllib.parse.quote(dev['ident'])}"
+                       f"&kind={kind}", "POST")
     except Exception as e:
         print(f"failed to start pairing: {e}")
         return 1
     if not res.get("ok"):
         print(f"  {res.get('message')}")
         return 1
+    if res.get("needs_pin") is False:
+        print(f"  {G}paired{N}")
+        return 0
     try:
         pin = input("  enter the PIN shown on the television: ").strip()
     except (EOFError, KeyboardInterrupt):
@@ -3460,13 +4045,20 @@ def main(argv=None) -> int:
     ap.add_argument("--refresh", action="store_true",
                     help="re-read SMART from the disks that are already spinning "
                          "(sleeping disks are left alone — use --wake for those)")
-    tv = ap.add_argument_group("Apple TV remote")
+    tv = ap.add_argument_group("television remote (Apple TV, LG, Samsung)")
     tv.add_argument("--atv", action="store_true",
-                    help="list the televisions found and whether they are paired")
+                    help="list the televisions known and whether they are paired")
     tv.add_argument("--atv-scan", action="store_true",
-                    help="search the network again for televisions")
+                    help="search the network again (finds Apple TVs; LG and "
+                         "Samsung are identified by address instead)")
+    tv.add_argument("--atv-probe", metavar="ADDRESS",
+                    help="ask what kind of television answers at an address")
     tv.add_argument("--atv-pair", metavar="TV",
-                    help="pair with a television, by name or identifier")
+                    help="pair with a television, by name, identifier or — for "
+                         "an LG or Samsung not yet known — its IP address")
+    tv.add_argument("--atv-key", nargs=2, metavar=("TV", "KEY"),
+                    help="send one raw remote key to a Samsung, to find out "
+                         "which code it listens to (e.g. --atv-key Obyvak KEY_FF)")
     tv.add_argument("--atv-unpair", metavar="TV",
                     help="forget the credentials for one television")
     tv.add_argument("--atv-unpair-all", action="store_true",
@@ -3484,8 +4076,8 @@ def main(argv=None) -> int:
     if args.diag:
         return diag()
 
-    if (args.atv or args.atv_scan or args.atv_pair or args.atv_unpair
-            or args.atv_unpair_all):
+    if (args.atv or args.atv_scan or args.atv_probe or args.atv_pair
+            or args.atv_key or args.atv_unpair or args.atv_unpair_all):
         return _atv_cli(args)
 
     if args.refresh:

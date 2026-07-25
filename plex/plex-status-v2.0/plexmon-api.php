@@ -56,8 +56,16 @@ function plexmon_call(string $path, string $method = 'GET',
 }
 
 /** Pass a daemon JSON reply straight through to the browser. */
-function plexmon_relay(string $path, string $method = 'GET', bool $auth = false): void {
-    [$status, $body] = plexmon_call($path, $method, $auth);
+function plexmon_relay(string $path, string $method = 'GET', bool $auth = false,
+                      float $timeout = 8.0): void {
+    // Pairing a television waits on a person, so the caller can ask for longer.
+    // PHP's own execution limit has to be lifted with it, or the script is cut
+    // off while the daemon is still waiting.
+    if ($timeout > 25.0) {
+        @set_time_limit((int) ceil($timeout) + 30);
+        @ini_set('default_socket_timeout', (string) ((int) ceil($timeout) + 10));
+    }
+    [$status, $body] = plexmon_call($path, $method, $auth, $timeout);
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store');
     if ($status === 0) {
