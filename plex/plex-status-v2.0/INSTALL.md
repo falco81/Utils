@@ -82,6 +82,7 @@ python3 plexmon.py            # the daemon (what systemd runs)
 python3 plexmon.py --check    # self-check against a running daemon
 python3 plexmon.py --diag     # probe the API + show disk state
 python3 plexmon.py --wake     # tell the RUNNING daemon to wake the disks + refresh SMART
+python3 plexmon.py --refresh  # re-read SMART from disks already spinning (wakes nothing)
 python3 plexmon.py --oneshot  # one collection without the service, print a summary, exit
 python3 plexmon.py --oneshot --wake   # …forcing a SMART read
 python3 plexmon.py -v         # add debug logging
@@ -146,6 +147,7 @@ none of them wakes a disk by accident.
 | `bridge-test.sh` | Which disks share a USB bridge, and does waking one wake the rest? `--test` runs the experiment with a control measurement. |
 | `nvme-check.sh` | Dumps every SMART field the NVMe exposes and compares it against what the daemon parsed, flagging anything missed. |
 | `diag-art.sh` | Traces the now-playing poster from the Plex API to the file the page serves. |
+| `hist-check.py` | Why a chart looks wrong: reports the keys the history is stored under, how much of each series is actually filled, and any gaps in the recording. |
 
 ## The no-wake guarantee
 

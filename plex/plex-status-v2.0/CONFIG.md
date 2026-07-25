@@ -79,7 +79,13 @@ a navíc disk probudí. `wake_standby` ruší hlavní záruku celého démona.
 | `smart_daily_at` | `4` | hodina, kdy jednou denně přečíst SMART ze všech disků |
 
 Bdělý disk se nečte při každém průchodu — hodnoty se mění v řádu minut a každé
-čtení spouští `smartctl`. Wake tlačítko a denní průchod tento odstup ignorují.
+čtení spouští `smartctl`. Tento odstup ignoruje wake tlačítko, denní průchod
+a příkaz `plexmon --refresh`.
+
+Do historie se zapisují **jen čerstvé odečty ze SMART**. Když disk spí, zůstane
+v grafu mezera: zapsat místo toho poslední známou hodnotu by znamenalo tvrdit
+něco, co jsme nezměřili, a všechna roztočení nasbíraná za dobu spánku by se pak
+připsala k pěti minutám mezi dvěma vzorky.
 
 ## Kadence sběru
 
