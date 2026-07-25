@@ -70,16 +70,12 @@ if (isset($_GET['wakecheck'])) {
 }
 
 // Full-resolution history for panning, straight from the daemon's file.
-if (isset($_GET['series']) && $_GET['series'] === 'full') {
-    $full = __DIR__ . '/history-full.json';
-    if (is_readable($full)) {
-        header('Content-Type: application/json; charset=utf-8');
-        header('Cache-Control: no-store');
-        readfile($full);
-        exit;
-    }
-    // fall through to building it from data.json below
-}
+// NOTE: ?series=full is NOT served by handing over history-full.json as-is.
+// The browser expects {t, charts} — the timestamps together with rebuilt chart
+// definitions. Returning the raw history gave it new timestamps while the chart
+// data arrays stayed at their down-sampled length, so everything past the old
+// end simply vanished. The full response is built further down, from the same
+// code that builds the embedded charts.
 
 // The daemon writes data.json into this directory; the whole page renders from
 // it. (The dynamic endpoints above are the only things that talk to the daemon
@@ -369,21 +365,31 @@ if ($wantFull) {
  * policy costs the drive. Readings are sparse (a sleeping disk isn't polled),
  * so each rate is derived from the gap to the previous real reading.
  */
-function rate_per_day(array $times, array $counts): array {
+function rate_per_day(array $times, array $counts, int $window = 3600,
+                     int $minWin = 1800): array {
+    // A per-day figure from a counter that ticks a handful of times a day has to
+    // be averaged over a decent stretch, or it turns into noise: one spin-up
+    // inside a five-minute sample extrapolates to 288 a day. So each reading is
+    // compared against the oldest reading still inside a trailing window, which
+    // gives a rolling average rather than an instantaneous guess.
     $out = array_fill(0, count($counts), null);
-    $prev = null;
-    foreach ($counts as $i => $v) {
-        if ($v === null || !isset($times[$i])) continue;
-        if ($prev !== null) {
-            $dt = $times[$i] - $times[$prev];
-            $dv = $v - $counts[$prev];
-            // negative means the counter reset or the disk was swapped: skip it
-            if ($dt >= 600 && $dv >= 0) $out[$i] = round($dv / $dt * 86400, 1);
+    $pts = [];
+    foreach ($counts as $i => $v) if ($v !== null && isset($times[$i])) $pts[] = $i;
+    foreach ($pts as $pi => $i) {
+        $j = null;
+        for ($k = $pi - 1; $k >= 0; $k--) {
+            if ($times[$i] - $times[$pts[$k]] <= $window) $j = $pts[$k];
+            else break;
         }
-        $prev = $i;
+        if ($j === null) continue;
+        $dt = $times[$i] - $times[$j];
+        $dv = $counts[$i] - $counts[$j];
+        // negative means the counter reset or the disk was swapped: skip it
+        if ($dt >= $minWin && $dv >= 0) $out[$i] = round($dv / $dt * 86400, 1);
     }
     return $out;
 }
+
 
 /** Least-squares slope per day; used to project when a disk fills up. */
 function trend_per_day(array $times, array $vals): ?float {
@@ -1386,7 +1392,25 @@ function trend_per_day(array $times, array $vals): ?float {
     if (max - min < 0.001) max = min + 1;
 
     var n = times.length;
-    var X = function (i) { return padL + (i / (n - 1)) * (W - padL - padR); };
+    // Position points by TIME, not by their position in the array. With an
+    // index-based axis an outage collapses to a single step and silently
+    // stretches everything around it — an eight-hour gap made the rest of the
+    // day look like it was missing. By time, a gap is simply a gap.
+    // Span the axis over the window the user asked for, not merely over the
+    // samples that happen to fall inside it — otherwise zooming into a period
+    // with an outage silently stretches the little data there is across the
+    // whole width. With no zoom ("All") the data's own extent is the window.
+    var tA = rangeH > 0 ? from : times[0];
+    var tB = rangeH > 0 ? to : times[n - 1];
+    if (!(tB > tA)) { tA = times[0]; tB = times[n - 1]; }
+    var tSpan = (tB - tA) || 1;
+    var X = function (i) { return padL + ((times[i] - tA) / tSpan) * (W - padL - padR); };
+    // Typical spacing, so an interruption can be told apart from normal cadence.
+    var stepGaps = [];
+    for (var gi = 1; gi < n; gi++) stepGaps.push(times[gi] - times[gi - 1]);
+    stepGaps.sort(function (a, b) { return a - b; });
+    var medGap = stepGaps.length ? stepGaps[Math.floor(stepGaps.length / 2)] : 0;
+    var gapLimit = Math.max(medGap * 3, 60);
     var Y = function (v) { return padT + (1 - ((v - min) / (max - min))) * (H - padT - padB); };
 
     var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">';
@@ -1405,10 +1429,14 @@ function trend_per_day(array $times, array $vals): ?float {
            + b.color + '" opacity=".85">' + b.label + '</text>';
     });
     var span = times[n - 1] - times[0];
-    [0, Math.floor((n - 1) / 2), n - 1].forEach(function (i) {
-      var a = i === 0 ? 'start' : (i === n - 1 ? 'end' : 'middle');
-      svg += '<text x="' + X(i).toFixed(1) + '" y="' + (H - 7) + '" text-anchor="' + a
-           + '" font-size="12" fill="#5b6472">' + fmtTime(times[i], span) + '</text>';
+    // Labels at fixed fractions of the time axis, so they read evenly even when
+    // the samples themselves are unevenly spaced.
+    [0, 0.5, 1].forEach(function (f) {
+      var at = tA + f * tSpan;
+      var x = padL + f * (W - padL - padR);
+      var a = f === 0 ? 'start' : (f === 1 ? 'end' : 'middle');
+      svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 7) + '" text-anchor="' + a
+           + '" font-size="12" fill="#5b6472">' + fmtTime(at, span) + '</text>';
     });
 
     series.forEach(function (s) {
@@ -1421,6 +1449,9 @@ function trend_per_day(array $times, array $vals): ?float {
       };
       s.data.forEach(function (v, i) {
         if (v === null || v === undefined) { flush(); return; }
+        // Don't draw through a period we have no readings for: a straight line
+        // across it would claim continuity we never measured.
+        if (i > 0 && times[i] - times[i - 1] > gapLimit) flush();
         seg.push(X(i).toFixed(1) + ',' + Y(+v).toFixed(1));
       });
       flush();
@@ -1448,8 +1479,15 @@ function trend_per_day(array $times, array $vals): ?float {
       var r = el.getBoundingClientRect();
       var cx = (ev.touches ? ev.touches[0].clientX : ev.clientX) - r.left;
       var rel = (cx / r.width) * W;
-      var i = Math.round(((rel - padL) / (W - padL - padR)) * (n - 1));
-      if (i < 0) i = 0; if (i > n - 1) i = n - 1;
+      // Which sample is nearest the cursor in time (the axis is time-based,
+      // so the array position no longer maps to the x coordinate).
+      var frac = (rel - padL) / (W - padL - padR);
+      if (frac < 0) frac = 0; if (frac > 1) frac = 1;
+      var want = tA + frac * tSpan, i = 0, bestD = Infinity;
+      for (var k = 0; k < n; k++) {
+        var dd = Math.abs(times[k] - want);
+        if (dd < bestD) { bestD = dd; i = k; }
+      }
       cross.setAttribute('x1', X(i)); cross.setAttribute('x2', X(i)); cross.setAttribute('opacity', '.5');
       var html = '<div class="ct">' + fmtTime(times[i], span) + '</div>';
       var any = false;

@@ -264,13 +264,44 @@ def log(msg: str, *, level: str = "info") -> None:
 
 
 def run(cmd: list[str], timeout: float = 10.0) -> str:
-    """Run a command, return stdout, never raise. Empty string on any failure."""
+    """
+    Run a command, return stdout, never raise, and never block past the timeout.
+
+    subprocess.run(timeout=...) is not safe here. On timeout it kills the child
+    and then *waits* for it — and a smartctl stuck on a wedged USB bridge sits in
+    uninterruptible sleep, where SIGKILL does nothing and the wait never returns.
+    That hung the collection thread indefinitely: it held the collection lock, so
+    every later poll skipped, and the daemon quietly stopped recording history
+    until someone restarted it. Here the child is killed and abandoned; a reaper
+    thread collects it whenever the kernel finally lets go, so no zombie is left
+    behind and the caller always gets its timeout honoured.
+    """
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.stdout
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL, text=True)
+    except (FileNotFoundError, OSError) as e:
         log(f"run {cmd[0]} failed: {e}", level="debug")
         return ""
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return out or ""
+    except subprocess.TimeoutExpired:
+        log(f"{cmd[0]} did not answer in {timeout}s — abandoning it "
+            f"(device may be wedged)")
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        threading.Thread(target=_reap, args=(proc,), daemon=True).start()
+        return ""
+
+
+def _reap(proc) -> None:
+    """Wait on an abandoned child so it doesn't linger as a zombie."""
+    try:
+        proc.wait()
+    except Exception:
+        pass
 
 
 def write_bytes_atomic(path: Path, data: bytes, *, mode: int = 0o644) -> bool:
@@ -1844,14 +1875,16 @@ def record(samples: list[dict], disks: list[dict], system: dict,
             d.get("temp"),
             d.get("fs_pct"),
             d.get("fs_used_b"),
-            # Start_Stop_Count and Load_Cycle_Count are cumulative and don't move
-            # while the disk sleeps, so the cached value is still correct — record
-            # it even from cache so the per-hour / per-day spin-up figures have
-            # data to work with instead of showing "—".
-            d.get("start_stop"),
-            d.get("load_cycle"),
-            # Throughput totals, by contrast, would draw a false flat line from a
-            # stale cache, so those stay fresh-only.
+            # Only ever record counters we have just read from the drive. A
+            # cached value is a real number but attached to the wrong moment: it
+            # repeats unchanged while the disk sleeps, and then the next genuine
+            # reading appears to jump by everything that accumulated meanwhile.
+            # A rate computed across that pair blames hours of spin-ups on the
+            # five minutes between two samples, which is where the absurd spikes
+            # came from. Gaps while a disk sleeps are the honest answer: we did
+            # not measure, so we do not claim.
+            None if d.get("from_cache") else d.get("start_stop"),
+            None if d.get("from_cache") else d.get("load_cycle"),
             None if d.get("from_cache") else (d.get("lba_written") or d.get("nvme_written")),
             None if d.get("from_cache") else (d.get("lba_read") or d.get("nvme_read")),
             None if d.get("from_cache") else d.get("crc_err"),
@@ -2147,6 +2180,8 @@ class Daemon:
         self._wake_deadline = 0.0             # forced-SMART requested until this time
         self._spinning_up = False             # a wake is currently spinning disks up
         self._wake_passes = 0                 # forced passes made in this wake window
+        self._tick_started = 0.0              # when the running collection began
+        self._stall_logged = 0.0              # last time a stall was reported
         self._last_slow = 0.0
         self._last_daily = 0.0
         self._plex_token = None
@@ -2225,11 +2260,26 @@ class Daemon:
             self.tick_lock.acquire()
         else:
             if not self.tick_lock.acquire(blocking=False):
+                # Normal for a moment. But if a collection drags on, nothing is
+                # being recorded — say so, rather than going quiet the way an
+                # eight-hour stall once did until someone looked at the charts.
+                started = self._tick_started
+                if started and time.time() - started > 300 \
+                        and time.time() - self._stall_logged > 300:
+                    self._stall_logged = time.time()
+                    log(f"a collection has been running for "
+                        f"{int(time.time() - started)}s — polls are being "
+                        f"skipped and no history is being recorded")
                 return
+        self._tick_started = time.time()
         try:
             self._tick_locked(force_smart=force_smart)
         finally:
+            took = time.time() - self._tick_started
+            self._tick_started = 0.0
             self.tick_lock.release()
+            if took > 60:
+                log(f"collection took {int(took)}s")
 
     def _tick_locked(self, *, force_smart: bool) -> None:
         now = time.time()
