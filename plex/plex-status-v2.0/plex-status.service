@@ -1,0 +1,29 @@
+[Unit]
+Description=Plex status monitoring daemon (SMART, temps, now-playing, API)
+After=network.target plexmediaserver.service
+Wants=plexmediaserver.service
+
+[Service]
+Type=simple
+# Runs as root: reading SMART needs it, and so does spinning a disk up on
+# request. The API is bound to 127.0.0.1 and privileged calls require a token,
+# so nothing on the network — and no unprivileged local process without the
+# token — can drive it.
+ExecStart=/usr/bin/python3 /usr/local/lib/plexmon/plexmon.py
+Restart=on-failure
+RestartSec=5
+
+# Deliberately light: a 10s memory-only loop, heavier work only every 5 min.
+# This cap is a backstop it should never approach.
+CPUQuota=25%
+MemoryMax=200M
+Nice=5
+IOSchedulingClass=idle
+
+ProtectSystem=full
+ReadWritePaths=/var/www/html/smart /var/lib/plex-status /run/plex-status
+RuntimeDirectory=plex-status
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target
