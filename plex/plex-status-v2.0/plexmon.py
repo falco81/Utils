@@ -2248,7 +2248,8 @@ class Daemon:
             elapsed = time.time() - start
             time.sleep(max(1.0, FAST_INTERVAL - elapsed))
 
-    def _tick(self, *, force_smart: bool, wait: bool = False) -> None:
+    def _tick(self, *, force_smart: bool, wait: bool = False,
+              refresh: bool = False) -> None:
         # Only one collection at a time. The fast loop and a wake-triggered tick
         # both call this; running two smartctl sweeps at once would race on the
         # cache. A routine tick skips if one is already running (the running one
@@ -2273,7 +2274,7 @@ class Daemon:
                 return
         self._tick_started = time.time()
         try:
-            self._tick_locked(force_smart=force_smart)
+            self._tick_locked(force_smart=force_smart, refresh=refresh)
         finally:
             took = time.time() - self._tick_started
             self._tick_started = 0.0
@@ -2281,7 +2282,7 @@ class Daemon:
             if took > 60:
                 log(f"collection took {int(took)}s")
 
-    def _tick_locked(self, *, force_smart: bool) -> None:
+    def _tick_locked(self, *, force_smart: bool, refresh: bool = False) -> None:
         now = time.time()
         tok = self._get_plex_token()
 
@@ -2311,8 +2312,10 @@ class Daemon:
         # Is this the pass that records a history sample? Decide before
         # collecting, so the SMART read can be aligned with it.
         do_slow = force or (now - self._last_slow >= SLOW_INTERVAL)
+        # `refresh` bypasses the read throttle but not the sleep rule: disks that
+        # are already turning get re-read now, sleeping ones are left alone.
         disks = self.mon.collect(force=force, read_smart=read_smart,
-                                 align_smart=do_slow)
+                                 align_smart=do_slow or refresh)
 
         # While a wake is spinning the platters up, say so. Without this the
         # disks keep reporting the standby they were in when the request came
@@ -2664,9 +2667,16 @@ class Daemon:
                 if path == "/wake":
                     self._send(200, daemon.request_wake())
                 elif path == "/smart":
-                    threading.Thread(target=lambda: daemon._tick(force_smart=True),
-                                     daemon=True).start()
-                    self._send(200, {"ok": True})
+                    # Refresh, not wake: re-read SMART from every disk that is
+                    # already spinning, and leave the sleeping ones asleep. Use
+                    # /wake when you want them spun up first.
+                    threading.Thread(
+                        target=lambda: daemon._tick(force_smart=False, refresh=True),
+                        daemon=True).start()
+                    with daemon.lock:
+                        awake = [d.get("dev") for d in daemon.snapshot.get("disks", [])
+                                 if d.get("power") == "active"]
+                    self._send(200, {"ok": True, "refreshing": awake})
                 else:
                     self._send(404, {"error": "not found"})
 
@@ -2693,6 +2703,9 @@ def main(argv=None) -> int:
     ap.add_argument("--wake", action="store_true",
                     help="tell the running daemon to wake the disks and refresh SMART "
                          "(or, with --oneshot, force a SMART read in the one-off run)")
+    ap.add_argument("--refresh", action="store_true",
+                    help="re-read SMART from the disks that are already spinning "
+                         "(sleeping disks are left alone — use --wake for those)")
     ap.add_argument("--check", action="store_true",
                     help="self-check the whole chain against a running daemon")
     ap.add_argument("--diag", action="store_true",
@@ -2704,6 +2717,22 @@ def main(argv=None) -> int:
         return check()
     if args.diag:
         return diag()
+
+    if args.refresh:
+        try:
+            tok = TOKEN_FILE.read_text().strip()
+        except OSError:
+            print("no API token — is the daemon running?")
+            return 1
+        req = urllib.request.Request(
+            f"http://{API_HOST}:{API_PORT}/smart", method="POST", data=b"")
+        req.add_header("X-Plexmon-Token", tok)
+        try:
+            print(urllib.request.urlopen(req, timeout=8).read().decode())
+            return 0
+        except Exception as e:
+            print(f"could not reach the daemon: {e}")
+            return 1
 
     # Standalone --wake (without --oneshot): ask the running daemon to wake the
     # disks over its API, using the token, rather than starting a second daemon.
