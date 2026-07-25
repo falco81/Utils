@@ -135,6 +135,106 @@ uprav ho i nahoře v `plexmon-api.php`.
 | `plex_url` | `"http://127.0.0.1:32400"` | Plex Media Server |
 | `plex_prefs` | cesta k `Preferences.xml` | odsud se čte token |
 
+## Ovládání Apple TV
+
+| volba | výchozí | význam |
+|---|---|---|
+| `atv_enable` | `false` | zapne ovládání přehrávání na Apple TV |
+| `atv_remote` | `""` | cesta k `atvremote`; prázdné = najde si ho sám |
+| `atv_storage` | `/var/lib/plex-status/atv-creds.json` | kam se ukládají údaje z párování |
+
+Plex vlastní Apple TV aplikaci ovládat neumí — klient se serveru jako
+ovladatelný nehlásí a `/clients` vrací prázdno. Démon proto mluví s televizí
+přímo Applovým protokolem Companion přes knihovnu [pyatv](https://pyatv.dev).
+
+### Jak to funguje uvnitř
+
+Příkazy jdou přes spojení, které démon **drží otevřené**. Navázání šifrovaného
+sezení trvá tři až pět sekund, takže kdyby se dělalo při každém stisku, tlačítko
+pauzy by reagovalo za pět sekund a bylo by k ničemu. Spojení se otevře na pozadí,
+jakmile se objeví přehrávání na spárované televizi, takže i první stisk je
+okamžitý — pod deset milisekund.
+
+Když spojení spadne (televize usnula, změnila adresu), démon se jednou pokusí
+připojit znovu. Kdyby ani to nevyšlo, sáhne po `atvremote` jako po záloze:
+pomalejší, řádově sekundy, ale tlačítka fungují dál.
+
+Kvůli tomu **démon pyatv importuje** — jinak by rychlé spojení nešlo. Import je
+odložený na první použití, běží na pozadí a je ošetřený: když knihovna chybí
+nebo se nenačte, ovládání se samo vypne a hlídání disků tím není dotčené. Je to
+ale slabší záruka než u zbytku démona, který vystačí se standardní knihovnou.
+
+### Instalace
+
+pyatv potřebuje **Python 3.10 nebo novější** — pro starší nejsou hotové balíčky
+a `miniaudio` by se muselo kompilovat. Zároveň musí být dostupný tomu Pythonu,
+pod kterým běží démon:
+
+```bash
+dnf install -y python3.12
+python3.12 -m pip install pyatv
+```
+
+Pokud démon dosud běžel pod systémovým Pythonem, přepni ho v unit souboru:
+
+```ini
+ExecStart=/usr/bin/python3.12 /usr/local/lib/plexmon/plexmon.py
+```
+
+Do systémového Pythonu spravovaného RPM pyatv **neinstaluj** — `pip` se pokusí
+přepsat balíčky patřící `dnf` a skončí chybou.
+
+### Limity služby
+
+S načteným pyatv sedí démon kolem 90–110 MB, a kdyby k tomu spustil `atvremote`
+jako zálohu, dalších 80 MB. Výchozí strop 200 MB je na to málo:
+
+```ini
+# /etc/systemd/system/plex-status.service.d/atv.conf
+[Service]
+MemoryMax=400M
+CPUQuota=60%
+```
+
+Podle spotřeby se dá poznat, která cesta zrovna jede:
+
+```bash
+systemctl show plex-status.service -p MemoryCurrent
+```
+
+Pod 30 MB znamená, že pyatv ještě není načtený a jelo by se pomalou cestou;
+kolem 90–110 MB je rychlé spojení aktivní.
+
+### Používání
+
+Zapni `atv_enable`, restartuj démona a v panelu Now Playing se u přehrávajícího
+streamu objeví tlačítko **Pair this TV**. Na obrazovce se ukáže čtyřmístný kód,
+který zadáš do okna na stránce. Pak se z tlačítka stanou ovládací prvky: zpět
+10 s, přehrát/pauza, vpřed 10 s. Skoky používají vlastní krok Plexu.
+
+Totéž jde z příkazové řádky:
+
+```bash
+plexmon --atv                 # co je vidět a co je spárované
+plexmon --atv-scan            # projít síť znovu
+plexmon --atv-pair "Ložnice"  # spárovat, zeptá se na PIN
+plexmon --atv-unpair "Ložnice"
+plexmon --atv-unpair-all
+```
+
+Stream se s televizí páruje podle **IP adresy**, kterou Plex u přehrávače
+hlásí — ne podle názvu, který nemusí být jedinečný.
+
+V pravém horním rohu karty je tlumený odkaz **unpair** (první klik se zeptá,
+druhý provede). Zruší to jen *náš* přístup — televize si server dál vede mezi
+spárovanými ovladači a odebrat ho tam jde jen v nastavení tvOS.
+
+Když něco nefunguje, důvod je v logu:
+
+```bash
+journalctl -u plex-status.service -f | grep -i "apple tv"
+```
+
 ## Cesty
 
 | volba | výchozí | význam |
@@ -186,7 +286,9 @@ neuvedeš, si podrží výchozí hodnotu.
   "perf_proxy_url": "https://plex.falco81.net",
 
   "api_host": "127.0.0.1",
-  "api_port": 9847
+  "api_port": 9847,
+
+  "atv_enable": false
 }
 ```
 
@@ -226,6 +328,10 @@ Ber ji spíš jako referenci než jako soubor k nasazení.
 
   "plex_url": "http://127.0.0.1:32400",
   "plex_prefs": "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Preferences.xml",
+
+  "atv_enable": false,
+  "atv_remote": "",
+  "atv_storage": "/var/lib/plex-status/atv-creds.json",
 
   "smartctl": "/usr/sbin/smartctl",
   "hdparm": "/usr/sbin/hdparm",

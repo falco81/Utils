@@ -83,6 +83,13 @@ python3 plexmon.py --check    # self-check against a running daemon
 python3 plexmon.py --diag     # probe the API + show disk state
 python3 plexmon.py --wake     # tell the RUNNING daemon to wake the disks + refresh SMART
 python3 plexmon.py --refresh  # re-read SMART from disks already spinning (wakes nothing)
+
+# Apple TV remote (needs atv_enable in config.json)
+plexmon --atv                 # which televisions are known, and which are paired
+plexmon --atv-scan            # search the network again
+plexmon --atv-pair "Ložnice"  # pair — asks for the PIN the television shows
+plexmon --atv-unpair "Ložnice"
+plexmon --atv-unpair-all
 python3 plexmon.py --oneshot  # one collection without the service, print a summary, exit
 python3 plexmon.py --oneshot --wake   # …forcing a SMART read
 python3 plexmon.py -v         # add debug logging
@@ -148,6 +155,28 @@ none of them wakes a disk by accident.
 | `nvme-check.sh` | Dumps every SMART field the NVMe exposes and compares it against what the daemon parsed, flagging anything missed. |
 | `diag-art.sh` | Traces the now-playing poster from the Plex API to the file the page serves. |
 | `hist-check.py` | Why a chart looks wrong: reports the keys the history is stored under, how much of each series is actually filled, and any gaps in the recording. |
+
+## Apple TV remote
+
+Optional playback control for Apple TV clients, off by default. Plex cannot do
+this itself — its Apple TV app advertises no remote-control capability — so the
+daemon speaks Apple's Companion protocol directly, over a connection it keeps
+open so a press lands in milliseconds rather than seconds.
+
+It needs [pyatv](https://pyatv.dev) available to the interpreter running the
+daemon, which in turn needs Python 3.10 or newer, and a more generous memory
+limit than the monitoring alone requires. **`CONFIG.md` has the full setup**;
+the short version:
+
+```bash
+dnf install -y python3.12 && python3.12 -m pip install pyatv
+# ExecStart=/usr/bin/python3.12 /usr/local/lib/plexmon/plexmon.py
+echo '{"atv_enable": true}' >> /etc/plex-status/config.json   # merge, one object
+plexmon --atv-pair "living room"
+```
+
+If pyatv is missing or fails to load, remote control switches itself off and
+disk monitoring carries on untouched.
 
 ## The no-wake guarantee
 

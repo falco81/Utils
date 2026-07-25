@@ -58,6 +58,25 @@ if (isset($_GET['art'])) {
     exit;
 }
 
+// Apple TV remote: relayed to the daemon, which owns the pyatv credentials.
+// The page never holds them, and the token guards every action just as it does
+// for waking disks.
+if (isset($_GET['atv'])) {
+    $action = (string) $_GET['atv'];
+    if (!in_array($action, ['cmd', 'pair', 'pin', 'rescan', 'unpair'], true)) {
+        http_response_code(400);
+        header('Content-Type: application/json');
+        echo json_encode(['ok' => false, 'message' => 'unknown action']);
+        exit;
+    }
+    $q = [];
+    foreach (['id', 'c', 'pin'] as $k) {
+        if (isset($_GET[$k])) $q[$k] = (string) $_GET[$k];
+    }
+    plexmon_relay('/atv/' . $action . ($q ? '?' . http_build_query($q) : ''), 'POST', true);
+    exit;
+}
+
 // Wake all disks — handed straight to the daemon, which owns the probe files and
 // the SMART refresh. No sudo, no shell_exec, no privileges on the web side.
 if (isset($_GET['wake'])) {
@@ -587,6 +606,74 @@ function trend_per_day(array $times, array $vals): ?float {
      letterbox against — whatever Plex hands us is shown whole.
      align-self keeps flexbox from stretching the frame to the card's height,
      which would show its background as bands above and below the image. */
+  /* PIN dialog for pairing an Apple TV */
+  .pinmask{position:fixed;inset:0;background:rgba(6,9,14,.72);backdrop-filter:blur(3px);
+           display:flex;align-items:center;justify-content:center;z-index:90;
+           opacity:0;pointer-events:none;transition:opacity .16s ease}
+  .pinmask.on{opacity:1;pointer-events:auto}
+  .pinbox{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+          padding:26px 30px 22px;width:min(92vw,380px);text-align:center;
+          box-shadow:0 18px 50px rgba(0,0,0,.55);transform:translateY(8px);
+          transition:transform .16s ease}
+  .pinmask.on .pinbox{transform:none}
+  .pinbox h3{margin:0 0 4px;font-size:16px;font-weight:600;color:var(--tx)}
+  .pinbox .pinsub{font-size:12.5px;color:var(--tx-dim);margin-bottom:18px;line-height:1.45}
+  .pindigits{display:flex;gap:10px;justify-content:center;margin-bottom:16px}
+  .pindigits input{width:52px;height:62px;text-align:center;font-size:26px;font-weight:600;
+                   color:var(--tx);background:var(--panel2);border:1px solid var(--line);
+                   border-radius:10px;outline:none;transition:border-color .12s,box-shadow .12s;
+                   -moz-appearance:textfield}
+  .pindigits input::-webkit-outer-spin-button,
+  .pindigits input::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+  .pindigits input:focus{border-color:var(--info);box-shadow:0 0 0 3px var(--info-bg)}
+  .pindigits input.filled{border-color:#3a4250}
+  .pinerr{font-size:12.5px;color:var(--crit);min-height:17px;margin-bottom:12px}
+  .pinacts{display:flex;gap:10px;justify-content:center}
+  .pinacts button{border-radius:8px;padding:8px 18px;font-size:13px;cursor:pointer;
+                  border:1px solid var(--line);background:var(--panel2);color:var(--tx)}
+  .pinacts button.go{background:var(--info-bg);border-color:rgba(88,166,255,.4);color:var(--info)}
+  .pinacts button:disabled{opacity:.5;cursor:default}
+
+  /* Bottom of a now-playing card: stream details on the left, the remote on
+     the right, where there is room for buttons big enough to hit. */
+  /* The rule belongs to the whole footer, not to the details block — hung off
+     .rows it stopped where the text stopped and looked snapped off. */
+  .npfoot{display:flex;align-items:flex-start;gap:24px;margin-top:10px;
+          padding-top:9px;border-top:1px solid var(--line)}
+  /* Higher specificity on purpose: the generic .np .rows rule sits further down
+     the sheet and would otherwise win, putting its own short rule back and
+     leaving two lines stacked above the stream details. */
+  .np .npfoot > .rows{flex:0 1 auto;min-width:0;margin-top:0;padding-top:0;
+                      border-top:none}
+  /* Takes the space left over and centres in it, so the remote sits toward the
+     middle of the card rather than pinned against the right edge. */
+  .atv{display:flex;flex-direction:column;align-items:center;gap:8px;
+       flex:1 1 auto;padding-top:2px}
+  .atvrow{display:flex;align-items:center;gap:10px}
+  .atvname{font-size:12px;color:var(--tx-mut)}
+  .atvbtn{background:var(--panel2);color:var(--tx);border:1px solid var(--line);
+          border-radius:11px;width:52px;height:44px;font-size:20px;line-height:1;
+          cursor:pointer;display:inline-flex;align-items:center;justify-content:center;
+          transition:border-color .12s,color .12s,background .12s}
+  .atvbtn:hover:not(:disabled){border-color:var(--info);color:var(--info);
+                               background:var(--info-bg)}
+  .atvbtn:active:not(:disabled){transform:translateY(1px)}
+  .atvbtn:disabled{opacity:.45;cursor:default}
+  .atvbtn.big{width:62px;height:44px;font-size:23px}
+  .atvbtn.pair{width:auto;height:34px;padding:0 14px;font-size:12.5px}
+  @media (max-width:780px){
+    .npfoot{flex-direction:column;gap:14px}
+    .atv{margin-left:0;align-items:flex-start}
+  }
+  .atvmsg{font-size:12px;color:var(--tx-mut)}
+  .np{position:relative}
+  .atvunpair{position:absolute;top:9px;right:12px;z-index:2;
+             font-size:10.5px;letter-spacing:.02em;color:var(--tx-mut);
+             text-decoration:none;opacity:.25;padding:2px 6px;border-radius:5px;
+             transition:opacity .14s,color .14s,background .14s}
+  .atvunpair:hover{opacity:1;color:var(--crit);background:var(--crit-bg)}
+  .atvunpair.arm{opacity:1;color:var(--crit);background:var(--crit-bg)}
+  .atvmsg.bad{color:var(--crit)}
   .np .art{width:132px;flex:0 0 auto;align-self:flex-start;
     border-radius:8px;overflow:hidden;background:var(--panel2)}
   .np .art img{width:100%;height:auto;display:block}
@@ -1573,9 +1660,14 @@ function trend_per_day(array $times, array $vals): ?float {
   var npSig = null;
   function npSignature() {
     return JSON.stringify(NP.map(function (s) {
-      return [s.show, s.title, s.season, s.episode, s.state, s.user, s.product, s.player,
+      // Deliberately without s.state: it changes on every play and pause, and a
+      // rebuild would tear out the transport buttons under the user's finger —
+      // clicks landing mid-rebuild vanished, and a re-enabled fresh button let
+      // the next click fire the command twice. The badge is synced in place.
+      return [s.show, s.title, s.season, s.episode, s.user, s.product, s.player,
               s.video, s.video_dec, s.audio, s.audio_dec, s.subs, s.subs_dec,
-              s.volume, s.bandwidth, s.duration_ms, s.art, s.thumb];
+              s.volume, s.bandwidth, s.duration_ms, s.art, s.thumb,
+              s.atv ? s.atv.ident + ':' + (s.atv.paired ? 1 : 0) : ''];
     }));
   }
 
@@ -1594,6 +1686,13 @@ function trend_per_day(array $times, array $vals): ?float {
       if (bar) bar.style.width = (dur ? off / dur * 100 : 0).toFixed(2) + '%';
       var t = card.querySelector('.times span');
       if (t) t.textContent = hms(off);
+      // Keep the playing/paused badge current without touching anything else.
+      var st = card.querySelector('.who .st');
+      var want = (s.state || '?');
+      if (st && st.textContent !== want) {
+        st.textContent = want;
+        st.className = 'st ' + want.toLowerCase();
+      }
     });
   }
 
@@ -1643,7 +1742,12 @@ function trend_per_day(array $times, array $vals): ?float {
       if (s.volume) rows += '<div class="rk">Reading from</div><div class="rv vol">' + esc(s.volume) + '</div>';
 
       var st = (s.state || '').toLowerCase();
-      return '<div class="card np">' +
+      // Tucked into the corner of the card, well away from the transport
+      // buttons: forgetting a pairing should take deliberate aim.
+      var unpair = (s.atv && s.atv.paired)
+        ? '<a href="#" class="atvunpair" data-atv-unpair="' + esc(s.atv.ident) + '" ' +
+          'title="forget the credentials stored for this TV">unpair</a>' : '';
+      return '<div class="card np">' + unpair +
         '<div class="art">' + art(s) + '</div>' +
         '<div class="meta">' +
           '<div class="t1">' + esc(head) + '</div>' +
@@ -1657,10 +1761,238 @@ function trend_per_day(array $times, array $vals): ?float {
             (s.bandwidth ? '<span>' + (s.bandwidth / 1000).toFixed(1) + ' Mbps' +
                            (s.local ? ' local' : ' remote') + '</span>' : '') +
           '</div>' +
-          (rows ? '<div class="rows">' + rows + '</div>' : '') +
+          '<div class="npfoot">' +
+            (rows ? '<div class="rows">' + rows + '</div>' : '<div></div>') +
+            atvControls(s) +
+          '</div>' +
         '</div></div>';
     }).join('');
   }
+
+  // ---- PIN dialog -------------------------------------------------------
+  // Four boxes rather than one field: the code on the television is four digits
+  // and typing it should feel like the device asked for it, not like a browser
+  // alert. Returns a promise for the code, or null if the user backs out.
+  var pinDlg = null;
+  function askPin(deviceName) {
+    if (!pinDlg) {
+      pinDlg = document.createElement('div');
+      pinDlg.className = 'pinmask';
+      pinDlg.innerHTML =
+        '<div class="pinbox" role="dialog" aria-modal="true">' +
+          '<h3>Pair with <span class="pinname"></span></h3>' +
+          '<div class="pinsub">Type the four-digit code shown on the television.</div>' +
+          '<div class="pindigits">' +
+            '<input type="text" inputmode="numeric" maxlength="1" autocomplete="off">' +
+            '<input type="text" inputmode="numeric" maxlength="1" autocomplete="off">' +
+            '<input type="text" inputmode="numeric" maxlength="1" autocomplete="off">' +
+            '<input type="text" inputmode="numeric" maxlength="1" autocomplete="off">' +
+          '</div>' +
+          '<div class="pinerr"></div>' +
+          '<div class="pinacts">' +
+            '<button type="button" class="cancel">Cancel</button>' +
+            '<button type="button" class="go" disabled>Pair</button>' +
+          '</div>' +
+        '</div>';
+      document.body.appendChild(pinDlg);
+    }
+    var boxes = [].slice.call(pinDlg.querySelectorAll('.pindigits input'));
+    var go = pinDlg.querySelector('.go'), cancel = pinDlg.querySelector('.cancel');
+    var err = pinDlg.querySelector('.pinerr');
+    pinDlg.querySelector('.pinname').textContent = deviceName || 'the TV';
+    boxes.forEach(function (b) { b.value = ''; b.classList.remove('filled'); });
+    err.textContent = '';
+    go.disabled = true;
+    pinDlg.classList.add('on');
+    setTimeout(function () { boxes[0].focus(); }, 60);
+
+    var code = function () { return boxes.map(function (b) { return b.value; }).join(''); };
+    var sync = function () {
+      boxes.forEach(function (b) { b.classList.toggle('filled', !!b.value); });
+      go.disabled = code().length !== 4;
+    };
+
+    return new Promise(function (resolve) {
+      function close(val) {
+        pinDlg.classList.remove('on');
+        boxes.forEach(function (b) { b.oninput = b.onkeydown = b.onpaste = null; });
+        go.onclick = cancel.onclick = null;
+        document.removeEventListener('keydown', onKey);
+        resolve(val);
+      }
+      function onKey(e) {
+        if (e.key === 'Escape') close(null);
+        else if (e.key === 'Enter' && code().length === 4) close(code());
+      }
+      boxes.forEach(function (b, i) {
+        b.oninput = function () {
+          b.value = b.value.replace(/\D/g, '').slice(0, 1);
+          sync();
+          if (b.value && i < boxes.length - 1) boxes[i + 1].focus();
+          if (code().length === 4) go.focus();
+        };
+        b.onkeydown = function (e) {
+          // Backspace on an empty box steps back, which is what everyone expects
+          if (e.key === 'Backspace' && !b.value && i > 0) { boxes[i - 1].focus(); e.preventDefault(); }
+          if (e.key === 'ArrowLeft' && i > 0) boxes[i - 1].focus();
+          if (e.key === 'ArrowRight' && i < boxes.length - 1) boxes[i + 1].focus();
+        };
+        b.onpaste = function (e) {
+          var t = (e.clipboardData || window.clipboardData).getData('text') || '';
+          var digits = t.replace(/\D/g, '').slice(0, 4);
+          if (!digits) return;
+          e.preventDefault();
+          digits.split('').forEach(function (d, k) { if (boxes[k]) boxes[k].value = d; });
+          sync();
+          (boxes[Math.min(digits.length, 3)]).focus();
+        };
+      });
+      go.onclick = function () { if (code().length === 4) close(code()); };
+      cancel.onclick = function () { close(null); };
+      document.addEventListener('keydown', onKey);
+      pinDlg.onclick = function (e) { if (e.target === pinDlg) close(null); };
+    });
+  }
+
+  function pinError(msg) {
+    if (!pinDlg) return;
+    var e = pinDlg.querySelector('.pinerr');
+    if (e) e.textContent = msg || '';
+  }
+
+  // ---- Apple TV remote --------------------------------------------------
+  // Plex cannot drive its own Apple TV app, so the collector talks to the
+  // device directly over Apple's Companion protocol. Buttons only appear for a
+  // stream we can actually match to a paired device.
+  function atvControls(s) {
+    if (!s.atv) return '';
+    var id = esc(s.atv.ident), name = esc(s.atv.name || 'Apple TV');
+    if (!s.atv.paired) {
+      return '<div class="atv">' +
+               '<span class="atvname">' + name + '</span>' +
+               '<button class="atvbtn pair" data-atv-pair="' + id + '">Pair this TV</button>' +
+               '<span class="atvmsg"></span>' +
+             '</div>';
+    }
+    return '<div class="atv">' +
+      '<span class="atvname">' + name + '</span>' +
+      '<div class="atvrow">' +
+        '<button class="atvbtn" data-atv="' + id + '" data-cmd="skip_backward" title="back 10 seconds">&#9198;</button>' +
+        '<button class="atvbtn big" data-atv="' + id + '" data-cmd="play_pause" title="play / pause">&#9199;</button>' +
+        '<button class="atvbtn" data-atv="' + id + '" data-cmd="skip_forward" title="forward 10 seconds">&#9197;</button>' +
+      '</div>' +
+      '<span class="atvmsg"></span></div>';
+  }
+
+  // One delegated handler: the panel is rebuilt on every poll, so listeners
+  // bound to individual buttons would not survive.
+  document.addEventListener('click', function (ev) {
+    // Unpairing asks twice, but without a dialog: the link turns into "sure?"
+    // and only the second click acts. Deliberate enough not to happen by
+    // accident, quiet enough not to dominate the card.
+    var u = ev.target.closest ? ev.target.closest('[data-atv-unpair]') : null;
+    if (u) {
+      ev.preventDefault();
+      if (!u.classList.contains('arm')) {
+        u.classList.add('arm');
+        u.textContent = 'sure?';
+        clearTimeout(u._t);
+        u._t = setTimeout(function () {
+          u.classList.remove('arm'); u.textContent = 'unpair';
+        }, 4000);
+        return;
+      }
+      clearTimeout(u._t);
+      u.textContent = 'forgetting…';
+      fetch('?atv=unpair&id=' + encodeURIComponent(u.getAttribute('data-atv-unpair')),
+            { method: 'POST', cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          u.textContent = j.ok ? 'forgotten' : (j.message || 'failed');
+          if (j.ok) {
+            // Redraw at once: the daemon has already corrected its device list,
+            // so the controls must not linger as if the TV were still paired.
+            npSig = null;
+            NP.forEach(function (s) {
+              if (s.atv && s.atv.ident === u.getAttribute('data-atv-unpair')) {
+                s.atv.paired = false;
+              }
+            });
+            renderNP();   // the controls must actually go, so a rebuild is right
+            setTimeout(function () { location.reload(); }, 700);
+          }
+        })
+        .catch(function (e) { u.textContent = String(e.message || e); });
+      return;
+    }
+
+    var b = ev.target.closest ? ev.target.closest('[data-atv],[data-atv-pair]') : null;
+    if (!b) return;
+    // The buttons sit in a row inside the block, so look for the panel rather
+    // than assuming the message element is a direct sibling.
+    var box = b.closest('.atv') || b.parentNode;
+    var msg = box.querySelector('.atvmsg');
+    var say = function (t, bad) { if (msg) { msg.textContent = t; msg.className = 'atvmsg' + (bad ? ' bad' : ''); } };
+
+    if (b.hasAttribute('data-atv-pair')) {
+      var id = b.getAttribute('data-atv-pair');
+      b.disabled = true; say('starting…');
+      var tvName = box.querySelector('.atvname');
+      tvName = tvName ? tvName.textContent : 'the TV';
+      fetch('?atv=pair&id=' + encodeURIComponent(id), { method: 'POST', cache: 'no-store' })
+        .then(function (r) { return r.json(); })
+        .then(function (j) {
+          b.disabled = false;
+          if (!j.ok) { say(j.message || 'failed', true); return; }
+          say('');
+          // The television is showing its code by now, so ask for it.
+          return askPin(tvName).then(function (pin) {
+            if (!pin) { say('cancelled'); return; }
+            pinError('pairing…');
+            return fetch('?atv=pin&id=' + encodeURIComponent(id) + '&pin=' + encodeURIComponent(pin),
+                         { method: 'POST', cache: 'no-store' })
+              .then(function (r) { return r.json(); })
+              .then(function (k) {
+                if (k.ok) {
+                  say('paired — reloading');
+                  setTimeout(function () { location.reload(); }, 1000);
+                } else {
+                  // Keep the dialog shut but say why on the card, so the code can
+                  // be retried without hunting for the message.
+                  say(k.message || 'pairing failed', true);
+                }
+              });
+          });
+        })
+        .catch(function (e) { b.disabled = false; say(String(e.message || e), true); });
+      return;
+    }
+
+    var id2 = b.getAttribute('data-atv'), cmd = b.getAttribute('data-cmd');
+    // A command now returns in milliseconds, so the disabled state alone is too
+    // brief to swallow a bouncy double-click.
+    if (b._busy && Date.now() - b._busy < 400) return;
+    b._busy = Date.now();
+    b.disabled = true; say('');
+    // Show the change immediately. The television has to tell Plex, and Plex has
+    // to tell us, which takes a moment — waiting for that round trip before
+    // moving the badge makes a working button feel broken.
+    if (cmd === 'play_pause') {
+      NP.forEach(function (sn) {
+        if (sn.atv && sn.atv.ident === id2) {
+          sn.state = (sn.state === 'playing') ? 'paused' : 'playing';
+          expectState(id2, sn.state);
+        }
+      });
+      tickNP();          // in place — the buttons stay exactly where they are
+    }
+    fetch('?atv=cmd&id=' + encodeURIComponent(id2) + '&c=' + encodeURIComponent(cmd),
+          { method: 'POST', cache: 'no-store' })
+      .then(function (r) { return r.json(); })
+      .then(function (j) { if (!j.ok) say(j.message || 'failed', true); })
+      .catch(function (e) { say(String(e.message || e), true); })
+      .then(function () { b.disabled = false; pollSoon(); });
+  });
 
   // ---- activity -------------------------------------------------------
   var ACT = <?= json_encode($activity ?? [], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE) ?>;
@@ -1713,6 +2045,28 @@ function trend_per_day(array $times, array $vals): ?float {
 
   // One request refreshes both live panels, so poll it for a
   // near-live panel without reloading the whole page
+  // After a press we show the new state at once, but Plex needs a moment to
+  // hear about it from the television. Without this the next poll would report
+  // the old state, the badge would snap back, and a second later flip again —
+  // exactly the flicker that made the buttons feel unpredictable.
+  var atvExpect = {};       // ident -> { state, until }
+
+  function expectState(ident, state) {
+    atvExpect[ident] = { state: state, until: Date.now() + 6000 };
+  }
+
+  function applyExpected(list) {
+    var now = Date.now();
+    list.forEach(function (s) {
+      var e = s.atv && atvExpect[s.atv.ident];
+      if (!e) return;
+      if (now > e.until) { delete atvExpect[s.atv.ident]; return; }
+      if (s.state === e.state) { delete atvExpect[s.atv.ident]; return; }
+      s.state = e.state;    // hold ours until the server agrees or time runs out
+    });
+    return list;
+  }
+
   function pollSessions() {
     if (typeof fetch !== 'function') return;
     try {
@@ -1720,7 +2074,11 @@ function trend_per_day(array $times, array $vals): ?float {
         .then(function (r) { return r.ok ? r.json() : null; })
         .then(function (j) {
           if (!j) return;
-          if (j.sessions) { NP = j.sessions; NP_AT = j.generated || NP_AT; renderNP(); }
+          if (j.sessions) {
+            NP = applyExpected(j.sessions);
+            NP_AT = j.generated || NP_AT;
+            renderNP();
+          }
           if (j.activity) { ACT = j.activity; renderACT(); }
           var warn = document.getElementById('livewarn');
           if (warn) {
@@ -1737,8 +2095,27 @@ function trend_per_day(array $times, array $vals): ?float {
   }
   renderNP();
   setInterval(tickNP, 1000);        // moves the bar without touching the poster
-  setInterval(pollSessions, 10000);   // both live panels come from one request
+
+  // Poll faster while something is playing. Ten seconds is fine for an idle
+  // server, but this panel now carries playback controls, and a pause that
+  // takes ten seconds to show on screen reads as "nothing happened".
+  var pollTimer = null;
+  function schedulePoll(ms) {
+    clearTimeout(pollTimer);
+    pollTimer = setTimeout(function () {
+      pollSessions();
+      schedulePoll(NP.length ? 4000 : 10000);
+    }, ms);
+  }
+  // Ask again shortly after a command, so the new state appears at once rather
+  // than whenever the next scheduled poll happens to land.
+  function pollSoon() {
+    setTimeout(pollSessions, 400);
+    setTimeout(pollSessions, 1500);
+    schedulePoll(NP.length ? 4000 : 10000);
+  }
   pollSessions();
+  schedulePoll(4000);
 
   // ---- wake all disks -------------------------------------------------
   // No helper service and no privileges: the button asks the page to read a

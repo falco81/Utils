@@ -29,6 +29,7 @@ import pwd
 import re
 import secrets
 import subprocess
+import shutil
 import sys
 import tempfile
 import threading
@@ -109,6 +110,17 @@ HISTORY_DAYS   = 7             # retention by age, not sample count
 HISTORY_MAX    = 25000         # hard cap so the file can't grow without bound
 HISTORY_POINTS = 140           # down-sampled points embedded in data.json
 
+# ---- Apple TV remote control --------------------------------------------
+# Optional. Plex cannot control its own Apple TV app (the client advertises no
+# remote-control capability), so this drives Apple's Companion protocol through
+# pyatv's CLI, which lives in its own virtualenv and is called like any other
+# external tool. Off by default; disk monitoring never depends on it.
+ATV_ENABLE  = False
+# Empty means "find it": whatever pyatv installed for the interpreter running
+# this daemon, then the usual places, then PATH. Set it explicitly to pin one.
+ATV_REMOTE  = ""
+ATV_STORAGE = "/var/lib/plex-status/atv-creds.json"
+
 # ---- perf probe ----------------------------------------------------------
 PERF_ENDPOINTS = ["/identity", "/library/sections", "/hubs"]
 PERF_SAMPLES   = 5
@@ -177,6 +189,7 @@ CONFIGURABLE = (
     "HISTORY_DAYS", "HISTORY_MAX", "HISTORY_POINTS",
     "PERF_ENDPOINTS", "PERF_SAMPLES", "PERF_PROXY_URL",
     "PLEX_URL", "PLEX_PREFS", "SMARTCTL", "HDPARM",
+    "ATV_ENABLE", "ATV_REMOTE", "ATV_STORAGE",
     "STATE_DIR", "WEB_DIR", "RUN_DIR",
     "DATA_FILE", "SESSIONS_WEB", "HISTORY_WEB",
     "CACHE_FILE", "HISTORY_FILE", "TOKEN_FILE",
@@ -1588,8 +1601,30 @@ def sessions(token: Optional[str], mounts: list[str]) -> list[dict]:
             "subs_dec": (streams["3"] or {}).get("decision"),
             "volume": vol,
             "art": m.get("grandparentThumb") or m.get("parentThumb") or m.get("thumb"),
+            # filled in below when an Apple TV is reachable at the player's address
+            "atv": None,
         })
     return out
+
+
+def attach_atv(sessions_list: list) -> None:
+    """
+    Note which Apple TV, if any, is playing each stream. Plex reports the
+    player's address and the scan gives every device's address, so matching on
+    that is exact — unlike names, which are not guaranteed unique.
+    """
+    ok, _ = atv_ready()
+    if not ok:
+        return
+    for s in sessions_list:
+        dev = atv_for_address(s.get("address"))
+        if dev:
+            s["atv"] = {"ident": dev["ident"], "name": dev["name"],
+                        "paired": dev["paired"]}
+            # Open the session now, in the background. Otherwise the first press
+            # still waits out a full handshake and only later presses feel quick.
+            if dev["paired"]:
+                atv_warm(dev["ident"], dev.get("address"))
 
 
 def cache_art(sessions_list: list[dict], token: Optional[str]) -> None:
@@ -2164,6 +2199,540 @@ def diag() -> int:
     return 0
 
 
+
+
+# ==========================================================================
+# apple tv remote
+# ==========================================================================
+
+# Playback control for Apple TV clients, driven through pyatv's `atvremote`.
+#
+# Plex itself cannot do this: its Apple TV app advertises no remote-control
+# capability (`/clients` comes back empty), so the documented /player/ endpoints
+# have nothing to talk to. pyatv instead speaks Apple's own Companion protocol
+# and controls the *device*, whatever it happens to be playing.
+#
+# pyatv is deliberately NOT imported. It needs some seventy packages and cannot
+# be installed into a distribution's system Python without fighting RPM, so it
+# lives in its own virtualenv and is invoked as a command — exactly how this
+# daemon already treats smartctl and lsblk. If that virtualenv is missing or
+# broken, remote control simply reports itself unavailable and disk monitoring
+# carries on untouched.
+
+_ATV_CACHE: dict = {"at": 0.0, "devices": [], "running": False, "fails": 0}
+_ATV_PAIRING: dict = {}          # identifier -> live pairing subprocess
+_ATV_LOCK = threading.Lock()
+
+
+def _find_atvremote() -> Optional[str]:
+    """
+    Locate pyatv's CLI. It may sit beside the interpreter running this daemon
+    (the usual case when pyatv was installed for that specific Python), in a
+    virtualenv, or simply on PATH.
+    """
+    if ATV_REMOTE:
+        return ATV_REMOTE if os.access(ATV_REMOTE, os.X_OK) else None
+    here = os.path.dirname(sys.executable)
+    candidates = [os.path.join(here, "atvremote"),
+                  "/usr/local/bin/atvremote", "/usr/bin/atvremote",
+                  "/opt/atv/bin/atvremote"]
+    found = shutil.which("atvremote")
+    if found:
+        candidates.append(found)
+    for c in candidates:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def atv_ready() -> tuple:
+    """(usable, reason) — why remote control is or isn't available."""
+    if not ATV_ENABLE:
+        return False, "turned off (set atv_enable in config.json)"
+    if not _find_atvremote():
+        return False, "atvremote not found — is pyatv installed for this Python?"
+    return True, ""
+
+
+def _atv_args(extra: list) -> list:
+    return [_find_atvremote() or "atvremote", "--storage", "file",
+            "--storage-filename", ATV_STORAGE] + extra
+
+
+def _atv_run(extra: list, timeout: float = 30.0) -> tuple:
+    """
+    Run atvremote and return (ok, output).
+
+    Success is the exit status, not the output. Playback commands print nothing
+    when they work, and treating that silence as failure meant every successful
+    pause was reported as "no response from the device" — while the television
+    dutifully paused.
+    """
+    ok, why = atv_ready()
+    if not ok:
+        return False, why
+    try:
+        proc = subprocess.Popen(_atv_args(extra), stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+    except OSError as e:
+        return False, str(e)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log(f"atvremote did not answer in {timeout}s — abandoning it")
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        threading.Thread(target=_reap, args=(proc,), daemon=True).start()
+        return False, "the device did not answer in time"
+    return proc.returncode == 0, (out or "").strip()
+
+
+def _parse_scan(text: str) -> list:
+    """
+    Turn `atvremote scan` output into device records. The CLI has no machine
+    readable mode, so this reads its human output — keep it forgiving.
+    """
+    devices, cur = [], None
+    for raw in text.splitlines():
+        line = raw.strip()
+        m = re.match(r"^Name:\s*(.+)$", line)
+        if m:
+            cur = {"name": m.group(1).strip(), "model": None, "address": None,
+                   "ident": None, "protocols": {}, "paired": False}
+            devices.append(cur)
+            continue
+        if cur is None:
+            continue
+        m = re.match(r"^Model/SW:\s*(.+)$", line)
+        if m:
+            cur["model"] = m.group(1).strip()
+            continue
+        m = re.match(r"^Address:\s*(\S+)$", line)
+        if m:
+            cur["address"] = m.group(1)
+            continue
+        # the first identifier is the stable UUID; the others are MAC forms
+        m = re.match(r"^-\s*([0-9A-F]{8}-[0-9A-F]{4}-[0-9A-F]{4}-"
+                     r"[0-9A-F]{4}-[0-9A-F]{12})$", line, re.I)
+        if m and not cur["ident"]:
+            cur["ident"] = m.group(1)
+            continue
+        m = re.match(r"^-\s*Protocol:\s*(\w+),\s*Port:\s*(\d+),"
+                     r"\s*Credentials:\s*([^,]+)", line)
+        if m:
+            proto, port, creds = m.group(1), int(m.group(2)), m.group(3).strip()
+            have = creds.lower() not in ("none", "")
+            cur["protocols"][proto] = {"port": port, "paired": have}
+            if proto == "Companion" and have:
+                cur["paired"] = True
+    return [d for d in devices if d.get("ident")]
+
+
+def atv_scan(force: bool = False, max_age: float = 300.0) -> list:
+    """
+    Discover Apple TVs. BLOCKS for up to forty seconds, so it belongs only in
+    paths where the caller expects to wait — an explicit rescan or a pairing
+    step. Everything else must go through atv_devices().
+    """
+    with _ATV_LOCK:
+        fresh = time.time() - _ATV_CACHE["at"] < max_age
+        if _ATV_CACHE["devices"] and fresh and not force:
+            return _ATV_CACHE["devices"]
+    # Only the protocol we actually use. A full scan probes several and takes
+    # correspondingly longer — and this runs inside the service's CPU quota,
+    # where everything is several times slower than on a shell.
+    ok, out = _atv_run(["--scan-protocols", "companion", "scan"], timeout=45)
+    devices = _parse_scan(out) if ok else []
+    with _ATV_LOCK:
+        # keep the previous list on a failed scan rather than forgetting devices
+        if devices or not _ATV_CACHE["devices"]:
+            _ATV_CACHE["devices"] = devices
+        if devices:
+            _ATV_CACHE["fails"] = 0
+        else:
+            # Back off after a failure instead of retrying on every cycle. A scan
+            # that cannot work — no route to the devices, a wedged helper — would
+            # otherwise fill the log and burn the service's CPU budget forever.
+            _ATV_CACHE["fails"] = _ATV_CACHE.get("fails", 0) + 1
+            if _ATV_CACHE["fails"] in (1, 5, 20):
+                log(f"no Apple TV found ({_ATV_CACHE['fails']} attempts); "
+                    f"backing off")
+        _ATV_CACHE["at"] = time.time()
+        _ATV_CACHE["running"] = False
+        return _ATV_CACHE["devices"]
+
+
+def atv_devices() -> list:
+    """
+    The known devices, without ever waiting. A network scan takes tens of
+    seconds; doing it inline once blocked the very request the page uses to draw
+    Now Playing, so the panel came up empty. Here a stale list triggers a
+    refresh in the background and the caller gets whatever is known right now —
+    at worst an empty list, which only means the buttons appear a scan later.
+    """
+    ok, _ = atv_ready()
+    if not ok:
+        return []
+    with _ATV_LOCK:
+        devices = _ATV_CACHE["devices"]
+        # five minutes normally, up to an hour once scans keep failing
+        wait = min(300 * (1 + _ATV_CACHE.get("fails", 0)), 3600)
+        stale = time.time() - _ATV_CACHE["at"] > wait
+        busy = _ATV_CACHE.get("running")
+        if stale and not busy:
+            _ATV_CACHE["running"] = True
+            threading.Thread(target=atv_scan, kwargs={"force": True},
+                             daemon=True).start()
+    return devices
+
+
+def atv_for_address(addr: str) -> Optional[dict]:
+    """The Apple TV at this address, which is how a Plex session is matched."""
+    if not addr:
+        return None
+    for d in atv_devices():
+        if d.get("address") == addr:
+            return d
+    return None
+
+
+
+
+# ---- live connections ----------------------------------------------------
+#
+# Spawning `atvremote` per keypress costs four to five seconds, nearly all of it
+# spent negotiating a fresh encrypted session with the television. A pause
+# button that answers in five seconds is not a pause button, so commands go
+# through a connection that is opened once and kept.
+#
+# That needs pyatv in-process. It is imported lazily and behind a guard: if the
+# library is missing or fails to load, remote control switches itself off and
+# the disk monitoring this daemon exists for is untouched. Everything runs on
+# one asyncio loop in a background thread, because pyatv is async and the rest
+# of this daemon is threads.
+
+_ATV_LOOP = None                 # asyncio loop owned by the helper thread
+_ATV_CONN: dict = {}             # identifier -> connected AppleTV interface
+_ATV_STORE = None                # pyatv credential storage, loaded once
+_ATV_IMPORT_FAILED = False
+
+
+def _atv_lib():
+    """Import pyatv on first use; None if it isn't usable."""
+    global _ATV_IMPORT_FAILED
+    if _ATV_IMPORT_FAILED:
+        return None
+    try:
+        import pyatv                                   # noqa: F401
+        import pyatv.storage.file_storage               # noqa: F401
+        return pyatv
+    except Exception as e:                             # pragma: no cover
+        _ATV_IMPORT_FAILED = True
+        log(f"pyatv unavailable ({e}) — remote control disabled")
+        return None
+
+
+def _atv_get_loop():
+    """The background asyncio loop, started on first use."""
+    global _ATV_LOOP
+    if _ATV_LOOP is None:
+        import asyncio
+        loop = asyncio.new_event_loop()
+        t = threading.Thread(target=loop.run_forever, daemon=True,
+                             name="plexmon-atv")
+        t.start()
+        _ATV_LOOP = loop
+    return _ATV_LOOP
+
+
+def _atv_submit(coro, timeout: float = 12.0):
+    """Run a coroutine on the helper loop and wait for it from a thread."""
+    import asyncio
+    fut = asyncio.run_coroutine_threadsafe(coro, _atv_get_loop())
+    return fut.result(timeout=timeout)
+
+
+async def _atv_storage():
+    """Credential store, loaded once and shared."""
+    global _ATV_STORE
+    if _ATV_STORE is None:
+        import asyncio
+        from pyatv.storage.file_storage import FileStorage
+        st = FileStorage(ATV_STORAGE, asyncio.get_running_loop())
+        await st.load()
+        _ATV_STORE = st
+    return _ATV_STORE
+
+
+async def _atv_connect(ident: str, address: Optional[str]):
+    """Open a session to one device, or reuse the one already open."""
+    import asyncio
+    import pyatv
+    existing = _ATV_CONN.get(ident)
+    if existing is not None:
+        return existing
+    loop = asyncio.get_running_loop()
+    store = await _atv_storage()
+    confs = await pyatv.scan(loop, identifier=ident, timeout=5,
+                             hosts=[address] if address else None, storage=store)
+    if not confs:
+        raise RuntimeError("device not found on the network")
+    atv = await pyatv.connect(confs[0], loop, storage=store)
+    _ATV_CONN[ident] = atv
+    log(f"connected to Apple TV {ident}", level="debug")
+    return atv
+
+
+async def _atv_drop(ident: str) -> None:
+    """Close a session, e.g. after an error, so the next try reconnects."""
+    atv = _ATV_CONN.pop(ident, None)
+    if atv is None:
+        return
+    try:
+        atv.close()
+    except Exception:
+        pass
+
+
+async def _atv_do(ident: str, address: Optional[str], cmd: str) -> None:
+    """
+    Send one command, reconnecting once if the held session has gone stale —
+    a television that slept or changed address drops it silently.
+    """
+    for attempt in (1, 2):
+        atv = await _atv_connect(ident, address)
+        try:
+            await getattr(atv.remote_control, cmd)()
+            return
+        except Exception:
+            await _atv_drop(ident)
+            if attempt == 2:
+                raise
+
+
+def atv_warm(ident: str, address: Optional[str]) -> None:
+    """
+    Make sure a session to this device is open, without waiting for it.
+
+    Even the library import is left to the background thread: it costs the best
+    part of a second the first time, and this is called from the collection and
+    from the request that draws Now Playing — neither should stall for it.
+    """
+    if ident in _ATV_CONN or _ATV_IMPORT_FAILED:
+        return
+    def go():
+        if not _atv_lib():
+            return
+        try:
+            _atv_submit(_atv_connect(ident, address), timeout=20)
+        except Exception as e:
+            log(f"could not open a session to {ident}: {e}", level="debug")
+    threading.Thread(target=go, daemon=True).start()
+
+
+def atv_command(ident: str, cmd: str) -> tuple:
+    """
+    Send one playback command. `skip_forward` / `skip_backward` use the app's
+    own step (ten seconds in Plex), so there's no need to compute a position.
+    """
+    allowed = {"play", "pause", "play_pause", "stop",
+               "skip_forward", "skip_backward", "next", "previous"}
+    if cmd not in allowed:
+        return False, f"unknown command '{cmd}'"
+    dev = next((d for d in atv_devices() if d.get("ident") == ident), None)
+    address = dev.get("address") if dev else None
+
+    # Preferred path: a session that is already open, so the command is one
+    # message on the wire rather than a fresh handshake.
+    live_err = None
+    if _atv_lib():
+        try:
+            _atv_submit(_atv_do(ident, address, cmd), timeout=8)
+            return True, ""
+        except Exception as e:
+            live_err = str(e) or e.__class__.__name__
+            # Visible in the journal, not hidden behind debug: when the buttons
+            # stop working this is the line that says why.
+            log(f"Apple TV {cmd} over the open session failed: {live_err}")
+
+    # Fallback: the CLI. Kept short — stacking a long retry behind the first
+    # attempt only means the browser gives up before either finishes and reports
+    # a failure that never happened.
+    args = ["--id", ident]
+    if address:
+        args += ["--scan-hosts", address]
+    ok, out = _atv_run(args + [cmd], timeout=15)
+    if ok:
+        return True, out
+    detail = _atv_safe_message(out)
+    if not detail and live_err:
+        detail = live_err[:160]
+    if detail:
+        log(f"Apple TV {cmd} failed: {detail}")
+    return False, detail or "the device did not respond"
+
+
+def atv_unpair(ident: str) -> tuple:
+    """
+    Forget the credentials we hold for a device.
+
+    pyatv has no unpair command, so the stored credential is removed from its
+    settings file directly. Note what this does and does not do: it revokes our
+    ability to control the television, but the television still lists this
+    server among its paired remotes. Removing it there is done in tvOS settings.
+    """
+    ok, why = atv_ready()
+    if not ok:
+        return False, why
+    data = read_json(Path(ATV_STORAGE), None)
+    if not isinstance(data, dict) or not isinstance(data.get("devices"), list):
+        return False, "no pairing store to change"
+    hit = False
+    for dev in data["devices"]:
+        protos = (dev or {}).get("protocols") or {}
+        for name, proto in protos.items():
+            if not isinstance(proto, dict):
+                continue
+            if str(proto.get("identifier", "")).upper() == ident.upper() \
+                    or name == "companion" and str(
+                        protos.get("companion", {}).get("identifier", "")).upper() == ident.upper():
+                if proto.pop("credentials", None) is not None:
+                    hit = True
+    if not hit:
+        return False, "that device is not paired here"
+    if not write_json(Path(ATV_STORAGE), data, mode=0o600):
+        return False, "could not write the pairing store"
+    log(f"forgot Apple TV credentials for {ident}")
+    _atv_forget(ident)
+    return True, "unpaired"
+
+
+def _atv_forget(ident: Optional[str]) -> None:
+    """
+    Clean up after removing credentials from the file.
+
+    Two things would otherwise undo it. The loaded credential store still holds
+    the old secrets in memory and would write them back on its next save, and
+    the cached device list still says "paired", so the page would keep drawing
+    the controls until a fresh network scan happened to run. Both are dropped
+    here, and the cached list is corrected immediately rather than waiting the
+    several seconds a scan takes.
+    """
+    global _ATV_STORE
+    for k in ([ident] if ident else list(_ATV_CONN)):
+        if _atv_lib() and k in _ATV_CONN:
+            try:
+                _atv_submit(_atv_drop(k), timeout=5)
+            except Exception:
+                pass
+    _ATV_STORE = None
+    with _ATV_LOCK:
+        for d in _ATV_CACHE["devices"]:
+            if ident is None or d.get("ident") == ident:
+                d["paired"] = False
+                for proto in d.get("protocols", {}).values():
+                    proto["paired"] = False
+
+
+def atv_unpair_all() -> tuple:
+    """Forget every stored credential, leaving the devices themselves listed."""
+    ok, why = atv_ready()
+    if not ok:
+        return False, why
+    data = read_json(Path(ATV_STORAGE), None)
+    if not isinstance(data, dict) or not isinstance(data.get("devices"), list):
+        return False, "no pairing store to change"
+    gone = 0
+    for dev in data["devices"]:
+        for proto in ((dev or {}).get("protocols") or {}).values():
+            if isinstance(proto, dict) and proto.pop("credentials", None) is not None:
+                gone += 1
+    if not gone:
+        return True, "nothing was paired"
+    if not write_json(Path(ATV_STORAGE), data, mode=0o600):
+        return False, "could not write the pairing store"
+    log(f"forgot Apple TV credentials for {gone} device(s)")
+    _atv_forget(None)
+    return True, f"forgot {gone} credential(s)"
+
+
+def atv_pair_start(ident: str) -> tuple:
+    """
+    Begin pairing. The Apple TV puts a PIN on screen and atvremote waits for it
+    on stdin, so the process is kept alive until the PIN arrives from the page.
+    """
+    ok, why = atv_ready()
+    if not ok:
+        return False, why
+    with _ATV_LOCK:
+        old = _ATV_PAIRING.pop(ident, None)
+    if old:
+        try:
+            old.kill()
+        except Exception:
+            pass
+    try:
+        proc = subprocess.Popen(
+            _atv_args(["--id", ident, "--protocol", "companion", "pair"]),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True)
+    except OSError as e:
+        return False, str(e)
+    with _ATV_LOCK:
+        _ATV_PAIRING[ident] = proc
+    # give the device a moment to show its PIN, and catch an immediate failure
+    time.sleep(2.0)
+    if proc.poll() is not None:
+        out = (proc.stdout.read() if proc.stdout else "") or "pairing ended early"
+        with _ATV_LOCK:
+            _ATV_PAIRING.pop(ident, None)
+        return False, _atv_safe_message(out) or "pairing ended early"
+    return True, "PIN should now be on the TV"
+
+
+def atv_pair_pin(ident: str, pin: str) -> tuple:
+    """Finish pairing by feeding the PIN shown on the television."""
+    if not re.fullmatch(r"\d{4,8}", pin or ""):
+        return False, "the PIN is four to eight digits"
+    with _ATV_LOCK:
+        proc = _ATV_PAIRING.pop(ident, None)
+    if proc is None:
+        return False, "no pairing in progress — start it again"
+    try:
+        out, _ = proc.communicate(input=pin + "\n", timeout=45)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        return False, "the device did not finish pairing in time"
+    out = (out or "").strip()
+    # pyatv announces success with "Pairing seems to have succeeded, yey!" and
+    # then prints the credentials. Matching on the word "success" missed it —
+    # the text says "succeeded" — so a perfectly good pairing was reported as an
+    # error, with the credentials themselves shown as the error message.
+    failed = re.search(r"pairing failed", out, re.I)
+    good = re.search(r"succeeded|you may now use these credentials", out, re.I)
+    if good and not failed:
+        atv_scan(force=True)          # pick up the stored credentials
+        return True, "paired"
+    return False, _atv_safe_message(out) or "pairing failed"
+
+
+def _atv_safe_message(out: str) -> str:
+    """
+    A line worth showing a user, with secrets removed. The pairing credentials
+    are a long hex string that grants control of the television — they belong in
+    the credential file, never on a web page or in a log.
+    """
+    lines = [l.strip() for l in (out or "").splitlines() if l.strip()]
+    keep = [l for l in lines if "credential" not in l.lower()]
+    text = (keep[-1] if keep else "")[:200]
+    return re.sub(r"[0-9a-f:]{40,}", "…", text, flags=re.I)
+
+
 # ==========================================================================
 # daemon
 # ==========================================================================
@@ -2361,6 +2930,7 @@ class Daemon:
         system = read_system()
         np = sessions(tok, mount_list())
         cache_art(np, tok)
+        attach_atv(np)
         acts = activity(self._get_roots(tok))
         srv = server_info(tok)
         srv["sessions"] = len(np)
@@ -2634,6 +3204,7 @@ class Daemon:
                     try:
                         np = sessions(tok, mount_list())
                         cache_art(np, tok)
+                        attach_atv(np)
                         acts = activity(daemon._get_roots(tok))
                         self._send(200, {"generated": int(time.time()),
                                          "sessions": np, "activity": acts})
@@ -2661,6 +3232,10 @@ class Daemon:
                             self._send(200, img, ctype="image/jpeg")
                         else:
                             self._send(404, {"error": "no poster"})
+                elif path == "/atv":
+                    ok, why = atv_ready()
+                    self._send(200, {"ok": ok, "reason": why,
+                                     "devices": atv_devices() if ok else []})
                 elif path == "/health":
                     self._send(200, {"ok": True, "uptime": int(time.time() - START)})
                 else:
@@ -2671,6 +3246,34 @@ class Daemon:
                 if not self._authed():
                     self._send(403, {"ok": False, "error": "bad or missing token"})
                     return
+                if path.startswith("/atv/"):
+                    from urllib.parse import parse_qs
+                    q = parse_qs(urlparse(self.path).query)
+                    ident = (q.get("id") or [""])[0]
+                    action = path[len("/atv/"):]
+                    if action == "rescan":
+                        self._send(200, {"ok": True, "devices": atv_scan(force=True)})
+                    elif action == "unpair-all":
+                        ok, msg = atv_unpair_all()
+                        self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                    elif not ident:
+                        self._send(400, {"ok": False, "error": "no device id"})
+                    elif action == "pair":
+                        ok, msg = atv_pair_start(ident)
+                        self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                    elif action == "pin":
+                        ok, msg = atv_pair_pin(ident, (q.get("pin") or [""])[0])
+                        self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                    elif action == "unpair":
+                        ok, msg = atv_unpair(ident)
+                        self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                    elif action == "cmd":
+                        ok, msg = atv_command(ident, (q.get("c") or [""])[0])
+                        self._send(200 if ok else 409, {"ok": ok, "message": msg})
+                    else:
+                        self._send(404, {"ok": False, "error": "unknown action"})
+                    return
+
                 if path == "/wake":
                     self._send(200, daemon.request_wake())
                 elif path == "/smart":
@@ -2702,6 +3305,150 @@ class Daemon:
         srv.serve_forever()
 
 
+
+
+def _atv_api(path: str, method: str = "GET", timeout: float = 60.0):
+    """
+    Talk to the running daemon rather than to the credential file. The daemon
+    owns the store and the open sessions; a second process writing the same file
+    behind its back is how you end up with a pairing that works in one place and
+    not the other.
+    """
+    req = urllib.request.Request(f"http://{API_HOST}:{API_PORT}{path}",
+                                 method=method,
+                                 data=b"" if method == "POST" else None)
+    if method == "POST":
+        try:
+            req.add_header("X-Plexmon-Token", TOKEN_FILE.read_text().strip())
+        except OSError:
+            raise RuntimeError("no API token — is the daemon running?")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.HTTPError as e:
+        # The daemon answers refusals with a JSON reason; showing that beats
+        # printing "HTTP Error 409: Conflict" at someone.
+        try:
+            return json.loads(e.read().decode())
+        except Exception:
+            raise RuntimeError(f"HTTP {e.code}")
+
+
+def _atv_pick(devices: list, want: str) -> Optional[dict]:
+    """Find a television by identifier or by name, however the user typed it."""
+    w = (want or "").strip().lower()
+    for d in devices:
+        if str(d.get("ident", "")).lower() == w:
+            return d
+    named = [d for d in devices if str(d.get("name", "")).lower() == w]
+    if len(named) == 1:
+        return named[0]
+    partial = [d for d in devices if w and w in str(d.get("name", "")).lower()]
+    if len(partial) == 1:
+        return partial[0]
+    if len(partial) > 1:
+        raise RuntimeError("that matches more than one television: "
+                           + ", ".join(d["name"] for d in partial))
+    return None
+
+
+def _atv_print(devices: list) -> None:
+    if not devices:
+        print("  no televisions found")
+        return
+    for d in devices:
+        mark = f"{G}paired{N}" if d.get("paired") else f"{D}not paired{N}"
+        print(f"  {d.get('name', '?'):22} {str(d.get('address', '?')):16} {mark}")
+        print(f"      {D}{d.get('ident', '')}{N}")
+        if d.get("model"):
+            print(f"      {D}{d['model']}{N}")
+
+
+def _atv_cli(args) -> int:
+    """--atv and friends: list, scan, pair and unpair from the command line."""
+    try:
+        state = _atv_api("/atv")
+    except Exception as e:
+        print(f"could not reach the daemon: {e}")
+        return 1
+    if not state.get("ok"):
+        print(f"remote control is unavailable: {state.get('reason')}")
+        return 1
+
+    if args.atv_scan:
+        print("searching the network…")
+        try:
+            res = _atv_api("/atv/rescan", "POST")
+        except Exception as e:
+            print(f"scan failed: {e}")
+            return 1
+        _atv_print(res.get("devices") or [])
+        return 0
+
+    if args.atv_unpair_all:
+        try:
+            res = _atv_api("/atv/unpair-all", "POST")
+        except Exception as e:
+            print(f"failed: {e}")
+            return 1
+        print(f"  {res.get('message')}")
+        print(f"  {D}the televisions still list this server among their paired"
+              f" remotes; remove it there in tvOS settings{N}")
+        return 0 if res.get("ok") else 1
+
+    devices = state.get("devices") or []
+
+    if args.atv:
+        _atv_print(devices)
+        if not any(d.get("paired") for d in devices):
+            print(f"\n  {D}pair one with: plexmon --atv-pair \"name\"{N}")
+        return 0
+
+    want = args.atv_pair or args.atv_unpair
+    try:
+        dev = _atv_pick(devices, want)
+    except RuntimeError as e:
+        print(f"  {e}")
+        return 1
+    if dev is None:
+        print(f"  no television matches {want!r}. Known:")
+        _atv_print(devices)
+        return 1
+
+    if args.atv_unpair:
+        try:
+            res = _atv_api(f"/atv/unpair?id={urllib.parse.quote(dev['ident'])}", "POST")
+        except Exception as e:
+            print(f"failed: {e}")
+            return 1
+        print(f"  {dev['name']}: {res.get('message')}")
+        return 0 if res.get("ok") else 1
+
+    # pairing: ask the device for a code, then hand back what the screen shows
+    print(f"  pairing with {dev['name']} ({dev['address']})…")
+    try:
+        res = _atv_api(f"/atv/pair?id={urllib.parse.quote(dev['ident'])}", "POST")
+    except Exception as e:
+        print(f"failed to start pairing: {e}")
+        return 1
+    if not res.get("ok"):
+        print(f"  {res.get('message')}")
+        return 1
+    try:
+        pin = input("  enter the PIN shown on the television: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print("\n  cancelled")
+        return 1
+    try:
+        res = _atv_api(f"/atv/pin?id={urllib.parse.quote(dev['ident'])}"
+                       f"&pin={urllib.parse.quote(pin)}", "POST")
+    except Exception as e:
+        print(f"failed: {e}")
+        return 1
+    print(f"  {G}paired{N}" if res.get("ok") else f"  {R}{res.get('message')}{N}")
+    return 0 if res.get("ok") else 1
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Plex status monitoring daemon")
     ap.add_argument("-v", "--debug", action="store_true")
@@ -2713,6 +3460,18 @@ def main(argv=None) -> int:
     ap.add_argument("--refresh", action="store_true",
                     help="re-read SMART from the disks that are already spinning "
                          "(sleeping disks are left alone — use --wake for those)")
+    tv = ap.add_argument_group("Apple TV remote")
+    tv.add_argument("--atv", action="store_true",
+                    help="list the televisions found and whether they are paired")
+    tv.add_argument("--atv-scan", action="store_true",
+                    help="search the network again for televisions")
+    tv.add_argument("--atv-pair", metavar="TV",
+                    help="pair with a television, by name or identifier")
+    tv.add_argument("--atv-unpair", metavar="TV",
+                    help="forget the credentials for one television")
+    tv.add_argument("--atv-unpair-all", action="store_true",
+                    help="forget the credentials for every television")
+
     ap.add_argument("--check", action="store_true",
                     help="self-check the whole chain against a running daemon")
     ap.add_argument("--diag", action="store_true",
@@ -2724,6 +3483,10 @@ def main(argv=None) -> int:
         return check()
     if args.diag:
         return diag()
+
+    if (args.atv or args.atv_scan or args.atv_pair or args.atv_unpair
+            or args.atv_unpair_all):
+        return _atv_cli(args)
 
     if args.refresh:
         try:
