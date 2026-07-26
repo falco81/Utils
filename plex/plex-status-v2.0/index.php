@@ -228,25 +228,29 @@ if (count($ht) >= 2) {
         if (array_filter($dh['temp'], fn($v) => $v !== null)) {
             $tempS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $dh['temp']];
         }
-        $ssRate = rate_per_day($ht, $dh['ss'] ?? []);
-        if (array_filter($ssRate, fn($v) => $v !== null)) {
-            $cycS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $ssRate];
+        // Counters are charted as what they are: increments at the moments they
+        // happened, which the browser adds into buckets to suit the range on
+        // screen. A rolling "per day" line drawn over nine events in seventeen
+        // hours mostly showed the shape of its own window sliding along.
+        $ssD = counter_deltas($ht, $dh['ss'] ?? []);
+        if (array_filter($ssD, fn($v) => $v)) {
+            $cycS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $ssD];
         }
-        $lcRate = rate_per_day($ht, $dh['lc'] ?? []);
-        if (array_filter($lcRate, fn($v) => $v !== null)) {
-            $parkS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $lcRate];
+        $lcD = counter_deltas($ht, $dh['lc'] ?? []);
+        if (array_filter($lcD, fn($v) => $v)) {
+            $parkS[] = ['label' => $dh['label'], 'color' => $col, 'data' => $lcD];
         }
         // LBA counts are sector counts; scale to GB so the number means something
         $ub = $dh['unit_b'] ?? 512;
-        $wr = rate_per_day($ht, $dh['lw'] ?? []);
-        if (array_filter($wr, fn($v) => $v !== null)) {
+        $wr = counter_deltas($ht, $dh['lw'] ?? []);
+        if (array_filter($wr, fn($v) => $v)) {
             $wrS[] = ['label' => $dh['label'], 'color' => $col,
-                      'data' => array_map(fn($v) => $v === null ? null : round($v * $ub / 1e9, 2), $wr)];
+                      'data' => array_map(fn($v) => $v === null ? null : round($v * $ub / 1e9, 3), $wr)];
         }
-        $rd = rate_per_day($ht, $dh['lr'] ?? []);
-        if (array_filter($rd, fn($v) => $v !== null)) {
+        $rd = counter_deltas($ht, $dh['lr'] ?? []);
+        if (array_filter($rd, fn($v) => $v)) {
             $rdS[] = ['label' => $dh['label'], 'color' => $col,
-                      'data' => array_map(fn($v) => $v === null ? null : round($v * $ub / 1e9, 2), $rd)];
+                      'data' => array_map(fn($v) => $v === null ? null : round($v * $ub / 1e9, 3), $rd)];
         }
         // Error counters are charted only if something actually happened —
         // otherwise it is a flat zero line that tells you nothing.
@@ -289,17 +293,16 @@ if (count($ht) >= 2) {
     }
     if ($cycS) {
         $charts[] = [
-            'id' => 'cyc', 'title' => 'Spin-ups per day', 'unit' => '/d', 'min' => 0,
-            'note' => 'How hard the spin-down policy works the motors. Averaged over a '
-                    . 'six-hour window: a single spin-up seen across a few minutes would '
-                    . 'otherwise read as hundreds a day. Needs an hour of readings before '
-                    . 'the first point appears, and only lands while a disk is awake.',
+            'id' => 'cyc', 'title' => 'Spin-ups', 'unit' => '', 'min' => 0, 'kind' => 'bars',
+            'note' => 'How hard the spin-down policy works the motors. Each bar counts the '
+                    . 'spin-ups in one slice of time, because that is what a counter has '
+                    . 'to say — nine events across a day is nine events, not a curve.',
             'series' => $cycS,
         ];
     }
     if ($wrS || $rdS) {
         $charts[] = [
-            'id' => 'thr', 'title' => 'Data written per day', 'unit' => ' GB/d', 'min' => 0,
+            'id' => 'thr', 'title' => 'Data written', 'unit' => ' GB', 'min' => 0, 'kind' => 'bars',
             'note' => 'How much each volume actually takes in — useful for spotting which '
                     . 'disk carries the write load.',
             'series' => $wrS ?: $rdS,
@@ -307,13 +310,13 @@ if (count($ht) >= 2) {
     }
     if ($rdS && $wrS) {
         $charts[] = [
-            'id' => 'thrd', 'title' => 'Data read per day', 'unit' => ' GB/d', 'min' => 0,
+            'id' => 'thrd', 'title' => 'Data read', 'unit' => ' GB', 'min' => 0, 'kind' => 'bars',
             'series' => $rdS,
         ];
     }
     if ($parkS) {
         $charts[] = [
-            'id' => 'park', 'title' => 'Head parks per day', 'unit' => '/d', 'min' => 0,
+            'id' => 'park', 'title' => 'Head parks', 'unit' => '', 'min' => 0, 'kind' => 'bars',
             'note' => 'Heads park far more often than the motor stops. Rated for 600,000 cycles.',
             'series' => $parkS,
         ];
@@ -376,6 +379,8 @@ if ($wantFull) {
         'charts' => array_map(fn($c) => [
             'id' => $c['id'], 'unit' => $c['unit'] ?? '', 'min' => $c['min'] ?? null,
             'max' => $c['max'] ?? null, 'bands' => $c['bands'] ?? [],
+            // without this the browser redraws a bar chart as a line
+            'kind' => $c['kind'] ?? 'line',
             'series' => array_map(fn($s) => ['label' => $s['label'], 'color' => $s['color'],
                                              'data' => $s['data']], $c['series']),
         ], $charts),
@@ -391,6 +396,26 @@ if ($wantFull) {
  * policy costs the drive. Readings are sparse (a sleeping disk isn't polled),
  * so each rate is derived from the gap to the previous real reading.
  */
+function counter_deltas(array $times, array $counts): array {
+    // How much the counter moved since the previous reading, at the moment the
+    // move was seen. This is the raw truth about a counter — nine spin-ups in
+    // seventeen hours is nine numbers, not a curve — and it lets the chart add
+    // them into whatever buckets the visible range calls for.
+    $out = array_fill(0, count($counts), null);
+    $prev = null;
+    foreach ($counts as $i => $v) {
+        if ($v === null || !isset($times[$i])) continue;
+        if ($prev !== null) {
+            $d = $v - $counts[$prev];
+            // negative means the counter reset or the disk was swapped
+            if ($d >= 0) $out[$i] = $d;
+        }
+        $prev = $i;
+    }
+    return $out;
+}
+
+
 function rate_per_day(array $times, array $counts, int $window = 21600,
                      int $minWin = 3600): array {
     // A per-day figure from a counter that ticks a handful of times a day only
@@ -652,6 +677,7 @@ function trend_per_day(array $times, array $vals): ?float {
                       border-top:none}
   /* Takes the space left over and centres in it, so the remote sits toward the
      middle of the card rather than pinned against the right edge. */
+  .bucketnote{color:var(--tx-mut);font-size:11px;margin-left:4px}
   .atv{display:flex;flex-direction:column;align-items:center;gap:8px;
        flex:1 1 auto;padding-top:2px}
   .atvrow{display:flex;align-items:center;gap:10px}
@@ -1218,6 +1244,7 @@ function trend_per_day(array $times, array $vals): ?float {
   var CHARTS = <?= json_encode(array_map(function ($c) {
       return ['id' => $c['id'], 'unit' => $c['unit'] ?? '', 'min' => $c['min'] ?? null,
               'max' => $c['max'] ?? null, 'bands' => $c['bands'] ?? [],
+              'kind' => $c['kind'] ?? 'line',
               'series' => array_map(fn($s) => ['label' => $s['label'], 'color' => $s['color'], 'data' => $s['data']], $c['series'])];
   }, $charts), JSON_UNESCAPED_SLASHES) ?>;
 
@@ -1452,6 +1479,23 @@ function trend_per_day(array $times, array $vals): ?float {
     return t;
   }
 
+  // Bucket width for a bar chart: aim for a couple of dozen bars across the
+  // window, then round to a slice a person recognises. Ten-minute bars over a
+  // week would be a smear; daily bars over six hours would be one column.
+  function bucketSize(span) {
+    var want = span / 26;
+    var steps = [300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400,
+                 172800, 604800];
+    for (var i = 0; i < steps.length; i++) if (want <= steps[i]) return steps[i];
+    return steps[steps.length - 1];
+  }
+
+  function bucketLabel(slot) {
+    if (slot < 3600) return 'per ' + Math.round(slot / 60) + ' min';
+    if (slot < 86400) return 'per ' + Math.round(slot / 3600) + ' h';
+    return 'per ' + Math.round(slot / 86400) + ' d';
+  }
+
   function draw(wrap, cfg) {
     var T = HIST.t || [];
     if (T.length < 2) { wrap.innerHTML = '<div class="nodata">Not enough history yet.</div>'; return; }
@@ -1540,7 +1584,64 @@ function trend_per_day(array $times, array $vals): ?float {
            + '" font-size="12" fill="#5b6472">' + fmtTime(at, span) + '</text>';
     });
 
-    series.forEach(function (s) {
+    // ---- bars -------------------------------------------------------------
+    // Counter charts are drawn as totals per slice of time. The increments
+    // arrive at the moments they were seen; adding them into buckets sized for
+    // the visible range is what turns them into something readable, and it says
+    // only what actually happened — an empty slice is an empty slice.
+    var isBars = cfg.kind === 'bars';
+    var slot = 0, base = 0, nb = 0, totals = null, bmax = 0;
+    if (isBars) {
+      slot = bucketSize(tSpan);
+      base = Math.floor(tA / slot) * slot;
+      nb = Math.max(1, Math.ceil((tB - base) / slot));
+      totals = series.map(function (s) {
+        var acc = new Array(nb).fill(0);
+        s.data.forEach(function (v, i) {
+          if (v === null || v === undefined || !isFinite(v)) return;
+          if (i >= times.length) return;
+          var b = Math.floor((times[i] - base) / slot);
+          if (b >= 0 && b < nb) acc[b] += +v;
+        });
+        return acc;
+      });
+      totals.forEach(function (a) { a.forEach(function (v) { if (v > bmax) bmax = v; }); });
+      if (bmax <= 0) {
+        wrap.innerHTML = '<div class="nodata">Nothing recorded in this range.</div>';
+        return;
+      }
+      // The grid belongs to the bucket totals, not to the raw increments.
+      svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" preserveAspectRatio="xMidYMid meet">';
+      for (var gg = 0; gg <= 3; gg++) {
+        var bv = bmax * gg / 3;
+        var by = (padT + (1 - gg / 3) * (H - padT - padB)).toFixed(1);
+        svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + by + '" y2="' + by
+             + '" stroke="#262c37"/>'
+             + '<text x="' + (padL - 8) + '" y="' + (+by + 4) + '" text-anchor="end" font-size="12" fill="#5b6472">'
+             + (bmax < 5 ? bv.toFixed(1) : Math.round(bv)) + '</text>';
+      }
+      [0, 0.5, 1].forEach(function (f) {
+        var at = tA + f * tSpan, x = padL + f * (W - padL - padR);
+        var a = f === 0 ? 'start' : (f === 1 ? 'end' : 'middle');
+        svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 7) + '" text-anchor="' + a
+             + '" font-size="12" fill="#5b6472">' + fmtTime(at, tSpan) + '</text>';
+      });
+      var plotW = W - padL - padR, plotH = H - padT - padB;
+      var slotW = plotW / nb, lanes = totals.length;
+      var bw = Math.max(1.5, Math.min(slotW / lanes - 0.6, 26));
+      totals.forEach(function (acc, si) {
+        acc.forEach(function (v, bi) {
+          if (!v) return;
+          var x = padL + bi * slotW + (slotW - bw * lanes) / 2 + si * bw;
+          var h = Math.max(1.5, v / bmax * plotH);
+          svg += '<rect x="' + x.toFixed(1) + '" y="' + (padT + plotH - h).toFixed(1)
+               + '" width="' + bw.toFixed(1) + '" height="' + h.toFixed(1)
+               + '" fill="' + series[si].color + '" opacity=".88" rx="1.5"/>';
+        });
+      });
+    }
+
+    if (!isBars) series.forEach(function (s) {
       var seg = [];
       var flush = function () {
         if (seg.length > 1) svg += '<polyline points="' + seg.join(' ') + '" fill="none" stroke="' + s.color
@@ -1562,12 +1663,19 @@ function trend_per_day(array $times, array $vals): ?float {
     svg += '</svg>';
 
     var leg = '<div class="legend">';
-    series.forEach(function (s) {
-      var last = null;
-      for (var i = s.data.length - 1; i >= 0; i--) if (s.data[i] !== null && s.data[i] !== undefined) { last = s.data[i]; break; }
+    series.forEach(function (s, si) {
+      var shown = null;
+      if (isBars) {
+        // The total in view, which is the question a bar chart answers.
+        shown = totals[si].reduce(function (a, b) { return a + b; }, 0);
+        if (!shown) shown = 0;
+      } else {
+        for (var i = s.data.length - 1; i >= 0; i--) if (s.data[i] !== null && s.data[i] !== undefined) { shown = s.data[i]; break; }
+      }
       leg += '<span class="li"><i style="background:' + s.color + '"></i>' + s.label
-           + (last !== null ? ' <b>' + (Math.round(last * 10) / 10) + cfg.unit + '</b>' : '') + '</span>';
+           + (shown !== null ? ' <b>' + (Math.round(shown * 10) / 10) + cfg.unit + '</b>' : '') + '</span>';
     });
+    if (isBars) leg += '<span class="bucketnote">' + bucketLabel(slot) + '</span>';
     leg += '</div>';
 
     wrap.innerHTML = svg + leg + '<div class="ctip"></div>';
@@ -1585,22 +1693,37 @@ function trend_per_day(array $times, array $vals): ?float {
       var frac = (rel - padL) / (W - padL - padR);
       if (frac < 0) frac = 0; if (frac > 1) frac = 1;
       var want = tA + frac * tSpan, i = 0, bestD = Infinity;
+      // Bars answer for a slice of time, so the readout follows the slice under
+      // the cursor rather than the nearest single reading.
+      var bi = -1;
+      if (isBars) {
+        bi = Math.floor((want - base) / slot);
+        if (bi < 0) bi = 0; if (bi >= nb) bi = nb - 1;
+      }
       for (var k = 0; k < n; k++) {
         var dd = Math.abs(times[k] - want);
         if (dd < bestD) { bestD = dd; i = k; }
       }
-      cross.setAttribute('x1', X(i)); cross.setAttribute('x2', X(i)); cross.setAttribute('opacity', '.5');
-      var html = '<div class="ct">' + fmtTime(times[i], span) + '</div>';
+      // Where the crosshair sits: on the slice for bars, on the sample for lines.
+      var cx2 = isBars
+        ? padL + (bi + 0.5) * ((W - padL - padR) / nb)
+        : X(i);
+      cross.setAttribute('x1', cx2); cross.setAttribute('x2', cx2); cross.setAttribute('opacity', '.5');
+      var head = isBars
+        ? fmtTime(base + bi * slot, tSpan) + '–' + fmtTime(base + (bi + 1) * slot, tSpan)
+        : fmtTime(times[i], span);
+      var html = '<div class="ct">' + head + '</div>';
       var any = false;
-      series.forEach(function (s) {
-        var v = s.data[i];
+      series.forEach(function (s, si) {
+        var v = isBars ? totals[si][bi] : s.data[i];
+        var missing = (v === null || v === undefined);
         html += '<div class="cr"><i style="background:' + s.color + '"></i>' + s.label
-              + '<b>' + (v === null || v === undefined ? '—' : (Math.round(v * 10) / 10) + cfg.unit) + '</b></div>';
-        if (v !== null && v !== undefined) any = true;
+              + '<b>' + (missing ? '—' : (Math.round(v * 10) / 10) + cfg.unit) + '</b></div>';
+        if (!missing && (!isBars || v)) any = true;
       });
       tip.innerHTML = html;
       tip.style.opacity = any ? '1' : '.75';
-      var px = (X(i) / W) * r.width;
+      var px = (cx2 / W) * r.width;
       tip.style.left = Math.min(Math.max(px - tip.offsetWidth / 2, 0), r.width - tip.offsetWidth) + 'px';
       tip.style.top = '4px';
     }
