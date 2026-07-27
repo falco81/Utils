@@ -269,6 +269,7 @@ _NEVER_REMOTE_KEYS = {
     'AUDIO_SEL': "per-run (--audio)", 'SUB_SEL': "per-run (--sub)",
     'SUBS_ONLY': "per-run (--subs-only)", 'MUSE_PASSWORD': "per-run (--password)",
     'CENC_KEYS': "per-run (--key/--keys)", 'FORCE_CONTAINER': "per-run (--container)",
+    'POST_SOURCE': "per-run (--only)",
     # Derived automatically from USER_AGENT / YT_IOS_UA / VIMEO_REFERER after a config load.
     'STREAMABLE_HEADERS': "derived from USER_AGENT", 'TWITCH_HEADERS': "derived from USER_AGENT",
     'YOUTUBE_HEADERS': "derived from YT_IOS_UA", 'VIMEO_HEADERS': "derived from VIMEO_REFERER",
@@ -988,12 +989,18 @@ _held_locks = set()
 _held_locks_lock = threading.Lock()
 
 
-def acquire_lock(lock_path: str) -> bool:
+def acquire_lock(lock_path: str, return_reason: bool = False):
     """Atomically create a lock file for a download target.
 
     Returns True if the lock was acquired. If another live process already holds it,
     prints a message and returns False. Stale locks (owner no longer running) are reclaimed.
+
+    With return_reason=True returns (acquired, own_collision): own_collision is True only when the
+    failure was OUR OWN pid already holding this name (two items in one run mapping to the same
+    file), which is a deliberate skip rather than a real lock contention.
     """
+    def _result(acquired, own_collision=False):
+        return (acquired, own_collision) if return_reason else acquired
     # Remember the ABSOLUTE path: downloads run with the CWD switched into -d/--output-dir, but
     # the atexit release happens after it has been switched back, so a relative path would then
     # point at the wrong directory and leave the real lock behind.
@@ -1005,7 +1012,7 @@ def acquire_lock(lock_path: str) -> bool:
                 f.write(str(os.getpid()))
             with _held_locks_lock:
                 _held_locks.add(lock_path)
-            return True
+            return _result(True)
         except FileExistsError:
             try:
                 with open(lock_path) as f:
@@ -1018,7 +1025,7 @@ def acquire_lock(lock_path: str) -> bool:
                 print(f"[WARN] Two downloads in this run map to the same file name "
                       f"({os.path.basename(lock_path)[:-5]}); keeping only the first.")
                 print("       Use -o to give one of them a different name.")
-                return False
+                return _result(False, own_collision=True)
 
             if not _pid_alive(owner):
                 # Stale lock from a crashed run -> reclaim it and retry.
@@ -1032,7 +1039,7 @@ def acquire_lock(lock_path: str) -> bool:
             print(f"        Lock held by PID {owner} ({lock_path}).")
             print("        Wait for it to finish, choose a different name with -o,")
             print("        or delete the lock file if you are sure no other run is active.")
-            return False
+            return _result(False)
 
 
 def release_lock(lock_path: str) -> None:
@@ -1206,7 +1213,12 @@ HLS/DASH stream.
      file, its stream and its key) or --url-list (one address per line). Both can be re-run
      safely: anything already downloaded is skipped, so an interrupted batch just continues.
 
-  {B}7.{R} {B}When it finishes{R} it offers to tidy the episode names, writes a report next to the
+  {B}7.{R} {B}Two videos in one post?{R} When a Patreon post has an embedded player AND a link to a
+     second video (any source — Vimeo, Drive, YouTube, Dropbox...), BOTH are downloaded and named
+     by origin: "Episode 14 embed" and "Episode 14 link". Use {B}--only embed{R} or {B}--only link{R}
+     to take just one; the default takes all.
+
+  {B}8.{R} {B}When it finishes{R} it offers to tidy the episode names, writes a report next to the
      files, and can push a notification (--test-notify to check that side works).
 """
 
@@ -1327,6 +1339,13 @@ def _prompt_cookie_choice(candidates: list) -> list:
     return [candidates[i] for i in idxs]
 
 
+# Set by --url-list for its whole run: when several cookie JSONs are found, load them ALL
+# (merged; later files win on clashes) instead of prompting — a batch over many URLs would
+# otherwise repeat the question for every single URL, and different creators may need
+# different cookie exports anyway.
+_auto_cookies_all = False
+
+
 def auto_detect_cookies(verbose: bool) -> list:
     """Find JSON cookie file(s) next to the script or in the working directory.
 
@@ -1371,6 +1390,15 @@ def auto_detect_cookies(verbose: bool) -> list:
     if len(candidates) == 1:
         print(f"[INFO] Auto-using cookies file: {os.path.basename(candidates[0])}")
         return [candidates[0]]
+
+    if _auto_cookies_all:
+        # --url-list: merge every detected cookie file, never prompt (the run is unattended and
+        # different URLs may need different accounts' cookies). Merge order is oldest -> newest:
+        # get_cookies_session lets LATER files win on a name/domain clash, and on a clash the
+        # freshest export is the one whose session is least likely to have expired.
+        print(f"[INFO] Auto-using all {len(candidates)} cookie files (merged): "
+              f"{', '.join(os.path.basename(p) for p in candidates)}")
+        return list(reversed(candidates))
 
     interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)()) and \
         bool(getattr(sys.stdout, 'isatty', lambda: False)())
@@ -1743,15 +1771,44 @@ def extract_muse_links_from_post(post: dict) -> list:
                                     (re.compile(r'https?://[^\s"\'<>\\)]+'),))
 
 
+def extract_youtube_links_from_post(post: dict) -> list:
+    """YouTube VIDEO links in a post body (watch / youtu.be / shorts / embed), de-duplicated by
+    video id. Channel/playlist links and the post's own embedded YouTube video are excluded — the
+    embed is handled as the primary stream, and creators routinely link their channel in every
+    post, which must not be mistaken for episode content."""
+    a = post.get('attributes', {}) or {}
+    # The embedded player's own video id, so we don't return it as a "link" as well.
+    emb_url = (a.get('embed') or {}).get('url', '') or ''
+    embed_yid = _yt_video_id(emb_url) if ('youtube.com' in emb_url or 'youtu.be' in emb_url) else None
+
+    out, seen = [], set()
+    for url in _extract_links_from_post(post, ('youtube.com', 'youtu.be'),
+                                        (re.compile(r'https?://[^\s"\'<>\\)]+'),),
+                                        body_only=True):
+        # Only accept URLs that carry a real 11-char video id; this drops /c/<channel>,
+        # /channel/..., /playlists, /@handle and other non-video links.
+        yid = _yt_video_id(url)
+        if not yid or yid == embed_yid or yid in seen:
+            continue
+        seen.add(yid)
+        out.append(url)
+    return out
+
+
 def extract_streamable_links_from_post(post: dict) -> list:
     """Return an ordered, de-duplicated list of Streamable URLs found anywhere in a post."""
     return _extract_links_from_post(post, ('streamable.com',), (_STREAMABLE_URL_RE,))
 
 
-def _extract_links_from_post(post: dict, host_needles, url_res) -> list:
+def _extract_links_from_post(post: dict, host_needles, url_res, body_only: bool = False) -> list:
     """Shared link scraper. Looks first at the rich-text body's explicit link anchors (the
     usual "WATCH HERE" proklik), then at any matching URL pasted as plain text, then at
-    HTML/teaser fields, and finally scans the whole post object as a catch-all."""
+    HTML/teaser fields, and finally scans the whole post object as a catch-all.
+
+    With body_only=True only the rich-text body is scanned (steps 2 and 3 are skipped). That is
+    used for YouTube, where description/credits fields routinely carry unrelated links — a
+    "Background Song:" credit, a channel link, upcoming-episode teasers — that must not be
+    mistaken for the episode's own video."""
     a = post.get('attributes', {}) or {}
     urls = []
     seen = set()
@@ -1793,6 +1850,10 @@ def _extract_links_from_post(post: dict, host_needles, url_res) -> list:
             walk_marks(doc)
             for s in _walk_strings(doc):
                 find_all(s)
+
+    if body_only:
+        # Only the post's own rich-text body counts; description/credits/catch-all are skipped.
+        return urls
 
     # 2) HTML / teaser fallbacks.
     for fld in ('content', 'teaser_text'):
@@ -1938,80 +1999,128 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
     seen_ids = set()
     seen_dropbox = set()
     seen_streamable = set()
+    seen_youtube = set()
     folder_targets = []  # (folder_id, post_title)
     posts_with_media = 0
+
+    # Which videos in a post count as its "embed": only the native embedded player (Vimeo/Mux) is
+    # ever embedded on Patreon; everything else (Drive, Dropbox, YouTube, Streamable, Vidyard,
+    # muse) is a link in the body. --only filters on exactly this distinction.
+    take_embed = POST_SOURCE in ('all', 'embed')
+    take_link = POST_SOURCE in ('all', 'link')
+    # Per post, remember every item added and whether it was the embed, so a post offering an
+    # embed AND a body link can name the linked "full" version apart afterwards.
+    post_groups = []   # list of {'title', 'items': [(origin, item_dict, kind)]}
 
     for post in posts:
         a = post.get('attributes', {}) or {}
         post_title = (a.get('title') or str(post.get('id') or '')).strip()
-        had_media = False
+        group = {'title': post_title, 'items': []}
 
-        # --- Google Drive links ---
-        drive_links = extract_drive_links_from_post(post)
-        file_ids = []
-        for url in drive_links:
-            kind, tid = extract_drive_target(url)
-            if not tid:
-                continue
-            if kind == 'folder':
-                folder_targets.append((tid, post_title))
-            else:
-                file_ids.append(tid)
-        multi = len(file_ids) > 1
-        for i, fid in enumerate(file_ids, 1):
-            if fid in seen_ids:
-                continue
-            seen_ids.add(fid)
-            name = f"{post_title} [{i}]" if multi else post_title
-            drive_videos.append({'id': fid, 'title': name, 'name': name})
-            had_media = True
+        def _add(origin, kind, item, _items=group['items']):
+            # Default-arg binds THIS post's list at definition time, so the closure can't
+            # accidentally append to a later post's group.
+            _items.append((origin, item, kind))
 
-        # --- Dropbox links ---
-        dbx_links = extract_dropbox_links_from_post(post)
-        for url in dbx_links:
-            key = normalize_dropbox_url(url).split('?')[0]
-            if key in seen_dropbox:
-                continue
-            seen_dropbox.add(key)
-            fname = dropbox_filename(url, post_title or 'video')
-            dropbox_items.append({'url': url, 'filename': fname, 'title': fname})
-            had_media = True
-
-        # --- Streamable links (progressive MP4, resolved via its API) ---
-        for url in extract_streamable_links_from_post(post):
-            sc = _streamable_id(url)
-            if not sc or sc in seen_streamable:
-                continue
-            seen_streamable.add(sc)
-            streamable_items.append({'shortcode': sc, 'title': post_title or sc})
-            had_media = True
-
-        # --- Vidyard links ---
-        for url in extract_vidyard_links_from_post(post):
-            vy = _vidyard_id(url)
-            if not vy or vy in seen_vidyard:
-                continue
-            seen_vidyard.add(vy)
-            vidyard_items.append({'uuid': vy, 'title': post_title or vy})
-            had_media = True
-
-        # --- muse.ai links (often password-protected; the password is written in the post) ---
-        for url in extract_muse_links_from_post(post):
-            svid = _muse_id(url)
-            if not svid or svid in seen_muse:
-                continue
-            seen_muse.add(svid)
-            muse_items.append({'svid': svid, 'title': post_title or svid,
-                               'password': _muse_password_from_text(_post_plain_text(post))})
-            had_media = True
-
-        # --- Native Patreon (Vimeo/Mux) streams ---
+        # --- Native Patreon (Vimeo/Mux) streams: the post's embedded player (+ any native body
+        #     links, which extract_streams_from_post already separates and tags). ---
         for stream in extract_streams_from_post(post, verbose):
-            hls_videos.append(stream)
-            had_media = True
+            # A stream from the post BODY is a link; the primary embed is the embed. The extractor
+            # marks grouped members, and only the primary lacks a body origin.
+            origin = 'link' if stream.pop('_body_link', False) else 'embed'
+            if (origin == 'embed' and take_embed) or (origin == 'link' and take_link):
+                _add(origin, 'native', stream)
 
-        if had_media:
+        # Everything below is a body link.
+        if take_link:
+            # --- Google Drive links ---
+            file_ids = []
+            for url in extract_drive_links_from_post(post):
+                kind, tid = extract_drive_target(url)
+                if not tid:
+                    continue
+                if kind == 'folder':
+                    folder_targets.append((tid, post_title))
+                else:
+                    file_ids.append(tid)
+            multi = len(file_ids) > 1
+            for i, fid in enumerate(file_ids, 1):
+                if fid in seen_ids:
+                    continue
+                seen_ids.add(fid)
+                name = f"{post_title} [{i}]" if multi else post_title
+                _add('link', 'drive', {'id': fid, 'title': name, 'name': name})
+
+            # --- Dropbox links ---
+            for url in extract_dropbox_links_from_post(post):
+                key = normalize_dropbox_url(url).split('?')[0]
+                if key in seen_dropbox:
+                    continue
+                seen_dropbox.add(key)
+                fname = dropbox_filename(url, post_title or 'video')
+                _add('link', 'dropbox', {'url': url, 'filename': fname, 'title': fname})
+
+            # --- YouTube links ---
+            for url in extract_youtube_links_from_post(post):
+                yid = _yt_video_id(url)
+                if not yid or yid in seen_youtube:
+                    continue
+                seen_youtube.add(yid)
+                _add('link', 'youtube', {'source': 'youtube', 'youtube_id': yid,
+                                         'title': post_title or yid})
+
+            # --- Streamable links (progressive MP4, resolved via its API) ---
+            for url in extract_streamable_links_from_post(post):
+                sc = _streamable_id(url)
+                if not sc or sc in seen_streamable:
+                    continue
+                seen_streamable.add(sc)
+                _add('link', 'streamable', {'shortcode': sc, 'title': post_title or sc})
+
+            # --- Vidyard links ---
+            for url in extract_vidyard_links_from_post(post):
+                vy = _vidyard_id(url)
+                if not vy or vy in seen_vidyard:
+                    continue
+                seen_vidyard.add(vy)
+                _add('link', 'vidyard', {'uuid': vy, 'title': post_title or vy})
+
+            # --- muse.ai links (often password-protected; the password is in the post text) ---
+            for url in extract_muse_links_from_post(post):
+                svid = _muse_id(url)
+                if not svid or svid in seen_muse:
+                    continue
+                seen_muse.add(svid)
+                _add('link', 'muse', {'svid': svid, 'title': post_title or svid,
+                                      'password': _muse_password_from_text(_post_plain_text(post))})
+
+        if group['items']:
+            post_groups.append(group)
             posts_with_media += 1
+
+    # Name alternate versions apart. A post that yielded more than one video gets its LINKED
+    # videos marked "... full" (they are the full-length copies alongside a shorter embed); when
+    # the whole group is links with no embed, the longest by duration is the full one. This works
+    # for any mix of sources — Vimeo embed + Drive link, Mux embed + YouTube link, and so on.
+    _name_post_versions(post_groups, session, verbose)
+
+    # Fan the grouped items back out into the per-source download lists.
+    for group in post_groups:
+        for origin, item, kind in group['items']:
+            if kind == 'native':
+                hls_videos.append(item)
+            elif kind == 'drive':
+                drive_videos.append(item)
+            elif kind == 'dropbox':
+                dropbox_items.append(item)
+            elif kind == 'youtube':
+                hls_videos.append(item)   # resolved as HLS like other native streams
+            elif kind == 'streamable':
+                streamable_items.append(item)
+            elif kind == 'vidyard':
+                vidyard_items.append(item)
+            elif kind == 'muse':
+                muse_items.append(item)
 
     # Expand any Drive folders linked from posts (recursive, like folder mode).
     for folder_id, post_title in folder_targets:
@@ -2063,14 +2172,21 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
             if verbose:
                 print(f"        url: https://muse.ai/v/{mu['svid']}")
         for h in hls_videos:
-            tag = 'Mux' if h.get('source') == 'mux' else f"Vimeo {h.get('vimeo_id')}"
+            src = h.get('source')
+            if src == 'mux':
+                tag = 'Mux'
+            elif src == 'youtube':
+                tag = f"YouTube {h.get('youtube_id')}"
+            else:
+                tag = f"Vimeo {h.get('vimeo_id')}"
             n += 1
             print(f"   {n:>3}) [{tag}] {h['title']}")
             if verbose:
-                src = h.get('master_url') or \
-                    (f"vimeo {h.get('vimeo_id')}/{h.get('vimeo_hash')}" if h.get('source') == 'vimeo' else '')
-                if src:
-                    print(f"        src: {src}")
+                src_url = h.get('master_url') or \
+                    (f"https://youtu.be/{h.get('youtube_id')}" if src == 'youtube' else
+                     f"vimeo {h.get('vimeo_id')}/{h.get('vimeo_hash')}" if src == 'vimeo' else '')
+                if src_url:
+                    print(f"        src: {src_url}")
         return
 
     # Combined interactive selection across all three kinds.
@@ -3547,6 +3663,8 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
     for job in jobs:
         if job.failed or not job.filename:
             tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} Skipping (no playback URL): {job.title}")
+            _record_undownloaded(job.title, getattr(job, 'fail_reason', None)
+                                 or 'no playback URL (private, expired, or unsupported)')
             continue
         # Final file goes to dest_subdir (if any); scratch parts/lock stay in CWD's .temp so
         # they never nest (.temp/.temp) and get cleaned normally.
@@ -3557,8 +3675,11 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             tqdm.write(f"[INFO] Already have {os.path.basename(job.out_path)}, skipping.")
             continue
         job.lock_path = _temp_artifact(job.filename, ".lock")
-        if not acquire_lock(job.lock_path):
+        got, own_collision = acquire_lock(job.lock_path, return_reason=True)
+        if not got:
             tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} Already downloading elsewhere: {job.title}")
+            if not own_collision:      # a same-run name clash is deliberate, not a failure
+                _record_undownloaded(job.title, 'already being downloaded by another run (locked)')
             continue
         job.locked = True
         # Build segments.
@@ -3810,7 +3931,67 @@ def _auto_settings():
 # =============================================================================
 def extract_streams_from_post(post: dict, verbose: bool) -> list:
     """Return native video stream descriptors for ONE Patreon post. Each is either
-    {'source':'vimeo','title','vimeo_id','vimeo_hash'} or {'source':'mux','title','master_url'}."""
+    {'source':'vimeo','title','vimeo_id','vimeo_hash'} or {'source':'mux','title','master_url'}.
+
+    A post may carry more than one video: the embedded player, PLUS a link in the post body to a
+    second, usually higher-quality, version ("full"). When those are genuinely different videos
+    both are returned, and every version after the primary one has its version label (e.g. 'full')
+    put in a 'version' field so the download can be named apart from the embed."""
+    a = post.get('attributes', {}) or {}
+    title = (a.get('title') or str(post.get('id'))).strip()
+    primary = _primary_stream_from_post(post)
+    out = list(primary)
+
+    # Extra native versions linked in the post body. Only Vimeo/Mux count as "another version"
+    # here; Drive/Dropbox/YouTube/... links are separate downloads handled by the caller and must
+    # not be duplicated. A link is a new version only if it points at a DIFFERENT video.
+    have = {_stream_identity(s) for s in out}
+    for ident, desc in _linked_video_versions(post):
+        if ident in have:
+            continue
+        have.add(ident)
+        desc['title'] = title
+        desc['_body_link'] = True     # tells _download_from_posts this is a link, not the embed
+        out.append(desc)
+    return out
+
+
+def _stream_identity(s):
+    """A value that is equal for two descriptors pointing at the same underlying video."""
+    if s.get('source') == 'vimeo':
+        return ('vimeo', s.get('vimeo_id'))
+    if s.get('source') == 'mux':
+        return ('mux', re.sub(r'\?.*$', '', s.get('master_url', '')))
+    return ('?', str(s))
+
+
+def _linked_video_versions(post: dict):
+    """Yield (identity, descriptor) for each Vimeo/Mux link found in the post BODY.
+
+    Labelling is not done here — the caller marks a group and picks the longest as 'full'."""
+    a = post.get('attributes', {}) or {}
+    text = ''
+    for key in ('content_json_string', 'content', 'teaser_text_json_string'):
+        v = a.get(key)
+        if isinstance(v, str):
+            text += ' ' + v
+    text = text.replace('\\/', '/')
+    if not text.strip():
+        return
+
+    for m in re.finditer(
+            r'(?:(?:https?:)?//)?(?:www\.|player\.)?\bvimeo\.com/(?:video/)?(\d+)'
+            r'(?:[/?](?:h=)?([0-9a-zA-Z]+))?', text):
+        vid, vhash = m.group(1), m.group(2) or ''
+        yield ('vimeo', vid), {'source': 'vimeo', 'vimeo_id': vid, 'vimeo_hash': vhash}
+    for m in re.finditer(r'https://stream\.mux\.com/[\w\-]+\.m3u8[^\s"\\<>]*', text):
+        url = m.group(0)
+        yield ('mux', re.sub(r'\?.*$', '', url)), {'source': 'mux', 'master_url': url}
+
+
+def _primary_stream_from_post(post: dict) -> list:
+    """The single main stream of a post (embed / post_file / Mux). Unchanged behaviour: this is
+    the old body of extract_streams_from_post, kept as the 'version 1' of a post."""
     a = post.get('attributes', {}) or {}
     post_type = a.get('post_type')
     out = []
@@ -3849,6 +4030,23 @@ def extract_streams_from_post(post: dict, verbose: bool) -> list:
         title = (emb.get('subject') or a.get('title') or mid.group(1)).strip()
         out.append({'source': 'vimeo', 'title': title,
                     'vimeo_id': mid.group(1), 'vimeo_hash': ''})
+        return out
+    # 2c) YouTube embed: the embedded player is a YouTube video (very common — the creator embeds
+    #     the YouTube upload and links the Vimeo copy in the body, or vice versa).
+    yt = _yt_video_id(url_field) if url_field else None
+    if not yt and html:
+        ym = re.search(r'(?:youtube\.com/embed/|youtu\.be/|youtube\.com/watch\?v=)'
+                       r'([0-9A-Za-z_-]{11})', html)
+        yt = ym.group(1) if ym else None
+    if yt:
+        title = (emb.get('subject') or a.get('title') or yt).strip()
+        out.append({'source': 'youtube', 'title': title, 'youtube_id': yt})
+        return out
+
+    # If the post HAS a structured embed pointing at some other host we don't natively play,
+    # do NOT fall through to the whole-post scan below: that scan would pick up a Vimeo/Mux link
+    # from the BODY and mislabel it as the embed. The body links are collected separately.
+    if url_field or html:
         return out
 
     # 3) Fallback: some collections don't populate the structured embed/post_file fields, but
@@ -4049,11 +4247,8 @@ def ensure_ffmpeg(verbose):
 
 
 # ---- Vimeo/Mux resolution + HLS playlist parsing -------------------------- #
-def _extract_player_config(html):
-    """Extract the playerConfig JSON object from a Vimeo iframe page."""
-    idx = html.find('playerConfig')
-    if idx < 0:
-        return None
+def _json_object_at(html, idx):
+    """Parse the first balanced {...} JSON object at/after position `idx`. Returns dict or None."""
     start = html.find('{', idx)
     if start < 0:
         return None
@@ -4081,6 +4276,84 @@ def _extract_player_config(html):
                         return json.loads(html[start:i + 1])
                     except Exception:
                         return None
+    return None
+
+
+def _extract_player_config(html):
+    """Extract the Vimeo player config JSON from a player/clip page.
+
+    Vimeo has embedded this under several names over the years, and the page layout changed to
+    Next.js (which no longer inlines it at all — that case is handled by the /config endpoint in
+    resolve_vimeo). For backward compatibility this tries every known anchor and returns the
+    first object that actually looks like a player config (has request.files or a video block)."""
+    if not html:
+        return None
+
+    def looks_like_config(obj):
+        if not isinstance(obj, dict):
+            return False
+        req = obj.get('request')
+        if isinstance(req, dict) and req.get('files'):
+            return True
+        # Some shapes nest it, some carry a top-level video/clip block alongside files.
+        return bool(obj.get('files') or (obj.get('video') and obj.get('cdn_url')))
+
+    # 1) Known assignment anchors, newest/most-specific first.
+    for anchor in ('playerConfig', 'clipPageConfig', 'clip_page_config', 'vimeoPlayerConfig',
+                   'window.vimeo_esi_config', 'config ='):
+        pos = 0
+        while True:
+            idx = html.find(anchor, pos)
+            if idx < 0:
+                break
+            obj = _json_object_at(html, idx + len(anchor))
+            if looks_like_config(obj):
+                return obj
+            # A nested {"...":{"request":{"files"...}}} — accept if it contains a config.
+            if isinstance(obj, dict):
+                for v in obj.values():
+                    if looks_like_config(v):
+                        return v
+            pos = idx + len(anchor)
+
+    # 2) <script type="application/json"> blocks (Next.js / __NEXT_DATA__ and friends): scan each
+    #    for an embedded config or a config URL we can hand back to the caller.
+    for m in re.finditer(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', html, re.S):
+        try:
+            blob = json.loads(m.group(1))
+        except Exception:
+            continue
+        found = _find_config_in(blob)
+        if found:
+            return found
+
+    # 3) Last resort: the very first balanced object after any 'request":{"files"' fingerprint.
+    fp = html.find('"files"')
+    if fp > 0:
+        # Walk back to the enclosing '{' of the request object's parent, then parse forward.
+        obj = _json_object_at(html, html.rfind('{', 0, fp))
+        if looks_like_config(obj):
+            return obj
+    return None
+
+
+def _find_config_in(obj, _depth=0):
+    """Recursively search a parsed JSON blob for a player-config-shaped dict."""
+    if _depth > 8 or obj is None:
+        return None
+    if isinstance(obj, dict):
+        req = obj.get('request')
+        if isinstance(req, dict) and req.get('files'):
+            return obj
+        for v in obj.values():
+            got = _find_config_in(v, _depth + 1)
+            if got:
+                return got
+    elif isinstance(obj, list):
+        for v in obj:
+            got = _find_config_in(v, _depth + 1)
+            if got:
+                return got
     return None
 
 
@@ -4164,8 +4437,53 @@ def _streamable_fname(base, shortcode):
     return _ensure_video_ext(safe_filename(base or shortcode, shortcode))
 
 
+def _vimeo_master_from_config(cfg):
+    """Pull (hls_master_url, title, duration) out of a Vimeo player config dict."""
+    req = cfg.get('request', {}) or {}
+    files = req.get('files', {}) or {}
+    hls = files.get('hls', {}) or {}
+    cdns = hls.get('cdns', {}) or {}
+    cdn = hls.get('default_cdn') or (next(iter(cdns)) if cdns else None)
+    master = cdns.get(cdn, {}).get('url') if cdn else None
+    vid = cfg.get('video', {}) or {}
+    return master, vid.get('title'), (vid.get('duration') or 0)
+
+
 def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
-    """Return (hls_master_url, title, duration_seconds) or (None, None, 0)."""
+    """Return (hls_master_url, title, duration_seconds) or (None, None, 0).
+
+    Primary path is the player's own JSON config endpoint
+    (player.vimeo.com/video/<id>/config?h=<hash>), which is what the site itself calls and which
+    returns the HLS master directly. The old approach — GET the player HTML and scrape a
+    `playerConfig` blob — broke when Vimeo moved the player page to Next.js: the HTML no longer
+    embeds that blob, so every video looked "private/unavailable" even though it plays fine. The
+    HTML scrape is kept only as a last-ditch fallback."""
+    headers = {'Referer': 'https://vimeo.com/', 'User-Agent': USER_AGENT,
+               'Accept': 'application/json'}
+
+    # 1) The JSON config endpoint — direct and stable.
+    config_url = f"https://player.vimeo.com/video/{vimeo_id}/config"
+    if vimeo_hash:
+        config_url += f"?h={vimeo_hash}"
+    try:
+        r = session.get(config_url, headers=headers,
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if r.status_code == 200:
+            try:
+                cfg = r.json()
+            except ValueError:
+                cfg = None
+            if cfg:
+                master, title, duration = _vimeo_master_from_config(cfg)
+                if master:
+                    return master, title, duration
+        elif verbose:
+            print(f"[WARN] Vimeo config returned {r.status_code} for {vimeo_id}")
+    except requests.RequestException as e:
+        if verbose:
+            print(f"[WARN] Vimeo config fetch failed for {vimeo_id}: {e}")
+
+    # 2) Fallback: scrape the player HTML for an embedded playerConfig (older/edge cases).
     embed = f"https://player.vimeo.com/video/{vimeo_id}"
     if vimeo_hash:
         embed += f"?h={vimeo_hash}"
@@ -4183,16 +4501,7 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     cfg = _extract_player_config(r.text)
     if not cfg:
         return None, None, 0
-    req = cfg.get('request', {})
-    files = req.get('files', {})
-    hls = files.get('hls', {})
-    cdns = hls.get('cdns', {})
-    cdn = hls.get('default_cdn') or (next(iter(cdns)) if cdns else None)
-    master = cdns.get(cdn, {}).get('url') if cdn else None
-    vid = cfg.get('video', {})
-    title = vid.get('title')
-    duration = vid.get('duration') or 0
-    return master, title, duration
+    return _vimeo_master_from_config(cfg)
 
 
 # ---- YouTube + Twitch (pure requests; both resolve to a standard HLS master) ---------- #
@@ -6220,6 +6529,9 @@ MUSE_PASSWORD = None              # --password: for a single password-protected 
 CENC_KEYS = []                    # user-supplied CENC/Widevine content keys (hex), for content you
 #                                   already hold keys for (own storage). NOT key extraction/DRM bypass.
 FORCE_CONTAINER = None            # None = auto (.mkv when multi-track, else .mp4); 'mp4'/'mkv' force it
+POST_SOURCE = 'all'               # --only: which videos to take from a Patreon post —
+#                                   'all' (default), 'embed' (only the embedded player), or
+#                                   'link' (only videos linked in the post body).
 
 
 def _parse_media_attrs(line):
@@ -6392,6 +6704,20 @@ _seg_tls = threading.local()
 _seg_sessions = []
 _seg_sessions_lock = threading.Lock()
 
+# Videos expected but never downloaded this invocation (resolve/lock failures). A module-level
+# list so the native downloader can record them and the collection / url-list layer can see that
+# not everything succeeded — downloaders don't pass a value back up the call chain.
+_undownloaded = []
+_undownloaded_lock = threading.Lock()
+
+
+def _record_undownloaded(title, reason):
+    try:
+        with _undownloaded_lock:
+            _undownloaded.append((title or '?', reason or 'not downloaded'))
+    except Exception:
+        pass
+
 
 def _seg_session(base):
     s = getattr(_seg_tls, 'session', None)
@@ -6440,10 +6766,38 @@ def _download_hls_segment(url, path, session, headers):
                         continue
                     return False, last
                 tmp = path + '.tmp'
-                # copyfileobj runs the transfer loop in C: with a hundred-plus parallel segment
-                # threads a Python-level chunk loop burns a lot of CPU for no extra throughput.
+                # Guard against an antibot / "Just a moment..." challenge page (or an error/JSON
+                # body) served with HTTP 200 in place of the segment: writing it would silently
+                # corrupt the video. A real HLS segment is fMP4 (an MP4 box: bytes 4..8 are an
+                # ASCII box name like 'moof'/'styp'/'ftyp'/'sidx'/'emsg') or MPEG-TS (first byte
+                # is the 0x47 sync byte). HTML/JSON starts with '<' or '{'. Only the first bytes
+                # are inspected, and the write proceeds normally for anything that looks binary,
+                # so the hot path costs nothing measurable.
+                ctype = (r.headers.get('Content-Type') or '').lower()
+                suspect_ct = ('text/html' in ctype or 'text/plain' in ctype or
+                              'application/json' in ctype or 'application/xml' in ctype)
+                r.raw.decode_content = True
+                first = r.raw.read(65536)
+                head = first.lstrip()[:16]
+                # Positive markers of a real segment: MPEG-TS sync byte, or an MP4 box whose
+                # 4-char name at offset 4 is one of the known top-level box types. (Checking the
+                # exact names avoids treating '<!DOCTYPE' — whose bytes 4..8 'CTYP' are alphabetic
+                # — as a valid box.)
+                is_ts = first[:1] == b'\x47'
+                is_mp4 = len(first) >= 8 and first[4:8] in (
+                    b'ftyp', b'styp', b'moof', b'sidx', b'emsg', b'free', b'mdat', b'moov')
+                is_html_json = head[:1] in (b'<', b'{') or head[:9].lower() == b'<!doctype'
+                if is_html_json or (suspect_ct and not (is_ts or is_mp4)):
+                    last = ("got a challenge/HTML page instead of the segment "
+                            "(antibot or expired link) — re-run to refresh")
+                    if attempt < attempts - 1:
+                        time.sleep(min(2 ** attempt, 15) + random.uniform(0, 0.5))
+                        continue
+                    return False, last
+                # copyfileobj runs the rest of the transfer loop in C: with a hundred-plus
+                # parallel segment threads a Python chunk loop burns CPU for no extra throughput.
                 with open(tmp, 'wb') as f:
-                    r.raw.decode_content = True
+                    f.write(first)
                     shutil.copyfileobj(r.raw, f, 1024 * 1024)
                 os.replace(tmp, path)
                 return True, None
@@ -8259,27 +8613,100 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
     return job
 
 
+def _stream_duration(stream, session, verbose):
+    """Best-effort duration in seconds for a native stream descriptor, or 0 if unknown."""
+    try:
+        if stream.get('source') == 'vimeo':
+            _m, _t, dur = resolve_vimeo(stream.get('vimeo_id'), stream.get('vimeo_hash'),
+                                        session, verbose)
+            return float(dur or 0)
+        if stream.get('source') == 'mux':
+            return float(_ffprobe_duration(stream.get('master_url'), MUX_HEADERS, verbose) or 0)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _name_post_versions(post_groups, session, verbose):
+    """When a post yielded more than one video, put its ORIGIN in the name so the versions are
+    told apart: the embedded player becomes '... embed' and each body link '... link' (numbered
+    'link 2', 'link 3' when there are several). A post with a single video keeps its plain title.
+
+    Origin is used rather than trying to guess which copy is the "full" one: embed-vs-link is
+    something the script knows for certain, whereas comparing durations across different hosts
+    (Vimeo vs Drive vs YouTube) is slow and unreliable. The user sorts out which is which by hand.
+    """
+    for group in post_groups:
+        items = group['items']
+        if len(items) < 2:
+            continue
+        base = group['title'] or 'video'
+        n_embed = sum(1 for origin, _i, _k in items if origin == 'embed')
+        n_link = sum(1 for origin, _i, _k in items if origin == 'link')
+        link_n = 0
+        embed_n = 0
+        for origin, item, _kind in items:
+            if origin == 'embed':
+                embed_n += 1
+                suffix = 'embed' if n_embed == 1 else f'embed {embed_n}'
+            else:
+                link_n += 1
+                # First link is just 'link'; extras get 'link 2', 'link 3', ...
+                suffix = 'link' if n_link == 1 or link_n == 1 else f'link {link_n}'
+            _set_item_title(item, f"{base} {suffix}")
+        if verbose:
+            tqdm.write(f"[INFO] Patreon: post '{base[:40]}' has {len(items)} videos; "
+                       f"naming them by origin (embed / link).")
+
+
+def _set_item_title(item, name):
+    """Set the display/file name on a source item, whatever field that source names it by."""
+    # Dropbox items are keyed by 'filename'; a bare id keeps its .ext. Everything else uses
+    # 'title', and Drive additionally carries 'name'. Set whatever the item actually has.
+    if 'filename' in item:
+        root, ext = os.path.splitext(item['filename'])
+        item['filename'] = name + (ext or '.mp4')
+    if 'name' in item:
+        item['name'] = name
+    item['title'] = name
+
+
 def download_hls_pooled(videos, session, out_dir, max_connections, max_height, verbose):
-    """Download all native (Vimeo/Mux) videos as HLS via a shared pool of segment workers,
-    then mux each with ffmpeg. All videos progress at once; the budget is shared."""
+    """Download all native (Vimeo/Mux/YouTube) videos as HLS via a shared pool of segment
+    workers, then mux each with ffmpeg. All videos progress at once; the budget is shared."""
     from concurrent.futures import ThreadPoolExecutor
 
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
     print(f"[INFO] Resolving {len(videos)} native video(s)...")
+
     # Each video is resolved independently with a visible progress bar; a network error or
     # timeout on one must not abort the whole batch (mirrors the Drive resolve phase).
     resolve_bar = make_bar(total=len(videos), desc='Resolving', unit='video',
                            unit_scale=False, leave=False)
     resolve_lock = threading.Lock()
 
+    # _build_hls_job returns None in two very different situations: a genuine failure (private /
+    # expired / rate-limited / no video track), or a deliberate no-op (a bare --audio/--sub scan
+    # that only lists tracks). Tell them apart so a real failure is COUNTED, never silently
+    # dropped — that was making "31 succeeded, 0 failed, out of 32" lose one video without a word.
+    listing_only = (AUDIO_SEL == 'SCAN' or SUB_SEL == 'SCAN')
+    resolve_failures = []      # (title, reason) for videos that could not be resolved
+    resolve_fail_lock = threading.Lock()
+
     def _resolve(v):
         try:
-            return _build_hls_job(v, session, out_dir, max_height, verbose)
+            job = _build_hls_job(v, session, out_dir, max_height, verbose)
+            if job is None and not listing_only:
+                with resolve_fail_lock:
+                    resolve_failures.append((v.get('title') or '?',
+                                             'could not resolve (private, expired, '
+                                             'rate-limited, or no video stream)'))
+            return job
         except Exception as exc:
-            if verbose:
-                tqdm.write(f"[WARN] Could not resolve {v.get('title')}: {exc}")
+            with resolve_fail_lock:
+                resolve_failures.append((v.get('title') or '?', f'{type(exc).__name__}: {exc}'))
             return None
         finally:
             with resolve_lock:
@@ -8290,15 +8717,33 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
         for job in ex.map(_resolve, videos):
             if job is None:
                 continue
-            if not acquire_lock(job.lock_path):
+            got, own_collision = acquire_lock(job.lock_path, return_reason=True)
+            if not got:
+                if not own_collision:
+                    # A DIFFERENT run holds this file's lock — that video won't come down here,
+                    # so record it as a failure. A same-run name collision (own_collision) is
+                    # deliberate ("keeping only the first") and is not a failure.
+                    with resolve_fail_lock:
+                        resolve_failures.append(
+                            (os.path.basename(job.filename or job.title or '?'),
+                             'already being downloaded by another run (locked)'))
                 continue
             job.locked = True
             jobs.append(job)
     resolve_bar.close()
 
+    # Surface resolve/lock failures immediately, even without -v: they were invisible before.
+    for title, reason in resolve_failures:
+        tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} {title}: {reason}.")
+        _record_undownloaded(title, reason)
+
     if not jobs:
-        print("[INFO] Nothing to download (native).")
-        return
+        if resolve_failures:
+            print(f"{CLR.YELLOW}[INFO]{CLR.RESET} Nothing downloaded: all "
+                  f"{len(resolve_failures)} native video(s) failed to resolve.")
+        else:
+            print("[INFO] Nothing to download (native).")
+        return {'ok': 0, 'fail': len(resolve_failures), 'total': len(resolve_failures)}
 
     per_file_bars = len(jobs) <= PER_FILE_BAR_LIMIT
     _seg_workers = _hls_worker_count(max_connections)
@@ -8434,11 +8879,22 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
         _seg_sessions.clear()
     _seg_tls.__dict__.clear()
 
-    color = CLR.GREEN if result['fail'] == 0 else CLR.YELLOW
-    print(f"\n{color}[INFO] Native videos done: {result['ok']} succeeded, {result['fail']} failed, "
-          f"out of {len(jobs)}.{CLR.RESET}")
+    color = CLR.GREEN if (result['fail'] == 0 and not resolve_failures) else CLR.YELLOW
+    total_attempted = len(jobs) + len(resolve_failures)
+    total_failed = result['fail'] + len(resolve_failures)
+    print(f"\n{color}[INFO] Native videos done: {result['ok']} succeeded, {total_failed} failed, "
+          f"out of {total_attempted}.{CLR.RESET}")
     for title, reason in failures:
         print(f"[WARN] {title}: {reason or 'failed'} (partial segments kept for resume).")
+        # NB: these were already handed to _record_failed above, so they flow into the retry loop
+        # and then summary['failed']. Do NOT also push them into _undownloaded — that would count
+        # the same failure twice. _undownloaded is only for resolve/lock losses the retry loop
+        # never sees.
+    # Resolve/lock failures were already printed above; repeat them in the summary so a long run's
+    # final lines make clear that not everything came down.
+    for title, reason in resolve_failures:
+        print(f"[WARN] {title}: {reason} (not downloaded).")
+    return {'ok': result['ok'], 'fail': total_failed, 'total': total_attempted}
 
 
 # =============================================================================
@@ -8945,9 +9401,12 @@ def print_preview(plan, skip, show_all, use_color):
 
 
 def apply_renames(changed, directory, use_color):
-    """Safe rename via temporary names (handles A<->B swaps and cycles)."""
+    """Safe rename via temporary names (handles A<->B swaps and cycles). If anything fails
+    midway, files already moved to temp names are rolled back to their original names, so a
+    disk-full/permission/AV-lock error can never leave files stranded under hidden temp names."""
     tag = uuid.uuid4().hex[:8]
-    temps = []
+    temps = []          # temp names created so far, parallel to changed[:len(temps)]
+    renamed_final = 0   # how many temps already made it to their final name
     try:
         for i, (old, _) in enumerate(changed):
             tmp = f".__rename_{tag}_{i}__"
@@ -8955,9 +9414,25 @@ def apply_renames(changed, directory, use_color):
             temps.append(tmp)
         for (old, new), tmp in zip(changed, temps):
             os.rename(os.path.join(directory, tmp), os.path.join(directory, new))
+            renamed_final += 1
         print(_rn_color(f"\n  Done - renamed {len(changed)} file(s).", "green", use_color))
     except OSError as e:
         print(_rn_color(f"\n  ERROR while renaming: {e}", "red", use_color))
+        # Roll back every file still sitting under a temp name to its ORIGINAL name.
+        rolled = 0
+        for (old, _new), tmp in list(zip(changed, temps))[renamed_final:]:
+            try:
+                os.rename(os.path.join(directory, tmp), os.path.join(directory, old))
+                rolled += 1
+            except OSError:
+                print(_rn_color(f"  Could not restore '{tmp}' back to '{old}' — "
+                                f"rename it by hand.", "red", use_color))
+        if rolled:
+            print(_rn_color(f"  Rolled {rolled} file(s) back to their original names.",
+                            "yellow", use_color))
+        if renamed_final:
+            print(_rn_color(f"  {renamed_final} file(s) had already been renamed and keep "
+                            f"their new names.", "yellow", use_color))
 
 
 _RENAME_VIDEO_EXTS = ('.mp4', '.mkv', '.webm', '.m4v', '.mov', '.avi', '.ts')
@@ -10391,6 +10866,8 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
     single Patreon post (any of which may link to Drive/Dropbox and/or host native Vimeo/Mux)."""
     summary = {'ok': False, 'kind': None, 'downloaded': [], 'rename': None, 'error': None,
                'failed': [], 'title': None, 'preview_note': ''}
+    with _undownloaded_lock:
+        _undownloaded.clear()
     global FFMPEG, FFMPEG_DOWNLOAD_URL
     if ffmpeg_path:
         FFMPEG = ffmpeg_path
@@ -10825,6 +11302,13 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
             _still_failed = _retry_loop(session, verbose, chunk_size)
             summary['failed'] = [{'filename': e.get('filename'), 'reason': e.get('reason')}
                                  for e in _still_failed]
+            # Videos that never resolved (private / expired / rate-limited / locked) are failures
+            # too, even though they never reached the retry loop. Without this a collection that
+            # lost a video would report ok with an empty 'failed', and --url-list would tick the
+            # URL off as fully done.
+            with _undownloaded_lock:
+                for title, reason in _undownloaded:
+                    summary['failed'].append({'filename': title, 'reason': reason})
     finally:
         session.close()
 
@@ -11456,6 +11940,8 @@ def run_url_list(list_path, base_kwargs, out_dir):
     JSON file (["url", ...] or [{"url": ..., "done": false}, ...] or {"urls": [...]}); finished
     URLs are commented out / marked "done": true, together with the collection name and any
     warning, so an interrupted run resumes where it stopped."""
+    global _auto_cookies_all
+    _auto_cookies_all = True    # unattended batch: use ALL detected cookie JSONs, never prompt
     setup_console(base_kwargs.get('use_color', True))   # style the header lines too
     urls, list_fmt = _read_url_list(list_path)
     if not urls:
@@ -11962,7 +12448,7 @@ if __name__ == "__main__":
                         help="Show this help — including the workflow, every option, and the exact "
                              "layout of the files this script reads — and exit.")
     parser.add_argument("video_id", type=str, nargs='?', default=None, help="A Drive file ID / file URL / FOLDER URL, a Dropbox share URL, a Vimeo URL, a YouTube video or playlist URL, a Twitch VOD URL, or a Patreon COLLECTION/POST URL, or a Patreon creator page narrowed by a tag (the ?filters[tag]=... address you get by clicking a tag - quote it in the shell). Folders, collections and playlists download every video found. Omit when using --url-list.")
-    parser.add_argument("--url-list", type=str, default=None, help="Path to a TEXT file with ONE URL per line, or a JSON file ([\"url\", ...] / [{\"url\": ..., \"done\": false}] / {\"urls\": [...]}); finished entries are marked done with the collection name, file count and any warning (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end.")
+    parser.add_argument("--url-list", type=str, default=None, help="Path to a TEXT file with ONE URL per line, or a JSON file ([\"url\", ...] / [{\"url\": ..., \"done\": false}] / {\"urls\": [...]}); finished entries are marked done with the collection name, file count and any warning (blank lines and '#' comments ignored). Downloads each in turn, auto-applies the rename when there are no conflicts (otherwise skips it), and writes a report .log at the end. When several JSON cookie files are found, ALL are loaded (merged; the newest wins on a clash) without asking.")
     parser.add_argument("--davka", "--batch", dest="davka", type=str, default=None, metavar="FILE", help="Batch list: a TEXT file describing one video per block - NAME line, then the video URL (.mpd/.m3u8 or a direct file), then optionally the KID:KEY decryption key you already hold (several key lines are allowed, and unencrypted streams simply have none). Blank lines and '#' comments are ignored. Each video is saved under its NAME. Re-running skips videos whose file is already there, so an interrupted batch just continues. Add -l to only list what was parsed.")
     parser.add_argument("--davka-browser", "--batch-browser", dest="davka_browser", type=str, default=None, metavar="FILE", help="Same list format and behaviour as --davka, except the middle line is a normal PAGE address instead of a stream: each one is opened in a real browser (as --scan-browser does), the stream its player fetches is discovered, and THAT is downloaded under the block's name with the block's key. Addresses that already point straight at a .mpd/.m3u8/file are used as-is, so a list may mix both.")
     parser.add_argument("-o", "--output", type=str, help="Output file name (single file only; ignored for folders/collections).")
@@ -11986,6 +12472,7 @@ if __name__ == "__main__":
     parser.add_argument("--key", action='append', default=None, metavar='KID:KEY', help="Content decryption key you ALREADY hold (for your own DRM-protected storage), as KID:KEY or a bare 32-hex KEY. Repeatable for multiple tracks. Used to decrypt CENC/Widevine HLS/DASH via ffmpeg. This is NOT key extraction or DRM-bypass; you must supply your own keys.")
     parser.add_argument("--keys", default=None, metavar='FILE', help="Read decryption keys (one KID:KEY per line) from a file, same purpose as --key.")
     parser.add_argument("--container", choices=['auto', 'mp4', 'mkv'], default='auto', help="Force the final container: 'mp4' or 'mkv'. Default 'auto' = .mkv when there are multiple audio tracks or subtitles (names/languages show reliably), otherwise .mp4.")
+    parser.add_argument("--only", choices=['all', 'embed', 'link'], default='all', help="For Patreon posts that hold more than one video: which to download. 'embed' = only the embedded player, 'link' = only videos linked in the post body (Drive/YouTube/Vimeo/Dropbox/...), 'all' (default) = both. When a post yields several, each file is named by origin (\"... embed\" / \"... link\") so you can tell the versions apart.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--insecure", "--no-check-certificate", "--no-check-certificates", dest="insecure", action="store_true", help="Never verify TLS certificates, on any connection (config, page scans, manifests, every download). Expired, self-signed or wrong-hostname certificates all work. Prints a warning once. Set INSECURE_TLS = True at the top of the script to make it permanent.")
@@ -12020,6 +12507,7 @@ if __name__ == "__main__":
         SUB_SEL = _parse_track_sel(args.sub)
     CENC_KEYS = _parse_cenc_keys(args.key, args.keys)
     FORCE_CONTAINER = args.container if args.container in ('mp4', 'mkv') else None
+    POST_SOURCE = args.only
     SUBS_ONLY = args.subs_only
     MUSE_PASSWORD = args.password
 
