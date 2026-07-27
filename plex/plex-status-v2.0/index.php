@@ -127,6 +127,35 @@ function bytes(int $b): string {
     return round($v, $i >= 2 ? 1 : 0) . ' ' . $u[$i];
 }
 
+function free_space($sizeB, $usedB): ?array {
+    // What is left, and how to say it. The unit follows the amount remaining
+    // rather than the size of the disk: on a nearly full 8 TB drive "0.05 TB
+    // free" tells you nothing, while "48 GB free" is something you can act on.
+    // Precision tightens as the number shrinks, for the same reason — nobody
+    // needs a decimal place on 648 GB, and everybody wants one on 4.2 GB.
+    if ($sizeB === null || $usedB === null) return null;
+    $free = (float) $sizeB - (float) $usedB;
+    if ($free < 0) return null;
+
+    if ($free >= 1e12) {
+        $txt = round($free / 1e12, $free >= 1e13 ? 1 : 2) . ' TB';
+    } elseif ($free >= 1e9) {
+        $g = $free / 1e9;
+        $txt = ($g >= 100 ? round($g) : round($g, 1)) . ' GB';
+    } elseif ($free >= 1e6) {
+        $txt = round($free / 1e6) . ' MB';
+    } elseif ($free >= 1e3) {
+        $txt = round($free / 1e3) . ' KB';
+    } else {
+        return ['full', 'crit'];      // "0 KB free" is a strange way to say this
+    }
+    // Only shout when any disk of any size would be in trouble. A data drive at
+    // 94 % is normal and is not worth colouring; ten gigabytes left is not.
+    $level = $free < 5e9 ? 'crit' : ($free < 2e10 ? 'warn' : '');
+    return [$txt, $level];
+}
+
+
 function temp_class(?int $t, array $thr, array $d = []): string {
     if ($t === null) return 'muted';
     // A drive that publishes its own limits knows better than our defaults:
@@ -529,6 +558,10 @@ function trend_per_day(array $times, array $vals): ?float {
   .kv+.kv{border-top:1px solid rgba(38,44,55,.6)}
   .big{font-size:29px;font-weight:700;line-height:1.1;margin:2px 0}
   .sub{color:var(--tx-mut);font-size:13px}
+  .sub.cap{display:flex;justify-content:space-between;align-items:baseline;gap:12px}
+  .freeval{white-space:nowrap}
+  .freeval.warn{color:var(--warn)}
+  .freeval.crit{color:var(--crit)}
   .flag{color:var(--ok)} .flag.warn{color:var(--warn)} .flag.crit{color:var(--crit)} .flag.muted{color:var(--tx-mut)}
 
   /* activity */
@@ -1061,7 +1094,13 @@ function trend_per_day(array $times, array $vals): ?float {
         <?php if ($d['mount'] !== null): ?>
           <div class="kv" style="padding-top:0"><span class="k">Usage</span><span class="v"><?= $pct !== null ? $pct . ' %' : '—' ?></span></div>
           <div class="bar <?= $barcls ?>"><i style="width:<?= (int) $pct ?>%"></i></div>
-          <div class="sub"><?= h($d['fs_used'] ?? '?') ?> / <?= h($d['fs_size'] ?? '?') ?></div>
+          <?php $fr = free_space($d['fs_size_b'] ?? null, $d['fs_used_b'] ?? null); ?>
+          <div class="sub cap">
+            <span><?= h($d['fs_used'] ?? '?') ?> / <?= h($d['fs_size'] ?? '?') ?></span>
+            <?php if ($fr !== null): ?>
+              <span class="freeval <?= $fr[1] ?>"><?= h($fr[0]) ?> free</span>
+            <?php endif; ?>
+          </div>
         <?php else: ?>
           <div class="sub flag muted">not mounted</div>
         <?php endif; ?>
