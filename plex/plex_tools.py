@@ -57,6 +57,7 @@ Usage
 """
 
 import argparse
+import datetime
 import getpass
 import json
 import os
@@ -218,6 +219,11 @@ SIGNIN_URL = f"{PLEX_TV}/api/v2/users/signin"
 PINS_URL = f"{PLEX_TV}/api/v2/pins"
 HOMEUSERS_URL = f"{PLEX_TV}/api/v2/home/users"
 SWITCH_URL = f"{PLEX_TV}/api/home/users/{{uid}}/switch"
+
+# Plex Discover: the account-level watchlist lives here (NOT on the local server).
+# Items are Plex online-metadata objects identified by a plex:// guid; the trailing
+# id of that guid is the "ratingKey" the watchlist actions expect.
+DISCOVER_URL = "https://discover.provider.plex.tv"
 
 
 # ---------------------------------------------------------------------------
@@ -389,10 +395,13 @@ def clear_screen():
 
 
 def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
-                     refresh_cb=None, header=None, refresh_all_cb=None):
+                     refresh_cb=None, header=None, refresh_all_cb=None, tags=None):
     """Arrow-key menu + type-to-search. Returns an index, or None (cancelled).
     Behaves like an app: clears the screen up front and redraws only the current
     view (no scrolling). header = context lines above the list.
+    tags = optional list (same length as labels) of short status strings shown in
+    an aligned column on the right (e.g. '[movie]'); the cursor highlight extends
+    across them. Pre-colour a tag to tint the column; the selected row overrides it.
     refresh_cb(current_index) -> message (str): called on F5 (e.g. library scan)."""
     if not _tui_supported():
         for h in (header or []):
@@ -401,6 +410,8 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
 
     n = len(labels)
     plain = [strip_ansi(l) for l in labels]
+    tag_plain = [strip_ansi(t) if t else "" for t in (tags or [])]
+    has_tags = any(tag_plain)
     header = list(header or [])
     filt = ""
     status = ""  # status line (e.g. F5 result) - shown INSIDE the window
@@ -466,13 +477,30 @@ def interactive_menu(prompt, labels, default=0, allow_cancel=False, page=None,
             sbr = _scrollbar_range(len(window), len(order), len(window), start)
             if start > 0:
                 vis_lines.append(f"  {Fore.CYAN}▲ ({start} above){Style.RESET_ALL}")
+            # align a trailing tag column (e.g. [movie]/[show]) next to the longest
+            # visible title that carries one, so the tags line up
+            win_tags = has_tags and any(tag_plain[i] for i in window)
+            if win_tags:
+                statw = max((len(tag_plain[i]) for i in window if tag_plain[i]), default=0)
+                longest = max((len(plain[i]) for i in window if tag_plain[i]), default=0)
+                gap = 2
+                textw = max(6, min(maxw - 4 - (gap + statw), longest + 1))
+
+            def fit(s, w):
+                return (s[:max(1, w - 1)] + "…") if len(s) > w else s + " " * (w - len(s))
+
             for pos, i in enumerate(window, start):
-                text = trunc(plain[i], maxw - 2)
-                if pos == sel_pos:
-                    line = (f"{Fore.GREEN}{Style.BRIGHT}›{Style.RESET_ALL} "
-                            f"{Fore.GREEN}{Style.BRIGHT}{text}{Style.RESET_ALL}")
+                if win_tags and tag_plain[i]:
+                    body = fit(plain[i], textw)
+                    tail = f"{' ' * gap}{tags[i]}"          # tag keeps its own colour
+                    seltail = f"{' ' * gap}{tag_plain[i]}"  # …but turns green when selected
                 else:
-                    line = f"  {text}"
+                    body = trunc(plain[i], maxw - 2)
+                    tail = seltail = ""
+                if pos == sel_pos:
+                    line = f"{Fore.GREEN}{Style.BRIGHT}› {body}{seltail}{Style.RESET_ALL}"
+                else:
+                    line = f"  {body}{tail}"
                 vis_lines.append(_with_scrollbar(line, cols, pos - start, sbr))
             rest = len(order) - (start + len(window))
             if rest > 0:
@@ -618,6 +646,46 @@ def strip_ansi_len(s):
     return len(strip_ansi(s))
 
 
+def _wrap_hint(text, width):
+    """Word-wrap a coloured hint/header line to a visible width WITHOUT truncating.
+    Breaks on ' · ' separators first, then on spaces, then hard-cuts a single over-long
+    token. The line's leading colour is re-applied on each continuation line so the
+    whole thing keeps its tint. Returns a list of lines, each with visible width
+    <= `width` (so the menu's line-based redraw stays correct)."""
+    width = max(8, width)
+    if strip_ansi_len(text) <= width:
+        return [text]
+    m = re.match(r"^((?:\x1b\[[0-9;]*m)+)", text)
+    lead = m.group(1) if m else ""
+    reset = Style.RESET_ALL if lead else ""
+    # tokens: ' · '-delimited pieces (separator kept), over-long ones split on spaces
+    tokens = []
+    parts = text.split(" · ")
+    for i, p in enumerate(parts):
+        tok = p + (" · " if i < len(parts) - 1 else "")
+        if strip_ansi_len(tok) <= width:
+            tokens.append(tok)
+        else:
+            tokens += [w for w in re.split(r"(\s+)", tok) if w]
+    lines, cur = [], ""
+    for tok in tokens:
+        if cur and strip_ansi_len(cur) + strip_ansi_len(tok) > width:
+            lines.append(cur.rstrip())
+            cur = ""
+        if not cur and strip_ansi_len(tok) > width:   # lone token still too long
+            plain = strip_ansi(tok)
+            for j in range(0, len(plain), width):
+                lines.append(plain[j:j + width])
+            continue
+        cur += tok
+    if cur.strip():
+        lines.append(cur.rstrip())
+    out = []
+    for k, ln in enumerate(lines):
+        out.append((lead if (lead and k > 0) else "") + ln + reset)
+    return out or [text]
+
+
 def _checkbox_classic(prompt, rows, header=None):
     """Fallback multi-select for non-TTY: number toggles, a/n/w/u group selects."""
     for h in (header or []):
@@ -656,7 +724,8 @@ def _checkbox_classic(prompt, rows, header=None):
 
 def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate=False,
                   ui_state=None, scope_picker=None, action_cb=None, f9_cb=None,
-                  edit_cb=None, editable=None, on_edit=None, find_cb=None):
+                  edit_cb=None, editable=None, on_edit=None, find_cb=None,
+                  country_picker=None, export_cb=None):
     """Smart app-like multi-select with [x]/[ ] checkboxes.
     tristate=True: rows carry 'state' ("on"/"off"/"mixed") instead of 'selected';
     Space cycles on -> off -> (mixed, if that was the original state) and the box
@@ -787,10 +856,62 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         _sync_plain()
         cols, rows_total = term_size()
         maxw = max(10, cols - 2)
-        page_rows = max(3, rows_total - (8 + len(header)
-                                        + (1 if ext_scope is not None else 0)
-                                        + (1 if mark_mode else 0)
-                                        + (1 if edit_i is not None else 0)))
+
+        # chrome = everything above the item list; header + hint lines are WRAPPED to
+        # the window width (never truncated), and the page size is derived from the
+        # chrome's real height so wrapped lines don't push items off-screen.
+        chrome = []
+        for h in header:
+            chrome += _wrap_hint(h, maxw)
+        n_eps = sum(1 for r in rows if not is_header(r))
+        if tristate:
+            n_sel = sum(1 for r in rows if not is_header(r) and r.get("state") == "on")
+        else:
+            n_sel = sum(1 for r in rows if not is_header(r) and r.get("selected"))
+        chrome.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
+        if tristate:
+            hint_line = "Space cycle [x]/[ ]/[~] · a all on · n all off · r reset"
+        else:
+            hint_line = "Space toggle · a all · n none · w watched · u unwatched · i invert"
+        for ln in _wrap_hint(hint_line, maxw):
+            chrome.append(f"{Fore.CYAN}{ln}{Style.RESET_ALL}")
+        s = cur_season()
+        scope_txt = "all seasons" if s is None else f"S{int(s):02d}"
+        has_seasons = len(scopes) > 1
+        line2 = ((f"[ / ] change season ({scope_txt}) · " if has_seasons else "") +
+                 "/ search · +/- check/uncheck by pattern"
+                 + (" · l label" if scope_picker is not None else "")
+                 + (" · c country" if country_picker is not None else "")
+                 + (" · x export" if export_cb is not None else "")
+                 + (" · F9 refresh checked" if f9_cb is not None else "")
+                 + (" · e edit" if (edit_cb is not None or editable) else "")
+                 + (" · f find match" if find_cb is not None else "")
+                 + " · Enter apply · Esc "
+                 + ("clear" if (filt or s is not None or ext_scope is not None) else "cancel"))
+        for ln in _wrap_hint(line2, maxw):
+            chrome.append(f"{Fore.CYAN}{ln}{Style.RESET_ALL}")
+        if ext_scope is not None:
+            for ln in _wrap_hint(ext_scope[0] + "   (Esc clears)", maxw):
+                chrome.append(f"{Fore.GREEN}{ln}{Style.RESET_ALL}")
+        if edit_i is not None and editable:
+            fname = editable[edit_i][1]
+            for ln in _wrap_hint(f"editing {fname} - type to change · ←/→ Home/End move · "
+                                 f"Backspace/Del erase · Tab/↑↓ switch field · "
+                                 f"Enter keep · Esc cancel", maxw):
+                chrome.append(f"{Fore.MAGENTA}{ln}{Style.RESET_ALL}")
+        if mark_mode:
+            verb = "check" if mark_mode == "+" else "uncheck"
+            nmatch = len(mark_matches(order))
+            prompt_txt = (f"{verb} matching: {mark_buf}\u2588   ({nmatch} match)  "
+                          f"Enter = apply · Esc = cancel")
+            chrome.append(f"{Fore.MAGENTA}{trunc(prompt_txt, maxw)}{Style.RESET_ALL}")
+        if search_mode or filt:
+            chrome.append(f"{Fore.MAGENTA}"
+                          f"{trunc('search: ' + filt + ('_' if search_mode else ''), maxw)}"
+                          f"{Style.RESET_ALL}")
+
+        # footer (1) + possible up/down arrow indicators (2) reserved below the list
+        page_rows = max(3, rows_total - len(chrome) - 3)
         buf = []
         if first:
             buf.append("\x1b[2J\x1b[H")
@@ -798,52 +919,7 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
         elif prev_lines > 0:
             up = prev_lines - 1
             buf.append((f"\x1b[{up}F" if up > 0 else "\r") + "\x1b[J")
-        vis = []
-        for h in header:
-            sp = strip_ansi(h)
-            vis.append(h if len(sp) <= maxw else trunc(sp, maxw))
-        n_eps = sum(1 for r in rows if not is_header(r))
-        if tristate:
-            n_sel = sum(1 for r in rows if not is_header(r) and r.get("state") == "on")
-        else:
-            n_sel = sum(1 for r in rows if not is_header(r) and r.get("selected"))
-        vis.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
-        if tristate:
-            hint_line = "Space cycle [x]/[ ]/[~] · a all on · n all off · r reset"
-        else:
-            hint_line = "Space toggle · a all · n none · w watched · u unwatched · i invert"
-        # note: '/' search accepts +pattern / -pattern to check/uncheck matches
-        vis.append(f"{Fore.CYAN}{trunc(hint_line, maxw)}{Style.RESET_ALL}")
-        s = cur_season()
-        scope_txt = "all seasons" if s is None else f"S{int(s):02d}"
-        has_seasons = len(scopes) > 1
-        line2 = ((f"[ / ] change season ({scope_txt}) · " if has_seasons else "") +
-                 "/ search · +/- check/uncheck by pattern"
-                 + (" · l label" if scope_picker is not None else "")
-                 + (" · F9 refresh checked" if f9_cb is not None else "")
-                 + (" · e edit" if (edit_cb is not None or editable) else "")
-                 + (" · f find match" if find_cb is not None else "")
-                 + " · Enter apply · Esc "
-                 + ("clear" if (filt or s is not None or ext_scope is not None) else "cancel"))
-        vis.append(f"{Fore.CYAN}{trunc(line2, maxw)}{Style.RESET_ALL}")
-        if ext_scope is not None:
-            vis.append(f"{Fore.GREEN}{trunc('label: ' + ext_scope[0] + '   (Esc clears)', maxw)}{Style.RESET_ALL}")
-        if edit_i is not None and editable:
-            fname = editable[edit_i][1]
-            vis.append(f"{Fore.MAGENTA}{trunc(f'editing {fname} - type to change · '
-                                             f'←/→ Home/End move · Backspace/Del erase · '
-                                             f'Tab/↑↓ switch field · Enter keep · '
-                                             f'Esc cancel', maxw)}{Style.RESET_ALL}")
-        if mark_mode:
-            verb = "check" if mark_mode == "+" else "uncheck"
-            nmatch = len(mark_matches(order))
-            prompt_txt = (f"{verb} matching: {mark_buf}\u2588   ({nmatch} match)  "
-                          f"Enter = apply · Esc = cancel")
-            vis.append(f"{Fore.MAGENTA}{trunc(prompt_txt, maxw)}{Style.RESET_ALL}")
-        if search_mode or filt:
-            vis.append(f"{Fore.MAGENTA}"
-                       f"{trunc('search: ' + filt + ('_' if search_mode else ''), maxw)}"
-                       f"{Style.RESET_ALL}")
+        vis = list(chrome)
         if not order:
             vis.append(f"  {Fore.RED}(no match){Style.RESET_ALL}")
         else:
@@ -1174,6 +1250,21 @@ def checkbox_menu(prompt, rows, header=None, start_pos=0, pos_out=None, tristate
                     order = visible_order()
                     sel_pos = 0
                 first = True   # the picker drew over the screen -> full redraw
+            elif key == ("char", "c") and country_picker is not None:
+                picked_scope = country_picker()
+                if picked_scope is not None:
+                    ext_scope = picked_scope
+                    order = visible_order()
+                    sel_pos = 0
+                first = True
+            elif key == ("char", "x") and export_cb is not None:
+                shown = [rows[i] for i in order
+                         if not is_header(rows[i]) and not rows[i].get("action")]
+                try:
+                    export_cb(shown, ext_scope[0] if ext_scope else None)
+                except Exception as ex:
+                    log_warn(f"Export failed: {ex}")
+                first = True
             elif key == ("char", "/"):
                 search_mode = True
                 filt = ""
@@ -1630,7 +1721,7 @@ class PlexClient:
             params["title"] = query
         j = self.get_json(f"/library/sections/{section_key}/all", params)
         return [{"ratingKey": m.get("ratingKey"), "title": m.get("title"),
-                 "year": m.get("year"), "type": m.get("type")}
+                 "year": m.get("year"), "type": m.get("type"), "guid": m.get("guid")}
                 for m in j.get("MediaContainer", {}).get("Metadata", [])]
 
     def get_metadata(self, rating_key):
@@ -1816,6 +1907,36 @@ class PlexClient:
         return [str(m.get("ratingKey"))
                 for m in j.get("MediaContainer", {}).get("Metadata", []) or []]
 
+    def section_country_entries(self, section_key, sec_type=None):
+        """Countries of origin present in a library as [{'id', 'title'}, ...]
+        (GET /library/sections/{key}/country). Empty if the library/agent stores no
+        country data or doesn't expose the filter - callers should fall back to
+        reading each item's Country metadata."""
+        params = {}
+        num = SECTION_TYPE_NUM.get(sec_type) if sec_type else None
+        if num:
+            params["type"] = num
+        try:
+            j = self.get_json(f"/library/sections/{section_key}/country", params)
+        except Exception:
+            return []
+        out = []
+        for d in j.get("MediaContainer", {}).get("Directory", []) or []:
+            if d.get("title") and d.get("key") is not None:
+                out.append({"id": d.get("key"), "title": d.get("title")})
+        return out
+
+    def items_with_country(self, section_key, sec_type, country_key, type_num=None):
+        """ratingKeys of items whose country of origin matches (server-side filter:
+        /library/sections/{key}/all?country=<key>&type=N)."""
+        params = {"country": country_key}
+        num = type_num if type_num is not None else SECTION_TYPE_NUM.get(sec_type)
+        if num:
+            params["type"] = num
+        j = self.get_json(f"/library/sections/{section_key}/all", params)
+        return [str(m.get("ratingKey"))
+                for m in j.get("MediaContainer", {}).get("Metadata", []) or []]
+
     def edit_labels(self, section_key, sec_type, rating_keys, add=(), remove=(), type_num=None):
         """Add/remove labels on one or more items in a single request:
         PUT /library/sections/{key}/all?type=..&id=rk1,rk2&label[i].tag.tag=..
@@ -1839,6 +1960,102 @@ class PlexClient:
                          {"type": params["type"], "id": params["id"],
                           "label.locked": 1, "label[].tag.tag-": tag})
         return self.put(f"/library/sections/{section_key}/all", params)
+
+    # --- Watchlist (account level, via Plex Discover) ----------------------
+    # The watchlist is NOT stored on the local server; it belongs to the signed-in
+    # Plex account/user and lives on discover.provider.plex.tv. The same user token
+    # that talks to the server authorises it. Items are online-metadata objects; the
+    # trailing id of their plex:// guid is the "ratingKey" the actions below expect.
+    def _discover_headers(self):
+        return {
+            "X-Plex-Token": self.token,
+            "X-Plex-Product": PRODUCT,
+            "X-Plex-Client-Identifier": self.client_id,
+            "Accept": "application/json",
+        }
+
+    def watchlist(self, libtype=None):
+        """The signed-in user's watchlist from Plex Discover as
+        [{'ratingKey','guid','title','year','type'}] (paged automatically).
+        ratingKey is the Discover id; guid is 'plex://movie/<id>'. libtype
+        ('movie'/'show') limits the kind returned."""
+        base = {"includeCollections": 0, "includeExternalMedia": 0}
+        if libtype:
+            base["type"] = SECTION_TYPE_NUM.get(libtype, "")
+        # Discover caps the container size (it rejects large values with HTTP 400) and,
+        # like Plex Web, expects the paging as query params — not headers. 50 is the size
+        # Plex Web itself uses.
+        out, start, size = [], 0, 50
+        while True:
+            params = dict(base)
+            params["X-Plex-Container-Start"] = start
+            params["X-Plex-Container-Size"] = size
+            url = f"{DISCOVER_URL}/library/sections/watchlist/all?" + urllib.parse.urlencode(params)
+            st, text = http_raw("GET", url, headers=self._discover_headers(), verify=True,
+                                timeout=self.timeout)
+            if st == 401:
+                raise RuntimeError("UNAUTHORIZED")
+            if st >= 400:
+                raise RuntimeError(f"HTTP {st} at watchlist - {text[:200]}")
+            try:
+                mc = json.loads(text).get("MediaContainer", {})
+            except json.JSONDecodeError:
+                raise RuntimeError("Watchlist: Plex Discover did not return JSON.")
+            batch = mc.get("Metadata", []) or []
+            for m in batch:
+                out.append({"ratingKey": str(m.get("ratingKey")), "guid": m.get("guid"),
+                            "title": m.get("title"), "year": m.get("year"),
+                            "type": m.get("type")})
+            total = mc.get("totalSize")
+            got = start + len(batch)
+            if not batch or len(batch) < size or (total is not None and got >= total):
+                break
+            start = got
+        return out
+
+    def watchlist_keys(self, libtype=None):
+        """Set of Discover ratingKeys currently on the watchlist (fast membership test)."""
+        return {w["ratingKey"] for w in self.watchlist(libtype) if w.get("ratingKey")}
+
+    def _watchlist_action(self, action, discover_rating_key):
+        url = (f"{DISCOVER_URL}/actions/{action}"
+               f"?ratingKey={urllib.parse.quote(str(discover_rating_key))}")
+        st, text = http_raw("PUT", url, headers=self._discover_headers(),
+                            verify=True, timeout=self.timeout)
+        if st == 401:
+            raise RuntimeError("UNAUTHORIZED")
+        if st >= 400:
+            raise RuntimeError(f"HTTP {st}: {text[:120]}")
+        return st
+
+    def add_to_watchlist(self, discover_rating_key):
+        """Put one online-metadata item on the watchlist (PUT addToWatchlist)."""
+        return self._watchlist_action("addToWatchlist", discover_rating_key)
+
+    def remove_from_watchlist(self, discover_rating_key):
+        """Take one item off the watchlist (PUT removeFromWatchlist)."""
+        return self._watchlist_action("removeFromWatchlist", discover_rating_key)
+
+    def children(self, rating_key):
+        """Direct children of a server item: the seasons of a show, or the episodes
+        of a season (GET /library/metadata/{id}/children)."""
+        j = self.get_json(f"/library/metadata/{rating_key}/children")
+        return j.get("MediaContainer", {}).get("Metadata", []) or []
+
+    def discover_metadata(self, discover_rating_key):
+        """Online (Plex Discover) metadata for a watchlist item that isn't on this
+        server. Returns a dict or None; never raises."""
+        try:
+            url = (f"{DISCOVER_URL}/library/metadata/"
+                   f"{urllib.parse.quote(str(discover_rating_key))}?includeUserState=1")
+            st, text = http_raw("GET", url, headers=self._discover_headers(), verify=True,
+                                timeout=self.timeout)
+            if st >= 400:
+                return None
+            md = json.loads(text).get("MediaContainer", {}).get("Metadata", [])
+            return md[0] if md else None
+        except Exception:
+            return None
 
 
 # ---------------------------------------------------------------------------
@@ -2631,8 +2848,9 @@ def select_and_configure(client, args, resume=None):
             if len(found) == 1:
                 fixed = _target_from_item(client, found[0])
             else:
-                labels = [f"{f['title']} ({f['year']}) [{f['type']}]" for f in found]
-                i = interactive_menu("Multiple found - select:", labels, allow_cancel=True)
+                labels = [f"{f['title']} ({f['year']})" if f.get("year") else f["title"] for f in found]
+                ftags = [f"{Style.DIM}[{f['type']}]{Style.RESET_ALL}" for f in found]
+                i = interactive_menu("Multiple found - select:", labels, allow_cancel=True, tags=ftags)
                 if i is None:
                     return None
                 fixed = _target_from_item(client, found[i])
@@ -2686,8 +2904,10 @@ def select_and_configure(client, args, resume=None):
         step = SUBS if subs_interactive else AUDIO
     while True:
         if step == LIB:
-            labels = [f"{s['title']}  [{s['type']}]" for s in secs]
+            labels = [s["title"] for s in secs]
+            libtags = [f"{Style.DIM}[{s['type']}]{Style.RESET_ALL}" for s in secs]
             i = interactive_menu("Select a library:", labels, default=lib_idx, allow_cancel=True,
+                                 tags=libtags,
                                  refresh_cb=lambda idx: scan_lib(secs[idx]) if idx is not None else None)
             if i is None:
                 return None
@@ -2791,8 +3011,10 @@ def pick_library_and_item(client):
     item_idx = {}  # section key -> last highlighted item index
     while True:
         if step == "lib":
-            labels = [f"{s['title']}  [{s['type']}]" for s in vid]
+            labels = [s["title"] for s in vid]
+            libtags = [f"{Style.DIM}[{s['type']}]{Style.RESET_ALL}" for s in vid]
             i = interactive_menu("Select a library:", labels, default=lib_idx, allow_cancel=True,
+                                 tags=libtags,
                                  refresh_cb=lambda idx: scan_lib(vid[idx]) if idx is not None else None)
             if i is None:
                 return None
@@ -3018,8 +3240,9 @@ def mark_watched_flow(client, args):
             if len(found) == 1:
                 fixed_item = found[0]
             else:
-                labels = [f"{f['title']} ({f['year']}) [{f['type']}]" for f in found]
-                i = interactive_menu("Multiple found - select:", labels, allow_cancel=True)
+                labels = [f"{f['title']} ({f['year']})" if f.get("year") else f["title"] for f in found]
+                ftags = [f"{Style.DIM}[{f['type']}]{Style.RESET_ALL}" for f in found]
+                i = interactive_menu("Multiple found - select:", labels, allow_cancel=True, tags=ftags)
                 if i is None:
                     return False
                 fixed_item = found[i]
@@ -3200,9 +3423,10 @@ def _pick_library(client, default=0):
         except Exception as ex:
             return f"{Fore.RED}Scan Library Files failed: {ex}{Style.RESET_ALL}"
 
-    labels = [f"{s['title']}  [{s['type']}]" for s in vid]
+    labels = [s["title"] for s in vid]
+    libtags = [f"{Style.DIM}[{s['type']}]{Style.RESET_ALL}" for s in vid]
     i = interactive_menu("Select a library:", labels, default=default,
-                         allow_cancel=True, refresh_cb=scan_lib,
+                         allow_cancel=True, tags=libtags, refresh_cb=scan_lib,
                          refresh_all_cb=(lambda idx: refresh_all_metadata(client, vid[idx])
                                          if idx is not None else None))
     if i is None:
@@ -3212,6 +3436,72 @@ def _pick_library(client, default=0):
 
 def _labels_of(md):
     return [t.get("tag") for t in (md.get("Label") or []) if t.get("tag")]
+
+
+def _dedup_titles(titles):
+    """Collapse variants of the same show to a single entry, preferring the plain
+    title. A variant is a title that ends in ' - <suffix>' (e.g. 'Something in the
+    Rain - Viki'); such rows are grouped with the base title ('Something in the
+    Rain') and only the base is kept. A title with no sibling variant is kept exactly
+    as-is (so a lone 'Law & Order - SVU' is never shortened). First-appearance order
+    is preserved. Returns (deduped_list, merged_count)."""
+    def base(t):
+        parts = t.rsplit(" - ", 1)
+        return parts[0].strip() if len(parts) == 2 and parts[1].strip() else t.strip()
+
+    groups, order = {}, []
+    for t in titles:
+        b = base(t)
+        k = b.casefold()
+        g = groups.get(k)
+        if g is None:
+            g = groups[k] = {"base": b, "members": []}
+            order.append(k)
+        g["members"].append(t)
+    out = []
+    for k in order:
+        g = groups[k]
+        members = g["members"]
+        plain = [m for m in members if m.strip().casefold() == g["base"].casefold()]
+        out.append(plain[0] if plain else min(members, key=len))
+    return out, len(titles) - len(out)
+
+
+def _export_titles(section_title, shown_rows, scope_name=None):
+    """Write the given rows' titles to a .txt in the current directory, one per line.
+    Variants of the same show (e.g. 'X' and 'X - Viki') are merged to a single line
+    using the main title. Filename: plex_<library>[_<filter>]_<timestamp>.txt.
+    Returns (abspath, count, merged), or (None, 0, 0) if there was nothing to write."""
+    titles = [(r.get("title") or strip_ansi(r.get("label") or "")).strip() for r in shown_rows]
+    titles = [t for t in titles if t]
+    if not titles:
+        return (None, 0, 0)
+    titles, merged = _dedup_titles(titles)
+
+    def slug(s):
+        s = re.sub(r"[^\w]+", "_", strip_ansi(s or ""), flags=re.UNICODE).strip("_")
+        return s[:40] or "all"
+
+    parts = ["plex", slug(section_title)]
+    if scope_name:
+        parts.append(slug(scope_name))
+    parts.append(datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    path = os.path.abspath("_".join(parts) + ".txt")
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(titles) + "\n")
+    return (path, len(titles), merged)
+
+
+def _country_index_from_metadata(client, rows):
+    """Fallback country index (name -> set of ratingKeys) built by reading each item's
+    Country metadata - used when the server doesn't expose the country filter."""
+    idx = {}
+    md_map = client.get_metadata_many([r["rk"] for r in rows if r.get("rk")])
+    for rk, md in md_map.items():
+        for c in (md.get("Country") or []):
+            if c.get("tag"):
+                idx.setdefault(c["tag"], set()).add(str(rk))
+    return idx
 
 
 def labels_flow(client, args):
@@ -3238,6 +3528,7 @@ def labels_flow(client, args):
                  "selected": False, "title": it["title"]} for it in items]
 
         label_cache = {}
+        country_cache = {}
 
         def pick_label_scope():
             """'l' - list every label in this library and narrow the view to the
@@ -3277,25 +3568,90 @@ def labels_flow(client, args):
                 labelled = set()
                 for g in groups:
                     labelled |= members(g)
-                return ("(no label)", {str(r["rk"]) for r in rows} - labelled)
+                return ("label: (none)", {str(r["rk"]) for r in rows} - labelled)
             g = groups[i]
             rks = members(g)
             if not rks:
                 log_warn(f"No items carry '{g['title']}'.")
                 return None
-            return (g["title"], rks)
+            return (f"label: {g['title']}", rks)
+
+        def pick_country_scope():
+            """'c' - list the countries of origin in this library and narrow the view
+            to the titles from the chosen one (searchable by typing). Uses Plex's fast
+            server-side country filter when available, otherwise reads each item's
+            Country metadata. Works in any library that stores a country of origin."""
+            entries = country_cache.get("entries")
+            if entries is None:
+                entries = client.section_country_entries(sec["key"], sec["type"])
+                country_cache["entries"] = entries
+            if entries:   # fast path: server-side filter
+                order_e = sorted(entries, key=lambda e: (e["title"] or "").lower())
+                i = interactive_menu("Show only titles from country:",
+                                     [e["title"] for e in order_e], allow_cancel=True)
+                if i is None:
+                    return None
+                e = order_e[i]
+                try:
+                    rks = set(client.items_with_country(sec["key"], sec["type"], e["id"]))
+                except Exception as ex:
+                    log_warn(f"Could not filter by country: {ex}")
+                    return None
+                rks &= {str(r["rk"]) for r in rows}
+                if not rks:
+                    log_warn(f"No titles from {e['title']} in this library.")
+                    return None
+                return (f"country: {e['title']}", rks)
+            # fallback: read Country from each item's metadata (cached)
+            idx = country_cache.get("idx")
+            if idx is None:
+                clear_screen()
+                log_info("Reading country of origin from metadata…")
+                idx = _country_index_from_metadata(client, rows)
+                country_cache["idx"] = idx
+            if not idx:
+                log_warn("No country-of-origin data found in this library.")
+                _pause_to_menu()
+                return None
+            names = sorted(idx, key=lambda c: c.lower())
+            labels = [f"{c}   {Style.DIM}({len(idx[c])}){Style.RESET_ALL}" for c in names]
+            i = interactive_menu("Show only titles from country:", labels, allow_cancel=True)
+            if i is None:
+                return None
+            return (f"country: {names[i]}", {str(x) for x in idx[names[i]]})
+
+        def export_shown(shown_rows, scope_name=None):
+            """'x' - write the titles currently shown (after any search / label /
+            country filter) to a .txt file, one per line, for handing off elsewhere.
+            Variants of the same show (e.g. 'X' and 'X - Viki') are merged to one line."""
+            path, n, merged = _export_titles(sec["title"], shown_rows, scope_name)
+            if not path:
+                log_warn("Nothing to export in the current view.")
+                _pause_to_menu()
+                return
+            clear_screen()
+            log_done(f"Exported {n} title(s) (one per line) to:")
+            print(f"    {Fore.CYAN}{path}{Style.RESET_ALL}")
+            if merged:
+                print(f"    {Style.DIM}{merged} duplicate variant(s) merged into their "
+                      f"main title{Style.RESET_ALL}")
+            if scope_name:
+                print(f"    {Style.DIM}filter: {scope_name}{Style.RESET_ALL}")
+            _pause_to_menu()
 
         while True:  # item selection level
             header = [
                 f"{Fore.CYAN}Library:{Style.RESET_ALL} {sec['title']}   ({len(rows)} items)",
                 f"{Style.DIM}/ = filter (e.g. *romance*) · + = check by pattern · "
-                f"- = uncheck by pattern · l = show only one label · a = all shown · "
-                f"n = none · i = invert{Style.RESET_ALL}",
+                f"- = uncheck by pattern · l = only one label · c = only one country · "
+                f"x = export shown to .txt · a = all shown · n = none · i = invert"
+                f"{Style.RESET_ALL}",
                 "",
             ]
             res = checkbox_menu("Select shows/movies to label:", rows, header=header,
                                 start_pos=item_cursor[0], pos_out=item_cursor,
-                                ui_state=item_view, scope_picker=pick_label_scope)
+                                ui_state=item_view, scope_picker=pick_label_scope,
+                                country_picker=pick_country_scope, export_cb=export_shown)
             if res is None:
                 if single_lib:
                     return False  # nothing to step back to
@@ -3761,9 +4117,19 @@ def titles_flow(client, args):
                 read_locked_fields(client, rows)
             lang_read_done[0] = True
 
+        # manual-split detection: several library items sharing one match (same guid).
+        # Marked with a [split] tag; computed before relabel so relabel can show it and
+        # it survives a metadata re-read (which rebuilds the tags).
+        guid_n = {}
+        for r in rows:
+            if r.get("guid"):
+                guid_n[r["guid"]] = guid_n.get(r["guid"], 0) + 1
+        for r in rows:
+            r["dup"] = bool(r.get("guid") and guid_n.get(r["guid"], 0) > 1)
+
         def relabel():
-            """Title stays in the label; the language and lock notes go to r['tag'],
-            which the menu prints in its own aligned column."""
+            """Title stays in the label; the language, lock and split notes go to
+            r['tag'], which the menu prints in its own aligned column."""
             lang_txt, lock_txt = {}, {}
             for r in rows:
                 hit = _is_target_lang(r["lang"], lang_name)
@@ -3792,6 +4158,8 @@ def titles_flow(client, args):
                     tag += f"{pad}{Fore.YELLOW}{kt}{Style.RESET_ALL}"
                 elif lt:
                     tag = f"{Style.DIM}{lt}{Style.RESET_ALL}"
+                if r.get("dup"):     # manual split -> keep it in the aligned tag column
+                    tag += f"{'  ' if tag else ''}{Fore.YELLOW}[split]{Style.RESET_ALL}"
                 r["label"] = r["title"]
                 r["tag"] = tag
         relabel()
@@ -3806,14 +4174,6 @@ def titles_flow(client, args):
                 return
             read_metadata_languages(client, targets, sec)
             relabel()
-        guid_n = {}
-        for r in rows:
-            if r.get("guid"):
-                guid_n[r["guid"]] = guid_n.get(r["guid"], 0) + 1
-        for r in rows:
-            if r.get("guid") and guid_n.get(r["guid"], 0) > 1:
-                r["dup"] = True          # manual split: several items share one match
-                r["label"] += f"   {Fore.YELLOW}[split]{Style.RESET_ALL}"
         counts = {}
         for r in rows:
             counts[r["lang"]] = counts.get(r["lang"], 0) + 1
@@ -4572,6 +4932,936 @@ def langsubs_flow(client, args):
     return True
 
 
+# ---------------------------------------------------------------------------
+# Watchlist flow (manage the account/user watchlist, using this server's content)
+# ---------------------------------------------------------------------------
+# The watchlist is an account-level Plex Discover feature, not a per-server list.
+# This tool deliberately works only with the movies and shows that live on THIS
+# server: to add or edit you browse a library (movies / shows, same as the other
+# tools), and each item is mapped to its Plex online entry via its plex:// guid.
+
+# --- a single-select browser (arrow keys, type-to-search, Enter opens, Esc back) ---
+def _browse_order(rows, plain, filt):
+    """Visible row indices for a browse_menu given the search text. Section header
+    rows (row['header']) are kept only when at least one of their children matches."""
+    n = len(rows)
+    if not filt:
+        return list(range(n))
+    mset = {i for i in range(n)
+            if not rows[i].get("header") and _match_filter(plain[i], filt)}
+    kids, cur = {}, None
+    for i in range(n):
+        if rows[i].get("header"):
+            cur = i
+            kids[cur] = []
+        elif cur is not None:
+            kids[cur].append(i)
+    keep = {h for h, ks in kids.items() if any(k in mset for k in ks)}
+    return [i for i in range(n) if (i in mset) or (rows[i].get("header") and i in keep)]
+
+
+def browse_menu(prompt, rows, header=None, default=0, cursor_out=None):
+    """Single-select browser used by the watchlist views. Arrow keys move, typing
+    filters (search by just typing), Enter opens the highlighted row, Esc clears the
+    search or steps back. Rows are dicts: 'label' (required); optional 'tag' (a coloured status
+    shown in an aligned column) and 'header' (a non-selectable section title). Returns
+    the chosen row index, or None on Esc. The final cursor row index is written to
+    cursor_out[0] (if given) so the caller can restore it next time."""
+    n = len(rows)
+    plain = [strip_ansi(r["label"]) for r in rows]
+    sel_rows = [i for i in range(n) if not rows[i].get("header")]
+
+    if not _tui_supported():
+        for i, r in enumerate(rows):
+            if r.get("header"):
+                print(strip_ansi(r["label"]))
+            else:
+                num = sel_rows.index(i) + 1
+                tag = f"   {strip_ansi(r.get('tag') or '')}" if r.get("tag") else ""
+                print(f"  {num:>3}) {strip_ansi(r['label'])}{tag}")
+        while True:
+            raw = input("Number = open · Enter/q = back: ").strip().lower()
+            if raw in ("", "q"):
+                return None
+            if raw.isdigit() and 1 <= int(raw) <= len(sel_rows):
+                idx = sel_rows[int(raw) - 1]
+                if cursor_out is not None:
+                    cursor_out[:] = [idx]
+                return idx
+
+    header = list(header or [])
+    filt = ""
+    prev_lines = 0
+    first = True
+
+    def term_size():
+        try:
+            sz = os.get_terminal_size()
+            return sz.columns, sz.lines
+        except Exception:
+            return 80, 24
+
+    def trunc(s, w):
+        return s[:max(1, w - 1)] + "…" if len(s) > w else s
+
+    def land_on(order, want):
+        """Nearest selectable position in `order` at/after the row index `want`."""
+        if not order:
+            return 0
+        non_h = [p for p, i in enumerate(order) if not rows[i].get("header")]
+        if not non_h:
+            return 0
+        for p, i in enumerate(order):
+            if i == want and not rows[i].get("header"):
+                return p
+        return min(non_h, key=lambda p: abs(order[p] - want))
+
+    def step(order, pos, d):
+        if not order:
+            return pos
+        j = pos
+        for _ in range(len(order)):
+            j = (j + d) % len(order)
+            if not rows[order[j]].get("header"):
+                return j
+        return pos
+
+    def render(order, sel_pos):
+        nonlocal prev_lines, first
+        cols, rows_total = term_size()
+        maxw = max(10, cols - 2)
+        page_rows = max(3, rows_total - (5 + len(header)))
+        buf = []
+        if first:
+            buf.append("\x1b[2J\x1b[H")
+            first = False
+        elif prev_lines > 0:
+            up = prev_lines - 1
+            buf.append((f"\x1b[{up}F" if up > 0 else "\r") + "\x1b[J")
+        vis = []
+        for h in header:
+            sp = strip_ansi(h)
+            vis.append(h if len(sp) <= maxw else trunc(sp, maxw))
+        vis.append(f"{Fore.YELLOW}{trunc(strip_ansi(prompt), maxw)}{Style.RESET_ALL}")
+        hint = ("↑↓ move · Enter = open · Esc = clear search" if filt
+                else "↑↓ move · type = search · Enter = open · Esc = back")
+        vis.append(f"{Fore.CYAN}{trunc(hint, maxw)}{Style.RESET_ALL}")
+
+        if not order:
+            vis.append(f"  {Fore.RED}(no match){Style.RESET_ALL}")
+        else:
+            # align the tag column next to the longest visible title that has a tag
+            statw = max((len(strip_ansi(rows[i].get("tag") or "")) for i in order
+                         if not rows[i].get("header")), default=0)
+            longest = max((len(plain[i]) for i in order
+                           if not rows[i].get("header") and rows[i].get("tag")), default=0)
+            gap = 3
+            textw = max(6, min(maxw - 6 - (gap + statw), longest + 1)) if statw else maxw - 6
+
+            def fit(s, w):
+                return (s[:max(1, w - 1)] + "…") if len(s) > w else s + " " * (w - len(s))
+
+            start = max(0, min(sel_pos - page_rows // 2, len(order) - page_rows))
+            window = order[start:start + page_rows]
+            sbr = _scrollbar_range(len(window), len(order), len(window), start)
+            if start > 0:
+                vis.append(f"  {Fore.CYAN}▲ ({start} above){Style.RESET_ALL}")
+            for pos, i in enumerate(window, start):
+                r = rows[i]
+                if r.get("header"):
+                    txt = trunc(plain[i], maxw - 2)
+                    line = f"  {Fore.CYAN}{Style.BRIGHT}{txt}{Style.RESET_ALL}"
+                    vis.append(_with_scrollbar(line, cols, pos - start, sbr))
+                    continue
+                tag = r.get("tag")
+                if tag:
+                    body = fit(plain[i], textw)
+                    tail = f"{' ' * gap}{tag}"
+                else:
+                    body = trunc(plain[i], maxw - 4)
+                    tail = ""
+                if pos == sel_pos:
+                    line = (f"{Fore.GREEN}{Style.BRIGHT}› {body}"
+                            f"{strip_ansi(tail)}{Style.RESET_ALL}")
+                else:
+                    line = f"  {body}{tail}"
+                vis.append(_with_scrollbar(line, cols, pos - start, sbr))
+            rest = len(order) - (start + len(window))
+            if rest > 0:
+                vis.append(f"  {Fore.CYAN}▼ ({rest} below){Style.RESET_ALL}")
+
+        sel_count = sum(1 for i in order if not rows[i].get("header"))
+        cur_no = sum(1 for p, i in enumerate(order)
+                     if p <= sel_pos and not rows[i].get("header"))
+        info = f" [{cur_no}/{sel_count}]" if sel_count else ""
+        if filt:
+            vis.append(f"{Fore.MAGENTA}{trunc('Search: ' + filt + info, maxw)}{Style.RESET_ALL}")
+        else:
+            vis.append(f"{Fore.CYAN}{trunc('(type to search)' + info, maxw)}{Style.RESET_ALL}")
+        buf.append("\r\n".join(vis))
+        sys.stdout.write("".join(buf))
+        sys.stdout.flush()
+        prev_lines = len(vis)
+        return page_rows
+
+    with _RawMode():
+        order = _browse_order(rows, plain, filt)
+        sel_pos = land_on(order, default if 0 <= default < n else 0)
+        page_rows = render(order, sel_pos)
+        while True:
+            key = _read_key()
+            if key == "up":
+                sel_pos = step(order, sel_pos, -1)
+            elif key == "down":
+                sel_pos = step(order, sel_pos, 1)
+            elif key == "pgup":
+                sel_pos = max(0, sel_pos - page_rows)
+                if order and rows[order[sel_pos]].get("header"):
+                    sel_pos = step(order, sel_pos, 1)
+            elif key == "pgdn":
+                sel_pos = min(len(order) - 1, sel_pos + page_rows) if order else 0
+                if order and rows[order[sel_pos]].get("header"):
+                    sel_pos = step(order, sel_pos, -1)
+            elif key == "home":
+                sel_pos = step(order, -1, 1) if order else 0
+            elif key == "end":
+                sel_pos = step(order, 0, -1) if order else 0
+            elif key in ("enter", "right"):
+                if order and not rows[order[sel_pos]].get("header"):
+                    idx = order[sel_pos]
+                    if cursor_out is not None:
+                        cursor_out[:] = [idx]
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return idx
+            elif key in ("esc", "left"):
+                if filt:
+                    filt = ""
+                    order = _browse_order(rows, plain, filt)
+                    sel_pos = land_on(order, order[sel_pos] if order else 0)
+                else:
+                    if cursor_out is not None and order:
+                        cursor_out[:] = [order[sel_pos]]
+                    sys.stdout.write("\r\n")
+                    sys.stdout.flush()
+                    return None
+            elif key == "backspace":
+                if filt:
+                    filt = filt[:-1]
+                    order = _browse_order(rows, plain, filt)
+                    sel_pos = land_on(order, 0)
+            elif isinstance(key, tuple) and key[0] == "char" and key[1].isprintable():
+                filt += key[1]
+                order = _browse_order(rows, plain, filt)
+                sel_pos = land_on(order, 0)
+            page_rows = render(order, sel_pos)
+
+
+# --- detail cards ----------------------------------------------------------
+def _fmt_duration(ms):
+    try:
+        secs = int(ms) // 1000
+    except Exception:
+        return None
+    h, m = secs // 3600, (secs % 3600) // 60
+    return (f"{h}h {m}m" if h else f"{m}m")
+
+
+def _wrap_lines(text, indent="  "):
+    import textwrap
+    try:
+        width = max(40, os.get_terminal_size().columns - 2)
+    except Exception:
+        width = 100
+    out = []
+    for para in str(text).split("\n"):
+        para = para.strip()
+        if not para:
+            out.append("")
+            continue
+        out += [f"{indent}{ln}" for ln in textwrap.wrap(para, width=width - len(indent))]
+    return out
+
+
+def _meta_line(md):
+    bits = []
+    if md.get("contentRating"):
+        bits.append(str(md["contentRating"]))
+    dur = _fmt_duration(md.get("duration"))
+    if dur:
+        bits.append(dur)
+    rating = md.get("rating") or md.get("audienceRating")
+    if rating:
+        try:
+            bits.append(f"★ {float(rating):.1f}")
+        except Exception:
+            bits.append(f"★ {rating}")
+    genres = ", ".join(g.get("tag") for g in (md.get("Genre") or []) if g.get("tag"))
+    if genres:
+        bits.append(genres)
+    return f"  {Style.DIM}" + "   ·   ".join(bits) + Style.RESET_ALL if bits else None
+
+
+def _title_card_head(md, fallback_title, on_server):
+    title = md.get("title") or fallback_title or "?"
+    year = md.get("year")
+    head = f"{Fore.MAGENTA}{Style.BRIGHT}{title}{Style.RESET_ALL}" + (f"  ({year})" if year else "")
+    where = (f"{Fore.GREEN}on this server{Style.RESET_ALL}" if on_server
+             else f"{Style.DIM}not on this server{Style.RESET_ALL}")
+    return [head, f"  {where}", ""]
+
+
+def _movie_card(md, fallback_title, on_server):
+    lines = _title_card_head(md, fallback_title, on_server)
+    ml = _meta_line(md)
+    if ml:
+        lines += [ml, ""]
+    if md.get("tagline"):
+        lines += [f"  {Style.DIM}{md['tagline']}{Style.RESET_ALL}", ""]
+    if md.get("summary"):
+        lines += _wrap_lines(md["summary"])
+    else:
+        lines += [f"  {Style.DIM}(no plot summary){Style.RESET_ALL}"]
+    directors = ", ".join(d.get("tag") for d in (md.get("Director") or []) if d.get("tag"))
+    if directors:
+        lines += ["", f"  {Fore.CYAN}Director:{Style.RESET_ALL} {directors}"]
+    return lines
+
+
+def _show_card(md, fallback_title, on_server):
+    lines = _title_card_head(md, fallback_title, on_server)
+    ml = _meta_line(md)
+    if ml:
+        lines += [ml, ""]
+    lc = md.get("leafCount") or md.get("childCount")
+    if lc:
+        kind = "episode" if md.get("leafCount") else "season"
+        lines += [f"  {Fore.CYAN}{lc}{Style.RESET_ALL} {kind}(s)", ""]
+    if md.get("summary"):
+        lines += _wrap_lines(md["summary"])
+    else:
+        lines += [f"  {Style.DIM}(no plot summary){Style.RESET_ALL}"]
+    return lines
+
+
+def _episode_card(md):
+    s, ep = md.get("parentIndex"), md.get("index")
+    try:
+        se = f"S{int(s):02d}E{int(ep):02d}"
+    except Exception:
+        se = ""
+    title = md.get("title") or ""
+    head = f"{Fore.MAGENTA}{Style.BRIGHT}{se}{Style.RESET_ALL}  {title}".strip()
+    lines = [head]
+    sub = []
+    if md.get("grandparentTitle"):
+        sub.append(md["grandparentTitle"])
+    if md.get("originallyAvailableAt"):
+        sub.append(str(md["originallyAvailableAt"]))
+    dur = _fmt_duration(md.get("duration"))
+    if dur:
+        sub.append(dur)
+    watched = (md.get("viewCount") or 0) > 0
+    sub.append("watched" if watched else "unwatched")
+    lines += [f"  {Style.DIM}" + "   ·   ".join(sub) + Style.RESET_ALL, ""]
+    if md.get("summary"):
+        lines += _wrap_lines(md["summary"])
+    else:
+        lines += [f"  {Style.DIM}(no plot summary){Style.RESET_ALL}"]
+    return lines
+
+
+def _detail_wait():
+    msg = f"\n{Style.DIM}Esc / Enter = back{Style.RESET_ALL}"
+    if not _tui_supported():
+        try:
+            input(strip_ansi(msg))
+        except EOFError:
+            pass
+        return
+    print(msg)
+    with _RawMode():
+        while True:
+            if _read_key() in ("esc", "enter", "left"):
+                return
+
+
+def _detail_screen(lines):
+    clear_screen()
+    for ln in lines:
+        print(ln)
+    _detail_wait()
+
+
+# persistent cursors so re-opening a view lands where you left it, not on the default
+_WL_STATE = {}
+
+
+def discover_key_from_guid(guid):
+    """'plex://movie/5d776…' -> '5d776…' (the Discover ratingKey the watchlist
+    actions use). Returns None for old-agent guids (com.plexapp.agents.…), i.e.
+    items that have no direct Plex online match to watchlist."""
+    g = str(guid or "")
+    if not g.startswith("plex://"):
+        return None
+    return g.rsplit("/", 1)[-1] or None
+
+
+def _ensure_guids(client, rows):
+    """Make sure every row has its 'guid'. The library listing normally carries it;
+    any that are missing are back-filled with a single batched metadata read."""
+    missing = [r for r in rows if not r.get("guid")]
+    if not missing:
+        return
+    md_map = client.get_metadata_many([r["rk"] for r in missing])
+    for r in missing:
+        md = md_map.get(str(r["rk"])) or {}
+        r["guid"] = md.get("guid")
+
+
+def _server_discover_index(client):
+    """Map Discover ratingKey -> {'title','type','section'} for every movie/show on
+    this server that has a plex:// guid (one request per library). Lets the watchlist
+    views show which titles actually live on the server."""
+    idx = {}
+    for s in client.sections():
+        if s["type"] not in ("movie", "show"):
+            continue
+        try:
+            items = client.items_in_section(s["key"], s["type"])
+        except Exception:
+            continue
+        for it in items:
+            dk = discover_key_from_guid(it.get("guid"))
+            if dk:
+                idx[dk] = {"rk": it["ratingKey"], "title": it["title"],
+                           "year": it.get("year"), "type": it["type"],
+                           "section": s["title"]}
+    return idx
+
+
+def _watchlist_error(ex):
+    """Explain a failed watchlist call in the same tone as the rest of the tool."""
+    if "UNAUTHORIZED" in str(ex).upper():
+        log_warn("Plex would not authorise the watchlist for the current user.")
+        print(f"    {Style.DIM}The watchlist belongs to the signed-in Plex account. A managed / "
+              f"restricted Home user may not have one — try --switch-user to the main account."
+              f"{Style.RESET_ALL}")
+    else:
+        log_warn(f"Could not reach the Plex watchlist: {ex}")
+        print(f"    {Style.DIM}This uses Plex Discover (discover.provider.plex.tv) and needs "
+              f"internet access to plex.tv.{Style.RESET_ALL}")
+
+
+def _apply_watchlist(client, targets):
+    """targets: list of (discover_rating_key, title, 'add'|'remove'). Applies each,
+    shows progress like the other tools, and returns True if anything succeeded."""
+    ok = fail = 0
+    total = len(targets)
+    for i, (dk, title, action) in enumerate(targets, 1):
+        try:
+            (client.add_to_watchlist if action == "add" else client.remove_from_watchlist)(dk)
+            ok += 1
+        except Exception as ex:
+            fail += 1
+            print(f"\r  {Fore.RED}x{Style.RESET_ALL} {title}: {ex}")
+        if total > 1:
+            print(f"\r  {Fore.CYAN}applying: {i * 100 // total:3d}%{Style.RESET_ALL} "
+                  f"({i}/{total})   ", end="", flush=True)
+    if total > 1:
+        print()
+    color = Fore.GREEN if not fail else Fore.YELLOW
+    print(f"{color}Done: {ok} updated" + (f", {fail} failed" if fail else "") + f".{Style.RESET_ALL}")
+    log_info("Watchlist changes may take a moment to appear in the Plex apps.")
+    return ok > 0
+
+
+def _watchlist_show(client, args):
+    """Browse the current watchlist (Movies / Shows), aligned status column, type-to-
+    search and '/'. Enter opens details: a movie/show card, and for shows the seasons →
+    episodes → episode plot. Esc steps back, remembering the row you came from. Read-
+    only, so it always returns False."""
+    clear_screen()
+    log_info("Loading your Plex watchlist…")
+    try:
+        wl = client.watchlist()
+    except RuntimeError as ex:
+        clear_screen()
+        _watchlist_error(ex)
+        _pause_to_menu()
+        return False
+    if not wl:
+        clear_screen()
+        log_info("Your watchlist is empty.")
+        _pause_to_menu()
+        return False
+    try:
+        srv = _server_discover_index(client)
+    except Exception:
+        srv = {}
+    on_srv = sum(1 for w in wl if w["ratingKey"] in srv)
+    movies = sorted((w for w in wl if w.get("type") == "movie"),
+                    key=lambda w: (w.get("title") or "").lower())
+    shows = sorted((w for w in wl if w.get("type") == "show"),
+                   key=lambda w: (w.get("title") or "").lower())
+    other = sorted((w for w in wl if w.get("type") not in ("movie", "show")),
+                   key=lambda w: (w.get("title") or "").lower())
+
+    rows = []
+
+    def _add_group(title, group):
+        if not group:
+            return
+        rows.append({"header": True, "label": f"{title}  ({len(group)})"})
+        for w in group:
+            hit = srv.get(w["ratingKey"])
+            tag = (f"{Fore.GREEN}on server{Style.RESET_ALL}" if hit
+                   else f"{Style.DIM}not on server{Style.RESET_ALL}")
+            yr = f" ({w['year']})" if w.get("year") else ""
+            rows.append({"label": f"{(w.get('title') or '?')}{yr}", "tag": tag,
+                         "type": w.get("type"), "dk": w["ratingKey"],
+                         "title": w.get("title"), "year": w.get("year"),
+                         "srv_rk": (hit or {}).get("rk")})
+
+    _add_group("Movies", movies)
+    _add_group("Shows", shows)
+    _add_group("Other", other)
+
+    head = [
+        f"{Fore.MAGENTA}{Style.BRIGHT}Your watchlist{Style.RESET_ALL}  "
+        f"({len(wl)} title(s) · {Fore.GREEN}{on_srv} on this server{Style.RESET_ALL} · "
+        f"{Style.DIM}{len(wl) - on_srv} elsewhere{Style.RESET_ALL})",
+        f"{Style.DIM}type = search · Enter = details / episodes · Esc = back"
+        f"{Style.RESET_ALL}",
+        "",
+    ]
+    cur = _WL_STATE.setdefault("show_cursor", [0])
+    while True:
+        idx = browse_menu("Watchlist — open a title:", rows, header=head,
+                          default=cur[0], cursor_out=cur)
+        if idx is None:
+            return False
+        row = rows[idx]
+        if row.get("type") == "show":
+            _wl_open_show(client, row)
+        else:
+            _wl_open_movie(client, row)
+
+
+def _wl_open_movie(client, row):
+    """Show a movie's card (plot etc.). Uses the server copy when present, otherwise
+    the Plex Discover metadata."""
+    on_server = bool(row.get("srv_rk"))
+    md = {}
+    if on_server:
+        try:
+            md = client.get_metadata(row["srv_rk"]) or {}
+        except Exception:
+            md = {}
+    if not md:
+        md = client.discover_metadata(row.get("dk")) or {}
+    if not md:
+        md = {"title": row.get("title"), "year": row.get("year")}
+    _detail_screen(_movie_card(md, row.get("title"), on_server))
+
+
+def _wl_open_show(client, row):
+    """Browse a show: seasons → episodes → episode plot. When the show isn't on the
+    server, show its Discover card instead of the season tree."""
+    rk = row.get("srv_rk")
+    title = row.get("title") or "?"
+    if not rk:
+        md = client.discover_metadata(row.get("dk")) or {"title": title, "year": row.get("year")}
+        _detail_screen(_show_card(md, title, on_server=False))
+        return
+    clear_screen()
+    log_info(f"Loading seasons of '{title}'…")
+    try:
+        seasons = [s for s in client.children(rk) if s.get("type") == "season" or s.get("leafCount")]
+    except Exception as ex:
+        _detail_screen([f"{Fore.RED}Could not load seasons: {ex}{Style.RESET_ALL}"])
+        return
+    if not seasons:
+        _wl_browse_episodes(client, rk, title, None)   # some shows expose episodes directly
+        return
+    seasons.sort(key=lambda s: (s.get("index") if s.get("index") is not None else 9999))
+    srows = []
+    for s in seasons:
+        lc, vc = s.get("leafCount") or 0, s.get("viewedLeafCount") or 0
+        tag = f"{Fore.GREEN}{vc}/{lc} watched{Style.RESET_ALL}" if lc else ""
+        srows.append({"label": s.get("title") or f"Season {s.get('index')}",
+                      "tag": tag, "rk": s.get("ratingKey"),
+                      "slabel": s.get("title") or f"Season {s.get('index')}"})
+    scur = _WL_STATE.setdefault(f"seasons:{rk}", [0])
+    while True:
+        head = [
+            f"{Fore.CYAN}Show:{Style.RESET_ALL} {title}   ({len(srows)} season(s))",
+            f"{Style.DIM}type = search · Enter = open season · Esc = back{Style.RESET_ALL}",
+            "",
+        ]
+        i = browse_menu("Seasons:", srows, header=head, default=scur[0], cursor_out=scur)
+        if i is None:
+            return
+        _wl_browse_episodes(client, srows[i]["rk"], title, srows[i]["slabel"])
+
+
+def _wl_browse_episodes(client, season_rk, show_title, season_label):
+    clear_screen()
+    log_info("Loading episodes…")
+    try:
+        eps = client.children(season_rk)
+    except Exception as ex:
+        _detail_screen([f"{Fore.RED}Could not load episodes: {ex}{Style.RESET_ALL}"])
+        return
+    if not eps:
+        _detail_screen([f"{Style.DIM}No episodes found.{Style.RESET_ALL}"])
+        return
+    eps.sort(key=lambda e: (e.get("parentIndex") if e.get("parentIndex") is not None else 0,
+                            e.get("index") if e.get("index") is not None else 9999))
+    erows = []
+    for e in eps:
+        s, ep = e.get("parentIndex"), e.get("index")
+        try:
+            se = f"S{int(s):02d}E{int(ep):02d}"
+        except Exception:
+            se = ""
+        watched = (e.get("viewCount") or 0) > 0
+        tag = (f"{Fore.GREEN}watched{Style.RESET_ALL}" if watched
+               else f"{Style.DIM}unwatched{Style.RESET_ALL}")
+        erows.append({"label": f"{se}  {e.get('title') or ''}".strip() or se or "?",
+                      "tag": tag, "rk": e.get("ratingKey"), "md": e})
+    ecur = _WL_STATE.setdefault(f"eps:{season_rk}", [0])
+    while True:
+        head = [
+            f"{Fore.CYAN}{show_title}{Style.RESET_ALL}"
+            + (f"  ·  {season_label}" if season_label else "")
+            + f"   ({len(erows)} episode(s))",
+            f"{Style.DIM}type = search · Enter = plot details · Esc = back{Style.RESET_ALL}",
+            "",
+        ]
+        i = browse_menu("Episodes:", erows, header=head, default=ecur[0], cursor_out=ecur)
+        if i is None:
+            return
+        _wl_episode_detail(client, erows[i])
+
+
+def _wl_episode_detail(client, row):
+    md = row.get("md") or {}
+    if not md.get("summary"):   # the season listing sometimes omits the plot
+        try:
+            full = client.get_metadata(row["rk"])
+            if full:
+                md = full
+        except Exception:
+            pass
+    _detail_screen(_episode_card(md))
+
+
+def _watchlist_add(client, args):
+    """Pick a library (movies / shows), then check the titles that are NOT yet on the
+    watchlist to add them. Returns True if anything was added."""
+    lib_idx = 0
+    item_cursor = [0]
+    item_view = {}
+    while True:
+        sec, lib_idx, single_lib = _pick_library(client, default=lib_idx)
+        if sec is None:
+            return False
+        clear_screen()
+        log_info(f"Loading '{sec['title']}' and your watchlist…")
+        items = client.items_in_section(sec["key"], sec["type"])
+        if not items:
+            log_warn("The library is empty.")
+            if single_lib:
+                return False
+            continue
+        try:
+            on_wl = client.watchlist_keys()
+        except RuntimeError as ex:
+            clear_screen()
+            _watchlist_error(ex)
+            _pause_to_menu()
+            return False
+        items.sort(key=lambda x: (x["title"] or "").lower())
+        rows = [{"rk": it["ratingKey"], "title": it["title"], "guid": it.get("guid"),
+                 "year": it.get("year"), "selected": False,
+                 "label": f"{it['title']} ({it['year']})" if it.get("year") else it["title"]}
+                for it in items]
+        _ensure_guids(client, rows)
+
+        addable, already, unmatched = [], 0, 0
+        for r in rows:
+            dk = discover_key_from_guid(r.get("guid"))
+            if not dk:
+                unmatched += 1
+                continue
+            r["dk"] = dk
+            if dk in on_wl:
+                already += 1
+                continue
+            addable.append(r)
+
+        if not addable:
+            clear_screen()
+            log_info(f"Nothing to add from '{sec['title']}'.")
+            note = []
+            if already:
+                note.append(f"{already} already on the watchlist")
+            if unmatched:
+                note.append(f"{unmatched} without a Plex match")
+            if note:
+                print(f"    {Style.DIM}({', '.join(note)}){Style.RESET_ALL}")
+            _pause_to_menu()
+            if single_lib:
+                return False
+            continue
+
+        header = [
+            f"{Fore.CYAN}Library:{Style.RESET_ALL} {sec['title']}   "
+            f"({len(addable)} not yet on the watchlist"
+            + (f" · {already} already on it" if already else "")
+            + (f" · {unmatched} without a Plex match" if unmatched else "") + ")",
+            f"{Style.DIM}Check the titles to ADD · / = search · + / - = check/uncheck by "
+            f"pattern · a = all · n = none · i = invert · Enter = add{Style.RESET_ALL}",
+            "",
+        ]
+        res = checkbox_menu("Select titles to add to your watchlist:", addable, header=header,
+                            start_pos=item_cursor[0], pos_out=item_cursor, ui_state=item_view)
+        if res is None:
+            if single_lib:
+                return False
+            continue
+        picked = [r for r in addable if r["selected"]]
+        if not picked:
+            log_info("Nothing selected.")
+            continue
+
+        clear_screen()
+        log_info(f"Will ADD {len(picked)} title(s) to your watchlist:")
+        for r in picked[:20]:
+            print(f"    {r['title']}")
+        if len(picked) > 20:
+            print(f"    … (+{len(picked) - 20} more)")
+        print()
+        if not args.yes:
+            ans = ask_yes_back("Add these to the watchlist?", default=True)
+            if ans is None:
+                continue  # Esc -> back to the selection (keeps the checkboxes)
+            if not ans:
+                continue
+        print()
+        return _apply_watchlist(client, [(r["dk"], r["title"], "add") for r in picked])
+
+
+def _watchlist_edit(client, args):
+    """Pick a library and reconcile its whole watchlist state at once: every item that
+    has a Plex match is shown pre-checked when it's already on the watchlist. Ticking
+    adds, unticking removes. Returns True if anything changed."""
+    lib_idx = 0
+    item_cursor = [0]
+    item_view = {}
+    while True:
+        sec, lib_idx, single_lib = _pick_library(client, default=lib_idx)
+        if sec is None:
+            return False
+        clear_screen()
+        log_info(f"Loading '{sec['title']}' and your watchlist…")
+        items = client.items_in_section(sec["key"], sec["type"])
+        if not items:
+            log_warn("The library is empty.")
+            if single_lib:
+                return False
+            continue
+        try:
+            on_wl = client.watchlist_keys()
+        except RuntimeError as ex:
+            clear_screen()
+            _watchlist_error(ex)
+            _pause_to_menu()
+            return False
+        items.sort(key=lambda x: (x["title"] or "").lower())
+        rows = [{"rk": it["ratingKey"], "title": it["title"], "guid": it.get("guid"),
+                 "year": it.get("year"),
+                 "label": f"{it['title']} ({it['year']})" if it.get("year") else it["title"]}
+                for it in items]
+        _ensure_guids(client, rows)
+
+        usable, unmatched = [], 0
+        for r in rows:
+            dk = discover_key_from_guid(r.get("guid"))
+            if not dk:
+                unmatched += 1
+                continue
+            r["dk"] = dk
+            r["orig_on"] = dk in on_wl
+            r["selected"] = r["orig_on"]      # checked = currently on the watchlist
+            r["tag"] = (f"{Fore.GREEN}on watchlist{Style.RESET_ALL}" if r["orig_on"]
+                        else f"{Style.DIM}not on watchlist{Style.RESET_ALL}")
+            usable.append(r)
+
+        if not usable:
+            clear_screen()
+            log_info(f"No items in '{sec['title']}' have a Plex online match to watchlist.")
+            _pause_to_menu()
+            if single_lib:
+                return False
+            continue
+
+        while True:  # editor level (Esc keeps the checkboxes and steps back)
+            n_on = sum(1 for r in usable if r["orig_on"])
+            header = [
+                f"{Fore.CYAN}Library:{Style.RESET_ALL} {sec['title']}   "
+                f"({len(usable)} items · {Fore.GREEN}{n_on} on the watchlist{Style.RESET_ALL}"
+                + (f" · {unmatched} without a Plex match" if unmatched else "") + ")",
+                f"{Style.DIM}[x] = on your watchlist · [ ] = not on it · Space toggles · "
+                f"/ = search · a = all · n = none · i = invert · Enter = apply{Style.RESET_ALL}",
+                "",
+            ]
+            res = checkbox_menu("Watchlist membership — check the titles that should be on it:",
+                                usable, header=header, start_pos=item_cursor[0],
+                                pos_out=item_cursor, ui_state=item_view)
+            if res is None:
+                if single_lib:
+                    return False
+                break  # back to the library picker
+
+            to_add = [r for r in usable if r["selected"] and not r["orig_on"]]
+            to_remove = [r for r in usable if not r["selected"] and r["orig_on"]]
+            if not to_add and not to_remove:
+                log_info("Nothing to change.")
+                continue
+
+            clear_screen()
+            log_info(f"On your watchlist ({sec['title']}):")
+            if to_add:
+                print(f"    {Fore.GREEN}add:{Style.RESET_ALL}    "
+                      + ", ".join(r["title"] for r in to_add[:12])
+                      + (f" … (+{len(to_add) - 12} more)" if len(to_add) > 12 else ""))
+            if to_remove:
+                print(f"    {Fore.RED}remove:{Style.RESET_ALL} "
+                      + ", ".join(r["title"] for r in to_remove[:12])
+                      + (f" … (+{len(to_remove) - 12} more)" if len(to_remove) > 12 else ""))
+            print()
+            if not args.yes:
+                ans = ask_yes_back("Apply these watchlist changes?", default=True)
+                if ans is None:
+                    continue  # Esc -> back to the editor (keeps the checkboxes)
+                if not ans:
+                    continue
+            print()
+            targets = ([(r["dk"], r["title"], "add") for r in to_add]
+                       + [(r["dk"], r["title"], "remove") for r in to_remove])
+            changed = _apply_watchlist(client, targets)
+            for r in to_add:      # reflect the new state in case the user stays
+                r["orig_on"] = True
+            for r in to_remove:
+                r["orig_on"] = False
+            return changed
+
+
+def _watchlist_remove(client, args):
+    """Work straight from the current watchlist: movies first, then shows, each tagged
+    with whether it lives on this server. Check the titles to remove. Returns True if
+    anything was removed."""
+    clear_screen()
+    log_info("Loading your Plex watchlist…")
+    try:
+        wl = client.watchlist()
+    except RuntimeError as ex:
+        clear_screen()
+        _watchlist_error(ex)
+        _pause_to_menu()
+        return False
+    if not wl:
+        clear_screen()
+        log_info("Your watchlist is empty — nothing to remove.")
+        _pause_to_menu()
+        return False
+    try:
+        srv = _server_discover_index(client)
+    except Exception:
+        srv = {}
+
+    type_order = {"movie": 0, "show": 1}
+    wl.sort(key=lambda w: (type_order.get(w.get("type"), 2), (w.get("title") or "").lower()))
+    rows = []
+    for w in wl:
+        on = w["ratingKey"] in srv
+        yr = f" ({w['year']})" if w.get("year") else ""
+        typ = w.get("type") or "?"
+        tag = (f"{Fore.CYAN}{typ}{Style.RESET_ALL}  "
+               + (f"{Fore.GREEN}on server{Style.RESET_ALL}" if on
+                  else f"{Style.DIM}not on server{Style.RESET_ALL}"))
+        rows.append({"rk": w["ratingKey"], "dk": w["ratingKey"], "title": w.get("title"),
+                     "label": f"{(w.get('title') or '?')}{yr}", "selected": False, "tag": tag})
+
+    on_srv = sum(1 for w in wl if w["ratingKey"] in srv)
+    header = [
+        f"{Fore.CYAN}Watchlist:{Style.RESET_ALL} {len(rows)} title(s)   "
+        f"({Fore.GREEN}{on_srv} on this server{Style.RESET_ALL})",
+        f"{Style.DIM}Check the titles to REMOVE · movies are listed first, then shows · "
+        f"/ = search · a = all · n = none · Enter = remove{Style.RESET_ALL}",
+        "",
+    ]
+    res = checkbox_menu("Select titles to remove from your watchlist:", rows, header=header)
+    if res is None:
+        return False
+    picked = [r for r in rows if r["selected"]]
+    if not picked:
+        log_info("Nothing selected.")
+        return False
+
+    clear_screen()
+    log_info(f"Will REMOVE {len(picked)} title(s) from your watchlist:")
+    for r in picked[:20]:
+        print(f"    {r['title']}")
+    if len(picked) > 20:
+        print(f"    … (+{len(picked) - 20} more)")
+    print()
+    if not args.yes:
+        ans = ask_yes_back("Remove these from the watchlist?", default=True)
+        if ans is None or not ans:
+            return False
+    print()
+    return _apply_watchlist(client, [(r["dk"], r["title"], "remove") for r in picked])
+
+
+def watchlist_flow(client, args):
+    """Little sub-menu for managing the signed-in user's Plex watchlist. Adding and
+    editing browse this server's libraries (movies / shows first, like the other
+    tools); viewing and removing work from the watchlist itself. It handles its own
+    'press Enter' pauses, so it always reports False to the main menu."""
+    actions = [
+        ("Show the current watchlist", _watchlist_show),
+        ("Add titles from a library  —  pick movies / shows to put on the watchlist", _watchlist_add),
+        ("Edit a library's watchlist  —  tick / untick to add & remove in bulk", _watchlist_edit),
+        ("Remove titles from the watchlist", _watchlist_remove),
+    ]
+    last = 0
+    while True:
+        header = [
+            f"{Fore.MAGENTA}{Style.BRIGHT}Watchlist{Style.RESET_ALL}  ·  {client.base_url}",
+            f"{Style.DIM}Adding & editing use the movies and shows on this server."
+            f"{Style.RESET_ALL}",
+            "",
+        ]
+        idx = interactive_menu("Watchlist — choose an action:",
+                               [a[0] for a in actions] + ["Back"],
+                               default=last, allow_cancel=True, header=header)
+        if idx is None or idx == len(actions):
+            return False
+        last = idx
+        try:
+            changed = actions[idx][1](client, args)
+        except RuntimeError as ex:
+            clear_screen()
+            _watchlist_error(ex)
+            _pause_to_menu()
+            changed = False
+        if changed:
+            _pause_to_menu()
+
+
 def _pause_to_menu():
     msg = f"\n{Style.DIM}Press Enter to return to the main menu…{Style.RESET_ALL}"
     if not _tui_supported():
@@ -4595,6 +5885,7 @@ def top_menu(client, args):
         ("Watched / unwatched  —  mark episodes or a whole show", mark_watched_flow),
         ("Labels  —  add / remove / rename custom labels on shows & movies", labels_flow),
         ("Titles  —  find non-English titles and switch them to English", titles_flow),
+        ("Watchlist  —  view / add / edit / remove titles on your Plex watchlist", watchlist_flow),
     ]
     last = 0
     while True:
@@ -4620,7 +5911,8 @@ def top_menu(client, args):
 def main():
     ap = argparse.ArgumentParser(
         description="Plex tools: set the default audio/subtitle tracks for a show "
-                    "or movie, or mark videos watched/unwatched.")
+                    "or movie, mark videos watched/unwatched, manage labels and titles, "
+                    "or manage your Plex watchlist.")
     ap.add_argument("--base-url", help="Server address/FQDN (otherwise the saved one is used / it asks)")
     ap.add_argument("--token", help="X-Plex-Token directly (skips sign-in)")
     ap.add_argument("--show", help="ratingKey, Plex URL, or show/movie title")
