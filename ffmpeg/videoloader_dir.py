@@ -137,6 +137,11 @@ SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's play
 PREFER_STREAM = 'dash'          # when a page offers both DASH (.mpd) and HLS (.m3u8), which to
 #                                 keep: 'dash' (default), 'hls', or 'both'. Many players fetch HLS
 #                                 first, but DASH is often preferred for downloading.
+AD_MAX_SECONDS = 90             # manifests measuring this many seconds or fewer are treated as
+#                                 pre-roll ads (not the main video), so the browser scan keeps
+#                                 waiting for the full-length stream. 0 disables the duration
+#                                 check. Only a positively-measured short length is rejected;
+#                                 an unknown length (0.0, e.g. live/DVR) is never treated as an ad.
                                 # its manifest (raise it on slow sites)
 # --scan-browser behaviour. A hidden window that nobody ever clicks is exactly the case where a
 # player never requests its manifest at all, so these default to a real, visible, interactive
@@ -212,7 +217,7 @@ _REMOTE_CONFIG_KEYS = {
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'PREVIEW_MAX_SECONDS',
     'PREVIEW_MAX_MB', 'SCAN_BROWSER_SHOW', 'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE',
-    'SCAN_BROWSER_PROBE_MAX', 'PREFER_STREAM',
+    'SCAN_BROWSER_PROBE_MAX', 'PREFER_STREAM', 'AD_MAX_SECONDS',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
@@ -10934,12 +10939,14 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
                 # manifests come from ad hosts, so we skip those and wait for the real stream.
                 partial = msg['partial']
                 _announce(partial)
-                real = _first_non_ad_manifest(partial)
+                real = _first_non_ad_manifest(partial, session=session, page_url=page_url,
+                                              verbose=verbose)
                 # Near the end of the scan window, if the preferred type never showed up, accept
                 # ANY non-ad manifest (e.g. a page that only serves HLS) so the window still
                 # closes and the download starts instead of running out the whole deadline.
                 if not real and (deadline_p - _pt.time()) < 20:
-                    real = _first_non_ad_manifest(partial, any_type=True)
+                    real = _first_non_ad_manifest(partial, any_type=True, session=session,
+                                                  page_url=page_url, verbose=verbose)
                 if real:
                     got = {'result': partial}
                     break
@@ -11063,7 +11070,57 @@ def _brightcove_ids_from_html(html):
     return list(found.values())
 
 
-def _first_non_ad_manifest(partial_json, any_type=False):
+def _hls_duration_seconds(text):
+    """Sum the #EXTINF segment durations in an HLS media playlist to get its length in seconds.
+    A master playlist (only #EXT-X-STREAM-INF, no #EXTINF) returns 0.0 — its length is unknown
+    without following a variant, so callers treat 0.0 as 'unknown', not 'short'."""
+    if not text:
+        return 0.0
+    total = 0.0
+    for m in re.finditer(r'#EXTINF:\s*([\d.]+)', text):
+        try:
+            total += float(m.group(1))
+        except ValueError:
+            pass
+    return total
+
+
+def _manifest_duration_seconds(url, session, headers, kind=None):
+    """Fetch a manifest and return its total duration in seconds, or 0.0 if unknown/unavailable.
+    Used to tell a short pre-roll AD manifest from the long main video. For an HLS MASTER playlist
+    (no #EXTINF) we follow the first variant once so we still get a real length."""
+    try:
+        r = session.get(url, timeout=15, headers=headers)
+        if not r.ok:
+            return 0.0
+        text = r.text
+    except requests.RequestException:
+        return 0.0
+    k = kind or (_classify_media_url(url) or ('', '', ''))[0]
+    if k == 'mpd':
+        m = re.search(r'mediaPresentationDuration\s*=\s*"([^"]+)"', text)
+        return _mpd_duration_seconds(m.group(1)) if m else 0.0
+    if k == 'hls':
+        dur = _hls_duration_seconds(text)
+        if dur > 0:
+            return dur
+        # Master playlist: follow the first variant URL once to measure it.
+        for line in text.splitlines():
+            line = line.strip()
+            if line and not line.startswith('#'):
+                var = urljoin(url, line)
+                try:
+                    r2 = session.get(var, timeout=15, headers=headers)
+                    if r2.ok:
+                        return _hls_duration_seconds(r2.text)
+                except requests.RequestException:
+                    pass
+                break
+    return 0.0
+
+
+def _first_non_ad_manifest(partial_json, any_type=False, session=None, page_url=None,
+                           verbose=False):
     """From a worker 'partial' payload, return the manifest the window should CLOSE on, or None to
     keep waiting. Pre-roll ads have their own manifests (often HLS), so closing on the first one
     grabs an ad. Two guards: (1) skip anything that looks like an ad by host or path; (2) honour
@@ -11090,6 +11147,30 @@ def _first_non_ad_manifest(partial_json, any_type=False):
             dash = u
         elif cls[0] == 'hls' and hls is None:
             hls = u
+
+    def _too_short(u):
+        # If we can measure the manifest, a very short one is a pre-roll ad, not the main video.
+        # A duration of 0.0 means 'unknown' (e.g. a live/DVR .mpd or a master playlist) — never
+        # reject on unknown, only on a positively-measured short length.
+        if session is None or u is None or AD_MAX_SECONDS <= 0:
+            return False
+        pg = urlparse(page_url or u)
+        hdrs = {'User-Agent': USER_AGENT, 'Referer': page_url or u,
+                'Origin': f"{pg.scheme}://{pg.netloc}"}
+        secs = _manifest_duration_seconds(u, session, hdrs)
+        if 0 < secs <= AD_MAX_SECONDS:
+            if verbose:
+                tqdm.write(f"[DBG] browser: skipping {secs:.0f}s manifest as a likely ad "
+                           f"(under AD_MAX_SECONDS={AD_MAX_SECONDS}): {u}")
+            return True
+        return False
+
+    # Drop manifests that measure as ad-length, so the window waits for the full-length video.
+    if dash and _too_short(dash):
+        dash = None
+    if hls and _too_short(hls):
+        hls = None
+
     if any_type:
         # Grace fallback near the deadline: take whatever real manifest we have.
         if pref == 'hls':

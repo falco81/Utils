@@ -261,5 +261,7 @@
     "yes",
     "you",
     "your"
-  ]
+  ],
+  "AD_MAX_SECONDS": 90,
+  "PREFER_STREAM": "dash"
 }
