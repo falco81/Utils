@@ -134,6 +134,9 @@ SCAN_BROWSER_AUTO_HOSTS = {
 SCRIPT_VERSION = "3.14.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
+PREFER_STREAM = 'dash'          # when a page offers both DASH (.mpd) and HLS (.m3u8), which to
+#                                 keep: 'dash' (default), 'hls', or 'both'. Many players fetch HLS
+#                                 first, but DASH is often preferred for downloading.
                                 # its manifest (raise it on slow sites)
 # --scan-browser behaviour. A hidden window that nobody ever clicks is exactly the case where a
 # player never requests its manifest at all, so these default to a real, visible, interactive
@@ -209,7 +212,7 @@ _REMOTE_CONFIG_KEYS = {
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'PREVIEW_MAX_SECONDS',
     'PREVIEW_MAX_MB', 'SCAN_BROWSER_SHOW', 'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE',
-    'SCAN_BROWSER_PROBE_MAX',
+    'SCAN_BROWSER_PROBE_MAX', 'PREFER_STREAM',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
@@ -1225,14 +1228,14 @@ HLS/DASH stream.
     epilog = f"""
 {h('FILE FORMATS')}
 
-{B}--davka FILE{R} / {B}--davka-browser FILE{R}
+{B}--davka FILE{R} / {B}--davka-browser FILE{R} / {B}--davka-login FILE{R}
   Blocks of up to three lines per video. Blank lines and lines starting with # are ignored.
   Lines are recognised by their SHAPE, not their position, so a stray blank line cannot shift
   the file, and the key may be left out for an unencrypted stream.
 
     {D}# name the finished file should get{R}
     Serial S01E01
-    {D}# the stream (--davka) or the PAGE holding it (--davka-browser){R}
+    {D}# the stream (--davka) or the PAGE holding it (--davka-browser / --davka-login){R}
     https://cdn.example/asset.ism/.mpd
     {D}# the key you already hold — optional, and several may follow one address{R}
     26dc8baa20b557a47c9f10b43f0a6fad:4ad13f26045246112815b49c6da3ed0f
@@ -1243,6 +1246,12 @@ HLS/DASH stream.
   With --davka-browser the middle line is a normal page address: it is opened in a real
   browser, the stream its player fetches is discovered, and that is what gets downloaded.
   An address that already points at a .mpd/.m3u8/file is used as-is, so a list may mix both.
+
+  {B}--davka-login{R} is the same as --davka-browser but uses NO cookie file: it relies only on
+  the login saved in the browser profile by {B}--browser-login{R}. Sign in once with
+  --browser-login, then --davka-login opens every page already logged in — nothing is injected,
+  which sidesteps the cookie-injection problems on Windows/WebView2. Recommended for sites whose
+  login cookie is HttpOnly.
 
 {B}--url-list FILE{R}
   One address per line; # comments and blank lines ignored. Finished entries are commented
@@ -9984,7 +9993,7 @@ _BROWSER_COLLECT_JS = r"""
   // /api/playback?type=dash) is indistinguishable from an ordinary request out here — Python
   // settles it by reading the first few KB of each candidate.
   var isAsset = function(n){
-    return /\.(jpe?g|png|gif|webp|avif|svg|ico|css|js|mjs|woff2?|ttf|otf|map|m4s|ts|aac|vtt|json)(\?|#|$)/i.test(n) ||
+    return /\.(jpe?g|png|gif|webp|avif|svg|ico|css|js|mjs|woff2?|ttf|otf|map|m4s|ts|aac|vtt)(\?|#|$)/i.test(n) ||
            /^(data|blob|about|chrome|file):/i.test(n);
   };
   var push = function(n){
@@ -10006,6 +10015,22 @@ _BROWSER_COLLECT_JS = r"""
       Array.prototype.forEach.call(doc.querySelectorAll('iframe'), function(e){
         if (e.src) out.urls.push(e.src);
       });
+      // Brightcove player (kocowa uses it): the account id, player id and video id live on the
+      // <video-js>/<video> element or an embed iframe. Capture them so Python can ask Brightcove's
+      // Playback API directly — the manifest itself is fetched inside a cross-origin player frame
+      // we can't hook. Also grab any brightcove/boltdns URL that IS visible.
+      try {
+        Array.prototype.forEach.call(
+          doc.querySelectorAll('video-js,[data-account],[data-video-id],[data-player]'),
+          function(e){
+            var acc = e.getAttribute('data-account');
+            var vid = e.getAttribute('data-video-id');
+            var ply = e.getAttribute('data-player');
+            if (acc || vid) out.brightcove = out.brightcove || [];
+            if (acc || vid) out.brightcove.push({account: acc||'', videoId: vid||'',
+                                                 player: ply||'default_default'});
+          });
+      } catch (e) {}
       // Player configuration frequently sits in data-* attributes rather than a real src.
       ['data-src','data-url','data-mpd','data-dash','data-hls','data-manifest','data-stream',
        'data-video','data-source','data-file','data-setup'].forEach(function(a){
@@ -10033,6 +10058,26 @@ _BROWSER_COLLECT_JS = r"""
     }
   } catch (e) {}
   try { (window.__vlSeen || []).forEach(push); } catch (e) {}
+  // Last resort for a SPA: the Brightcove account/video id often lives in a global config object
+  // or anywhere in the RENDERED html (which the plain requests fetch never sees, because it's
+  // built by JS after login). Scan the live document for it and hand it back.
+  try {
+    var html = document.documentElement ? document.documentElement.outerHTML : '';
+    out.renderedLen = html.length;
+    var accs = html.match(/(?:account[_-]?[iI]d["'\s:=]+|players\.brightcove\.net\/)(\d{6,})/g) || [];
+    var vids = html.match(/(?:video[_-]?[iI]d["'\s:=]+|data-video-id=["'])([\w-]{4,})/gi) || [];
+    if (accs.length || vids.length) {
+      out.bcHints = {accounts: accs.slice(0, 5), videos: vids.slice(0, 8)};
+    }
+    // Grab a compact slice of the rendered html around any brightcove/boltdns/mpd mention so the
+    // exact structure can be inspected without shipping the whole DOM.
+    var marks = [];
+    ['brightcove', 'boltdns', 'videoId', 'accountId', '.mpd', 'data-video-id'].forEach(function(k){
+      var i = html.indexOf(k);
+      if (i >= 0) marks.push(html.substring(Math.max(0, i - 60), i + 120));
+    });
+    if (marks.length) out.bcContext = marks;
+  } catch (e) {}
   return JSON.stringify(out);
 })()
 """
@@ -10148,6 +10193,7 @@ def _browser_worker(url, wait_s, conn, opts=None):
     cookies = opts.get('cookies') or []
     cookie_txt = opts.get('cookie_txt') or None
     login_only = opts.get('login', False)
+    web_storage_restore = opts.get('web_storage') or ''
     holder = {'urls': [], 'all': [], 'title': None, 'cookies': 'none'}
 
     def _merge(raw):
@@ -10163,9 +10209,73 @@ def _browser_worker(url, wait_s, conn, opts=None):
                     holder[key].append(u)
         if data.get('title') and not holder['title']:
             holder['title'] = data['title']
+        for bc in (data.get('brightcove') or []):
+            if bc not in holder.setdefault('brightcove', []):
+                holder['brightcove'].append(bc)
+        if data.get('bcHints'):
+            holder['bcHints'] = data['bcHints']
+        if data.get('bcContext'):
+            holder['bcContext'] = data['bcContext']
+        if data.get('renderedLen'):
+            holder['renderedLen'] = data['renderedLen']
 
     def _on_start(window):
         import time as _t
+        # Hook the browser's OWN network events (WebView2 fires these for EVERY request in EVERY
+        # frame, including cross-origin player iframes — exactly what F12's Network tab shows).
+        # This is the reliable way to see a Brightcove/boltdns .mpd that our in-page JS can't,
+        # because it runs inside the engine, not inside a sandboxed page script. Safe: the events
+        # are delivered on the UI thread by pywebview.
+        def _note_url(u):
+            try:
+                u = str(getattr(u, 'url', u) or '')
+            except Exception:
+                return
+            if not u:
+                return
+            cls = _classify_media_url(u)
+            _merge({'urls': [u]} if cls else {'all': [u]})
+            # Push a real manifest to the parent THE MOMENT the browser fetches it, straight from
+            # the network-event handler (UI thread) — not from the scan loop, which on some builds
+            # only gets to run when the window closes. This is what makes the URL show up live and
+            # lets the parent close the window immediately.
+            if cls and cls[0] in ('mpd', 'hls'):
+                try:
+                    conn.send({'partial': json.dumps({
+                        'urls': holder['urls'], 'all': holder['all'],
+                        'title': holder['title'],
+                        'brightcove': holder.get('brightcove') or []})})
+                except Exception:
+                    pass
+
+        def _on_resp(resp):
+            _note_url(resp)
+
+        def _on_req(req):
+            _note_url(req)
+        try:
+            window.events.response_received += _on_resp
+        except Exception:
+            pass
+        try:
+            window.events.request_sent += _on_req
+        except Exception:
+            pass
+        # Restore a previously harvested SPA login (localStorage/sessionStorage) before the app
+        # boots, then reload so it reads the token and comes up logged in. This is what carries
+        # token-based logins that cookies miss.
+        if web_storage_restore:
+            _t.sleep(1.0)
+            try:
+                window.evaluate_js(
+                    "(function(s){try{var o=JSON.parse(s);"
+                    "if(o.local){for(var k in o.local){localStorage.setItem(k,o.local[k]);}}"
+                    "if(o.session){for(var k in o.session){sessionStorage.setItem(k,o.session[k]);}}"
+                    "}catch(e){}})(" + json.dumps(web_storage_restore) + ")")
+                window.load_url(url)
+                _t.sleep(1.5)
+            except Exception:
+                pass
         # Cookies must exist BEFORE the real page loads, otherwise the site has already decided
         # you are a guest. So the window starts on the site's root, cookies go in, and only then
         # does it navigate to the page we actually care about.
@@ -10177,14 +10287,76 @@ def _browser_worker(url, wait_s, conn, opts=None):
             except Exception:
                 pass
             _t.sleep(1.5)
+        # Install the network hook AS EARLY AS POSSIBLE (right after the last navigation), so the
+        # manifest request the player fires on start-up is captured. A DRM player (kocowa, etc.)
+        # fetches its .mpd once, feeds MSE and moves on, so a late hook misses it entirely.
+        if not login_only:
+            try:
+                window.evaluate_js(_BROWSER_HOOK_JS)
+            except Exception:
+                pass
 
         if login_only:
-            # Manual-login mode: leave the window open. webview.start() returns when the user
-            # closes it, and the profile keeps whatever session was established.
+            # Manual-login mode: leave the window open until the user closes it. Meanwhile,
+            # periodically HARVEST the site's cookies through pywebview's official get_cookies()
+            # (which marshals to the UI thread safely — no freeze) and hand them back. WebView2
+            # drops session cookies (no expiry) when it closes, so persisting the profile alone
+            # doesn't keep a session-cookie login; capturing the cookies here does.
+            harvest = {}
+            import time as _t2
+            while True:
+                try:
+                    jar = window.get_cookies()
+                except Exception:
+                    jar = None
+                if jar:
+                    for c in jar:
+                        try:
+                            # c is a SimpleCookie/Morsel-like mapping.
+                            for k in c.keys():
+                                m = c[k]
+                                harvest[(k, m['domain'], m['path'])] = {
+                                    'name': k, 'value': m.value,
+                                    'domain': m['domain'] or '', 'path': m['path'] or '/',
+                                    'secure': bool(m['secure']),
+                                    'httponly': bool(m.get('httponly', '')),
+                                    'expires': m['expires'] or '',
+                                }
+                        except Exception:
+                            continue
+                    holder['harvested'] = list(harvest.values())
+                # Modern streaming SPAs (kocowa, etc.) keep the auth token in localStorage /
+                # sessionStorage, NOT cookies — capture those too via evaluate_js (safe, no
+                # freeze). This is usually what actually carries the login.
+                try:
+                    store = window.evaluate_js(
+                        "JSON.stringify({local: Object.assign({}, window.localStorage), "
+                        "session: Object.assign({}, window.sessionStorage)})")
+                    if store:
+                        holder['web_storage'] = store
+                except Exception:
+                    pass
+                # get_current_url returns None once the window is gone.
+                try:
+                    if window.get_current_url() is None:
+                        break
+                except Exception:
+                    break
+                _t2.sleep(1.0)
             return
 
-        deadline = _t.time() + max(4, wait_s) * 3
+        # Give the scan enough time to sit through a pre-roll ad break (kocowa ~1 min) and still
+        # catch the main video after it. The window closes as soon as the stream settles (see the
+        # loop below), so a long ceiling doesn't mean a long wait on ad-free pages.
+        deadline = _t.time() + max(90, max(4, wait_s) * 3)
         played = 0
+        # Pre-roll ads (kocowa runs ~1 min) each fetch their OWN manifest, so the first .mpd we
+        # see is usually an AD, and the MAIN video's manifest only appears after the ad break.
+        # So: scan a long window, keep every manifest, and DON'T stop at the first one. Stop only
+        # once manifests have stopped arriving for a good while (the stream settled) — or at the
+        # deadline. This is why the window used to close on an ad or before the main video.
+        last_new = _t.time()
+        seen_media = set()
         while _t.time() < deadline:
             try:
                 window.evaluate_js(_BROWSER_HOOK_JS)      # idempotent; also covers new frames
@@ -10199,31 +10371,78 @@ def _browser_worker(url, wait_s, conn, opts=None):
                 _merge(window.evaluate_js(_BROWSER_COLLECT_JS))
             except Exception:
                 pass
-            # Stop early once something conclusive turned up, but always give the page at least
-            # the configured wait so a slow player isn't cut off.
-            if holder['urls'] and _t.time() > deadline - max(4, wait_s) * 2:
+            # Track when the last NEW media URL arrived. A steady stream of ad manifests keeps
+            # resetting this; once nothing new has shown up for ~15s we assume the main stream is
+            # in and stop. But we always give the ad break time to finish first.
+            cur = set(holder['urls'])
+            if cur - seen_media:
+                seen_media = cur
+                last_new = _t.time()
+                # Push what we have to the parent IMMEDIATELY. On builds where destroy() from this
+                # worker thread is ignored, the parent closes the window by killing the process as
+                # soon as it sees a real manifest — that's what makes the window close on its own.
+                if any(_classify_media_url(u) and _classify_media_url(u)[0] in ('mpd', 'hls')
+                       for u in holder['urls']):
+                    try:
+                        conn.send({'partial': json.dumps({
+                            'urls': holder['urls'], 'all': holder['all'],
+                            'title': holder['title'],
+                            'brightcove': holder.get('brightcove') or []})})
+                    except Exception:
+                        pass
+            # Only allowed to stop early AFTER the typical ad break, and then only once things
+            # have gone quiet.
+            if holder.get('brightcove'):
+                break                                    # IDs in hand -> Playback API does the rest
+            if _t.time() - last_new > 15 and seen_media:
                 break
             _t.sleep(0.5)
         holder['played'] = played
-        try:
-            window.destroy()
-        except Exception:
-            pass
+        # Close robustly: some WebView2 builds ignore a single destroy() from the worker thread.
+        # Try a couple of times and also ask the page to close itself, so the window doesn't
+        # linger after the scan is done.
+        for _ in range(3):
+            try:
+                window.destroy()
+            except Exception:
+                pass
+            try:
+                if window.get_current_url() is None:
+                    break
+            except Exception:
+                break
+            _t.sleep(0.4)
 
     try:
         pu = urlparse(url)
         start_url = f"{pu.scheme}://{pu.netloc}/" if cookies and pu.netloc else url
         w = webview.create_window('videoloader scan', url=start_url, hidden=not show,
                                   width=1280, height=800)
-        kwargs = {}
+        started = False
         if profile:
             # A persistent profile keeps a login you performed in this window, so the next run
-            # sees the real stream instead of a paywall.
-            kwargs = {'private_mode': False, 'storage_path': profile}
-        try:
-            webview.start(_on_start, (w,), **kwargs)
-        except TypeError:
-            webview.start(_on_start, (w,))     # older pywebview without those options
+            # sees the real stream instead of a paywall. private_mode defaults to True in
+            # pywebview ("store NOTHING"), which would wipe the login every run — it MUST be
+            # False, and storage_path is where the profile lives.
+            try:
+                webview.start(_on_start, (w,), private_mode=False, storage_path=profile)
+                started = True
+                holder.setdefault('cookie_notes', []).append(f"profile stored at {profile}")
+            except TypeError:
+                # This pywebview build doesn't accept these kwargs: the profile canNOT persist,
+                # so a --browser-login would be forgotten. Make that LOUD instead of silent.
+                holder.setdefault('cookie_notes', []).append(
+                    "PERSISTENCE UNAVAILABLE: this pywebview build ignores private_mode/"
+                    "storage_path (needs pywebview >= 3.4). A --browser-login will NOT be "
+                    "remembered between runs. Upgrade with:  pip install -U pywebview")
+        if not started:
+            webview.start(_on_start, (w,))
+        if login_only:
+            # After the window closes, WebView2 finishes writing the profile (cookies/session)
+            # asynchronously. Pause so that flush completes before this process exits, otherwise
+            # the freshly performed login is lost and the next run opens logged out.
+            import time as _t
+            _t.sleep(3)
     except Exception as e:
         try:
             conn.send({'error': str(e)})
@@ -10234,7 +10453,13 @@ def _browser_worker(url, wait_s, conn, opts=None):
     try:
         conn.send({'result': json.dumps({'urls': holder['urls'], 'all': holder['all'],
                                          'title': holder['title'], 'cookies': holder['cookies'],
+                                         'brightcove': holder.get('brightcove') or [],
+                                         'bcHints': holder.get('bcHints') or {},
+                                         'bcContext': holder.get('bcContext') or [],
+                                         'renderedLen': holder.get('renderedLen') or 0,
                                          'cookie_notes': holder.get('cookie_notes') or [],
+                                         'harvested': holder.get('harvested') or [],
+                                         'web_storage': holder.get('web_storage') or '',
                                          'played': holder.get('played', 0)})})
         conn.close()
     except Exception:
@@ -10248,8 +10473,9 @@ _NON_MANIFEST_EXT_RE = re.compile(
     r'\.(?:jpe?g|png|gif|webp|avif|svg|ico|css|js|mjs|woff2?|ttf|otf|eot|map|wasm|m4s|ts|aac|'
     r'vtt|srt|html?|php)(?:[?#]|$)', re.I)
 _MANIFEST_HINT_RE = re.compile(
-    r'(?:/|[?&=])(?:manifest|master|playlist|index|stream|streams|playback|dash|hls|mpd|m3u8|'
-    r'smil|media|source|video)(?:[/.?&=#]|$)|\.isml?/', re.I)
+    r'(?:/|[?&=])(?:manifest|master|playlist|index|stream|streams|playback|playinfo|play_info|'
+    r'dash|hls|mpd|m3u8|smil|media|source|video|entitlement|getmanifest|getvideo|contents?|'
+    r'vod|asset|delivery|cmaf)(?:[/.?&=#-]|$)|\.isml?/|[?&=][^&]*\.(?:mpd|m3u8)(?:[&#]|$)', re.I)
 
 
 def _looks_probeable(u):
@@ -10492,8 +10718,129 @@ def _browser_profile_dir():
     return d
 
 
+def _base_domain(host):
+    """A best-effort registrable domain: the last two labels (kocowa.com from www.kocowa.com or
+    m.kocowa.com). Good enough to match a saved login across www/subdomain/video-page hosts."""
+    host = (host or '').lower().strip('.')
+    parts = [p for p in host.split('.') if p]
+    if len(parts) <= 2:
+        return host
+    # Handle a couple of common two-label public suffixes so we don't over-truncate.
+    two_label_suffixes = {'co.uk', 'com.au', 'co.jp', 'co.kr', 'com.br', 'co.nz', 'org.uk'}
+    if '.'.join(parts[-2:]) in two_label_suffixes and len(parts) >= 3:
+        return '.'.join(parts[-3:])
+    return '.'.join(parts[-2:])
+
+
+def _find_login_storage_file(page_url):
+    """Find a saved web-storage file (login_<domain>.storage.json) for this page, matching by
+    BASE domain so a login saved on kocowa.com is found when the video page is www.kocowa.com."""
+    want = _base_domain(urlparse(page_url).hostname or '')
+    if not want:
+        return None
+    want_slug = re.sub(r'[^a-z0-9]+', '_', want)
+    for _d in (os.getcwd(), os.path.dirname(os.path.abspath(sys.argv[0] or '.'))):
+        d = _d or '.'
+        # Exact base-domain file first.
+        exact = os.path.join(d, f"login_{want_slug}.storage.json")
+        if os.path.isfile(exact):
+            return exact
+        # Otherwise any login_*.storage.json whose slug shares the base domain.
+        try:
+            for fn in os.listdir(d):
+                if fn.startswith('login_') and fn.endswith('.storage.json'):
+                    mid = fn[len('login_'):-len('.storage.json')]
+                    if want_slug in mid or mid in want_slug:
+                        return os.path.join(d, fn)
+        except OSError:
+            pass
+    return None
+
+
+def _save_harvested_cookies(harvested, page_url, web_storage=''):
+    """Write cookies harvested from the login browser to a JSON file the next run auto-detects,
+    plus a companion _storage file holding localStorage/sessionStorage (where SPA logins keep
+    their token). Session cookies get a one-year expiry so the login survives the browser
+    closing — WebView2 drops session cookies on exit."""
+    host = (urlparse(page_url).hostname or 'site').lower()
+    base = os.getcwd()
+    slug = re.sub(r'[^a-z0-9]+', '_', host)
+
+    # Companion web-storage file (localStorage/sessionStorage) — often the real login carrier.
+    if web_storage:
+        try:
+            sfile = os.path.join(base, f"login_{slug}.storage.json")
+            with open(sfile, 'w', encoding='utf-8') as f:
+                f.write(web_storage)
+            try:
+                _parsed = json.loads(web_storage)
+                _nloc = len(_parsed.get('local') or {})
+                _nses = len(_parsed.get('session') or {})
+            except Exception:
+                _nloc = _nses = 0
+            if _nloc or _nses:
+                print(f"[INFO] --browser-login: saved web storage "
+                      f"({_nloc} localStorage, {_nses} sessionStorage) to "
+                      f"{os.path.basename(sfile)} — restored automatically on browser runs.")
+        except OSError:
+            pass
+
+    if not harvested:
+        return
+    future = int(time.time()) + 365 * 24 * 3600
+    out = []
+    for c in harvested:
+        exp = c.get('expires')
+        # Normalise expiry to a unix timestamp; blank/None/0 means a session cookie -> make it last.
+        ts = 0
+        if exp:
+            try:
+                ts = int(exp)
+            except (ValueError, TypeError):
+                try:
+                    from email.utils import parsedate_to_datetime
+                    ts = int(parsedate_to_datetime(exp).timestamp())
+                except Exception:
+                    ts = 0
+        if not ts or ts < time.time():
+            ts = future
+        out.append({
+            'name': c.get('name', ''), 'value': c.get('value', ''),
+            'domain': c.get('domain', ''), 'path': c.get('path', '/'),
+            'secure': bool(c.get('secure')), 'httpOnly': bool(c.get('httponly')),
+            'expirationDate': ts,
+        })
+    fname = os.path.join(base, f"login_{slug}.json")
+    try:
+        with open(fname, 'w', encoding='utf-8') as f:
+            json.dump(out, f)
+        n_http = sum(1 for c in out if c['httpOnly'])
+        print(f"[INFO] --browser-login: saved {len(out)} cookie(s) to "
+              f"{os.path.basename(fname)} (session cookies made persistent).")
+        if n_http:
+            # An HttpOnly login cookie can't be injected into the browser from a file (neither
+            # document.cookie nor a safe pywebview API can set it). The non-browser download
+            # path CAN use it though, since requests sends whatever the file holds.
+            print(f"[INFO] --browser-login: {n_http} of them are HttpOnly. Use this file with the "
+                  f"NORMAL download (it sends cookies directly):  --cookies "
+                  f"{os.path.basename(fname)}  — not with --davka-browser, whose in-page "
+                  f"injection can't set HttpOnly cookies.")
+        else:
+            print("[INFO] --browser-login: none are HttpOnly, so --davka-browser can inject them "
+                  "too. The file is auto-detected next run.")
+    except OSError as e:
+        # Fall back to the current directory if the script dir isn't writable.
+        try:
+            alt = os.path.join(os.getcwd(), f"login_{re.sub(r'[^a-z0-9]+', '_', host)}.json")
+            with open(alt, 'w', encoding='utf-8') as f:
+                json.dump(out, f)
+            print(f"[INFO] --browser-login: saved {len(out)} cookie(s) to {alt}.")
+        except OSError:
+            print(f"[WARN] --browser-login: could not save harvested cookies ({e}).")
+
+
 def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_only=False):
-    """Load a page in a real webview and return (media_urls, page_title, other_requests).
+    """Load a page in a real webview and return (media_urls, page_title, other_requests, brightcove_players).
 
     `session` supplies the cookies loaded from --cookies / an auto-detected cookie file, so the
     browser is logged in the same way the rest of the script is. `other_requests` is everything
@@ -10521,9 +10868,21 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
     elif session is not None:
         print("[INFO] --scan-browser: no cookies loaded — use --cookies FILE (or drop a cookie "
               ".json next to the script) if the page needs a login.")
+    # Load previously harvested web storage (localStorage/sessionStorage) for this host, so a
+    # token-based SPA login (kocowa etc.) is restored — cookies alone don't carry those.
+    web_storage_restore = ''
+    _sf = _find_login_storage_file(page_url)
+    if _sf:
+        try:
+            with open(_sf, encoding='utf-8') as f:
+                web_storage_restore = f.read()
+            print(f"[INFO] browser: restoring saved login state from "
+                  f"{os.path.basename(_sf)}.")
+        except OSError:
+            pass
     opts = {'click': bool(SCAN_BROWSER_CLICK), 'show': bool(SCAN_BROWSER_SHOW) or login_only,
             'profile': profile, 'cookies': cookies, 'cookie_txt': cookie_txt,
-            'login': bool(login_only)}
+            'login': bool(login_only), 'web_storage': web_storage_restore}
     if opts['show'] and not login_only:
         print("[INFO] --scan-browser: a browser window will open — you can log in or press play "
               "in it if the page needs that; it closes on its own.")
@@ -10534,12 +10893,65 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         proc = ctx.Process(target=_browser_worker, args=(page_url, wait_s, child, opts),
                            daemon=True)
         proc.start()
-        # The worker keeps polling for up to 3x the wait, so allow for that plus startup.
-        budget = 3600 if login_only else max(4, wait_s) * 3 + 60
-        got = parent.recv() if parent.poll(budget) else None
-        proc.join(5)
+        # The worker keeps polling for up to the deadline, so allow for that plus startup.
+        budget = 3600 if login_only else max(150, max(4, wait_s) * 3 + 60)
+        import time as _pt
+        deadline_p = _pt.time() + budget
+        got = None
+        partial = None
+        announced = set()
+
+        def _announce(pl):
+            # Print any newly found manifest the instant the worker reports it — so the URL shows
+            # up while the browser is still open, not only after it closes.
+            try:
+                d = json.loads(pl)
+            except (ValueError, TypeError):
+                return
+            for u in (d.get('urls') or []):
+                cls = _classify_media_url(u)
+                if cls and cls[0] in ('mpd', 'hls') and u not in announced:
+                    announced.add(u)
+                    print(f"[INFO] browser: found [{cls[0]}] {u}")
+
+        while _pt.time() < deadline_p:
+            remaining = max(0.1, deadline_p - _pt.time())
+            if not parent.poll(remaining):
+                break
+            try:
+                msg = parent.recv()
+            except EOFError:
+                break
+            if not isinstance(msg, dict):
+                continue
+            if 'result' in msg or 'error' in msg:
+                got = msg
+                break
+            if msg.get('partial'):
+                # The worker found a manifest and pushed it the moment the browser fetched it.
+                # Announce it live, and as soon as we have a NON-AD manifest, close the window and
+                # start downloading — in BOTH --davka-browser and --davka-login. Pre-roll ad
+                # manifests come from ad hosts, so we skip those and wait for the real stream.
+                partial = msg['partial']
+                _announce(partial)
+                real = _first_non_ad_manifest(partial)
+                # Near the end of the scan window, if the preferred type never showed up, accept
+                # ANY non-ad manifest (e.g. a page that only serves HLS) so the window still
+                # closes and the download starts instead of running out the whole deadline.
+                if not real and (deadline_p - _pt.time()) < 20:
+                    real = _first_non_ad_manifest(partial, any_type=True)
+                if real:
+                    got = {'result': partial}
+                    break
+        # In login mode the worker must flush the WebView2 profile (the freshly signed-in
+        # session) to disk when the window closes; give it a short clean join for that. Then
+        # terminate hard — WebView2 spawns child processes that can keep the window alive even
+        # after destroy(), so a single terminate on the parent isn't always enough.
+        proc.join(6 if login_only else 1)
         if proc.is_alive():
-            proc.terminate()
+            _kill_process_tree(proc)
+        if got is None and partial is not None:
+            got = {'result': partial}
     except Exception as e:
         if verbose:
             print(f"[WARN] --scan-browser webview failed: {e}")
@@ -10552,6 +10964,19 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         data = json.loads(got['result'])
     except (ValueError, TypeError):
         return [], None, []
+    # In login mode, persist the cookies harvested from the browser (with a future expiry so a
+    # session-cookie login survives WebView2 closing) to a file the next run auto-detects.
+    harvested = data.get('harvested') or []
+    web_storage = data.get('web_storage') or ''
+    if login_only and (harvested or web_storage):
+        _save_harvested_cookies(harvested, page_url, web_storage)
+    # Persistence / profile notes matter even in --browser-login (no cookies at all), so print
+    # them unconditionally. A build that can't persist the profile is why a login is forgotten.
+    for note in (data.get('cookie_notes') or []):
+        if note.startswith('PERSISTENCE UNAVAILABLE'):
+            print(f"{CLR.YELLOW}[WARN]{CLR.RESET} {note}")
+        elif note.startswith('profile stored at') and verbose:
+            print(f"[DBG] {note}")
     ck = data.get('cookies')
     if cookies and isinstance(ck, dict):
         if verbose:
@@ -10573,9 +10998,135 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         tqdm.write(f"[DBG] --scan-browser: {data.get('played', 0)} play attempt(s), "
                    f"{len(data.get('urls') or [])} media hit(s), "
                    f"{len(data.get('all') or [])} other request(s) observed")
+    bcove = data.get('brightcove') or []
+    # If the standard patterns found nothing, build candidates from the rendered-DOM hints: pair
+    # each account id with each video id seen (the Playback API call simply fails for wrong pairs).
+    hints = data.get('bcHints') or {}
+    if not bcove and hints:
+        accts, vids = [], []
+        for a in (hints.get('accounts') or []):
+            m = re.search(r'(\d{6,})', a)
+            if m and m.group(1) not in accts:
+                accts.append(m.group(1))
+        for v in (hints.get('videos') or []):
+            m = re.search(r'([\w-]{4,})\s*$', v)
+            if m and m.group(1) not in vids:
+                vids.append(m.group(1))
+        for a in accts:
+            for v in vids:
+                bcove.append({'account': a, 'videoId': v, 'player': 'default_default'})
+    holder_ctx = {'bcContext': data.get('bcContext') or [],
+                  'renderedLen': data.get('renderedLen') or 0}
+    globals()['_LAST_BROWSER_DIAG'] = holder_ctx
     return (list(dict.fromkeys(data.get('urls') or [])),
             (data.get('title') or None),
-            list(dict.fromkeys(data.get('all') or [])))
+            list(dict.fromkeys(data.get('all') or [])),
+            bcove)
+
+
+def _brightcove_ids_from_html(html):
+    """Pull Brightcove account/player/video IDs out of raw page HTML — no browser needed. Covers
+    the <video-js data-account=.. data-video-id=..> embed and the players.brightcove.net script
+    (players.brightcove.net/<account>/<player>_default/index.min.js) plus common JSON fields."""
+    if not html:
+        return []
+    found = {}
+
+    def _add(acc, vid, ply):
+        acc = (acc or '').strip()
+        vid = (vid or '').strip()
+        if acc and vid:
+            found[(acc, vid)] = {'account': acc, 'videoId': vid,
+                                 'player': (ply or 'default_default').strip()}
+
+    # <video-js data-account="123" data-player="abc" data-video-id="456">
+    for m in re.finditer(r'<video-js\b[^>]*>', html, re.I):
+        tag = m.group(0)
+        acc = re.search(r'data-account\s*=\s*["\']([^"\']+)', tag, re.I)
+        vid = re.search(r'data-video-id\s*=\s*["\']([^"\']+)', tag, re.I)
+        ply = re.search(r'data-player\s*=\s*["\']([^"\']+)', tag, re.I)
+        _add(acc and acc.group(1), vid and vid.group(1), ply and ply.group(1))
+    # The player <script src="players.brightcove.net/<account>/<player>_default/index.min.js">
+    # gives the account+player; pair it with any data-video-id / "videoId" nearby.
+    acc_ply = re.search(r'players\.brightcove\.net/(\d+)/([\w-]+?)_default/', html, re.I)
+    if acc_ply:
+        acc, ply = acc_ply.group(1), acc_ply.group(2)
+        for vm in re.finditer(
+                r'data-video-id\s*=\s*["\']([^"\']+)|["\']video[_-]?[iI]d["\']\s*:\s*["\']([^"\']+)',
+                html):
+            _add(acc, vm.group(1) or vm.group(2), ply)
+    # accountId + videoId as JSON fields anywhere (some pages embed a config blob).
+    acc_json = re.search(r'["\']account[_-]?[iI]d["\']\s*:\s*["\']?(\d+)', html)
+    if acc_json:
+        for vm in re.finditer(r'["\']video[_-]?[iI]d["\']\s*:\s*["\']?(\d+)', html):
+            _add(acc_json.group(1), vm.group(1), None)
+    return list(found.values())
+
+
+def _first_non_ad_manifest(partial_json, any_type=False):
+    """From a worker 'partial' payload, return the manifest the window should CLOSE on, or None to
+    keep waiting. Pre-roll ads have their own manifests (often HLS), so closing on the first one
+    grabs an ad. Two guards: (1) skip anything that looks like an ad by host or path; (2) honour
+    PREFER_STREAM — when it's 'dash', only a real .mpd closes the window, so an ad .m3u8 (or the
+    site's own HLS rendition) can't end the scan before the main DASH manifest appears."""
+    try:
+        d = json.loads(partial_json)
+    except (ValueError, TypeError):
+        return None
+    ad_re = re.compile(
+        r'(?:^|[./_-])(?:ad|ads|adserver|advert|doubleclick|googlesyndication|imasdk|'
+        r'pubads|adsystem|adservice|moatads|innovid|spotx|freewheel|fwmrm|yspace|teads|'
+        r'springserve|dai|vast|vmap|preroll|midroll|postroll|/ads?/|_ad_|/ad-)(?:[./?&_-]|$)',
+        re.I)
+    pref = (PREFER_STREAM or 'dash').lower()
+    dash = hls = None
+    for u in (d.get('urls') or []):
+        cls = _classify_media_url(u)
+        if not cls or cls[0] not in ('mpd', 'hls'):
+            continue
+        if ad_re.search(u):
+            continue                     # looks like an ad manifest — keep waiting
+        if cls[0] == 'mpd' and dash is None:
+            dash = u
+        elif cls[0] == 'hls' and hls is None:
+            hls = u
+    if any_type:
+        # Grace fallback near the deadline: take whatever real manifest we have.
+        if pref == 'hls':
+            return hls or dash
+        return dash or hls
+    # Close on the PREFERRED type when we have it; only fall back to the other type if the page
+    # can't provide the preferred one — but while waiting, a lone non-preferred manifest does NOT
+    # close the window (return None), which is what stops an ad/HLS from ending the scan early.
+    if pref == 'dash':
+        return dash                       # wait for the .mpd; ignore .m3u8 (ads or alt rendition)
+    if pref == 'hls':
+        return hls
+    return dash or hls                    # 'both': first real manifest of either type is fine
+
+
+def _kill_process_tree(proc):
+    """Terminate a worker process AND its children. WebView2 spawns helper processes that keep
+    the window alive after the parent is asked to quit, so on Windows we use taskkill /T to take
+    the whole tree down; elsewhere terminate()/kill() suffices."""
+    pid = getattr(proc, 'pid', None)
+    if os.name == 'nt' and pid:
+        try:
+            import subprocess as _sp
+            _sp.run(['taskkill', '/F', '/T', '/PID', str(pid)],
+                    stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=10)
+        except Exception:
+            pass
+    try:
+        proc.terminate()
+        proc.join(3)
+    except Exception:
+        pass
+    try:
+        if proc.is_alive():
+            proc.kill()
+    except Exception:
+        pass
 
 
 def _browser_scan_items(page_url, session, verbose, wait_s=None):
@@ -10585,8 +11136,99 @@ def _browser_scan_items(page_url, session, verbose, wait_s=None):
     Returns discovery items shaped like scan_page_for_media()'s, so both callers (--scan-browser
     and --davka-browser) go through exactly the same logic."""
     items = []
-    burls, btitle, bother = _browser_collect_media(page_url, verbose, wait_s=wait_s,
-                                                   session=session)
+    # FIRST try Brightcove straight from the page HTML (fetched via requests) — no browser JS
+    # involved, so it works even when evaluate_js returns nothing on this WebView2 build. kocowa
+    # and many sites embed a Brightcove player whose manifest we then get from the Playback API.
+    try:
+        _r = session.get(page_url, timeout=20,
+                         headers={'User-Agent': USER_AGENT,
+                                  'Referer': f"{urlparse(page_url).scheme}://"
+                                             f"{urlparse(page_url).netloc}/"})
+        _html = _r.text if _r.ok else ''
+    except requests.RequestException:
+        _html = ''
+    _bc_html = _brightcove_ids_from_html(_html)
+    if _bc_html:
+        if verbose:
+            tqdm.write(f"[DBG] found {len(_bc_html)} Brightcove player(s) in the page HTML: "
+                       + ", ".join(f"{b['account']}/{b['videoId']}" for b in _bc_html))
+        for k, u, lbl in _resolve_brightcove(_bc_html, page_url, session, verbose):
+            if not any(i['url'] == u for i in items):
+                items.append({'kind': k, 'url': u, 'label': lbl, 'name': None,
+                              'page': page_url})
+        if items:
+            # Got the manifest without opening a window at all — done.
+            return items
+
+    burls, btitle, bother, bcove = _browser_collect_media(page_url, verbose, wait_s=wait_s,
+                                                          session=session)
+    # Diagnostic dumps (browser_requests.log + browser_page.html) are ONLY written with -v/verbose
+    # — they're for troubleshooting when a manifest isn't found, not needed for normal operation.
+    if verbose:
+        try:
+            _dumpf = os.path.join(os.getcwd(), 'browser_requests.log')
+            with open(_dumpf, 'w', encoding='utf-8') as _df:
+                _df.write(f"# page: {page_url}\n# title: {btitle}\n")
+                _df.write(f"# media candidates ({len(burls)}):\n")
+                for u in burls:
+                    _df.write(f"MEDIA  {u}\n")
+                _df.write(f"# other requests ({len(bother)}):\n")
+                for u in bother:
+                    _df.write(f"OTHER  {u}\n")
+                _df.write(f"# brightcove players ({len(bcove)}):\n")
+                for b in bcove:
+                    _df.write(f"BRIGHTCOVE  account={b.get('account')} "
+                              f"videoId={b.get('videoId')} player={b.get('player')}\n")
+                _df.write(f"# brightcove IDs found in page HTML ({len(_bc_html)}):\n")
+                for b in _bc_html:
+                    _df.write(f"HTML_BRIGHTCOVE  account={b.get('account')} "
+                              f"videoId={b.get('videoId')} player={b.get('player')}\n")
+                _df.write(f"# page HTML length: {len(_html)} chars "
+                          f"(if ~0, the page needs JS/login to render)\n")
+                # Diagnostic traces: any clue in the HTML that could carry the Brightcove account or a
+                # video id, so we can see WHERE the id lives when the standard patterns miss it.
+                _diag = globals().get('_LAST_BROWSER_DIAG') or {}
+                _df.write(f"# rendered DOM length (in browser): "
+                          f"{_diag.get('renderedLen', 0)} chars\n")
+                for _c in (_diag.get('bcContext') or []):
+                    _df.write(f"RENDERED_CTX  {str(_c)[:180]}\n")
+                _df.write("# --- id/brightcove traces in HTML ---\n")
+                for _pat, _lbl in [
+                        (r'brightcove[^"\'<>\s]{0,80}', 'brightcove'),
+                        (r'boltdns[^"\'<>\s]{0,80}', 'boltdns'),
+                        (r'players\.brightcove\.net/[^"\'<>\s]+', 'player-script'),
+                        (r'"[a-zA-Z_]*[vV]ideo[_a-zA-Z]*[iI]d"\s*:\s*"?[\w-]+', 'videoId-json'),
+                        (r'"[a-zA-Z_]*account[_a-zA-Z]*[iI]d"\s*:\s*"?\d+', 'accountId-json'),
+                        (r'data-video-id\s*=\s*["\'][^"\']+', 'data-video-id'),
+                        (r'data-account\s*=\s*["\'][^"\']+', 'data-account'),
+                        (r'/(?:videos?|contents?|watch|player|vod)/[\w-]{4,}', 'url-path-id'),
+                        (r'6154734805001', 'known-account'),
+                        (r'(?:api|edge)[^"\'<>\s]{0,60}', 'api-endpoint'),
+                        (r'\.mpd[^"\'<>\s]{0,40}', 'mpd-ref'),
+                        (r'\.m3u8[^"\'<>\s]{0,40}', 'm3u8-ref')]:
+                    try:
+                        hits = re.findall(_pat, _html, re.I)
+                        seen = []
+                        for h in hits:
+                            if h not in seen:
+                                seen.append(h)
+                            if len(seen) >= 5:
+                                break
+                        for h in seen:
+                            _df.write(f"TRACE[{_lbl}]  {h[:120]}\n")
+                    except Exception:
+                        pass
+            # Save the raw HTML too, so the exact structure can be inspected if traces aren't enough.
+            try:
+                with open(os.path.join(os.getcwd(), 'browser_page.html'), 'w',
+                          encoding='utf-8') as _hf:
+                    _hf.write(_html or '')
+            except OSError:
+                pass
+            print(f"[INFO] browser: wrote {len(burls)} media + {len(bother)} other request(s) to "
+                  f"{os.path.basename(_dumpf)} (send this + browser_page.html if not found).")
+        except OSError:
+            pass
     if verbose:
         tqdm.write(f"[DBG] browser collected {len(burls)} candidate URL(s):")
         for u in burls:
@@ -10624,7 +11266,108 @@ def _browser_scan_items(page_url, session, verbose, wait_s=None):
                                             session, hdrs, verbose, SCAN_BROWSER_PROBE_MAX):
             _add(k, cu, ('DASH stream (.mpd)' if k == 'mpd' else 'HLS stream (.m3u8)')
                  + ' (browser request)')
+    # Brightcove player (kocowa and many others): the manifest is fetched inside a cross-origin
+    # player frame we can't hook, so ask Brightcove's Playback API for it directly using the IDs
+    # scraped from the page. This is far more reliable than trying to observe the request.
+    if bcove and not any(i['kind'] in ('mpd', 'hls') for i in items):
+        for src_kind, src_url, src_label in _resolve_brightcove(bcove, page_url, session, verbose):
+            _add(src_kind, src_url, src_label)
+    # Prefer DASH (.mpd) over HLS (.m3u8): Brightcove (and others) serve both, and whichever the
+    # player fetched FIRST is often HLS, but DASH is what we want. Order manifests mpd-before-hls
+    # so the downloader picks the .mpd; non-manifest items keep their original order after them.
+    _rank = {'mpd': 0, 'hls': 1}
+    items.sort(key=lambda i: _rank.get(i.get('kind'), 2))
     return items
+
+
+def _resolve_brightcove(players, page_url, session, verbose):
+    """Ask Brightcove's Playback API for a video's streams, given the account/video IDs scraped
+    from the page. Returns [(kind, url, label), ...]. The player page carries a 'policy key'
+    (BCpkc...) that authorises the API; we fetch the player config to find it."""
+    out = []
+    pg = urlparse(page_url)
+    ref = f"{pg.scheme}://{pg.netloc}"
+    for p in players:
+        acc = (p.get('account') or '').strip()
+        vid = (p.get('videoId') or '').strip()
+        ply = (p.get('player') or 'default_default').strip()
+        if not acc or not vid:
+            continue
+        policy = None
+        # The policy key lives in the player's JS config at players.brightcove.net.
+        cfg_url = f"https://players.brightcove.net/{acc}/{ply}_default/config.json"
+        try:
+            r = session.get(cfg_url, timeout=15,
+                            headers={'User-Agent': USER_AGENT, 'Referer': ref})
+            if r.ok:
+                m = re.search(r'"policyKey"\s*:\s*"([^"]+)"', r.text)
+                if m:
+                    policy = m.group(1)
+        except requests.RequestException:
+            pass
+        if not policy:
+            # Fall back to the JS bundle, which embeds the key as policyKey:"BCpkc...".
+            for js_url in (f"https://players.brightcove.net/{acc}/{ply}_default/index.min.js",
+                           f"https://players.brightcove.net/{acc}/{ply}_default/index.js"):
+                try:
+                    r = session.get(js_url, timeout=15,
+                                    headers={'User-Agent': USER_AGENT, 'Referer': ref})
+                    if r.ok:
+                        m = re.search(r'policyKey["\':\s]+(BCpk[\w-]+)', r.text)
+                        if m:
+                            policy = m.group(1)
+                            break
+                except requests.RequestException:
+                    continue
+        if not policy:
+            if verbose:
+                tqdm.write(f"[DBG] Brightcove: no policy key for account {acc}; cannot query "
+                           "the Playback API.")
+            continue
+        api = f"https://edge.api.brightcove.com/playback/v1/accounts/{acc}/videos/{vid}"
+        try:
+            r = session.get(api, timeout=20, headers={
+                'Accept': f"application/json;pk={policy}",
+                'User-Agent': USER_AGENT, 'Referer': ref, 'Origin': ref})
+        except requests.RequestException as e:
+            if verbose:
+                tqdm.write(f"[DBG] Brightcove Playback API failed: {e}")
+            continue
+        if not r.ok:
+            if verbose:
+                tqdm.write(f"[DBG] Brightcove Playback API returned HTTP {r.status_code} "
+                           f"for video {vid}.")
+            continue
+        try:
+            payload = r.json()
+        except ValueError:
+            continue
+        # sources[] holds the renditions; prefer DASH (.mpd), then HLS (.m3u8).
+        srcs = payload.get('sources') or []
+        got_dash = got_hls = None
+        for s in srcs:
+            u = s.get('src') or ''
+            typ = (s.get('type') or '').lower()
+            if not u:
+                continue
+            if not got_dash and ('dash' in typ or u.lower().split('?')[0].endswith('.mpd')):
+                got_dash = u
+            if not got_hls and ('mpegurl' in typ or 'm3u8' in u.lower()):
+                got_hls = u
+        if got_dash:
+            out.append(('mpd', got_dash, 'DASH stream (.mpd) (Brightcove API)'))
+        elif got_hls:
+            out.append(('hls', got_hls, 'HLS stream (.m3u8) (Brightcove API)'))
+        elif verbose:
+            tqdm.write(f"[DBG] Brightcove: video {vid} returned {len(srcs)} source(s) but no "
+                       "DASH/HLS (may be DRM-only or geo-blocked).")
+        # DRM note: Brightcove DASH is frequently Widevine-encrypted. Flag it so the user knows a
+        # key will be needed even though the manifest was found.
+        if payload.get('sources') and any(
+                (s.get('key_systems') or s.get('drm')) for s in payload['sources']):
+            print("[INFO] Brightcove: this video is DRM-protected (Widevine/PlayReady) — the "
+                  "manifest was found but playback needs a decryption key (--key KID:KEY).")
+    return out
 
 
 def _direct_label(url):
@@ -11014,6 +11757,18 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                 found = [f for f in found if f['kind'] != 'direct']
                 print(f"[INFO] --scan: HLS/DASH stream found; preferring it over {dropped} direct "
                       f"file(s) (use --select to choose manually).")
+            # When BOTH DASH (.mpd) and HLS (.m3u8) are present, keep the preferred one (default
+            # DASH). Many players fetch HLS first, so without this the .m3u8 would win by order.
+            _pref = (PREFER_STREAM or 'dash').lower()
+            if _pref in ('dash', 'hls'):
+                keep = 'mpd' if _pref == 'dash' else 'hls'
+                drop = 'hls' if _pref == 'dash' else 'mpd'
+                if any(f['kind'] == keep for f in found) and any(f['kind'] == drop for f in found):
+                    n = sum(1 for f in found if f['kind'] == drop)
+                    found = [f for f in found if f['kind'] != drop]
+                    print(f"[INFO] --scan: both DASH and HLS present; keeping "
+                          f"{keep.upper()} and dropping {n} {drop.upper()} stream(s) "
+                          f"(set PREFER_STREAM='both' or use --select to keep both).")
             # If the URLs encode a resolution (e.g. 720P_4000K, 480P_2000K), keep only the best
             # rendition of each stream.
             before = len(found)
@@ -12171,12 +12926,12 @@ def _download_batch_entry(entry, session, max_height, verbose, chunk_size=DEFAUL
     # A page address needs resolving; an address that already IS a manifest or a file does not,
     # so a list may freely mix the two.
     if use_browser and not _classify_media_url(url):
-        print(f"[INFO] --davka-browser: opening {url}")
+        print(f"[INFO] browser: opening {url}")
         hit = _batch_resolve_page(url, session, verbose, True)
         if not hit:
             return False, "no stream found on that page (try raising SCAN_BROWSER_WAIT)", None
         page_url, url = url, hit['url']
-        print(f"[INFO] --davka-browser: found [{hit['kind']}] {url}")
+        print(f"[INFO] browser: found [{hit['kind']}] {url}")
 
     # CDNs commonly reject a manifest request that lacks the page's Referer/Origin, so those come
     # from the PAGE the stream was found on whenever we know it.
@@ -12236,14 +12991,17 @@ def run_batch(list_path, base_kwargs, out_dir):
 
     Re-running is safe and cheap: entries whose output file already exists are skipped, so an
     interrupted batch simply continues where it stopped."""
+    global _auto_cookies_all
+    _auto_cookies_all = True    # unattended batch: load ALL detected cookie JSONs, never prompt
     # Colour, UTF-8 output and ASCII progress bars must be set up BEFORE the first message —
     # exactly like main() and run_resume() do. Doing it later (or not at all on the --list and
     # error-exit paths) is why the very first lines came out unstyled.
     setup_console(base_kwargs.get('use_color', True))
 
     entries, problems = _read_batch_file(list_path)
-    use_browser = bool(base_kwargs.get('browser'))
-    mode = '--davka-browser' if use_browser else '--davka'
+    use_browser = bool(base_kwargs.get('browser')) or bool(base_kwargs.get('login_mode'))
+    login_mode = bool(base_kwargs.get('login_mode'))
+    mode = '--davka-login' if login_mode else ('--davka-browser' if use_browser else '--davka')
     verbose = base_kwargs.get('verbose', False)
     max_height = base_kwargs.get('max_height', DEFAULT_MAX_HEIGHT)
     list_only = base_kwargs.get('list_only', False)
@@ -12257,8 +13015,10 @@ def run_batch(list_path, base_kwargs, out_dir):
     enc_n = sum(1 for e in entries if e['keys'])
     print(f"[INFO] {mode}: {len(entries)} video(s) from '{list_path}' "
           f"({enc_n} with a decryption key)."
-          + ("  Each address is opened in a real browser to find its stream."
-             if use_browser else ""))
+          + ("  Each address is opened in a real browser (using the login saved by "
+             "--browser-login) to find its stream." if login_mode else
+             ("  Each address is opened in a real browser to find its stream."
+              if use_browser else "")))
     if list_only:
         for i, e in enumerate(entries, 1):
             print(f"  {i:>3}. {e['name']}")
@@ -12300,9 +13060,17 @@ def run_batch(list_path, base_kwargs, out_dir):
               f"{(NTFY_SERVER or 'https://ntfy.sh').rstrip('/')}/{NTFY_TOPIC}")
 
     try:
-        session = get_cookies_session(
-            [base_kwargs['cookies_file']] if base_kwargs.get('cookies_file')
-            else (auto_detect_cookies(verbose) if base_kwargs.get('auto_cookies', True) else []))
+        if login_mode:
+            # --davka-login: use the login saved by --browser-login — both the harvested cookies
+            # (login_*.json, auto-detected) AND the web storage (restored per page). Injection of
+            # these cookies is via document.cookie (they're the harvested, non-HttpOnly ones),
+            # which is safe and doesn't freeze the window.
+            session = get_cookies_session(auto_detect_cookies(verbose))
+        else:
+            session = get_cookies_session(
+                [base_kwargs['cookies_file']] if base_kwargs.get('cookies_file')
+                else (auto_detect_cookies(verbose) if base_kwargs.get('auto_cookies', True)
+                      else []))
     except (FileNotFoundError, ValueError) as e:
         print(f"[ERROR] {mode}: failed to load cookies: {e}")
         sys.exit(1)
@@ -12465,7 +13233,9 @@ if __name__ == "__main__":
     parser.add_argument("--ascii", action="store_true", help="Force plain-ASCII filenames: strip accents (é->e) and drop non-Latin characters (Korean, etc.). Useful so Windows cmd shows names correctly and progress bars line up. Files keep their content; only names change.")
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
     parser.add_argument("--scan", nargs='?', const=True, default=None, metavar='N', help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.mpd/.webm/.mov) and download them all. Give a number to grab only the N-th found item, e.g. --scan 2 (1-indexed, in discovery order).")
-    parser.add_argument("--browser-login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
+    parser.add_argument("--prefer-stream", dest="prefer_stream", choices=['dash', 'hls', 'both'], default=None, help="When a page offers BOTH a DASH (.mpd) and an HLS (.m3u8) stream, which to keep: 'dash' (default) grabs the .mpd, 'hls' grabs the .m3u8, 'both' keeps both. Overrides the PREFER_STREAM config value for this run.")
+    parser.add_argument("--davka-login", "--batch-login", dest="davka_login", type=str, default=None, metavar="FILE", help="Like --davka-browser, but does NOT use any cookie file: each PAGE address is opened in the real browser using ONLY the login saved by --browser-login (a persistent browser profile). Nothing is injected, so this avoids the cookie-injection issues on Windows/WebView2. First run --browser-login once to sign in by hand; then --davka-login reuses that session for every entry. Same name/URL/key list format as --davka-browser.")
+    parser.add_argument("--browser-login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
     parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
@@ -12535,32 +13305,56 @@ if __name__ == "__main__":
 
     if args.browser_login:
         setup_console(USE_COLOR and not args.no_color)
-        try:
-            _sess = get_cookies_session(
-                [args.cookies] if args.cookies
-                else (auto_detect_cookies(args.verbose)
-                      if (AUTO_COOKIES and not args.no_auto_cookies) else []))
-        except (FileNotFoundError, ValueError) as e:
-            print(f"[ERROR] Failed to load cookies: {e}")
-            sys.exit(1)
-        print("[INFO] --browser-login: sign in in the window, then close it. The session is kept "
-              "for later --scan-browser runs.")
+        _sess = get_cookies_session([])
+        profile_dir = _browser_profile_dir() if SCAN_BROWSER_PROFILE else None
+        print("[INFO] --browser-login: a window opens on the site. Sign in by hand, then CLOSE "
+              "the window. Your login cookies are captured and saved so later runs are logged "
+              "in (this works even for HttpOnly/session-cookie logins).")
+        if profile_dir:
+            print(f"[INFO] --browser-login: profile directory is {profile_dir}")
+        # Snapshot the profile so we can tell afterwards whether anything was actually written.
+        def _profile_fingerprint(d):
+            if not d or not os.path.isdir(d):
+                return (0, 0)
+            files = total = 0
+            for root, _dirs, names in os.walk(d):
+                for n in names:
+                    try:
+                        total += os.path.getsize(os.path.join(root, n))
+                        files += 1
+                    except OSError:
+                        pass
+            return (files, total)
+        before = _profile_fingerprint(profile_dir)
         try:
             _browser_collect_media(args.browser_login, args.verbose, session=_sess,
                                    login_only=True)
         finally:
             _sess.close()
-        print("[INFO] --browser-login: done.")
+        # The cookie-save message (from _save_harvested_cookies) already reports success. Add a
+        # profile-changed note only as a secondary signal.
+        after = _profile_fingerprint(profile_dir)
+        if profile_dir and after != before:
+            print("[INFO] --browser-login: done. If a login_*.json was saved above, it will be "
+                  "used automatically next run (or pass it with --cookies).")
+        else:
+            print("[INFO] --browser-login: done. If no cookies were captured, make sure you "
+                  "actually signed in before closing the window.")
         sys.exit(0)
 
+    if args.prefer_stream:
+        PREFER_STREAM = args.prefer_stream
+
     if sum(bool(x) for x in (args.video_id, args.url_list, args.davka,
-                             args.davka_browser)) > 1:
-        parser.error("give only ONE of: a single URL, --url-list, --davka, or --davka-browser.")
+                             args.davka_browser, args.davka_login)) > 1:
+        parser.error("give only ONE of: a single URL, --url-list, --davka, --davka-browser, "
+                     "or --davka-login.")
 
     # The batch modes run their own loop (name/URL/key blocks), so they short-circuit the rest.
-    if args.davka or args.davka_browser:
-        _list = args.davka or args.davka_browser
-        _mode = "--davka-browser" if args.davka_browser else "--davka"
+    if args.davka or args.davka_browser or args.davka_login:
+        _list = args.davka or args.davka_browser or args.davka_login
+        _mode = ("--davka-login" if args.davka_login else
+                 "--davka-browser" if args.davka_browser else "--davka")
         if args.output:
             print(f"[WARN] -o/--output is ignored with {_mode}; names come from the file.")
         run_batch(_list, dict(
@@ -12569,6 +13363,7 @@ if __name__ == "__main__":
             auto_cookies=(AUTO_COOKIES and not args.no_auto_cookies), list_only=args.list,
             chunk_size=args.chunk_size, auto=(not args.no_auto),
             browser=bool(args.davka_browser),
+            login_mode=bool(args.davka_login),
         ), args.output_dir)
         sys.exit(0)
 
@@ -12618,10 +13413,10 @@ if __name__ == "__main__":
     )
 
     # No URL and no --url-list: retry previously-failed files from resume.json, if present.
-    if args.resume and (args.video_id or args.url_list or args.davka or args.davka_browser):
+    if args.resume and (args.video_id or args.url_list or args.davka or args.davka_browser or args.davka_login):
         parser.error("--resume retries the previous run, so it takes no URL or list.")
 
-    if args.resume or not (args.url_list or args.video_id or args.davka or args.davka_browser):
+    if args.resume or not (args.url_list or args.video_id or args.davka or args.davka_browser or args.davka_login):
         with _failed_lock:
             _failed_jobs.clear()
             _session_failed.clear()
