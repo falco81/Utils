@@ -4102,9 +4102,18 @@ def _try_ffmpeg(path):
     if not path:
         return False
     try:
-        subprocess.run([path, '-version'], stdout=subprocess.DEVNULL,
-                       stderr=subprocess.DEVNULL, check=True)
-        return True
+        # Don't rely on check=True: some builds print the banner to stderr and/or return a
+        # non-zero code for '-version' depending on how they were compiled. Accept it as working
+        # if the command runs and mentions ffmpeg. On Windows, suppress the console window and cap
+        # the time so a bad binary can't hang the check.
+        kwargs = {'stdout': subprocess.PIPE, 'stderr': subprocess.STDOUT, 'timeout': 15}
+        if os.name == 'nt':
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        r = subprocess.run([path, '-version'], **kwargs)
+        out = (r.stdout or b'')
+        if isinstance(out, bytes):
+            out = out.decode('utf-8', 'replace')
+        return r.returncode == 0 or 'ffmpeg version' in out.lower()
     except Exception:
         return False
 
@@ -13297,6 +13306,193 @@ def run_batch(list_path, base_kwargs, out_dir):
         sys.exit(1)
 
 
+# ---- Dependency check / install (--test / --setup) ------------------------ #
+# Every third-party Python module the script can use, with the pip name to install it. 'required'
+# means the script won't run without it; the rest enable specific features.
+_PYTHON_DEPS = [
+    ('requests', 'requests', True, 'HTTP downloads and page fetches'),
+    ('tqdm', 'tqdm', True, 'progress bars'),
+    ('urllib3', 'urllib3', True, 'HTTP retry/timeout handling'),
+    ('colorama', 'colorama', False, 'coloured console output on Windows'),
+    ('webview', 'pywebview', False, '--scan-browser / --davka-browser / --browser-login'),
+]
+
+
+def _check_python_deps():
+    """Return a list of (module, pip_name, required, purpose, installed_bool)."""
+    import importlib.util
+    out = []
+    for mod, pip_name, required, purpose in _PYTHON_DEPS:
+        try:
+            installed = importlib.util.find_spec(mod) is not None
+        except (ImportError, ValueError):
+            installed = False
+        out.append((mod, pip_name, required, purpose, installed))
+    return out
+
+
+def _pip_install(pip_name):
+    """Install one package with the current interpreter's pip. Returns (ok, combined_output)."""
+    try:
+        r = subprocess.run([sys.executable, '-m', 'pip', 'install', '--upgrade', pip_name],
+                           capture_output=True, text=True, timeout=600)
+        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+    except Exception as e:
+        return False, str(e)
+
+
+def _dep_report_line(name, ok, detail=''):
+    """A coloured PASS/FAIL/WARN line that also renders correctly on a Win10 console."""
+    if ok is True:
+        mark = f"{CLR.GREEN}[ OK ]{CLR.RESET}"
+    elif ok is False:
+        mark = f"{CLR.RED}[FAIL]{CLR.RESET}"
+    else:
+        mark = f"{CLR.YELLOW}[WARN]{CLR.RESET}"
+    return f"  {mark}  {name}" + (f"  {CLR.DIM}- {detail}{CLR.RESET}" if detail else '')
+
+
+def _locate_ffmpeg_file(dirs, max_depth=None):
+    """Like _find_ffmpeg_in but returns the FIRST matching file WITHOUT running it — so we can tell
+    'no binary anywhere' apart from 'found a binary but -version failed'."""
+    name = 'ffmpeg.exe' if os.name == 'nt' else 'ffmpeg'
+    for d in dirs:
+        if not d or not os.path.isdir(d):
+            continue
+        base_depth = os.path.abspath(d).rstrip(os.sep).count(os.sep)
+        for root, subdirs, files in os.walk(d):
+            if max_depth is not None:
+                depth = os.path.abspath(root).rstrip(os.sep).count(os.sep) - base_depth
+                if depth >= max_depth:
+                    subdirs[:] = []
+                    continue
+            if name in files:
+                return os.path.join(root, name)
+    return None
+
+
+def _check_external_tools():
+    """Locate ffmpeg and mp4decrypt without downloading. Returns (ff, ff_ok, ff_note, md, md_ok).
+    ff_note explains a 'found but not runnable' case so --test can report it instead of a bare
+    'not found'."""
+    script_dir = os.path.dirname(os.path.abspath(sys.argv[0] or '.')) or os.getcwd()
+    ff_search = ([_ffmpeg_cache_dir()] +
+                 (list(FFMPEG_PROGRAM_FILES_DIRS) if os.name == 'nt' else []) +
+                 [script_dir, os.getcwd()])
+    ff, ff_ok, ff_note = None, False, ''
+    try:
+        resolved = _resolve_ffmpeg(FFMPEG)
+        if resolved and _try_ffmpeg(resolved):
+            ff, ff_ok = resolved, True
+        else:
+            ff = _find_ffmpeg_in(ff_search, max_depth=4)
+            if ff:
+                ff_ok = True
+            else:
+                # Nothing runnable. Did we at least SEE a binary that just wouldn't run?
+                seen = _locate_ffmpeg_file(ff_search, max_depth=4)
+                if seen:
+                    ff, ff_note = seen, "found but 'ffmpeg -version' failed to run"
+    except Exception as e:
+        ff_note = f"error while checking: {e}"
+    try:
+        md = _find_cached_mp4decrypt()
+        if os.name == 'nt' and not md:
+            md = _find_mp4decrypt_in(list(MP4DECRYPT_PROGRAM_FILES_DIRS) + [script_dir,
+                                     os.getcwd()], max_depth=4)
+        md_ok = bool(md)
+    except Exception:
+        md, md_ok = None, False
+    return ff, ff_ok, ff_note, md, md_ok
+
+
+def _run_test(verbose):
+    """Print a tidy PASS/FAIL report of every dependency. Installs nothing. Returns exit code 0
+    iff all REQUIRED dependencies (Python modules + ffmpeg) are present."""
+    setup_console(USE_COLOR)
+    print(f"{CLR.BRIGHT}videoloader_dir - dependency check{CLR.RESET}")
+    print(f"  Python {sys.version.split()[0]} at {sys.executable}\n")
+    all_required_ok = True
+
+    print(f"{CLR.BRIGHT}Python modules{CLR.RESET}")
+    for mod, pip_name, required, purpose, installed in _check_python_deps():
+        tag = 'required' if required else 'optional'
+        detail = f"{purpose} ({tag})"
+        if not installed and not required:
+            print(_dep_report_line(mod, None, detail + " - not installed"))
+        else:
+            print(_dep_report_line(mod, installed, detail))
+        if required and not installed:
+            all_required_ok = False
+
+    print(f"\n{CLR.BRIGHT}External tools{CLR.RESET}")
+    ff, ff_ok, ff_note, md, md_ok = _check_external_tools()
+    if ff_ok:
+        print(_dep_report_line("ffmpeg", True, ff or 'ready'))
+    elif ff_note:
+        # A binary was located but wouldn't run — point at the real problem, not 'not found'.
+        print(_dep_report_line("ffmpeg", False, f"{ff}: {ff_note}"))
+        all_required_ok = False
+    else:
+        print(_dep_report_line("ffmpeg", False, "not found - run --setup to download"))
+        all_required_ok = False
+    print(_dep_report_line("mp4decrypt", True if md_ok else None,
+                           (md if md_ok else "not found - only needed for --key/--keys "
+                            "decryption; run --setup to download") or ''))
+
+    print(f"\n{CLR.BRIGHT}Browser support{CLR.RESET}")
+    err = _yt_pywebview_import_error()
+    print(_dep_report_line("pywebview engine", True if err is None else None,
+                           "ready" if err is None else "install pywebview for browser modes"))
+
+    print()
+    if all_required_ok:
+        print(f"{CLR.GREEN}{CLR.BRIGHT}All required dependencies are present.{CLR.RESET}")
+        return 0
+    print(f"{CLR.RED}{CLR.BRIGHT}Some required dependencies are missing.{CLR.RESET} "
+          f"Run:  {os.path.basename(sys.argv[0])} --setup")
+    return 1
+
+
+def _run_setup(verbose):
+    """Install missing Python modules (pip) and download the external tools into the cache folder,
+    then print the same report as --test."""
+    setup_console(USE_COLOR)
+    print(f"{CLR.BRIGHT}videoloader_dir - setup{CLR.RESET}")
+    print(f"  Python {sys.version.split()[0]} at {sys.executable}\n")
+
+    print(f"{CLR.BRIGHT}Python modules{CLR.RESET}")
+    for mod, pip_name, required, purpose, installed in _check_python_deps():
+        if installed:
+            print(_dep_report_line(mod, True, "already installed"))
+            continue
+        print(f"  {CLR.CYAN}installing{CLR.RESET} {pip_name} ({purpose})...")
+        ok, out = _pip_install(pip_name)
+        if ok:
+            print(_dep_report_line(mod, True, f"installed via pip ({pip_name})"))
+        else:
+            tail = out.strip().splitlines()[-1] if out.strip() else 'pip failed'
+            print(_dep_report_line(mod, False if required else None,
+                                   f"pip install {pip_name} failed: {tail}"))
+
+    print(f"\n{CLR.BRIGHT}External tools{CLR.RESET}")
+    print(f"  {CLR.CYAN}checking{CLR.RESET} ffmpeg...")
+    try:
+        if ensure_ffmpeg(verbose):
+            print(_dep_report_line("ffmpeg", True, FFMPEG or 'ready'))
+    except Exception as e:
+        print(_dep_report_line("ffmpeg", False, f"error: {e}"))
+    print(f"  {CLR.CYAN}checking{CLR.RESET} mp4decrypt...")
+    try:
+        if ensure_mp4decrypt(verbose):
+            print(_dep_report_line("mp4decrypt", True, MP4DECRYPT or 'ready'))
+    except Exception as e:
+        print(_dep_report_line("mp4decrypt", False, f"error: {e}"))
+
+    print(f"\n{CLR.BRIGHT}Verifying...{CLR.RESET}")
+    return _run_test(verbose)
+
+
 if __name__ == "__main__":
     if sys.platform == "win32":
         # Put the console into UTF-8 so non-Latin titles (Korean, etc.) print correctly where the
@@ -13382,7 +13578,9 @@ if __name__ == "__main__":
     parser.add_argument("--prefer-stream", dest="prefer_stream", choices=['auto', 'dash', 'hls', 'both'], default=None, help="Which manifest to keep when a page offers BOTH DASH (.mpd) and HLS (.m3u8): 'auto' (default) takes the first real (non-ad) full-length stream of either type; 'dash' grabs the .mpd; 'hls' grabs the .m3u8; 'both' keeps both. Overrides the PREFER_STREAM config value for this run.")
     parser.add_argument("--ad-max-seconds", dest="ad_max_seconds", type=int, default=None, metavar="SECS", help="A found manifest whose measured duration is this many seconds or fewer is treated as a pre-roll ad and skipped, so the browser scan waits for the full-length video (default 90). 0 disables the duration check. Overrides the AD_MAX_SECONDS config value for this run.")
     parser.add_argument("--davka-login", "--batch-login", dest="davka_login", type=str, default=None, metavar="FILE", help="Like --davka-browser, but does NOT use any cookie file: each PAGE address is opened in the real browser using ONLY the login saved by --browser-login (a persistent browser profile). Nothing is injected, so this avoids the cookie-injection issues on Windows/WebView2. First run --browser-login once to sign in by hand; then --davka-login reuses that session for every entry. Same name/URL/key list format as --davka-browser.")
-    parser.add_argument("--browser-login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
+    parser.add_argument("--browser-login", "--login", dest="browser_login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
+    parser.add_argument("--setup", action="store_true", help="Check and install everything the script needs, then exit: required Python modules (via pip) and the external tools ffmpeg + mp4decrypt (downloaded into the script's cache folder if missing, just like a normal run does). Run this once after copying the script to a new machine.")
+    parser.add_argument("--test", action="store_true", help="Check that every dependency is present and print a tidy PASS/FAIL report (Python modules, ffmpeg, mp4decrypt, browser support), then exit. Installs nothing — use --setup for that.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
     parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
@@ -13410,6 +13608,12 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     print(f"[INFO] videoloader_dir v{SCRIPT_VERSION}")
+
+    # Dependency setup/test run standalone and exit — they need no URL and no other options.
+    if args.setup:
+        sys.exit(_run_setup(args.verbose))
+    if args.test:
+        sys.exit(_run_test(args.verbose))
 
     # Already applied from raw argv before the config fetch; repeating it is a no-op and keeps the
     # parsed flag as the single source of truth for anything added later.
