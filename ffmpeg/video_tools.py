@@ -10818,6 +10818,108 @@ def run_extract_audio(args):
     log_done(f"Done: {wrote} audio files from {done} videos ({skipped} skipped).")
 
 
+def run_convert_container(args):
+    """Batch-convert videos between MP4 and MKV containers WITHOUT re-encoding (fast, lossless remux
+    with -c copy). Scans the directory, offers a multi-select checkbox of the videos, asks for the
+    target container, and remuxes each pick to <name>.<target>. The original is kept."""
+    directory = str(args.mkv) if getattr(args, "mkv", None) else "."
+    if not os.path.isdir(directory):
+        directory = os.path.dirname(directory) or "."
+    log_info(f"Working directory: {os.path.abspath(directory)}")
+    ffmpeg_bin = _ensure_ffmpeg_bin(args, directory)
+    if not ffmpeg_bin:
+        die("ffmpeg is required for container conversion (see --help).")
+
+    # scan for both mp4 and mkv (recursive honours --recursive)
+    exts = (".mp4", ".m4v", ".mov", ".mkv", ".webm")
+    vids = []
+    if bool(getattr(args, "recursive", False)):
+        for root, _d, files in os.walk(directory):
+            for f in files:
+                if Path(f).suffix.lower() in exts:
+                    vids.append(os.path.join(root, f))
+    else:
+        for f in os.listdir(directory):
+            full = os.path.join(directory, f)
+            if os.path.isfile(full) and Path(f).suffix.lower() in exts:
+                vids.append(full)
+    vids = sorted(vids)
+    if not vids:
+        die("No .mp4/.mkv videos found in the directory.")
+
+    interactive = sys.stdin.isatty()
+    labels = [f"{Path(v).name}  [{Path(v).suffix.lower().lstrip('.')}]" for v in vids]
+    if interactive:
+        sel = _ask_checkbox(f"Select videos to convert ({len(vids)} found) - Space toggles, "
+                            f"a = all/none, Enter confirms:", labels, preselect=list(range(len(vids))))
+        if not sel:
+            raise WizardBack           # Esc / nothing chosen -> silently back to the menu
+        picked = [vids[i] for i in sel]
+    else:
+        picked = vids
+
+    # target container
+    target = getattr(args, "to_container", None)
+    if target not in ("mkv", "mp4"):
+        if interactive:
+            ch = _ask_checkbox("Convert the selected videos TO which container?",
+                               ["MKV (.mkv)", "MP4 (.mp4)"], preselect=[0], single=True)
+            if not ch:
+                raise WizardBack       # Esc -> silently back to the menu
+            target = "mkv" if ch[0] == 0 else "mp4"
+        else:
+            # non-interactive default: flip each file to the other container
+            target = None
+    log_info(f"Selected {len(picked)} video(s) | codec copy (no re-encode)"
+             + (f" | target: {target}" if target else " | target: opposite container"))
+
+    done = skipped = failed = 0
+    for v in picked:
+        vp = Path(v)
+        cur = vp.suffix.lower().lstrip(".")
+        tgt = target or ("mkv" if cur in ("mp4", "m4v", "mov") else "mp4")
+        if cur == tgt or (tgt == "mkv" and cur == "mkv") or (tgt == "mp4" and cur == "mp4"):
+            log_info(f"  {vp.name}: already {tgt} - skipping.")
+            skipped += 1
+            continue
+        out = vp.with_suffix("." + tgt)
+        if out.exists():
+            log_warn(f"  {out.name} already exists - skipping (remove it to reconvert).")
+            skipped += 1
+            continue
+        # MP4 has no native subtitle-format for SRT/ASS the way MKV does; when going TO mp4 put text
+        # subs into mov_text, otherwise straight copy. Going TO mkv, everything copies as-is.
+        if tgt == "mp4":
+            cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", "0", "-c", "copy",
+                   "-c:s", "mov_text", "-movflags", "+faststart", str(out)]
+        else:
+            cmd = [ffmpeg_bin, "-y", "-i", str(vp), "-map", "0", "-c", "copy", str(out)]
+        sys.stdout.write(f"  {vp.name}  ->  {out.name} ...")
+        sys.stdout.flush()
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode != 0:
+            # retry without forcing a subtitle codec (some streams can't go into mov_text)
+            cmd2 = [ffmpeg_bin, "-y", "-i", str(vp), "-map", "0", "-c", "copy"]
+            if tgt == "mp4":
+                cmd2 += ["-map", "-0:s", "-movflags", "+faststart"]   # drop incompatible subs
+            cmd2 += [str(out)]
+            r = subprocess.run(cmd2, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+            sys.stdout.write(f" {Fore.GREEN}done{Style.RESET_ALL} ({out.stat().st_size // (1024*1024)} MB)\n")
+            done += 1
+        else:
+            sys.stdout.write(f" {Fore.RED}FAILED{Style.RESET_ALL}\n")
+            dbg(f"convert {vp.name}: ffmpeg rc={r.returncode}: {(r.stderr or '')[-300:]}")
+            try:
+                if out.exists():
+                    out.unlink()
+            except OSError:
+                pass
+            failed += 1
+    print()
+    log_done(f"Converted {done}, skipped {skipped}, failed {failed} (originals kept).")
+
+
 def run_convert_audio(args):
     """Re-encodes all audio tracks in each MKV to a chosen codec (default AC-3),
     copying video and subtitles. Output: <base>_<codec>.mkv (or overwrite)."""
@@ -17316,6 +17418,7 @@ _INTERACTIVE_COMMANDS = {
     "extract-audio": ("Extract audio track from videos", "run_extract_audio"),
     "import-audio": ("Insert (mux) external audio into videos", "run_import_audio"),
     "convert-audio": ("Convert audio (e.g. to AC-3)", "run_convert_audio"),
+    "convert-container": ("Convert container MP4<->MKV", "run_convert_container"),
     "rename-files": ("Intelligent file rename", "run_rename_files"),
     "video-browser": ("Video browser / inspector", "run_video_browser"),
 }
@@ -17331,7 +17434,8 @@ def dispatch_interactive_command(cmd, args):
         "import-subs": run_import_subs, "remove-tracks": run_remove_tracks,
         "set-default": run_set_default, "edit-tracks-all": run_edit_tracks_global, "rename-subs": run_rename_subs, "subs-download": run_subs_download, "retime-subs": run_retime_batch, "retime-subs-2in1": run_retime_2in1_batch,
         "extract-audio": run_extract_audio, "import-audio": run_import_audio,
-        "convert-audio": run_convert_audio, "rename-files": run_rename_files,
+        "convert-audio": run_convert_audio, "convert-container": run_convert_container,
+        "rename-files": run_rename_files,
         "video-browser": run_video_browser,
     }.get(cmd)
     if not fn:
@@ -17560,6 +17664,11 @@ def _wizard_action_specs():
             help="Re-encodes all audio in each MKV to a chosen codec (AC-3/E-AC-3/AAC) at a chosen "
                  "bitrate, copying video and subtitles. Output <name>_<codec>.mkv (or overwrite).",
             kind="wizard", run=run_convert_audio, flag="convert_audio", preset="convert-audio"),
+        "convert-container": dict(
+            label="Convert container MP4 <-> MKV (no re-encode)",
+            help="Scans the folder, lets you multi-select videos, and remuxes them between MP4 and MKV "
+                 "with -c copy (fast, lossless). Originals are kept as <name>.<target>.",
+            kind="direct", run=run_convert_container, flag="convert_container", preset="convert-container"),
         "remove-tracks": dict(
             label="Remove audio/subtitle tracks from MKV (by language)",
             help="Shows the languages of audio/subtitle tracks and you pick which to drop (fast remux). "
@@ -17610,7 +17719,7 @@ _WIZARD_CATEGORIES = [
     ("Audio", "Extract, mux and convert audio tracks",
      ["extract-audio", "import-audio", "convert-audio"]),
     ("Video / tracks", "Remove tracks, set the default track",
-     ["remove-tracks", "set-default", "edit-tracks-all", "video-browser"]),
+     ["convert-container", "remove-tracks", "set-default", "edit-tracks-all", "video-browser"]),
     ("Files", "Intelligent bulk file renaming",
      ["rename-files"]),
     ("Presets & settings", "Saved presets, API keys/config, API test",
@@ -17647,7 +17756,10 @@ def _run_wizard_action(key, args):
     elif kind == "config":
         run_with_back(spec["run"], args)
     else:   # direct (p1/p2/test-api)
-        spec["run"](args)
+        try:
+            spec["run"](args)
+        except WizardBack:
+            return False   # user backed out (e.g. Esc in a picker) - no post-run pause
     return True
 
 
@@ -19050,6 +19162,11 @@ DIFFERENT LANGUAGES (target vs reference):
     parser.add_argument("--import-audio", action="store_true",
                         help="Interactive mode: muxes an external audio file (paired by SxxExx) into each "
                              "video as the default audio and sets default subtitles.")
+    parser.add_argument("--convert-container", action="store_true",
+                        help="Batch-convert videos between MP4 and MKV containers without re-encoding "
+                             "(fast remux, -c copy). Scans the folder and multi-selects videos. Optionally a path.")
+    parser.add_argument("--to-container", dest="to_container", choices=["mkv", "mp4"], default=None,
+                        help="Target container for --convert-container (mkv or mp4). Default: ask / opposite.")
     parser.add_argument("--convert-audio", action="store_true",
                         help="Interactive mode: re-encodes audio in each MKV to a chosen codec (e.g. AC-3), "
                              "copying video and subtitles.")
@@ -19356,6 +19473,7 @@ DIFFERENT LANGUAGES (target vs reference):
                        else "extract-audio" if args.extract_audio
                        else "import-audio" if args.import_audio
                        else "convert-audio" if args.convert_audio
+                       else "convert-container" if getattr(args, "convert_container", False)
                        else "rename-files" if args.rename_files
                        else "video-browser" if args.video_browser
                        else "subs-download" if args.subs_download
@@ -19409,6 +19527,11 @@ DIFFERENT LANGUAGES (target vs reference):
             run_import_audio(args)
         elif interactive_cmd == "convert-audio":
             run_convert_audio(args)
+        elif interactive_cmd == "convert-container":
+            try:
+                run_convert_container(args)
+            except WizardBack:
+                pass
         elif interactive_cmd == "rename-files":
             run_rename_files(args)
         elif interactive_cmd == "video-browser":

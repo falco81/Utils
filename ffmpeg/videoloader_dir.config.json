@@ -263,5 +263,5 @@
     "your"
   ],
   "AD_MAX_SECONDS": 90,
-  "PREFER_STREAM": "dash"
+  "PREFER_STREAM": "auto"
 }

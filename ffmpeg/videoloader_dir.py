@@ -134,9 +134,11 @@ SCAN_BROWSER_AUTO_HOSTS = {
 SCRIPT_VERSION = "3.14.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
-PREFER_STREAM = 'dash'          # when a page offers both DASH (.mpd) and HLS (.m3u8), which to
-#                                 keep: 'dash' (default), 'hls', or 'both'. Many players fetch HLS
-#                                 first, but DASH is often preferred for downloading.
+PREFER_STREAM = 'auto'          # which manifest to keep when a page offers both DASH (.mpd) and
+#                                 HLS (.m3u8): 'auto' (default) takes the first real (non-ad,
+#                                 full-length) manifest of EITHER type — fastest, since the
+#                                 duration check already rejects ads; 'dash' waits for the .mpd;
+#                                 'hls' waits for the .m3u8; 'both' keeps both.
 AD_MAX_SECONDS = 90             # manifests measuring this many seconds or fewer are treated as
 #                                 pre-roll ads (not the main video), so the browser scan keeps
 #                                 waiting for the full-length stream. 0 disables the duration
@@ -10907,17 +10909,39 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         announced = set()
 
         def _announce(pl):
-            # Print any newly found manifest the instant the worker reports it — so the URL shows
-            # up while the browser is still open, not only after it closes.
+            # Print each newly found manifest the instant the worker reports it — WITH a verdict
+            # (main video vs ad) so the console shows, live, why the scan does or doesn't stop on
+            # a given URL.
             try:
                 d = json.loads(pl)
             except (ValueError, TypeError):
                 return
+            ad_host_re = re.compile(
+                r'(?:^|[./_-])(?:ad|ads|adserver|advert|doubleclick|googlesyndication|imasdk|'
+                r'pubads|adsystem|adservice|moatads|innovid|spotx|freewheel|fwmrm|yspace|teads|'
+                r'springserve|dai|vast|vmap|preroll|midroll|postroll|/ads?/|_ad_|/ad-)'
+                r'(?:[./?&_-]|$)', re.I)
             for u in (d.get('urls') or []):
                 cls = _classify_media_url(u)
-                if cls and cls[0] in ('mpd', 'hls') and u not in announced:
-                    announced.add(u)
-                    print(f"[INFO] browser: found [{cls[0]}] {u}")
+                if not cls or cls[0] not in ('mpd', 'hls') or u in announced:
+                    continue
+                announced.add(u)
+                verdict = "video"
+                why = ""
+                if ad_host_re.search(u):
+                    verdict, why = "ad", "ad host/path"
+                else:
+                    pg = urlparse(page_url or u)
+                    hdrs = {'User-Agent': USER_AGENT, 'Referer': page_url or u,
+                            'Origin': f"{pg.scheme}://{pg.netloc}"}
+                    secs = _manifest_duration_seconds(u, session, hdrs) if session else 0.0
+                    if 0 < secs <= AD_MAX_SECONDS:
+                        verdict, why = "ad", f"{secs:.0f}s (≤ {AD_MAX_SECONDS}s)"
+                    elif secs > 0:
+                        why = f"{int(secs // 60)}m{int(secs % 60):02d}s"
+                tag = "MAIN VIDEO" if verdict == "video" else "AD — skipping"
+                print(f"[INFO] browser: found [{cls[0]}] {tag}"
+                      + (f" ({why})" if why else "") + f": {u}")
 
         while _pt.time() < deadline_p:
             remaining = max(0.1, deadline_p - _pt.time())
@@ -10948,7 +10972,18 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
                     real = _first_non_ad_manifest(partial, any_type=True, session=session,
                                                   page_url=page_url, verbose=verbose)
                 if real:
-                    got = {'result': partial}
+                    # Return ONLY the chosen manifest as the media URL — not every observed URL,
+                    # or the downstream picker could grab a different one (e.g. a short bumper/logo
+                    # .mpd). Keep the rest under 'all' for diagnostics/probing only.
+                    try:
+                        pd = json.loads(partial)
+                    except (ValueError, TypeError):
+                        pd = {}
+                    other = [u for u in (pd.get('urls') or []) if u != real] + (pd.get('all') or [])
+                    got = {'result': json.dumps({
+                        'urls': [real], 'all': other,
+                        'title': pd.get('title'),
+                        'brightcove': pd.get('brightcove') or []})}
                     break
         # In login mode the worker must flush the WebView2 profile (the freshly signed-in
         # session) to disk when the window closes; give it a short clean join for that. Then
@@ -11135,14 +11170,16 @@ def _first_non_ad_manifest(partial_json, any_type=False, session=None, page_url=
         r'pubads|adsystem|adservice|moatads|innovid|spotx|freewheel|fwmrm|yspace|teads|'
         r'springserve|dai|vast|vmap|preroll|midroll|postroll|/ads?/|_ad_|/ad-)(?:[./?&_-]|$)',
         re.I)
-    pref = (PREFER_STREAM or 'dash').lower()
+    pref = (PREFER_STREAM or 'auto').lower()
     dash = hls = None
+    ordered = []                         # real (non-ad-by-URL) manifests in arrival order
     for u in (d.get('urls') or []):
         cls = _classify_media_url(u)
         if not cls or cls[0] not in ('mpd', 'hls'):
             continue
         if ad_re.search(u):
             continue                     # looks like an ad manifest — keep waiting
+        ordered.append((cls[0], u))
         if cls[0] == 'mpd' and dash is None:
             dash = u
         elif cls[0] == 'hls' and hls is None:
@@ -11170,6 +11207,14 @@ def _first_non_ad_manifest(partial_json, any_type=False, session=None, page_url=
         dash = None
     if hls and _too_short(hls):
         hls = None
+
+    if pref == 'auto':
+        # Duration already weeds out ads, so take the FIRST real, non-short manifest of either
+        # type — whichever the player fetched first — for the quickest close on the main video.
+        for k, u in ordered:
+            if (k == 'mpd' and u == dash) or (k == 'hls' and u == hls):
+                return u                 # survived the _too_short check above
+        return None
 
     if any_type:
         # Grace fallback near the deadline: take whatever real manifest we have.
@@ -11337,8 +11382,13 @@ def _browser_scan_items(page_url, session, verbose, wait_s=None):
         if cls:
             _add(cls[0], cls[1], cls[2] + ' (browser)')
     # The player may have fetched its manifest from an address containing no .mpd/.m3u8 at all.
-    # Those look like any other request, so they are settled by their content.
-    if bother and SCAN_BROWSER_PROBE_MAX:
+    # Those look like any other request, so they are settled by their content — BUT only when the
+    # chosen media URLs above gave us no manifest yet. Once we already have the selected main
+    # manifest, we must NOT probe the leftovers: they include short logo/bumper/ad .mpd files that
+    # the browser also fetched, and confirming those would add a second stream and download the
+    # wrong one (the reported bug).
+    have_manifest = any(i['kind'] in ('mpd', 'hls') for i in items)
+    if bother and SCAN_BROWSER_PROBE_MAX and not have_manifest:
         pg = urlparse(page_url)
         hdrs = {'User-Agent': USER_AGENT, 'Referer': page_url,
                 'Origin': f"{pg.scheme}://{pg.netloc}"}
@@ -11840,7 +11890,7 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                       f"file(s) (use --select to choose manually).")
             # When BOTH DASH (.mpd) and HLS (.m3u8) are present, keep the preferred one (default
             # DASH). Many players fetch HLS first, so without this the .m3u8 would win by order.
-            _pref = (PREFER_STREAM or 'dash').lower()
+            _pref = (PREFER_STREAM or 'auto').lower()
             if _pref in ('dash', 'hls'):
                 keep = 'mpd' if _pref == 'dash' else 'hls'
                 drop = 'hls' if _pref == 'dash' else 'mpd'
@@ -12974,11 +13024,26 @@ def _batch_resolve_page(page_url, session, verbose, use_browser):
     Used by --davka-browser, where the list holds page addresses instead of manifests. The
     picking order mirrors --scan: a real manifest beats a plain file (it is adaptive, so it
     carries the best quality), and same-stream renditions collapse to the best one."""
-    found = scan_page_for_media(page_url, session, verbose)
     if use_browser:
-        for it in _browser_scan_items(page_url, session, verbose):
-            if not any(f['url'] == it['url'] for f in found):
-                found.append(it)
+        # The browser scan applies the ad/logo filtering (duration + ad-host checks) and returns
+        # the ONE main stream. It must take precedence over scan_page_for_media(), whose static
+        # HTML parse can turn up a stray logo/bumper .mpd embedded in the page markup — which is
+        # exactly what was getting downloaded instead of the video. So try the browser first and,
+        # if it yields a manifest, use it directly.
+        browser_items = _browser_scan_items(page_url, session, verbose)
+        for kinds in (('mpd', 'hls'), ('direct',), ('url',)):
+            subset = [it for it in browser_items if it['kind'] in kinds]
+            if subset:
+                if len(subset) > 1:
+                    subset = _scan_resolution_winners(subset)
+                if verbose:
+                    tqdm.write(f"[DBG] --davka-browser: using browser result "
+                               f"[{subset[0]['kind']}] {subset[0]['url']}")
+                return subset[0]
+        # Browser found nothing usable — fall back to a plain page scan.
+        found = scan_page_for_media(page_url, session, verbose)
+    else:
+        found = scan_page_for_media(page_url, session, verbose)
     if not found:
         return None
     for kinds in (('mpd', 'hls'), ('direct',), ('url',)):
@@ -13314,7 +13379,8 @@ if __name__ == "__main__":
     parser.add_argument("--ascii", action="store_true", help="Force plain-ASCII filenames: strip accents (é->e) and drop non-Latin characters (Korean, etc.). Useful so Windows cmd shows names correctly and progress bars line up. Files keep their content; only names change.")
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
     parser.add_argument("--scan", nargs='?', const=True, default=None, metavar='N', help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.mpd/.webm/.mov) and download them all. Give a number to grab only the N-th found item, e.g. --scan 2 (1-indexed, in discovery order).")
-    parser.add_argument("--prefer-stream", dest="prefer_stream", choices=['dash', 'hls', 'both'], default=None, help="When a page offers BOTH a DASH (.mpd) and an HLS (.m3u8) stream, which to keep: 'dash' (default) grabs the .mpd, 'hls' grabs the .m3u8, 'both' keeps both. Overrides the PREFER_STREAM config value for this run.")
+    parser.add_argument("--prefer-stream", dest="prefer_stream", choices=['auto', 'dash', 'hls', 'both'], default=None, help="Which manifest to keep when a page offers BOTH DASH (.mpd) and HLS (.m3u8): 'auto' (default) takes the first real (non-ad) full-length stream of either type; 'dash' grabs the .mpd; 'hls' grabs the .m3u8; 'both' keeps both. Overrides the PREFER_STREAM config value for this run.")
+    parser.add_argument("--ad-max-seconds", dest="ad_max_seconds", type=int, default=None, metavar="SECS", help="A found manifest whose measured duration is this many seconds or fewer is treated as a pre-roll ad and skipped, so the browser scan waits for the full-length video (default 90). 0 disables the duration check. Overrides the AD_MAX_SECONDS config value for this run.")
     parser.add_argument("--davka-login", "--batch-login", dest="davka_login", type=str, default=None, metavar="FILE", help="Like --davka-browser, but does NOT use any cookie file: each PAGE address is opened in the real browser using ONLY the login saved by --browser-login (a persistent browser profile). Nothing is injected, so this avoids the cookie-injection issues on Windows/WebView2. First run --browser-login once to sign in by hand; then --davka-login reuses that session for every entry. Same name/URL/key list format as --davka-browser.")
     parser.add_argument("--browser-login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
@@ -13425,6 +13491,8 @@ if __name__ == "__main__":
 
     if args.prefer_stream:
         PREFER_STREAM = args.prefer_stream
+    if args.ad_max_seconds is not None:
+        AD_MAX_SECONDS = args.ad_max_seconds
 
     if sum(bool(x) for x in (args.video_id, args.url_list, args.davka,
                              args.davka_browser, args.davka_login)) > 1:
