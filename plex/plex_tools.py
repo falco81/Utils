@@ -1937,6 +1937,18 @@ class PlexClient:
         return [str(m.get("ratingKey"))
                 for m in j.get("MediaContainer", {}).get("Metadata", []) or []]
 
+    def items_by_filter(self, section_key, sec_type, **filters):
+        """Items matching a server-side filter (e.g. actor=<id>, director=<id>) as
+        [{'rk','title','year','type'}]. /library/sections/{key}/all?<filter>&type=N."""
+        params = dict(filters)
+        num = SECTION_TYPE_NUM.get(sec_type)
+        if num:
+            params["type"] = num
+        j = self.get_json(f"/library/sections/{section_key}/all", params)
+        return [{"rk": str(m.get("ratingKey")), "title": m.get("title"),
+                 "year": m.get("year"), "type": m.get("type")}
+                for m in j.get("MediaContainer", {}).get("Metadata", []) or []]
+
     def edit_labels(self, section_key, sec_type, rating_keys, add=(), remove=(), type_num=None):
         """Add/remove labels on one or more items in a single request:
         PUT /library/sections/{key}/all?type=..&id=rk1,rk2&label[i].tag.tag=..
@@ -5183,6 +5195,76 @@ def _wrap_lines(text, indent="  "):
     return out
 
 
+def _rating_bits(md):
+    """Reviewer scores from a metadata dict as short strings, e.g.
+    ['IMDb 7.7', 'RT 100%', 'RT Audience 94%', 'TMDB 82%'] - just like the Plex web
+    detail page. Reads the Rating[] array when present, else the flat rating /
+    audienceRating fields. IMDb/TMDB-style /10 values stay as x.x; Rotten Tomatoes and
+    TMDB are shown as percentages (value*10)."""
+    def source(image):
+        im = (image or "").lower()
+        if "imdb" in im:
+            return ("IMDb", "ten")
+        if "rottentomatoes" in im:
+            return (("RT Audience" if ("upright" in im or "spilled" in im) else "RT"), "pct")
+        if "themoviedb" in im or "tmdb" in im:
+            return ("TMDB", "pct")
+        return (None, "ten")
+
+    def fmt(value, kind):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        if kind == "pct":
+            return f"{round(v if v > 10 else v * 10)}%"
+        return f"{v:.1f}"
+
+    pairs = []
+    ratings = md.get("Rating")
+    if isinstance(ratings, list) and ratings:
+        for r in ratings:
+            pairs.append((r.get("value"), r.get("image")))
+    else:
+        pairs.append((md.get("rating"), md.get("ratingImage")))
+        pairs.append((md.get("audienceRating"), md.get("audienceRatingImage")))
+    bits, seen = [], set()
+    for value, image in pairs:
+        if value is None:
+            continue
+        label, kind = source(image)
+        val = fmt(value, kind)
+        if val is None:
+            continue
+        entry = f"{label} {val}" if label else f"\u2605 {val}"
+        if entry not in seen:
+            seen.add(entry)
+            bits.append(entry)
+    return bits
+
+
+def _ratings_line(md, indent="  "):
+    bits = _rating_bits(md)
+    return f"{indent}{Fore.YELLOW}" + "   ·   ".join(bits) + Style.RESET_ALL if bits else None
+
+
+def _cast_names(md, n=6):
+    """Comma-separated top cast names ('A, B, C +4 more'), or None."""
+    names = [r.get("tag") for r in (md.get("Role") or []) if r.get("tag")]
+    if not names:
+        return None
+    extra = len(names) - n
+    return ", ".join(names[:n]) + (f"  +{extra} more" if extra > 0 else "")
+
+
+def _episode_rating_tag(e):
+    """Compact star rating for an episode row ('\u2b509.1'), or '' when unrated."""
+    try:
+        return f"\u2b50{float(e.get('rating')):.1f}"
+    except (TypeError, ValueError):
+        return ""
+
+
 def _meta_line(md):
     bits = []
     if md.get("contentRating"):
@@ -5190,12 +5272,6 @@ def _meta_line(md):
     dur = _fmt_duration(md.get("duration"))
     if dur:
         bits.append(dur)
-    rating = md.get("rating") or md.get("audienceRating")
-    if rating:
-        try:
-            bits.append(f"★ {float(rating):.1f}")
-        except Exception:
-            bits.append(f"★ {rating}")
     genres = ", ".join(g.get("tag") for g in (md.get("Genre") or []) if g.get("tag"))
     if genres:
         bits.append(genres)
@@ -5213,9 +5289,13 @@ def _title_card_head(md, fallback_title, on_server):
 
 def _movie_card(md, fallback_title, on_server):
     lines = _title_card_head(md, fallback_title, on_server)
+    rl = _ratings_line(md)
+    if rl:
+        lines += [rl]
     ml = _meta_line(md)
     if ml:
-        lines += [ml, ""]
+        lines += [ml]
+    lines += [""]
     if md.get("tagline"):
         lines += [f"  {Style.DIM}{md['tagline']}{Style.RESET_ALL}", ""]
     if md.get("summary"):
@@ -5225,14 +5305,21 @@ def _movie_card(md, fallback_title, on_server):
     directors = ", ".join(d.get("tag") for d in (md.get("Director") or []) if d.get("tag"))
     if directors:
         lines += ["", f"  {Fore.CYAN}Director:{Style.RESET_ALL} {directors}"]
+    cast = _cast_names(md)
+    if cast:
+        lines += [f"  {Fore.CYAN}Cast:{Style.RESET_ALL} {cast}"]
     return lines
 
 
 def _show_card(md, fallback_title, on_server):
     lines = _title_card_head(md, fallback_title, on_server)
+    rl = _ratings_line(md)
+    if rl:
+        lines += [rl]
     ml = _meta_line(md)
     if ml:
-        lines += [ml, ""]
+        lines += [ml]
+    lines += [""]
     lc = md.get("leafCount") or md.get("childCount")
     if lc:
         kind = "episode" if md.get("leafCount") else "season"
@@ -5241,6 +5328,9 @@ def _show_card(md, fallback_title, on_server):
         lines += _wrap_lines(md["summary"])
     else:
         lines += [f"  {Style.DIM}(no plot summary){Style.RESET_ALL}"]
+    cast = _cast_names(md)
+    if cast:
+        lines += ["", f"  {Fore.CYAN}Cast:{Style.RESET_ALL} {cast}"]
     return lines
 
 
@@ -5263,11 +5353,27 @@ def _episode_card(md):
         sub.append(dur)
     watched = (md.get("viewCount") or 0) > 0
     sub.append("watched" if watched else "unwatched")
-    lines += [f"  {Style.DIM}" + "   ·   ".join(sub) + Style.RESET_ALL, ""]
+    lines += [f"  {Style.DIM}" + "   ·   ".join(sub) + Style.RESET_ALL]
+    rl = _ratings_line(md)
+    if rl:
+        lines += [rl]
+    lines += [""]
     if md.get("summary"):
         lines += _wrap_lines(md["summary"])
     else:
         lines += [f"  {Style.DIM}(no plot summary){Style.RESET_ALL}"]
+    credits = []
+    directors = ", ".join(d.get("tag") for d in (md.get("Director") or []) if d.get("tag"))
+    if directors:
+        credits.append(f"  {Fore.CYAN}Director:{Style.RESET_ALL} {directors}")
+    writers = ", ".join(w.get("tag") for w in (md.get("Writer") or []) if w.get("tag"))
+    if writers:
+        credits.append(f"  {Fore.CYAN}Writer:{Style.RESET_ALL} {writers}")
+    cast = _cast_names(md)
+    if cast:
+        credits.append(f"  {Fore.CYAN}Cast:{Style.RESET_ALL} {cast}")
+    if credits:
+        lines += [""] + credits
     return lines
 
 
@@ -5449,8 +5555,7 @@ def _watchlist_show(client, args):
 
 
 def _wl_open_movie(client, row):
-    """Show a movie's card (plot etc.). Uses the server copy when present, otherwise
-    the Plex Discover metadata."""
+    """Open a movie: a little menu with its plot/details card and its cast."""
     on_server = bool(row.get("srv_rk"))
     md = {}
     if on_server:
@@ -5462,47 +5567,155 @@ def _wl_open_movie(client, row):
         md = client.discover_metadata(row.get("dk")) or {}
     if not md:
         md = {"title": row.get("title"), "year": row.get("year")}
-    _detail_screen(_movie_card(md, row.get("title"), on_server))
+    _wl_title_menu(client, md, row.get("title"), on_server, is_show=False, show_rk=None)
 
 
 def _wl_open_show(client, row):
-    """Browse a show: seasons → episodes → episode plot. When the show isn't on the
-    server, show its Discover card instead of the season tree."""
+    """Open a show: a menu with plot/details, cast, and the seasons (→ episodes →
+    episode plot). Off-server shows use Plex Discover metadata (no season tree)."""
     rk = row.get("srv_rk")
     title = row.get("title") or "?"
     if not rk:
         md = client.discover_metadata(row.get("dk")) or {"title": title, "year": row.get("year")}
-        _detail_screen(_show_card(md, title, on_server=False))
+        _wl_title_menu(client, md, title, on_server=False, is_show=True, show_rk=None)
         return
     clear_screen()
-    log_info(f"Loading seasons of '{title}'…")
+    log_info(f"Loading '{title}'…")
     try:
-        seasons = [s for s in client.children(rk) if s.get("type") == "season" or s.get("leafCount")]
-    except Exception as ex:
-        _detail_screen([f"{Fore.RED}Could not load seasons: {ex}{Style.RESET_ALL}"])
-        return
-    if not seasons:
-        _wl_browse_episodes(client, rk, title, None)   # some shows expose episodes directly
-        return
-    seasons.sort(key=lambda s: (s.get("index") if s.get("index") is not None else 9999))
-    srows = []
-    for s in seasons:
-        lc, vc = s.get("leafCount") or 0, s.get("viewedLeafCount") or 0
-        tag = f"{Fore.GREEN}{vc}/{lc} watched{Style.RESET_ALL}" if lc else ""
-        srows.append({"label": s.get("title") or f"Season {s.get('index')}",
-                      "tag": tag, "rk": s.get("ratingKey"),
-                      "slabel": s.get("title") or f"Season {s.get('index')}"})
-    scur = _WL_STATE.setdefault(f"seasons:{rk}", [0])
+        md = client.get_metadata(rk) or {}
+    except Exception:
+        md = {}
+    if not md:
+        md = {"title": title, "year": row.get("year"), "ratingKey": rk}
+    _wl_title_menu(client, md, title, on_server=True, is_show=True, show_rk=rk)
+
+
+def _wl_title_menu(client, md, fallback_title, on_server, is_show, show_rk):
+    """Shared movie/show screen: ratings in the header, then rows for the plot/details
+    card, the cast, and (for shows) each season. Enter opens the highlighted row."""
+    title = md.get("title") or fallback_title or "?"
+    rbits = _rating_bits(md)
+    rows = [{"kind": "info", "label": "Plot & details"}]
+    ncast = len([r for r in (md.get("Role") or []) if r.get("tag")])
+    if ncast:
+        rows.append({"kind": "cast", "label": f"Cast & crew ({ncast})"})
+    if is_show and show_rk:
+        try:
+            seasons = [s for s in client.children(show_rk)
+                       if s.get("type") == "season" or s.get("leafCount")]
+        except Exception:
+            seasons = []
+        seasons.sort(key=lambda s: (s.get("index") if s.get("index") is not None else 9999))
+        if seasons:
+            rows.append({"header": True, "label": "Seasons"})
+            for s in seasons:
+                lc, vc = s.get("leafCount") or 0, s.get("viewedLeafCount") or 0
+                tag = f"{Fore.GREEN}{vc}/{lc} watched{Style.RESET_ALL}" if lc else ""
+                rows.append({"kind": "season", "tag": tag, "rk": s.get("ratingKey"),
+                             "label": s.get("title") or f"Season {s.get('index')}",
+                             "slabel": s.get("title") or f"Season {s.get('index')}"})
+        else:   # a show that lists episodes directly, no season folders
+            rows.append({"kind": "episodes", "label": "Episodes"})
+
+    kind_word = "Show" if is_show else "Movie"
+    cur = _WL_STATE.setdefault(f"title:{md.get('ratingKey') or title}", [0])
     while True:
-        head = [
-            f"{Fore.CYAN}Show:{Style.RESET_ALL} {title}   ({len(srows)} season(s))",
-            f"{Style.DIM}type = search · Enter = open season · Esc = back{Style.RESET_ALL}",
-            "",
-        ]
-        i = browse_menu("Seasons:", srows, header=head, default=scur[0], cursor_out=scur)
+        htitle = (f"{Fore.MAGENTA}{Style.BRIGHT}{title}{Style.RESET_ALL}"
+                  + (f"  ({md['year']})" if md.get("year") else ""))
+        head = [htitle]
+        if rbits:
+            head.append(f"  {Fore.YELLOW}" + "   ·   ".join(rbits) + Style.RESET_ALL)
+        head += [f"{Style.DIM}type = search · Enter = open · Esc = back{Style.RESET_ALL}", ""]
+        i = browse_menu(f"{kind_word}:", rows, header=head, default=cur[0], cursor_out=cur)
         if i is None:
             return
-        _wl_browse_episodes(client, srows[i]["rk"], title, srows[i]["slabel"])
+        r = rows[i]
+        k = r.get("kind")
+        if k == "info":
+            _detail_screen(_show_card(md, title, on_server) if is_show
+                           else _movie_card(md, title, on_server))
+        elif k == "cast":
+            _wl_cast_browser(client, md, title)
+        elif k == "season":
+            _wl_browse_episodes(client, r["rk"], title, r["slabel"])
+        elif k == "episodes":
+            _wl_browse_episodes(client, show_rk, title, None)
+
+
+def _wl_cast_browser(client, md, title):
+    """List the cast; Enter on a person finds the other titles they appear in on this
+    server (which then open just like any other title)."""
+    roles = [r for r in (md.get("Role") or []) if r.get("tag")]
+    if not roles:
+        _detail_screen([f"{Style.DIM}No cast information for this title.{Style.RESET_ALL}"])
+        return
+    rows = []
+    for r in roles:
+        char = r.get("role")
+        rows.append({"label": r.get("tag"), "actor": r.get("tag"), "actor_id": r.get("id"),
+                     "tag": (f"{Style.DIM}as {char}{Style.RESET_ALL}" if char else "")})
+    cur = _WL_STATE.setdefault(f"cast:{md.get('ratingKey') or title}", [0])
+    while True:
+        head = [
+            f"{Fore.CYAN}Cast & crew:{Style.RESET_ALL} {title}   ({len(rows)} people)",
+            f"{Style.DIM}type = search · Enter = other titles with this person · Esc = back"
+            f"{Style.RESET_ALL}",
+            "",
+        ]
+        i = browse_menu("Cast & crew:", rows, header=head, default=cur[0], cursor_out=cur)
+        if i is None:
+            return
+        _wl_actor_titles(client, rows[i]["actor"], rows[i]["actor_id"])
+
+
+def _wl_actor_titles(client, actor_name, actor_id):
+    """Every movie/show on this server featuring the given person; Enter opens a title."""
+    clear_screen()
+    log_info(f"Finding titles with {actor_name} on this server…")
+    found, seen = [], set()
+    if actor_id is not None:
+        for s in client.sections():
+            if s["type"] not in ("movie", "show"):
+                continue
+            try:
+                items = client.items_by_filter(s["key"], s["type"], actor=actor_id)
+            except Exception:
+                items = []
+            for it in items:
+                if it["rk"] in seen:
+                    continue
+                seen.add(it["rk"])
+                found.append(it)
+    if not found:
+        _detail_screen([f"{Fore.MAGENTA}{Style.BRIGHT}{actor_name}{Style.RESET_ALL}", "",
+                        f"  {Style.DIM}No titles with this person found on this server."
+                        f"{Style.RESET_ALL}"])
+        return
+    found.sort(key=lambda x: ({"movie": 0, "show": 1}.get(x.get("type"), 2),
+                              (x.get("title") or "").lower()))
+    rows = []
+    for it in found:
+        yr = f" ({it['year']})" if it.get("year") else ""
+        rows.append({"label": f"{it['title']}{yr}",
+                     "tag": f"{Fore.CYAN}{it.get('type', '')}{Style.RESET_ALL}",
+                     "srv_rk": it["rk"], "type": it.get("type"), "title": it.get("title"),
+                     "year": it.get("year"), "dk": None})
+    cur = _WL_STATE.setdefault(f"actor:{actor_id or actor_name}", [0])
+    while True:
+        head = [
+            f"{Fore.MAGENTA}{Style.BRIGHT}{actor_name}{Style.RESET_ALL}   "
+            f"({len(rows)} title(s) on this server)",
+            f"{Style.DIM}type = search · Enter = open title · Esc = back{Style.RESET_ALL}",
+            "",
+        ]
+        i = browse_menu("Titles:", rows, header=head, default=cur[0], cursor_out=cur)
+        if i is None:
+            return
+        r = rows[i]
+        if r.get("type") == "show":
+            _wl_open_show(client, r)
+        else:
+            _wl_open_movie(client, r)
 
 
 def _wl_browse_episodes(client, season_rk, show_title, season_label):
@@ -5526,8 +5739,10 @@ def _wl_browse_episodes(client, season_rk, show_title, season_label):
         except Exception:
             se = ""
         watched = (e.get("viewCount") or 0) > 0
-        tag = (f"{Fore.GREEN}watched{Style.RESET_ALL}" if watched
-               else f"{Style.DIM}unwatched{Style.RESET_ALL}")
+        star = _episode_rating_tag(e)
+        wtag = (f"{Fore.GREEN}watched{Style.RESET_ALL}" if watched
+                else f"{Style.DIM}unwatched{Style.RESET_ALL}")
+        tag = (f"{Fore.YELLOW}{star}{Style.RESET_ALL}  " if star else "") + wtag
         erows.append({"label": f"{se}  {e.get('title') or ''}".strip() or se or "?",
                       "tag": tag, "rk": e.get("ratingKey"), "md": e})
     ecur = _WL_STATE.setdefault(f"eps:{season_rk}", [0])
@@ -5536,7 +5751,7 @@ def _wl_browse_episodes(client, season_rk, show_title, season_label):
             f"{Fore.CYAN}{show_title}{Style.RESET_ALL}"
             + (f"  ·  {season_label}" if season_label else "")
             + f"   ({len(erows)} episode(s))",
-            f"{Style.DIM}type = search · Enter = plot details · Esc = back{Style.RESET_ALL}",
+            f"{Style.DIM}type = search · Enter = plot & ratings · Esc = back{Style.RESET_ALL}",
             "",
         ]
         i = browse_menu("Episodes:", erows, header=head, default=ecur[0], cursor_out=ecur)
@@ -5546,14 +5761,15 @@ def _wl_browse_episodes(client, season_rk, show_title, season_label):
 
 
 def _wl_episode_detail(client, row):
+    # the season listing is lightweight (no ratings, cast or crew); pull the full
+    # episode metadata so the card can show the plot, rating, director/writer and cast
     md = row.get("md") or {}
-    if not md.get("summary"):   # the season listing sometimes omits the plot
-        try:
-            full = client.get_metadata(row["rk"])
-            if full:
-                md = full
-        except Exception:
-            pass
+    try:
+        full = client.get_metadata(row["rk"])
+        if full:
+            md = full
+    except Exception:
+        pass
     _detail_screen(_episode_card(md))
 
 
