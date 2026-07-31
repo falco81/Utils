@@ -18934,7 +18934,42 @@ def run_selftest():
     return 0 if cnt["fail"] == 0 else 1
 
 
+def _ensure_utf8_runtime():
+    """On Windows, Python's default text codec for subprocess pipes and open() is the ANSI code page
+    (e.g. cp1252), which throws 'charmap codec can't decode byte 0x81/0x83' on Korean/Chinese/Arabic
+    track names, subtitle text, filenames, etc. First make our own console I/O UTF-8; then, if not
+    already in UTF-8 mode, re-launch the interpreter ONCE in UTF-8 mode so every text read defaults to
+    UTF-8. A guard env var prevents a re-exec loop."""
+    if os.name != "nt":
+        return
+    # 1) our own stdout/stderr/stdin -> UTF-8 (safe, no restart)
+    for stream in (sys.stdout, sys.stderr, sys.stdin):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    # 2) already UTF-8, or this IS the re-launched child -> done
+    try:
+        if getattr(sys.flags, "utf8_mode", 0) or os.environ.get("PYTHONUTF8") == "1":
+            return
+    except Exception:
+        return
+    if os.environ.get("_VT_UTF8_REEXEC"):
+        return
+    # 3) re-launch in UTF-8 mode. Use subprocess with a LIST (never os.execv, which mangles a python
+    #    path containing spaces like 'C:\\Program Files\\...') so quoting is handled correctly.
+    os.environ["_VT_UTF8_REEXEC"] = "1"
+    os.environ["PYTHONUTF8"] = "1"
+    os.environ["PYTHONIOENCODING"] = "utf-8"
+    try:
+        rc = subprocess.call([sys.executable] + sys.argv)
+    except Exception:
+        return          # could not re-launch - continue; explicit encoding= on our calls still helps
+    sys.exit(rc)
+
+
 def main():
+    _ensure_utf8_runtime()
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=f"{Fore.CYAN}{Style.BRIGHT}video_tools{Style.RESET_ALL} - synchronization, translation, extraction and maintenance of subtitles "
