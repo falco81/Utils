@@ -99,6 +99,10 @@ DROPBOX_DEFAULT_CONNECTIONS = 8   # Dropbox rate-limits shared links hard, so un
 AUTO_RETRIES = 3                  # how many times to automatically re-download files that failed
                                   # (resume) before giving up and recording them in resume.json.
                                   # Set to 0 to disable automatic retries.
+URL_LIST_RETRIES = 3              # how many times --url-list / --davka re-attempts a whole URL that
+                                  # failed before moving on. A URL that still fails after all
+                                  # attempts is left NOT-done in the list and recorded so a later
+                                  # run (or --resume) fixes it. Set to 0 for a single attempt.
 BAR_NCOLS = 100                   # fixed progress-bar width so bars don't stretch across wide terminals
 BAR_DESC_WIDTH = 26               # fixed filename column width so all bars line up
 
@@ -131,9 +135,14 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.14.0"
+SCRIPT_VERSION = "3.17.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
+VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
+#                                 gave only the numeric id and the privacy hash can't be recovered),
+#                                 open the player in the real browser and capture the HLS master /
+#                                 hash from its network traffic (needs pywebview). Set False to
+#                                 disable and let such videos fail instead.
 PREFER_STREAM = 'auto'          # which manifest to keep when a page offers both DASH (.mpd) and
 #                                 HLS (.m3u8): 'auto' (default) takes the first real (non-ad,
 #                                 full-length) manifest of EITHER type — fastest, since the
@@ -213,11 +222,12 @@ _REMOTE_CONFIG_KEYS = {
     # -- USER CONFIG section --
     'DEFAULT_THREADS', 'DEFAULT_FOLDER_WORKERS', 'DEFAULT_MAX_CONNECTIONS', 'DEFAULT_CHUNK_SIZE',
     'DEFAULT_RECURSIVE', 'AUTO_COOKIES', 'USE_COLOR', 'FORCE_ASCII_BARS', 'PER_FILE_BAR_LIMIT',
-    'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES', 'BAR_NCOLS', 'BAR_DESC_WIDTH',
+    'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES', 'URL_LIST_RETRIES', 'BAR_NCOLS', 'BAR_DESC_WIDTH',
     'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     # -- network / quality --
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
-    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'PREVIEW_MAX_SECONDS',
+    'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'VIMEO_BROWSER_FALLBACK',
+    'PREVIEW_MAX_SECONDS',
     'PREVIEW_MAX_MB', 'SCAN_BROWSER_SHOW', 'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE',
     'SCAN_BROWSER_PROBE_MAX', 'PREFER_STREAM', 'AD_MAX_SECONDS',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
@@ -241,10 +251,10 @@ _REMOTE_CONFIG_KEYS = {
 # appended alphabetically, so a newly added setting can never fall out of the generated file.
 _CONFIG_KEY_ORDER = (
     'DEFAULT_THREADS', 'DEFAULT_FOLDER_WORKERS', 'DEFAULT_MAX_CONNECTIONS', 'DEFAULT_CHUNK_SIZE',
-    'DEFAULT_RECURSIVE', 'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES',
+    'DEFAULT_RECURSIVE', 'SEGMENT_MIB', 'DROPBOX_DEFAULT_CONNECTIONS', 'AUTO_RETRIES', 'URL_LIST_RETRIES',
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'SCAN_BROWSER_SHOW',
-    'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE', 'SCAN_BROWSER_PROBE_MAX',
+    'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE', 'SCAN_BROWSER_PROBE_MAX', 'VIMEO_BROWSER_FALLBACK',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP',
     'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
@@ -274,6 +284,7 @@ _NEVER_REMOTE_KEYS = {
     # Runtime state, filled in while running — not settings.
     'CLR': "runtime palette object built by setup_console()",
     'ASCII_BARS': "runtime, derived from FORCE_ASCII_BARS by setup_console()",
+    'ALLOW_CORRUPT': "runtime flag set only by the --allow-corrupt CLI switch",
     'MP4DECRYPT': "runtime cache of the resolved executable path",
     # Per-run choices that come from the command line.
     'AUDIO_SEL': "per-run (--audio)", 'SUB_SEL': "per-run (--sub)",
@@ -772,6 +783,10 @@ MUX_HEADERS = {'Referer': "https://www.patreon.com/"}
 
 # Runtime console state (filled in by setup_console()).
 ASCII_BARS = False
+ALLOW_CORRUPT = False           # --allow-corrupt: when a segment is corrupt and a clean "-c copy"
+#                                 mux fails, retry TOLERANTLY (skip the bad packets) to still get a
+#                                 playable — but possibly slightly glitched — file. OFF by default:
+#                                 normally a corrupt input FAILS so no broken video is produced.
 # Clean, aligned bar layout (no ragged columns, no odd characters).
 BAR_FORMAT = '{desc} {percentage:3.0f}% |{bar}| {n_fmt:>7}/{total_fmt:>7} {rate_fmt:>10}'
 
@@ -1685,6 +1700,8 @@ def list_collection_posts(collection_id: str, campaign_id, session: requests.Ses
     """Return all post objects of a collection, following cursor pagination."""
     params = {
         'include': 'collections,drop,primary_image,audio,video,embed',
+        'fields[post]': ('embed,post_file,post_metadata,content,content_json_string,'
+                         'title,post_type,url,thumbnail,published_at'),
         'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
         'sort': 'collection_order',
         'filter[collection_id]': collection_id,
@@ -1707,6 +1724,8 @@ def list_tag_posts(campaign_id: str, tag: str, session: requests.Session,
     Mirrors what the site itself requests when you click a tag on a creator's page."""
     params = {
         'include': 'collections,drop,primary_image,audio,video,embed',
+        'fields[post]': ('embed,post_file,post_metadata,content,content_json_string,'
+                         'title,post_type,url,thumbnail,published_at'),
         'fields[primary-image]': 'is_fallback,image_small,image_medium,prefer_alternate_display',
         'fields[post_tag]': 'tag_type,value',
         'sort': '-published_at',
@@ -2370,6 +2389,8 @@ def fetch_patreon_post(post_id: str, session: requests.Session, verbose: bool):
     link/stream extraction can see them). Returns the post dict or None."""
     params = {
         'include': 'collections,drop,primary_image,audio,video,embed',
+        'fields[post]': ('embed,post_file,post_metadata,content,content_json_string,'
+                         'title,post_type,url,thumbnail,published_at'),
         'json-api-version': '1.0',
         'json-api-use-default-includes': 'false',
     }
@@ -3969,6 +3990,21 @@ def extract_streams_from_post(post: dict, verbose: bool) -> list:
         desc['title'] = title
         desc['_body_link'] = True     # tells _download_from_posts this is a link, not the embed
         out.append(desc)
+    # Diagnostics: a Vimeo stream WITHOUT a hash resolves to 403/private. Dump what the post
+    # actually carried so we can see where the hash lives (or that Patreon didn't send it).
+    if verbose:
+        for s in out:
+            if s.get('source') == 'vimeo' and not s.get('vimeo_hash'):
+                _emb = json.dumps(a.get('embed') or {})[:500]
+                _cjs = a.get('content_json_string')
+                _cjs = _cjs[:500] if isinstance(_cjs, str) else '(none)'
+                _cont = a.get('content')
+                _cont = _cont[:300] if isinstance(_cont, str) else '(none)'
+                tqdm.write(f"[DBG] Vimeo {s.get('vimeo_id')} NO-HASH post '{title}':")
+                tqdm.write(f"[DBG]   embed={_emb}")
+                tqdm.write(f"[DBG]   content_json_string(head)={_cjs}")
+                tqdm.write(f"[DBG]   content(head)={_cont}")
+                tqdm.write(f"[DBG]   attribute keys={sorted(a.keys())}")
     return out
 
 
@@ -4027,25 +4063,32 @@ def _primary_stream_from_post(post: dict) -> list:
         out.append({'source': 'mux', 'title': title, 'master_url': mux_url})
         return out
 
-    # 2) Vimeo embed: extract id + privacy hash.
+    # 2) Vimeo embed: extract id + privacy hash. The hash can appear as a path segment
+    #    (vimeo.com/<id>/<hash>) OR as an h= query param that may sit anywhere in the query
+    #    (e.g. player.vimeo.com/video/<id>?app_id=122963&h=<hash>&badge=0) — matching only
+    #    "?h=" right after the id missed those and made the video look private (hash=NO).
     emb = a.get('embed') or {}
     url_field = emb.get('url', '') or ''
     html = emb.get('html', '') or ''
+    # Patreon wraps the Vimeo player in an embedly iframe whose src holds the player URL
+    # URL-ENCODED: …media.html?src=https%3A%2F%2Fplayer.vimeo.com%2Fvideo%2F<id>%3Fh%3D<hash>…
+    # The privacy hash is right there, but only after percent-decoding — a literal "?h=" match
+    # never sees it (that was why these posts showed hash=NO). So search the decoded text too.
+    blob = url_field + ' ' + html + ' ' + unquote(html)
     m = re.search(r'vimeo\.com/(\d+)/([0-9a-zA-Z]+)', url_field)
-    if not m:
-        m = re.search(r'player\.vimeo\.com/video/(\d+)\?h=([0-9a-zA-Z]+)', html)
+    vid_hash = None
     if m:
-        title = (emb.get('subject') or a.get('title') or m.group(1)).strip()
+        vid_hash = (m.group(1), m.group(2))
+    else:
+        idm = re.search(r'player\.vimeo\.com/video/(\d+)', blob) or \
+            re.search(r'vimeo\.com/(?:video/)?(\d+)', blob)
+        if idm:
+            hm = re.search(r'[?&]h=([0-9a-zA-Z]+)', blob)              # h= anywhere in the query
+            vid_hash = (idm.group(1), hm.group(1) if hm else '')
+    if vid_hash:
+        title = (emb.get('subject') or a.get('title') or vid_hash[0]).strip()
         out.append({'source': 'vimeo', 'title': title,
-                    'vimeo_id': m.group(1), 'vimeo_hash': m.group(2)})
-        return out
-    # 2b) Vimeo without a privacy hash (public/unlisted): just the numeric id.
-    mid = re.search(r'vimeo\.com/(\d+)(?:[/?#]|$)', url_field) or \
-        re.search(r'player\.vimeo\.com/video/(\d+)', html)
-    if mid:
-        title = (emb.get('subject') or a.get('title') or mid.group(1)).strip()
-        out.append({'source': 'vimeo', 'title': title,
-                    'vimeo_id': mid.group(1), 'vimeo_hash': ''})
+                    'vimeo_id': vid_hash[0], 'vimeo_hash': vid_hash[1]})
         return out
     # 2c) YouTube embed: the embedded player is a YouTube video (very common — the creator embeds
     #     the YouTube upload and links the Vimeo copy in the body, or vice versa).
@@ -4073,14 +4116,25 @@ def _primary_stream_from_post(post: dict) -> list:
         if not s or ('mux.com' not in s and 'vimeo.com' not in s):
             continue
         s2 = s.replace('\\/', '/')
+        if '%3A' in s2 or '%2F' in s2 or '%3F' in s2 or '%3D' in s2:
+            s2 = s2 + ' ' + unquote(s2)      # embedly src is percent-encoded; decode to see h=
         mm = re.search(r'https://stream\.mux\.com/[\w\-]+\.m3u8[^\s"\\<>]*', s2)
         if mm:
             out.append({'source': 'mux', 'title': title, 'master_url': mm.group(0)})
             return out
-        vm = re.search(r'vimeo\.com/(?:video/)?(\d+)(?:/|\?h=)([0-9a-zA-Z]+)', s2)
+        # id + hash where the hash can be a path segment OR an h= param ANYWHERE in the query
+        # (…/video/<id>?app_id=122963&h=<hash>&referrer=…) — matching only "?h=" or "/hash" right
+        # after the id missed the body-embedded players and lost the hash (hash=NO -> 403).
+        vm = re.search(r'vimeo\.com/(?:video/)?(\d+)/([0-9a-zA-Z]+)', s2)
         if vm:
             out.append({'source': 'vimeo', 'title': title,
                         'vimeo_id': vm.group(1), 'vimeo_hash': vm.group(2)})
+            return out
+        vid = re.search(r'vimeo\.com/(?:video/)?(\d+)', s2)
+        if vid:
+            hm = re.search(r'[?&]h=([0-9a-zA-Z]+)', s2)
+            out.append({'source': 'vimeo', 'title': title,
+                        'vimeo_id': vid.group(1), 'vimeo_hash': hm.group(1) if hm else ''})
             return out
     return out
 
@@ -4474,6 +4528,109 @@ def _vimeo_master_from_config(cfg):
     return master, vid.get('title'), (vid.get('duration') or 0)
 
 
+def _vimeo_lookup_hash(vimeo_id, session, verbose):
+    """For an unlisted Vimeo video where the embed gave only the numeric id, find its privacy hash
+    the way a browser does: request vimeo.com/<id> and read the hash from the redirect target or
+    the canonical link (vimeo.com/<id>/<hash>). Returns the hash string or None."""
+    for url in (f"https://vimeo.com/{vimeo_id}",
+                f"https://player.vimeo.com/video/{vimeo_id}"):
+        try:
+            r = session.get(url, headers={'User-Agent': USER_AGENT,
+                                          'Referer': 'https://www.patreon.com/'},
+                            timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT), allow_redirects=True)
+        except requests.RequestException:
+            continue
+        # (a) final URL after any redirect: vimeo.com/<id>/<hash> or ...?h=<hash>
+        final = r.url or ''
+        m = re.search(rf'vimeo\.com/(?:video/)?{vimeo_id}/([0-9a-zA-Z]+)', final) or \
+            re.search(r'[?&]h=([0-9a-zA-Z]+)', final)
+        if m:
+            return m.group(1)
+        # (b) hash inside the returned HTML (canonical link / og:url / player src)
+        body = r.text or ''
+        for pat in (rf'vimeo\.com/(?:video/)?{vimeo_id}/([0-9a-zA-Z]+)',
+                    r'"hash"\s*:\s*"([0-9a-zA-Z]+)"',
+                    rf'player\.vimeo\.com/video/{vimeo_id}[^"\'<>]*?[?&]h=([0-9a-zA-Z]+)'):
+            hm = re.search(pat, body)
+            if hm:
+                return hm.group(1)
+        if verbose:
+            print(f"[WARN] Vimeo {vimeo_id}: no privacy hash found via {url} "
+                  f"(status {r.status_code}).")
+    return None
+
+
+def _vimeo_lookup_browser(vimeo_id, session, verbose):
+    """Last-resort Vimeo resolution using the real browser (same engine as --davka-browser): open
+    the player page and capture, from the browser's own network events, EITHER the HLS master URL
+    directly (vimeocdn master.json/.m3u8) OR the privacy hash (from the redirected vimeo.com/<id>/
+    <hash> URL). Returns (master_url_or_None, hash_or_None). Only used when the plain requests path
+    can't recover the hash, and only if pywebview is available."""
+    if not _yt_pywebview_available():
+        if verbose:
+            print(f"[INFO] Vimeo {vimeo_id}: browser fallback unavailable (pywebview not "
+                  f"installed).")
+        return None, None
+    # Vimeo refuses to load the bare player standalone ("Sorry, we're having a little trouble") —
+    # it must be embedded by an allowed host. The normal watch page vimeo.com/<id> DOES play and
+    # fetches the HLS master itself (Referer vimeo.com/), and the Patreon route is the embedly
+    # wrapper. Try the watch page first, then the embedly wrapper the site actually uses.
+    pages = [
+        f"https://vimeo.com/{vimeo_id}",
+        (f"https://cdn.embedly.com/widgets/media.html?src=https%3A%2F%2Fplayer.vimeo.com"
+         f"%2Fvideo%2F{vimeo_id}%3Fapp_id%3D122963&url=https%3A%2F%2Fvimeo.com%2F{vimeo_id}"
+         f"&image=&type=text%2Fhtml&schema=vimeo"),
+        f"https://player.vimeo.com/video/{vimeo_id}",
+    ]
+    if verbose:
+        print(f"[INFO] Vimeo {vimeo_id}: resolving via browser (opening the watch page)…")
+    media, other = [], []
+    for page in pages:
+        try:
+            _m, _title, _o, _bc = _browser_collect_media(page, verbose, session=session)
+        except Exception as e:
+            if verbose:
+                print(f"[WARN] Vimeo {vimeo_id}: browser resolve failed on {page[:50]}: {e}")
+            continue
+        media += list(_m or [])
+        other += list(_o or [])
+        # Stop as soon as we've seen a usable master or a hash.
+        if any('vimeocdn.com' in u and ('master' in u or '.m3u8' in u)
+               for u in media + other):
+            break
+        if any(re.search(rf'vimeo\.com/(?:video/)?{vimeo_id}/[0-9a-zA-Z]+', u)
+               or re.search(r'[?&]h=[0-9a-zA-Z]+', u) for u in media + other):
+            break
+    # 1) A Vimeo HLS master captured straight from the network (best — no hash needed afterwards).
+    for u in list(media or []) + list(other or []):
+        if 'vimeocdn.com' in u and re.search(r'\.m3u8|master\.json|/playlist', u) \
+                and '/chop/' not in u and '/segment' not in u:
+            if verbose:
+                print(f"[INFO] Vimeo {vimeo_id}: captured HLS master from the browser.")
+            return u, None
+    # 1b) The player config URL (…/config?…&h=…) carries the hash and returns the master when
+    #     fetched — grab its hash.
+    for u in list(media or []) + list(other or []):
+        cm = re.search(rf'player\.vimeo\.com/video/{vimeo_id}/config\?[^"\'<>]*[?&]h='
+                       r'([0-9a-zA-Z]+)', u)
+        if cm:
+            if verbose:
+                print(f"[INFO] Vimeo {vimeo_id}: recovered hash {cm.group(1)} from a config "
+                      f"request.")
+            return None, cm.group(1)
+    # 2) Otherwise dig the privacy hash out of any captured vimeo URL.
+    for u in list(media or []) + list(other or []):
+        m = re.search(rf'vimeo\.com/(?:video/)?{vimeo_id}/([0-9a-zA-Z]+)', u) or \
+            re.search(r'[?&]h=([0-9a-zA-Z]+)', u)
+        if m:
+            if verbose:
+                print(f"[INFO] Vimeo {vimeo_id}: recovered hash {m.group(1)} via browser.")
+            return None, m.group(1)
+    if verbose:
+        print(f"[WARN] Vimeo {vimeo_id}: browser opened but no master/hash was seen.")
+    return None, None
+
+
 def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     """Return (hls_master_url, title, duration_seconds) or (None, None, 0).
 
@@ -4483,16 +4640,44 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     `playerConfig` blob — broke when Vimeo moved the player page to Next.js: the HTML no longer
     embeds that blob, so every video looked "private/unavailable" even though it plays fine. The
     HTML scrape is kept only as a last-ditch fallback."""
-    headers = {'Referer': 'https://vimeo.com/', 'User-Agent': USER_AGENT,
-               'Accept': 'application/json'}
+    headers = {'Referer': 'https://player.vimeo.com/', 'User-Agent': USER_AGENT,
+               'Accept': 'application/json',
+               'Origin': 'https://player.vimeo.com'}
+
+    # Patreon's embed for these posts carries only the numeric id (embed.url = vimeo.com/<id>),
+    # NOT the privacy hash — and Vimeo's config endpoint 403s without the hash, so the video looks
+    # "private/unavailable". Recover the hash the way a browser does: load vimeo.com/<id>, which
+    # for an unlisted video redirects to (or embeds a canonical of) vimeo.com/<id>/<hash>.
+    if not vimeo_hash:
+        vimeo_hash = _vimeo_lookup_hash(vimeo_id, session, verbose) or ''
+        if verbose and vimeo_hash:
+            print(f"[INFO] Vimeo {vimeo_id}: recovered privacy hash {vimeo_hash} from vimeo.com.")
 
     # 1) The JSON config endpoint — direct and stable.
     config_url = f"https://player.vimeo.com/video/{vimeo_id}/config"
     if vimeo_hash:
         config_url += f"?h={vimeo_hash}"
-    try:
-        r = session.get(config_url, headers=headers,
-                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+    def _try_config(url, referer):
+        try:
+            rr = session.get(url, headers={**headers, 'Referer': referer},
+                             timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+            return rr
+        except requests.RequestException as exc:
+            if verbose:
+                print(f"[WARN] Vimeo config fetch failed for {vimeo_id}: {exc}")
+            return None
+
+    r = _try_config(config_url, 'https://player.vimeo.com/')
+    # Unlisted videos can be picky about the referer; if the first try is rejected, try the other
+    # referer the player/site uses before giving up.
+    if r is not None and r.status_code in (401, 403):
+        if verbose:
+            print(f"[WARN] Vimeo config {r.status_code} for {vimeo_id} "
+                  f"(referer player.vimeo.com); retrying with patreon referer.")
+        r2 = _try_config(config_url, 'https://www.patreon.com/')
+        if r2 is not None and r2.status_code == 200:
+            r = r2
+    if r is not None:
         if r.status_code == 200:
             try:
                 cfg = r.json()
@@ -4503,10 +4688,9 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
                 if master:
                     return master, title, duration
         elif verbose:
-            print(f"[WARN] Vimeo config returned {r.status_code} for {vimeo_id}")
-    except requests.RequestException as e:
-        if verbose:
-            print(f"[WARN] Vimeo config fetch failed for {vimeo_id}: {e}")
+            _body = (r.text or '')[:150].replace('\n', ' ')
+            print(f"[WARN] Vimeo config returned {r.status_code} for {vimeo_id} "
+                  f"(hash={'yes' if vimeo_hash else 'NO'}): {_body}")
 
     # 2) Fallback: scrape the player HTML for an embedded playerConfig (older/edge cases).
     embed = f"https://player.vimeo.com/video/{vimeo_id}"
@@ -4518,15 +4702,55 @@ def resolve_vimeo(vimeo_id, vimeo_hash, session, verbose):
     except requests.RequestException as e:
         if verbose:
             print(f"[WARN] Vimeo player fetch failed for {vimeo_id}: {e}")
-        return None, None, 0
+        return _vimeo_browser_last_resort(vimeo_id, session, verbose)
     if r.status_code != 200:
         if verbose:
             print(f"[WARN] Vimeo player returned {r.status_code} for {vimeo_id}")
-        return None, None, 0
+        return _vimeo_browser_last_resort(vimeo_id, session, verbose)
     cfg = _extract_player_config(r.text)
     if not cfg:
+        return _vimeo_browser_last_resort(vimeo_id, session, verbose)
+    result = _vimeo_master_from_config(cfg)
+    if result and result[0]:
+        return result
+    return _vimeo_browser_last_resort(vimeo_id, session, verbose)
+
+
+_vimeo_browser_lock = threading.Lock()
+
+
+def _vimeo_browser_last_resort(vimeo_id, session, verbose):
+    """Everything with plain requests failed. If the browser is enabled, open the player and let
+    it resolve — capturing the HLS master directly, or a hash to re-run the config with. Serialized
+    with a lock: this runs inside the native-download thread pool, and we must never open several
+    browser windows at once."""
+    if not VIMEO_BROWSER_FALLBACK:
+        if verbose:
+            print(f"[INFO] Vimeo {vimeo_id}: browser fallback disabled "
+                  f"(VIMEO_BROWSER_FALLBACK=false).")
         return None, None, 0
-    return _vimeo_master_from_config(cfg)
+    if not _yt_pywebview_available():
+        _err = _yt_pywebview_import_error()
+        print(f"{CLR.YELLOW}[WARN]{CLR.RESET} Vimeo {vimeo_id}: can't open the browser fallback — "
+              f"pywebview unavailable ({_err}). Install it with:  pip install pywebview")
+        return None, None, 0
+    with _vimeo_browser_lock:
+        master, vhash = _vimeo_lookup_browser(vimeo_id, session, verbose)
+    if master:
+        # Got the HLS master straight from the browser's network traffic — use it directly.
+        return master, None, 0
+    if vhash:
+        # Got the hash; re-run the config endpoint (now it will succeed).
+        try:
+            r = session.get(f"https://player.vimeo.com/video/{vimeo_id}/config?h={vhash}",
+                            headers={'Referer': 'https://player.vimeo.com/',
+                                     'User-Agent': USER_AGENT, 'Accept': 'application/json'},
+                            timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+            if r.status_code == 200:
+                return _vimeo_master_from_config(r.json())
+        except (requests.RequestException, ValueError):
+            pass
+    return None, None, 0
 
 
 # ---- YouTube + Twitch (pure requests; both resolve to a standard HLS master) ---------- #
@@ -6824,6 +7048,24 @@ def _download_hls_segment(url, path, session, headers):
                 with open(tmp, 'wb') as f:
                     f.write(first)
                     shutil.copyfileobj(r.raw, f, 1024 * 1024)
+                # A truncated segment (connection dropped mid-transfer) is the classic cause of
+                # ffmpeg's "Invalid data found when processing input" at mux time — and because
+                # the file is >0 bytes, a later retry would SKIP it and keep the corruption. So
+                # verify we received the whole thing when the server told us how big it is.
+                clen = r.headers.get('Content-Length')
+                if clen and clen.isdigit():
+                    want = int(clen)
+                    got = os.path.getsize(tmp)
+                    if got < want:
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                        last = f"truncated segment ({got}/{want} bytes)"
+                        if attempt < attempts - 1:
+                            time.sleep(min(2 ** attempt, 10) + random.uniform(0, 0.4))
+                            continue
+                        return False, last
                 os.replace(tmp, path)
                 return True, None
         except requests.RequestException as e:
@@ -8509,6 +8751,25 @@ def _ffmpeg_mux_multi(video_file, audio_files, sub_files, audio_meta, sub_meta, 
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-3:] if l.strip()) or "(no error text)"
+        low = tail.lower()
+        # A corrupt/misaligned packet in one segment makes a plain "-c copy" mux abort with
+        # "Invalid data found" and lose the ENTIRE video. Retry once telling ffmpeg to skip the
+        # bad packets (discard corrupt, ignore errors, regenerate timestamps) — the result has a
+        # tiny glitch where the bad segment was, instead of no file at all.
+        if ALLOW_CORRUPT and ('invalid data' in low or 'error muxing' in low
+                              or '-1094995529' in low):
+            if verbose:
+                tqdm.write("[INFO] mux: --allow-corrupt set; retrying tolerantly "
+                           "(skipping corrupt packets, output may glitch).")
+            tol = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error',
+                   '-err_detect', 'ignore_err', '-fflags', '+genpts+igndts+discardcorrupt']
+            tol += cmd[cmd.index('-i'):]     # reuse all inputs/maps/metadata from the original cmd
+            proc = subprocess.run(tol, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if proc.returncode == 0:
+                os.replace(tmp, out_path)
+                return True, None
+            tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-3:]
+                              if l.strip()) or tail
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -8537,6 +8798,21 @@ def _ffmpeg_mux(video_file, audio_file, out_path, verbose):
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if proc.returncode != 0:
         tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-3:] if l.strip()) or "(no error text)"
+        low = tail.lower()
+        if ALLOW_CORRUPT and ('invalid data' in low or 'error muxing' in low
+                              or '-1094995529' in low):
+            if verbose:
+                tqdm.write("[INFO] mux: --allow-corrupt set; retrying tolerantly "
+                           "(skipping corrupt packets, output may glitch).")
+            tol = [FFMPEG, '-hide_banner', '-nostdin', '-loglevel', 'error',
+                   '-err_detect', 'ignore_err', '-fflags', '+genpts+igndts+discardcorrupt']
+            tol += cmd[cmd.index('-i'):]
+            proc = subprocess.run(tol, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+            if proc.returncode == 0:
+                os.replace(tmp, out_path)
+                return True, None
+            tail = " | ".join(l for l in (proc.stderr or '').splitlines()[-3:]
+                              if l.strip()) or tail
         if os.path.exists(tmp):
             try:
                 os.remove(tmp)
@@ -8746,12 +9022,21 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
             if not got:
                 if not own_collision:
                     # A DIFFERENT run holds this file's lock — that video won't come down here,
-                    # so record it as a failure. A same-run name collision (own_collision) is
-                    # deliberate ("keeping only the first") and is not a failure.
+                    # so record it as a failure.
                     with resolve_fail_lock:
                         resolve_failures.append(
-                            (os.path.basename(job.filename or job.title or '?'),
+                            (os.path.basename(job.out_path or job.title or '?'),
                              'already being downloaded by another run (locked)'))
+                else:
+                    # A same-run name collision: two videos resolved to the SAME output filename.
+                    # This is NOT harmless — the second video is being dropped, so a 16-episode
+                    # collection silently comes down as 15. Record it as a failure so --url-list
+                    # does NOT tick the URL off as fully done and the miss is visible/recoverable.
+                    with resolve_fail_lock:
+                        resolve_failures.append(
+                            (os.path.basename(job.out_path or job.title or '?'),
+                             'duplicate output filename in this run (another video maps to the '
+                             'same name) — not downloaded'))
                 continue
             job.locked = True
             jobs.append(job)
@@ -8834,6 +9119,16 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
             shutil.rmtree(job.parts_dir, ignore_errors=True)
             _record_download(job.out_path)
         else:
+            # "Invalid data found" means a segment on disk is corrupt/truncated. If we KEEP the
+            # parts, every retry re-concatenates the same broken bytes and fails identically
+            # forever (the loop you saw). Discard the segments so the retry downloads them fresh.
+            low = (reason or '').lower()
+            if ('invalid data' in low or 'error muxing' in low or '-1094995529' in low
+                    or 'corrupt' in low):
+                shutil.rmtree(job.parts_dir, ignore_errors=True)
+                if verbose:
+                    tqdm.write(f"[INFO] {job.title}: discarded segments after a corrupt-input "
+                               f"mux error; the retry will re-download them.")
             _record_failed({'kind': 'native', 'out_dir': os.getcwd(),
                             'filename': os.path.basename(job.out_path or ''),
                             'reason': reason or 'download failed',
@@ -8907,6 +9202,18 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
     color = CLR.GREEN if (result['fail'] == 0 and not resolve_failures) else CLR.YELLOW
     total_attempted = len(jobs) + len(resolve_failures)
     total_failed = result['fail'] + len(resolve_failures)
+    # Safety net: every job that entered the download phase must come back either ok or fail. If
+    # the tally doesn't add up, a job vanished without being counted — record the shortfall so
+    # --url-list never ticks a URL off as done while a video is silently missing.
+    finished = result['ok'] + result['fail']
+    if finished < len(jobs):
+        missing = len(jobs) - finished
+        for _m in range(missing):
+            _record_undownloaded('(unaccounted video)',
+                                 'did not complete and was not reported as failed '
+                                 '(counted as missing so the URL is not marked done)')
+        total_failed += missing
+        color = CLR.YELLOW
     print(f"\n{color}[INFO] Native videos done: {result['ok']} succeeded, {total_failed} failed, "
           f"out of {total_attempted}.{CLR.RESET}")
     for title, reason in failures:
@@ -9666,6 +9973,9 @@ def offer_strict_rename(directory, new_files, verbose, enabled=True, rename_mode
               'renames': [], 'conflict_names': []}
     if not enabled or not new_files:
         return result
+    if rename_mode == 'skip':
+        result['status'] = 'skipped'
+        return result
     interactive = bool(getattr(sys.stdin, 'isatty', lambda: False)()) and \
         bool(getattr(sys.stdout, 'isatty', lambda: False)())
     if rename_mode == 'ask' and not interactive:
@@ -10193,6 +10503,16 @@ def _browser_worker(url, wait_s, conn, opts=None):
 
     Polling repeatedly (rather than looking once at the end) matters: a player may fetch its
     manifest, hand the <video> element a blob: URL and move on, so the evidence is transient."""
+    # WebView2 ships the Widevine CDM but, unlike Chrome, does NOT enable it by default — so
+    # DRM/EME players (Brightcove, etc.) throw "server error on the player" even for free videos.
+    # Turn it on via the documented environment switch BEFORE the engine starts. Only affects our
+    # own private browser process.
+    if os.name == 'nt':
+        _extra = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
+        for _flag in ('--enable-features=WidevineCdm',):
+            if _flag not in _extra:
+                _extra = (_extra + ' ' + _flag).strip()
+        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = _extra
     try:
         import webview
     except Exception as e:
@@ -12779,6 +13099,30 @@ def _sidecar_mark(txt_path, url, label=None, count=None, warn=None):
     return _sidecar_write(path, doc)
 
 
+def _sidecar_mark_failed(txt_path, url, why, label=None):
+    """Record a URL that FAILED after all retries in the JSON twin: kept done:false (so it is
+    retried next run) but stamped with the error and a failure count, so the failure is explicit
+    and recoverable. For a JSON list, the same is written in place; harmless for other formats."""
+    try:
+        path = _sidecar_path(txt_path)
+        doc = _sidecar_load(path, os.path.basename(txt_path))
+        rec = next((e for e in doc['urls']
+                    if isinstance(e, dict) and str(e.get('url')) == url), None)
+        if rec is None:
+            rec = {'url': url}
+            doc['urls'].append(rec)
+        rec['done'] = False                    # MUST stay not-done so a later run retries it
+        rec['failures'] = int(rec.get('failures') or 0) + 1
+        rec['last_error'] = why
+        rec['last_attempt'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        if label:
+            rec['title'] = label
+        doc['updated'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        _sidecar_write(path, doc)
+    except Exception:
+        pass
+
+
 def _mark_url_done(path, fmt, url, label=None, count=None, warn=None):
     """Mark a finished URL in whichever list format is in use. For a TEXT list the same data is
     ALSO mirrored into a structured JSON twin next to it (downurl.txt -> downurl.json)."""
@@ -12829,6 +13173,40 @@ def _comment_url_in_list(list_path, url, label=None, count=None, warn=None):
         return False
 
 
+def _is_retryable_failure(reason):
+    """True if a failure reason looks TRANSIENT (worth re-attempting) rather than PERMANENT.
+    Private/unavailable/tier-locked videos never come back, so retrying the whole URL just
+    re-downloads everything else for nothing. Network/timeout/mux/truncated errors are transient
+    and worth a retry."""
+    r = (reason or '').lower()
+    permanent = ('private', 'unavailable', 'no video stream', 'no downloadable',
+                 'higher tier', 'tier-locked', 'not a member', 'members only',
+                 'deleted', 'removed', 'does not exist', '404', 'forbidden',
+                 'duplicate output filename')
+    if any(p in r for p in permanent):
+        return False
+    transient = ('network', 'timeout', 'timed out', 'connection', 'truncated',
+                 'invalid data', 'error muxing', 'corrupt', 'rate-limit', '429',
+                 'http 5', 'server error', 'temporarily', 'reset', 'incomplete',
+                 'expired', 'refresh')
+    if any(t in r for t in transient):
+        return True
+    # Unknown reason: retry once rather than silently giving up — but see the caller, which caps
+    # attempts and still records the failure either way.
+    return True
+
+
+def _entry_has_retryable_failure(entry):
+    """Does this URL's outcome contain at least one TRANSIENT failure worth another attempt?"""
+    if entry.get('error') and _is_retryable_failure(entry['error']):
+        return True
+    for f in (entry.get('failed') or []):
+        reason = f.get('reason') if isinstance(f, dict) else str(f)
+        if _is_retryable_failure(reason):
+            return True
+    return False
+
+
 def run_url_list(list_path, base_kwargs, out_dir):
     """Download every URL in `list_path` in turn (auto-rename mode), then write a report log.
     The list may be a plain TEXT file (one URL per line; '#' comments and blanks ignored) or a
@@ -12862,52 +13240,129 @@ def run_url_list(list_path, base_kwargs, out_dir):
         print("=" * 70)
         entry = {'index': i, 'url': url, 'ok': False, 'kind': None, 'title': None,
                  'preview_note': '',
-                 'downloaded': [], 'rename': None, 'error': None, 'failed': [], 'seconds': 0.0}
+                 'downloaded': [], 'rename': None, 'error': None, 'failed': [], 'seconds': 0.0,
+                 'attempts': 0}
         t0 = time.time()
-        try:
-            res = main(url, **base_kwargs, rename_mode='auto', return_summary=True)
-            if isinstance(res, dict):
-                for k in ('ok', 'kind', 'downloaded', 'rename', 'error', 'failed', 'title',
-                          'preview_note'):
-                    entry[k] = res.get(k, entry[k])
-        except KeyboardInterrupt:
-            entry['error'] = "interrupted"
-            entry['seconds'] = time.time() - t0
-            results.append(entry)
-            print("\n[WARN] Interrupted during --url-list. Writing a partial report...")
-            interrupted = True
+        max_attempts = max(1, URL_LIST_RETRIES + 1)
+        clean = False
+        for attempt in range(1, max_attempts + 1):
+            entry['attempts'] = attempt
+            if attempt > 1:
+                wait = min(30, 5 * (attempt - 1))
+                print(f"{CLR.YELLOW}[RETRY]{CLR.RESET} URL {i}/{len(urls)} attempt "
+                      f"{attempt}/{max_attempts} after {wait}s "
+                      f"(previous: {entry.get('error') or 'files failed'})")
+                time.sleep(wait)
+            # Reset per-attempt outcome fields so a later success isn't masked by an earlier error.
+            entry['error'] = None
+            entry['failed'] = []
+            # NEVER rename during the attempt loop. Renaming changes the files on disk so the
+            # "already have" check (which matches the download's own name) stops recognising them,
+            # and a later attempt would re-download everything and collide on names. We download
+            # with the original names across all attempts, and rename ONCE at the very end when the
+            # URL is complete (see after the loop).
+            try:
+                res = main(url, **base_kwargs, rename_mode='skip', return_summary=True)
+                if isinstance(res, dict):
+                    for k in ('ok', 'kind', 'downloaded', 'rename', 'error', 'failed', 'title',
+                              'preview_note'):
+                        entry[k] = res.get(k, entry[k])
+            except KeyboardInterrupt:
+                entry['error'] = "interrupted"
+                entry['seconds'] = time.time() - t0
+                results.append(entry)
+                print("\n[WARN] Interrupted during --url-list. Writing a partial report...")
+                interrupted = True
+                break
+            except SystemExit as e:
+                entry['error'] = entry['error'] or f"exited (code {getattr(e, 'code', None)})"
+            except Exception as e:
+                entry['error'] = f"{type(e).__name__}: {e}"
+            # A clean result = it downloaded something with no error and nothing still failing.
+            clean = bool(entry['ok'] and not entry['error'] and not entry.get('failed')
+                         and (entry.get('downloaded')))
+            if clean:
+                if attempt > 1:
+                    print(f"{CLR.GREEN}[OK]{CLR.RESET} URL {i} succeeded on attempt {attempt}.")
+                break
+            # "No downloadable video found" is a definitive verdict (tier-locked / unsupported),
+            # not a transient error — don't waste retries on it.
+            if not entry['error'] and not entry.get('failed'):
+                break
+            # If everything that failed is PERMANENT (private / unavailable / tier-locked), another
+            # attempt would just re-run the whole collection and re-download the videos that DID
+            # succeed — pointless. Stop retrying; these are recorded as a warning below.
+            if not _entry_has_retryable_failure(entry):
+                if attempt == 1:
+                    print(f"{CLR.YELLOW}[INFO]{CLR.RESET} URL {i}: the failures are permanent "
+                          f"(private/unavailable) — not retrying.")
+                break
+        if interrupted:
             break
-        except SystemExit as e:
-            entry['error'] = entry['error'] or f"exited (code {getattr(e, 'code', None)})"
-        except Exception as e:
-            entry['error'] = f"{type(e).__name__}: {e}"
         entry['seconds'] = time.time() - t0
         results.append(entry)
 
-        # If this URL downloaded correctly (no error, nothing still failing), mark it as done
-        # in the list file RIGHT NOW by prepending '#', flushing straight to disk — so an
-        # interrupted run resumes at the first not-yet-done URL.
         label = entry.get('title') or None
         n_files = len(entry.get('downloaded') or [])
-        clean = entry['ok'] and not entry['error'] and not entry.get('failed')
+
+        # Attempts ran with rename skipped (so retries recognise already-downloaded files). Now
+        # that the URL is settled, apply the rename ONCE — but only when it completed cleanly, so
+        # a partial/failed URL isn't half-renamed before its next run.
+        if clean and n_files:
+            try:
+                rn = offer_strict_rename(os.getcwd(), _session_downloads_in(os.getcwd()),
+                                         base_kwargs.get('verbose', False), rename_mode='auto')
+                entry['rename'] = rn or entry.get('rename')
+            except Exception as _re:
+                if base_kwargs.get('verbose'):
+                    print(f"[WARN] rename after --url-list URL {i} failed: {_re}")
+
+        # A URL that DOWNLOADED cleanly is marked done in the list right away, so an interrupted
+        # run resumes at the first not-yet-done URL.
         if clean and n_files:
             if _mark_url_done(list_path, list_fmt, url, label=label, count=n_files,
                               warn=entry.get('preview_note') or None):
                 extra = f" — noted as '{label}'" if label else ""
                 print(f"[INFO] Marked as done in {os.path.basename(list_path)}{extra}.")
-        else:
-            # Nothing came out of this URL (or it errored): still mark it done, but write the reason
-            # above it so the list itself says what happened (uncomment it to try again later).
-            if entry['error']:
-                why = f"failed: {entry['error']}"
-            elif entry.get('failed'):
-                why = f"{len(entry['failed'])} file(s) failed to download"
-            else:
-                why = ("no downloadable videos found (locked to a higher tier, or an unsupported "
-                       "video host)")
+            continue
+
+        # A URL that produced NO downloadable video (tier-locked / unsupported host) is a settled
+        # verdict — mark it done (with the reason) so we don't loop on it forever.
+        if not entry['error'] and not entry.get('failed'):
+            why = ("no downloadable videos found (locked to a higher tier, or an unsupported "
+                   "video host)")
             if _mark_url_done(list_path, list_fmt, url, label=label, count=n_files, warn=why):
                 print(f"{CLR.YELLOW}[WARN]{CLR.RESET} Marked as done in "
                       f"{os.path.basename(list_path)} with a warning: {why}")
+            continue
+
+        # If the ONLY failures are permanent (private / unavailable / tier-locked), the URL is as
+        # done as it will ever be: the reachable videos are downloaded and the rest never resolve.
+        # Mark it done WITH A WARNING (listing how many are unavailable) instead of retrying it
+        # forever or leaving it not-done — those videos aren't coming back.
+        if not _entry_has_retryable_failure(entry):
+            n_unavail = len(entry.get('failed') or []) or 1
+            why = (f"{n_unavail} video(s) unavailable (private / removed / tier-locked); "
+                   f"{n_files} downloaded")
+            if _mark_url_done(list_path, list_fmt, url, label=label, count=n_files, warn=why):
+                print(f"{CLR.YELLOW}[WARN]{CLR.RESET} Marked as done in "
+                      f"{os.path.basename(list_path)} with a warning: {why}")
+            continue
+
+        # OTHERWISE this URL has a TRANSIENT failure that survived all retries. It must NOT be
+        # marked done: it stays in the list so a future run retries it, and it is recorded in the
+        # sidecar so the failure is unambiguous and recoverable.
+        if entry['error']:
+            why = f"failed after {entry['attempts']} attempt(s): {entry['error']}"
+        else:
+            n_retryable = sum(1 for f in (entry.get('failed') or [])
+                              if _is_retryable_failure(f.get('reason') if isinstance(f, dict)
+                                                       else str(f)))
+            why = (f"{n_retryable} file(s) failed to download after "
+                   f"{entry['attempts']} attempt(s)")
+        _sidecar_mark_failed(list_path, url, why, label=label)
+        print(f"{CLR.RED}[FAILED]{CLR.RESET} URL {i}/{len(urls)} — {why}")
+        print(f"         Left NOT done in {os.path.basename(list_path)}; re-run to retry it.")
 
     log_path = _write_url_list_log(results, out_dir, started)
     _notify_url_list_report(results, log_path)
@@ -13576,6 +14031,7 @@ if __name__ == "__main__":
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
     parser.add_argument("--scan", nargs='?', const=True, default=None, metavar='N', help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.mpd/.webm/.mov) and download them all. Give a number to grab only the N-th found item, e.g. --scan 2 (1-indexed, in discovery order).")
     parser.add_argument("--prefer-stream", dest="prefer_stream", choices=['auto', 'dash', 'hls', 'both'], default=None, help="Which manifest to keep when a page offers BOTH DASH (.mpd) and HLS (.m3u8): 'auto' (default) takes the first real (non-ad) full-length stream of either type; 'dash' grabs the .mpd; 'hls' grabs the .m3u8; 'both' keeps both. Overrides the PREFER_STREAM config value for this run.")
+    parser.add_argument("--allow-corrupt", action="store_true", help="If a video has a corrupt/damaged segment that makes the normal (lossless) mux fail, still produce a playable file by skipping the bad packets — the output may have a brief glitch where the damage was. OFF by default: normally such a video FAILS (and is retried / recorded) rather than saving a broken file.")
     parser.add_argument("--ad-max-seconds", dest="ad_max_seconds", type=int, default=None, metavar="SECS", help="A found manifest whose measured duration is this many seconds or fewer is treated as a pre-roll ad and skipped, so the browser scan waits for the full-length video (default 90). 0 disables the duration check. Overrides the AD_MAX_SECONDS config value for this run.")
     parser.add_argument("--davka-login", "--batch-login", dest="davka_login", type=str, default=None, metavar="FILE", help="Like --davka-browser, but does NOT use any cookie file: each PAGE address is opened in the real browser using ONLY the login saved by --browser-login (a persistent browser profile). Nothing is injected, so this avoids the cookie-injection issues on Windows/WebView2. First run --browser-login once to sign in by hand; then --davka-login reuses that session for every entry. Same name/URL/key list format as --davka-browser.")
     parser.add_argument("--browser-login", "--login", dest="browser_login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
@@ -13697,6 +14153,8 @@ if __name__ == "__main__":
         PREFER_STREAM = args.prefer_stream
     if args.ad_max_seconds is not None:
         AD_MAX_SECONDS = args.ad_max_seconds
+    if args.allow_corrupt:
+        ALLOW_CORRUPT = True
 
     if sum(bool(x) for x in (args.video_id, args.url_list, args.davka,
                              args.davka_browser, args.davka_login)) > 1:
