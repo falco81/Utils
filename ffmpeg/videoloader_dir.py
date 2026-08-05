@@ -135,7 +135,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.17.0"
+SCRIPT_VERSION = "3.17.1"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -12971,15 +12971,19 @@ def _read_url_list(path):
         pending, retries = [], 0
         for it in _json_list_entries(doc):
             if isinstance(it, str):
-                if it.strip():
-                    pending.append(it.strip())
+                s = it.strip()
+                if s and not s.startswith('#'):     # '#…' = commented out, same as in TXT
+                    pending.append(s)
             elif isinstance(it, dict) and it.get('url'):
+                u = str(it['url']).strip()
+                if u.startswith('#'):               # commented-out entry — ignore
+                    continue
                 # Not done yet, OR done but flagged (no videos found / preview-only / failed) —
                 # those are worth another try, e.g. after a tier upgrade.
                 if not it.get('done'):
-                    pending.append(str(it['url']).strip())
+                    pending.append(u)
                 elif it.get('warning'):
-                    pending.append(str(it['url']).strip())
+                    pending.append(u)
                     retries += 1
         if retries:
             print(f"[INFO] --url-list: retrying {retries} entry(ies) that finished with a warning "
