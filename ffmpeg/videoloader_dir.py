@@ -11,6 +11,7 @@ import threading
 import math
 import shutil
 import json
+import html
 import base64
 import subprocess
 import time
@@ -135,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.17.1"
+SCRIPT_VERSION = "3.19.1"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -160,6 +161,12 @@ AD_MAX_SECONDS = 90             # manifests measuring this many seconds or fewer
 SCAN_BROWSER_SHOW = True        # show the window (you can log in / press play in it yourself)
 SCAN_BROWSER_CLICK = True       # auto-press play buttons and start muted <video> elements
 SCAN_BROWSER_PROFILE = True     # keep cookies between runs, so a login survives
+BROWSER_CACHE_AUTOCLEAN = True  # once per run, before the first browser window opens, delete the
+#                                 profile's CACHE dirs (service workers, code cache, GPU cache)
+#                                 while KEEPING the login. A weeks-old cache rots and breaks site
+#                                 players (the kocowa "server error") even though the login looks
+#                                 fine; this makes that self-heal instead of needing the profile
+#                                 folder deleted by hand. Set False to keep caches between runs.
 SCAN_BROWSER_PROBE_MAX = 25     # max observed requests confirmed as a manifest by their content
 SCAN_PAGE_WORKERS = 4           # parallel page/subtitle requests when scanning (keep low for rate-limited servers)
 # Native-HLS segment threads. Both accept a number, or 0 / null / "auto" / "max" meaning
@@ -229,6 +236,7 @@ _REMOTE_CONFIG_KEYS = {
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'VIMEO_BROWSER_FALLBACK',
     'PREVIEW_MAX_SECONDS',
     'PREVIEW_MAX_MB', 'SCAN_BROWSER_SHOW', 'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE',
+    'BROWSER_CACHE_AUTOCLEAN',
     'SCAN_BROWSER_PROBE_MAX', 'PREFER_STREAM', 'AD_MAX_SECONDS',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
@@ -243,7 +251,8 @@ _REMOTE_CONFIG_KEYS = {
     # -- filename sanitising and the rename heuristics (worth tuning per language) --
     'ILLEGAL_WIN', 'RESERVED_WIN', 'EMOJI_RANGES', 'SMALL_WORDS', 'VOWELS', 'DEFAULT_STOP',
     # -- YouTube / Twitch API constants (handy to hot-fix remotely when they rotate) --
-    'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY', 'TWITCH_CLIENT_ID',
+    'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY',
+    'YT_SUBTITLES', 'YT_SUB_LANGS', 'TWITCH_CLIENT_ID',
 }
 
 
@@ -255,11 +264,13 @@ _CONFIG_KEY_ORDER = (
     'CONNECT_TIMEOUT', 'META_READ_TIMEOUT', 'DOWNLOAD_READ_TIMEOUT', 'DEFAULT_MAX_HEIGHT',
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'SCAN_BROWSER_SHOW',
     'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE', 'SCAN_BROWSER_PROBE_MAX', 'VIMEO_BROWSER_FALLBACK',
+    'BROWSER_CACHE_AUTOCLEAN',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP',
     'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
     'MP4DECRYPT_DOWNLOAD_URL', 'MP4DECRYPT_FALLBACK_URL', 'MP4DECRYPT_PROGRAM_FILES_DIRS',
-    'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY', 'TWITCH_CLIENT_ID',
+    'YT_IOS_VERSION', 'YT_IOS_UA', 'YT_IOS_KEY', 'YT_WEB_VERSION', 'YT_WEB_KEY',
+    'YT_SUBTITLES', 'YT_SUB_LANGS', 'TWITCH_CLIENT_ID',
     'USE_COLOR', 'FORCE_ASCII_BARS', 'PER_FILE_BAR_LIMIT', 'BAR_NCOLS', 'BAR_DESC_WIDTH',
     'ASCII_FILENAMES', 'AUTO_COOKIES', 'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'USER_AGENT',
     'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
@@ -1459,7 +1470,14 @@ def get_cookies_session(cookies_files=None) -> requests.Session:
     if cookies_files:
         merged = RequestsCookieJar()
         for cf in cookies_files:
-            sub_jar = load_cookies_from_file(cf)
+            try:
+                sub_jar = load_cookies_from_file(cf)
+            except (ValueError, OSError) as e:
+                # One bad file (e.g. a login_*.storage.json passed by hand, or a corrupt export)
+                # must not kill the whole run — skip it, keep the rest.
+                print(f"{CLR.YELLOW}[WARN]{CLR.RESET} Skipping cookies file "
+                      f"'{os.path.basename(cf)}': {e}")
+                continue
             for cookie in sub_jar:
                 merged.set_cookie(cookie)
         session.cookies = merged
@@ -4761,6 +4779,13 @@ YT_IOS_UA = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 17_5_1 like 
 YT_IOS_KEY = "AIzaSyB-63vPrdThhKuerbB2N_l7Kwwcxj6yUAc"
 YT_WEB_VERSION = "2.20260114.08.00"
 YT_WEB_KEY = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+YT_SUBTITLES = True             # YouTube: also download the video's subtitle (caption) tracks and
+#                                 mux them into the file as real subtitle streams (MKV: SubRip,
+#                                 MP4: mov_text). Auto-generated ("asr") captions are skipped
+#                                 unless they are the only ones. Set False to skip subtitles.
+YT_SUB_LANGS = 'all'            # which caption languages to take: 'all', or a comma list of
+#                                 language codes like 'en,cs,ko' (matches the code prefix, so 'en'
+#                                 also takes 'en-US').
 YOUTUBE_HEADERS = {'User-Agent': YT_IOS_UA, 'Origin': 'https://www.youtube.com'}
 TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"
 TWITCH_HEADERS = {'User-Agent': USER_AGENT, 'Referer': 'https://www.twitch.tv/'}
@@ -6329,18 +6354,44 @@ def _yt_gather(video_id, session, max_height, verbose):
         parsed.append((role, needs, s_val, sp, base_url))
     if needs_js and sig_needed and not (_yt_can_solve() and base_js is not None):
         return {'__no_solver__': True, 'title': title}
+    # Subtitle (caption) tracks — carried in the player response, downloadable from their
+    # timedtext baseUrl. 'asr' = YouTube's auto-generated captions. The SAME language track can
+    # carry a differently signed baseUrl in each client's player response, and one of them may be
+    # gated (empty/XML answer) while the other works — so collect the candidates from BOTH
+    # responses, merged per (language, auto) with a list of urls to try in order.
+    _cap_map = {}
+    for src_player in (player, wp_player):
+        if not src_player:
+            continue
+        for tr in (((src_player.get('captions') or {})
+                    .get('playerCaptionsTracklistRenderer') or {}).get('captionTracks') or []):
+            burl = tr.get('baseUrl')
+            if not burl:
+                continue
+            nm = tr.get('name') or {}
+            label = nm.get('simpleText') or ''.join(
+                r.get('text', '') for r in (nm.get('runs') or []))
+            key = (tr.get('languageCode') or '', tr.get('kind') == 'asr')
+            ent = _cap_map.setdefault(key, {'url': burl, 'urls': [], 'lang': key[0],
+                                            'name': (label or key[0] or '').strip(),
+                                            'auto': key[1]})
+            if burl not in ent['urls']:
+                ent['urls'].append(burl)
+    captions = list(_cap_map.values())
     if verbose:
         tqdm.write(f"[DBG] {video_id}: {mode} itag {chosen[0][1].get('itag')} | client '{client}' "
-              f"needs_js={needs_js} | {len(sig_needed)} sig, {len(n_needed)} n")
+              f"needs_js={needs_js} | {len(sig_needed)} sig, {len(n_needed)} n"
+              + (f" | {len(captions)} caption track(s)" if captions else ""))
     return {'title': title, 'mode': mode, 'parsed': parsed, 'needs_js': needs_js,
-            'base_js': base_js, 'sig': sig_needed, 'n': n_needed}
+            'base_js': base_js, 'sig': sig_needed, 'n': n_needed, 'captions': captions}
 
 
 def _yt_build(plan, sig_map, n_map, verbose):
     """Turn a gathered plan + solved maps into a download descriptor, or None."""
     if not plan or plan.get('__no_solver__'):
         return plan
-    out = {'title': plan['title'], 'mode': plan['mode']}
+    out = {'title': plan['title'], 'mode': plan['mode'],
+           'captions': plan.get('captions') or []}
     for role, needs, s_val, sp, base_url in plan['parsed']:
         final = _yt_apply(base_url, needs and plan['needs_js'], s_val, sp, sig_map, n_map)
         if not final:
@@ -6367,6 +6418,140 @@ def _yt_pick_streams(video_id, session, max_height, verbose):
             tqdm.write(f"[WARN] {video_id}: no webview — 'n' left untransformed; download will be "
                   f"throttled. Install pywebview for full speed.")
     return _yt_build(plan, sig_map, n_map, verbose)
+
+
+def _yt_pick_captions(captions):
+    """Filter a descriptor's caption tracks by YT_SUBTITLES / YT_SUB_LANGS. Manual tracks are
+    preferred; auto-generated ('asr') are used only when no manual track matches."""
+    if not YT_SUBTITLES or not captions:
+        return []
+    langs = (YT_SUB_LANGS or 'all').strip().lower()
+    wanted = None if langs in ('all', '*', '') else \
+        [x.strip() for x in langs.split(',') if x.strip()]
+
+    def _match(tr):
+        if wanted is None:
+            return True
+        code = (tr.get('lang') or '').lower()
+        return any(code == w or code.startswith(w + '-') for w in wanted)
+    manual = [t for t in captions if not t.get('auto') and _match(t)]
+    if manual:
+        return manual
+    return [t for t in captions if _match(t)]
+
+
+def _yt_ts_vtt(sec):
+    """Seconds (float) -> 'HH:MM:SS.mmm' WebVTT timestamp."""
+    ms = max(0, int(round(sec * 1000)))
+    h, rem = divmod(ms, 3600000)
+    m, rem = divmod(rem, 60000)
+    s, ms = divmod(rem, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d}.{ms:03d}"
+
+
+def _yt_caption_to_vtt(body):
+    """Normalize a timedtext response to WebVTT. Accepts native WebVTT, the srv1 XML
+    (<transcript><text start dur>), the srv3 XML (<timedtext><body><p t d>), and json3
+    ({'events':[{tStartMs,dDurationMs,segs:[{utf8}]}]}). Returns the VTT text or None."""
+    if not body or len(body.strip()) < 5:
+        return None
+    txt = body.lstrip('\ufeff').strip()
+    if txt.startswith('WEBVTT'):
+        return body
+    cues = []
+    if txt.startswith('{'):
+        try:
+            doc = json.loads(txt)
+        except ValueError:
+            return None
+        for ev in doc.get('events') or []:
+            segs = ev.get('segs') or []
+            text = ''.join(s.get('utf8', '') for s in segs).strip('\n')
+            if not text.strip():
+                continue
+            start = (ev.get('tStartMs') or 0) / 1000.0
+            dur = (ev.get('dDurationMs') or 0) / 1000.0
+            cues.append((start, start + max(dur, 0.001), text))
+    elif txt.startswith('<'):
+        import xml.etree.ElementTree as _ET
+        try:
+            root = _ET.fromstring(txt)
+        except _ET.ParseError:
+            return None
+        for el in root.iter('text'):                       # srv1: <text start="s" dur="s">
+            try:
+                start = float(el.get('start') or 0)
+                dur = float(el.get('dur') or 2)
+            except ValueError:
+                continue
+            text = html.unescape(''.join(el.itertext())).strip()
+            if text:
+                cues.append((start, start + max(dur, 0.001), text))
+        if not cues:
+            for el in root.iter('p'):                      # srv3: <p t="ms" d="ms">
+                try:
+                    start = float(el.get('t') or 0) / 1000.0
+                    dur = float(el.get('d') or 2000) / 1000.0
+                except ValueError:
+                    continue
+                text = html.unescape(''.join(el.itertext())).strip()
+                if text:
+                    cues.append((start, start + max(dur, 0.001), text))
+    if not cues:
+        return None
+    out = ["WEBVTT", ""]
+    for start, end, text in cues:
+        out.append(f"{_yt_ts_vtt(start)} --> {_yt_ts_vtt(end)}")
+        out.append(text)
+        out.append("")
+    return "\n".join(out)
+
+
+def _yt_fetch_caption_vtt(track, session, dest_path, verbose):
+    """Download one caption track and save it as WebVTT to dest_path. Tries every candidate
+    baseUrl (the same language can be signed differently per client, and one may be gated),
+    REPLACES any pre-existing fmt= parameter with fmt=vtt (appending a second fmt is ignored by
+    the server, which then answers in XML), and converts an XML/json3 answer to VTT when the
+    server ignores the format request anyway. Returns True on success."""
+    urls = [u for u in (track.get('urls') or [track.get('url')]) if u]
+    if not urls:
+        return False
+    attempts = []
+    for base in urls:
+        stripped = re.sub(r'([&?])fmt=[^&]*&?', r'\1', base).rstrip('&?')
+        attempts.append(stripped + ('&' if '?' in stripped else '?') + 'fmt=vtt')
+        attempts.append(stripped + ('&' if '?' in stripped else '?') + 'fmt=json3')
+        attempts.append(base)                    # exactly as the player gave it (any XML variant)
+    for url in attempts:
+        try:
+            r = session.get(url, headers={'User-Agent': USER_AGENT},
+                            timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        except requests.RequestException as e:
+            if verbose:
+                tqdm.write(f"[WARN] subtitle fetch failed ({track.get('lang')}): {e}")
+            continue
+        if r.status_code != 200:
+            if verbose:
+                tqdm.write(f"[WARN] subtitle track {track.get('lang')}: HTTP {r.status_code}.")
+            continue
+        vtt = _yt_caption_to_vtt(r.text or '')
+        if not vtt:
+            if verbose:
+                head = (r.text or '')[:80].replace('\n', ' ')
+                tqdm.write(f"[DBG] subtitle track {track.get('lang')}: unusable answer "
+                           f"({len(r.text or '')} B): {head!r}")
+            continue
+        try:
+            os.makedirs(os.path.dirname(dest_path) or '.', exist_ok=True)
+            with open(dest_path, 'w', encoding='utf-8') as f:
+                f.write(vtt)
+        except OSError:
+            return False
+        return True
+    if verbose:
+        tqdm.write(f"[WARN] subtitle track {track.get('lang')}: no usable format from "
+                   f"{len(urls)} url(s) — skipped.")
+    return False
 
 
 def download_youtube(items, session, chunk_size, max_connections, max_height, verbose):
@@ -6431,13 +6616,28 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
             return
         base = safe_filename(prefer_mp4_ext(desc['title']), it['youtube_id'])
         stem = os.path.splitext(base)[0]
+        # Subtitles: pick + download the caption tracks now (tiny files, direct GET), so the mux
+        # step below can embed them as real subtitle streams.
+        subs = []
+        for tr in _yt_pick_captions(desc.get('captions')):
+            _lang = re.sub(r'[^A-Za-z0-9-]+', '', tr.get('lang') or 'und') or 'und'
+            _sp = os.path.join(TEMP_SUBDIR, f"{stem}.{_lang}"
+                               + (f".{len(subs)}" if any(s[1] == _lang for s in subs) else "")
+                               + ".vtt")
+            if _yt_fetch_caption_vtt(tr, session, os.path.join(os.getcwd(), _sp), verbose):
+                subs.append((_sp, _lang, tr.get('name') or _lang))
+        if subs and verbose:
+            tqdm.write(f"[INFO] {stem}: {len(subs)} subtitle track(s) downloaded "
+                       f"({', '.join(s[1] for s in subs)}).")
         # The RAW streams keep their native container (.mp4/.m4a) inside .temp; only the finished
         # file honours --container (ffmpeg writes it directly, so no extra remux is needed).
-        final_ext = _container_ext(False)
+        # Subtitles push the default container to .mkv (same rule as everywhere else).
+        final_ext = _container_ext(bool(subs))
         if desc['mode'] == 'progressive':
             raw_jobs.append({'direct_url': desc['url'], 'id': it['youtube_id'],
                              'title': stem, 'name': stem + '.mp4'})
-            mux_plan.append((stem + final_ext, os.path.join(TEMP_SUBDIR, stem + '.mp4'), None))
+            mux_plan.append((stem + final_ext, os.path.join(TEMP_SUBDIR, stem + '.mp4'), None,
+                             subs))
         else:
             vname, aname = stem + '.ytv.mp4', stem + '.yta.m4a'
             raw_jobs.append({'direct_url': desc['video_url'], 'id': it['youtube_id'] + ':v',
@@ -6445,7 +6645,7 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
             raw_jobs.append({'direct_url': desc['audio_url'], 'id': it['youtube_id'] + ':a',
                              'title': aname, 'name': aname})
             mux_plan.append((stem + final_ext, os.path.join(TEMP_SUBDIR, vname),
-                             os.path.join(TEMP_SUBDIR, aname)))
+                             os.path.join(TEMP_SUBDIR, aname), subs))
 
     if not raw_jobs:
         print("[INFO] Nothing to download (YouTube).")
@@ -6463,17 +6663,40 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
     if not ensure_ffmpeg(verbose):
         print("[ERROR] ffmpeg is required to finalize YouTube videos.")
         return
-    for final, vfile, afile in mux_plan:
+    for final, vfile, afile, subs in mux_plan:
         vpath = vfile if os.path.isabs(vfile) else os.path.join(os.getcwd(), vfile)
         final_path = os.path.join(os.getcwd(), final)
+        _sub_all = [((p if os.path.isabs(p) else os.path.join(os.getcwd(), p)), l, n)
+                    for p, l, n in subs]
+        _sub_all = [(p, l, n) for p, l, n in _sub_all if os.path.exists(p)]
+        sub_paths = [p for p, _l, _n in _sub_all]
+        sub_meta = [(l, n) for _p, l, n in _sub_all]
+
+        def _cleanup_subs():
+            for sp in sub_paths:
+                try:
+                    os.remove(sp)
+                except OSError:
+                    pass
         if afile is None:
-            # Progressive: the downloaded file IS the result. Same container -> just move it out
-            # of .temp; a forced different container (--container mkv) needs a real remux, since
-            # renaming .mp4 to .mkv would only mislabel it.
+            # Progressive: the downloaded file IS the result. Without subtitles (and in the same
+            # container) it just moves out of .temp; subtitles or a forced other container need a
+            # real mux/remux — renaming .mp4 to .mkv would only mislabel it.
             if not os.path.exists(vpath):
                 print(f"[WARN] Missing stream: {final} (nothing downloaded)")
                 continue
-            if os.path.splitext(vpath)[1].lower() == os.path.splitext(final_path)[1].lower():
+            if sub_paths:
+                ok, err = _ffmpeg_mux_multi(vpath, [], sub_paths, [], sub_meta,
+                                            final_path, verbose)
+                if not ok:
+                    print(f"[WARN] Could not mux subtitles into {final}: {err}")
+                    continue
+                try:
+                    os.remove(vpath)
+                except OSError:
+                    pass
+                _cleanup_subs()
+            elif os.path.splitext(vpath)[1].lower() == os.path.splitext(final_path)[1].lower():
                 try:
                     os.replace(vpath, final_path)
                 except OSError as e:
@@ -6489,22 +6712,29 @@ def download_youtube(items, session, chunk_size, max_connections, max_height, ve
                 except OSError:
                     pass
             _record_download(os.path.abspath(final_path))
-            tqdm.write(f"[OK] {final}")
+            tqdm.write(f"[OK] {final}"
+                       + (f"  (+{len(sub_paths)} subtitle track(s))" if sub_paths else ""))
             continue
         apath = afile if os.path.isabs(afile) else os.path.join(os.getcwd(), afile)
         if not (os.path.exists(vpath) and os.path.exists(apath)):
             print(f"[WARN] Missing stream for mux: {final} "
                   f"(video: {os.path.exists(vpath)}, audio: {os.path.exists(apath)})")
             continue
-        ok, err = _ffmpeg_mux(vpath, apath, final_path, verbose)
+        if sub_paths:
+            ok, err = _ffmpeg_mux_multi(vpath, [apath], sub_paths, [('', '')], sub_meta,
+                                        final_path, verbose)
+        else:
+            ok, err = _ffmpeg_mux(vpath, apath, final_path, verbose)
         if ok:
             for t in (vpath, apath):
                 try:
                     os.remove(t)
                 except OSError:
                     pass
+            _cleanup_subs()
             _record_download(os.path.abspath(final_path))
-            tqdm.write(f"[OK] {final}")
+            tqdm.write(f"[OK] {final}"
+                       + (f"  (+{len(sub_paths)} subtitle track(s))" if sub_paths else ""))
         else:
             print(f"[WARN] Mux failed for {final}: {err}")
 
@@ -11054,6 +11284,68 @@ def _browser_profile_dir():
     return d
 
 
+# Cache directories inside a WebView2/Chromium profile that are SAFE to delete: they are all
+# regenerated on the next start. Over weeks of use these rot (stale service workers, corrupt code
+# cache) and break site players — the kocowa "server error" popup — while cookies still look fine.
+# Deleting ONLY these fixes the player without losing the login (Cookies / Local Storage /
+# IndexedDB / Login Data are deliberately NOT on this list).
+_BROWSER_CACHE_DIRS = frozenset({
+    'cache', 'code cache', 'gpucache', 'dawncache', 'dawngraphitecache', 'graphitedawncache',
+    'shadercache', 'grshadercache', 'service worker', 'media cache', 'blob_storage',
+    'scriptcache', 'component_crx_cache', 'crashpad', 'browsermetrics', 'optimization guide'
+    ' model store',
+})
+
+
+def _browser_clear_cache(verbose=False):
+    """Delete cache/service-worker directories from the browser profile while KEEPING the login
+    (cookies, local storage, IndexedDB). Returns (dirs_removed, mib_freed). Safe to run any time
+    no browser window is open; everything removed is rebuilt automatically."""
+    profile = _browser_profile_dir()
+    if not profile or not os.path.isdir(profile):
+        return 0, 0.0
+    removed, freed = 0, 0
+    for root, dirs, _files in os.walk(profile, topdown=True):
+        for name in list(dirs):
+            if name.lower() in _BROWSER_CACHE_DIRS:
+                full = os.path.join(root, name)
+                try:
+                    for r2, _d2, f2 in os.walk(full):
+                        for f in f2:
+                            try:
+                                freed += os.path.getsize(os.path.join(r2, f))
+                            except OSError:
+                                pass
+                    shutil.rmtree(full, ignore_errors=True)
+                    removed += 1
+                    dirs.remove(name)      # don't descend into what we just deleted
+                except OSError:
+                    pass
+    mib = freed / (1024 * 1024)
+    if verbose and removed:
+        print(f"[INFO] browser: cleared {removed} cache dir(s) from the profile "
+              f"({mib:.0f} MiB freed); login/cookies kept.")
+    return removed, mib
+
+
+_browser_cache_cleaned = False
+_browser_cache_lock = threading.Lock()
+
+
+def _browser_maybe_autoclean(verbose=False):
+    """Once per run, before the first browser window opens: clear the profile's cache dirs so a
+    rotted cache can't break the site player mid-batch. Login data is kept. Controlled by
+    BROWSER_CACHE_AUTOCLEAN. Thread-safe: the Vimeo fallback calls this from pool threads."""
+    global _browser_cache_cleaned
+    if not BROWSER_CACHE_AUTOCLEAN or not SCAN_BROWSER_PROFILE:
+        return
+    with _browser_cache_lock:
+        if _browser_cache_cleaned:
+            return
+        _browser_cache_cleaned = True
+        _browser_clear_cache(verbose=verbose)
+
+
 def _base_domain(host):
     """A best-effort registrable domain: the last two labels (kocowa.com from www.kocowa.com or
     m.kocowa.com). Good enough to match a saved login across www/subdomain/video-page hosts."""
@@ -11183,6 +11475,7 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
     else the page fetched that wasn't obviously an asset — a manifest served from an
     extension-less address hides in there, so the caller confirms those by reading their first
     bytes. Requires pywebview (same engine used for YouTube signatures)."""
+    _browser_maybe_autoclean(verbose=verbose)   # heal a rotted profile cache before opening
     if wait_s is None:
         wait_s = max(1, int(SCAN_BROWSER_WAIT or 6))
     if not _yt_pywebview_available():
@@ -14041,6 +14334,7 @@ if __name__ == "__main__":
     parser.add_argument("--browser-login", "--login", dest="browser_login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
     parser.add_argument("--setup", action="store_true", help="Check and install everything the script needs, then exit: required Python modules (via pip) and the external tools ffmpeg + mp4decrypt (downloaded into the script's cache folder if missing, just like a normal run does). Run this once after copying the script to a new machine.")
     parser.add_argument("--test", action="store_true", help="Check that every dependency is present and print a tidy PASS/FAIL report (Python modules, ffmpeg, mp4decrypt, browser support), then exit. Installs nothing — use --setup for that.")
+    parser.add_argument("--clear-browser-cache", action="store_true", help="Delete the browser profile's CACHE directories (service workers, code cache, GPU cache) and exit, KEEPING the login/cookies. Fixes a site player that stopped loading in --davka-browser/--davka-login after long use (e.g. the kocowa 'server error') without having to delete the whole profile and log in again. Runs automatically once per run unless BROWSER_CACHE_AUTOCLEAN is off.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
     parser.add_argument("--sub", nargs='?', const='SCAN', default=None, metavar='N', help="Subtitles (HLS): without a value, lists available subtitle tracks and exits; with a value picks them, e.g. --sub 1,2 (or 'all'). Default (no --sub) includes ALL subtitles found.")
@@ -14074,6 +14368,12 @@ if __name__ == "__main__":
         sys.exit(_run_setup(args.verbose))
     if args.test:
         sys.exit(_run_test(args.verbose))
+    if args.clear_browser_cache:
+        _n, _mib = _browser_clear_cache(verbose=True)
+        if not _n:
+            print("[INFO] browser: no cache directories found to clear (profile is clean or "
+                  "missing).")
+        sys.exit(0)
 
     # Already applied from raw argv before the config fetch; repeating it is a no-op and keeps the
     # parsed flag as the single source of truth for anything added later.
