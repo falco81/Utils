@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.19.1"
+SCRIPT_VERSION = "3.21.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -161,6 +161,16 @@ AD_MAX_SECONDS = 90             # manifests measuring this many seconds or fewer
 SCAN_BROWSER_SHOW = True        # show the window (you can log in / press play in it yourself)
 SCAN_BROWSER_CLICK = True       # auto-press play buttons and start muted <video> elements
 SCAN_BROWSER_PROFILE = True     # keep cookies between runs, so a login survives
+BROWSER_ENABLE_FEATURES = 'WidevineCdm'  # comma list of Chromium features to enable in the
+#                                 WebView2 scan/login browser. WidevineCdm turns on the DRM/EME
+#                                 module WebView2 ships but leaves OFF by default, so encrypted
+#                                 players (Brightcove/kocowa/viki) don't throw "server error".
+#                                 All features are merged into ONE --enable-features switch
+#                                 (Chromium honours only the last such switch). Add more here,
+#                                 e.g. 'WidevineCdm,PlatformEncryptedDolbyVision'.
+BROWSER_EXTRA_ARGS = ''         # extra raw command-line switches for that browser, space-
+#                                 separated, e.g. '--disable-gpu'. Appended verbatim after the
+#                                 merged --enable-features switch.
 BROWSER_CACHE_AUTOCLEAN = True  # once per run, before the first browser window opens, delete the
 #                                 profile's CACHE dirs (service workers, code cache, GPU cache)
 #                                 while KEEPING the login. A weeks-old cache rots and breaks site
@@ -237,6 +247,7 @@ _REMOTE_CONFIG_KEYS = {
     'PREVIEW_MAX_SECONDS',
     'PREVIEW_MAX_MB', 'SCAN_BROWSER_SHOW', 'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE',
     'BROWSER_CACHE_AUTOCLEAN',
+    'BROWSER_ENABLE_FEATURES', 'BROWSER_EXTRA_ARGS',
     'SCAN_BROWSER_PROBE_MAX', 'PREFER_STREAM', 'AD_MAX_SECONDS',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     # -- external tools (paths, download URLs, install dirs) --
@@ -265,6 +276,7 @@ _CONFIG_KEY_ORDER = (
     'SCAN_LINK_CAP', 'SCAN_PAGE_WORKERS', 'SCAN_BROWSER_WAIT', 'SCAN_BROWSER_SHOW',
     'SCAN_BROWSER_CLICK', 'SCAN_BROWSER_PROFILE', 'SCAN_BROWSER_PROBE_MAX', 'VIMEO_BROWSER_FALLBACK',
     'BROWSER_CACHE_AUTOCLEAN',
+    'BROWSER_ENABLE_FEATURES', 'BROWSER_EXTRA_ARGS',
     'HLS_SEGMENT_WORKERS', 'HLS_AUTO_WORKERS_CAP',
     'PREVIEW_MAX_SECONDS', 'PREVIEW_MAX_MB', 'RESUME_FILE', 'MAX_FILENAME_CHARS',
     'FFMPEG', 'FFMPEG_DOWNLOAD_URL', 'FFMPEG_PROGRAM_FILES_DIRS',
@@ -10727,6 +10739,30 @@ _BROWSER_PLAY_JS = r"""
 """
 
 
+def _merge_browser_args(existing, features_csv, extra_args):
+    """Merge WebView2 additional-browser-arguments: union every requested Chromium feature into a
+    SINGLE --enable-features switch (Chromium honours only the last one, so a second switch would
+    drop the first), preserve any other switches already present, and append extra raw args.
+    This is why an extra '--enable-features=WidevineCdm' tacked on separately did nothing."""
+    want = [f.strip() for f in (features_csv or '').split(',') if f.strip()]
+    feats, rest = [], []
+    for tok in (existing or '').split():
+        m = re.match(r'--enable-features=(.*)$', tok)
+        if m:
+            feats += [x for x in m.group(1).split(',') if x]
+        else:
+            rest.append(tok)
+    for f in want:
+        if f not in feats:
+            feats.append(f)
+    parts = list(rest)
+    if feats:
+        parts.append('--enable-features=' + ','.join(feats))
+    if extra_args and extra_args.strip():
+        parts.append(extra_args.strip())
+    return ' '.join(parts).strip()
+
+
 def _browser_worker(url, wait_s, conn, opts=None):
     """Separate process: open the page in a REAL webview, let its scripts and player run, press
     play, and keep collecting media URLs the whole time.
@@ -10734,15 +10770,20 @@ def _browser_worker(url, wait_s, conn, opts=None):
     Polling repeatedly (rather than looking once at the end) matters: a player may fetch its
     manifest, hand the <video> element a blob: URL and move on, so the evidence is transient."""
     # WebView2 ships the Widevine CDM but, unlike Chrome, does NOT enable it by default — so
-    # DRM/EME players (Brightcove, etc.) throw "server error on the player" even for free videos.
-    # Turn it on via the documented environment switch BEFORE the engine starts. Only affects our
-    # own private browser process.
+    # DRM/EME players (Brightcove, kocowa, viki) throw "server error on the player" even for free
+    # videos. Turn it on via the documented environment switch BEFORE the engine starts. Only
+    # affects our own private browser process.
+    #
+    # CRITICAL: Chromium honours only the LAST --enable-features on the line, so every feature we
+    # want must live in ONE merged switch. We parse whatever --enable-features is already present
+    # (from the environment or a prior arg), union our features into it, and rewrite a single
+    # switch — appending them as a second --enable-features would silently drop the first set
+    # (which is exactly why WidevineCdm looked like it "did nothing").
     if os.name == 'nt':
-        _extra = os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', '')
-        for _flag in ('--enable-features=WidevineCdm',):
-            if _flag not in _extra:
-                _extra = (_extra + ' ' + _flag).strip()
-        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = _extra
+        os.environ['WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS'] = _merge_browser_args(
+            os.environ.get('WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS', ''),
+            (opts or {}).get('browser_features', ''),
+            (opts or {}).get('browser_extra_args', ''))
     try:
         import webview
     except Exception as e:
@@ -10759,6 +10800,7 @@ def _browser_worker(url, wait_s, conn, opts=None):
     cookies = opts.get('cookies') or []
     cookie_txt = opts.get('cookie_txt') or None
     login_only = opts.get('login', False)
+    restore_mode = opts.get('restore', False)
     web_storage_restore = opts.get('web_storage') or ''
     holder = {'urls': [], 'all': [], 'title': None, 'cookies': 'none'}
 
@@ -10847,12 +10889,64 @@ def _browser_worker(url, wait_s, conn, opts=None):
         # does it navigate to the page we actually care about.
         if cookies:
             _t.sleep(1.2)                    # let the placeholder page settle
-            holder['cookies'] = _browser_apply_cookies(window, cookies, url, cookie_txt)
+            try:
+                holder['cookies'] = _browser_apply_cookies(window, cookies, url, cookie_txt)
+            except Exception as _ce:
+                holder['cookies'] = f"failed ({type(_ce).__name__})"
             try:
                 window.load_url(url)
             except Exception:
                 pass
-            _t.sleep(1.5)
+            _t.sleep(2.0)                    # let the (possibly redirected) app origin land
+        # Web storage is PER-ORIGIN and the early cookie navigation may have redirected
+        # (kocowa.com -> www.kocowa.com), so inject the saved localStorage/sessionStorage NOW, on
+        # whatever origin actually landed, and DON'T reload afterwards: a reload drops the
+        # sessionStorage we just wrote (kocowa keeps its auth token there). Injected in a retry
+        # loop because the app origin can still be settling.
+        if web_storage_restore:
+            _inj = ("(function(s){try{var o=JSON.parse(s);var n=0;"
+                    "if(o.local){for(var k in o.local){try{localStorage.setItem(k,o.local[k]);n++;}"
+                    "catch(e){}}}"
+                    "if(o.session){for(var k in o.session){try{sessionStorage.setItem(k,"
+                    "o.session[k]);n++;}catch(e){}}}return n;}catch(e){return -1;}})("
+                    + json.dumps(web_storage_restore) + ")")
+            wrote = 0
+            for _try in range(3):
+                _t.sleep(1.0)
+                try:
+                    wrote = window.evaluate_js(_inj) or 0
+                except Exception:
+                    wrote = 0
+                if wrote and wrote > 0:
+                    break
+            holder['storage_written'] = wrote
+            # Nudge the SPA to re-read the tokens WITHOUT a full reload (which would wipe
+            # sessionStorage): a soft in-app event most frameworks listen for.
+            try:
+                window.evaluate_js("try{window.dispatchEvent(new Event('storage'));"
+                                   "window.dispatchEvent(new Event('focus'));}catch(e){}")
+            except Exception:
+                pass
+        if restore_mode:
+            # --login-restore: cookies + localStorage are now in the persistent profile. NOTE:
+            # sessionStorage is per-tab and is NOT persisted to the profile by the browser — a
+            # site that keeps its auth there (kocowa) can only be restored for the SAME window,
+            # so the durable part of this is the cookies + localStorage. Let the app settle so it
+            # writes its own derived state, then close deterministically — no media scanning.
+            _t.sleep(max(3, int(opts.get('restore_wait') or 6)))
+            try:
+                conn.send({'result': json.dumps({
+                    'urls': [], 'all': [], 'title': holder.get('title'),
+                    'cookies': holder.get('cookies'),
+                    'storage_written': holder.get('storage_written', 0),
+                    'brightcove': []})})
+            except Exception:
+                pass
+            try:
+                window.destroy()
+            except Exception:
+                pass
+            return
         # Install the network hook AS EARLY AS POSSIBLE (right after the last navigation), so the
         # manifest request the player fires on start-up is captured. A DRM player (kocowa, etc.)
         # fetches its .mpd once, feeds MSE and moves on, so a late hook misses it entirely.
@@ -11385,6 +11479,90 @@ def _find_login_storage_file(page_url):
     return None
 
 
+def _find_login_cookie_file(page_url):
+    """Find a previously saved login cookie file (login_<domain>.json) for this page, matched by
+    BASE domain — the cookie twin of _find_login_storage_file. Used by --login-restore."""
+    want = _base_domain(urlparse(page_url).hostname or '')
+    if not want:
+        return None
+    want_slug = re.sub(r'[^a-z0-9]+', '_', want)
+    for _d in (os.getcwd(), os.path.dirname(os.path.abspath(sys.argv[0] or '.'))):
+        d = _d or '.'
+        exact = os.path.join(d, f"login_{want_slug}.json")
+        if os.path.isfile(exact):
+            return exact
+        try:
+            for fn in os.listdir(d):
+                if fn.startswith('login_') and fn.endswith('.json') \
+                        and not fn.endswith('.storage.json'):
+                    mid = fn[len('login_'):-len('.json')]
+                    if want_slug in mid or mid in want_slug:
+                        return os.path.join(d, fn)
+        except OSError:
+            pass
+    return None
+
+
+def _login_files_all():
+    """Every saved login cookie file (login_*.json, not the .storage.json twins) in the working
+    directory and next to the script, deduplicated by filename (cwd wins)."""
+    out, seen = [], set()
+    for _d in (os.getcwd(), os.path.dirname(os.path.abspath(sys.argv[0] or '.'))):
+        d = _d or '.'
+        try:
+            for fn in sorted(os.listdir(d)):
+                if fn.startswith('login_') and fn.endswith('.json') \
+                        and not fn.endswith('.storage.json') and fn not in seen:
+                    seen.add(fn)
+                    out.append(os.path.join(d, fn))
+        except OSError:
+            pass
+    return out
+
+
+def _login_restore_targets(url_arg):
+    """Build the (site_url, cookie_file) list for --login-restore. With a URL: that site's saved
+    login file (if any). Without: every saved login file. The site URL must be the EXACT host the
+    login was made on (www.kocowa.com, not kocowa.com): localStorage is per-origin, so restoring
+    on the bare domain and letting the site redirect would leave the app's real origin without
+    its tokens — logged out. The host is recovered from the filename slug (login_<host>.json,
+    '_' were dots) validated against the cookie domains, falling back to the most specific
+    cookie domain in the file."""
+    if url_arg:
+        cf = _find_login_cookie_file(url_arg)
+        return [(url_arg, cf)] if cf else []
+    targets = []
+    for cf in _login_files_all():
+        try:
+            with open(cf, encoding='utf-8') as f:
+                cookies = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(cookies, list):
+            continue
+        doms = [str((c or {}).get('domain') or '').strip().lower() for c in cookies]
+        doms = [d for d in doms if d]
+        if not doms:
+            continue
+        bare = {d.lstrip('.') for d in doms}
+        host = None
+        # 1) The filename slug IS the login host with '.'->'_'; reverse it and accept it when it
+        #    belongs to one of the cookie domains (guards against hostnames containing '-').
+        slug = os.path.basename(cf)[len('login_'):-len('.json')]
+        cand = slug.replace('_', '.')
+        if any(cand == b or cand.endswith('.' + b) for b in bare):
+            host = cand
+        # 2) Fallback: the most specific host-set cookie domain (no leading dot, most labels),
+        #    then the most specific domain of any kind.
+        if not host:
+            host_cookies = sorted((d for d in doms if not d.startswith('.')),
+                                  key=lambda d: (-d.count('.'), d))
+            any_cookies = sorted(bare, key=lambda d: (-d.count('.'), d))
+            host = (host_cookies[0] if host_cookies else any_cookies[0])
+        targets.append((f"https://{host}/", cf))
+    return targets
+
+
 def _save_harvested_cookies(harvested, page_url, web_storage=''):
     """Write cookies harvested from the login browser to a JSON file the next run auto-detects,
     plus a companion _storage file holding localStorage/sessionStorage (where SPA logins keep
@@ -11467,7 +11645,8 @@ def _save_harvested_cookies(harvested, page_url, web_storage=''):
             print(f"[WARN] --browser-login: could not save harvested cookies ({e}).")
 
 
-def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_only=False):
+def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_only=False,
+                           restore=False):
     """Load a page in a real webview and return (media_urls, page_title, other_requests, brightcove_players).
 
     `session` supplies the cookies loaded from --cookies / an auto-detected cookie file, so the
@@ -11491,10 +11670,11 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         _host = (urlparse(page_url).hostname or '').lower()
         _mine = [c for c in cookies if _cookie_applies(c['domain'], _host)]
         _http = sum(1 for c in _mine if c['httponly'])
-        print(f"[INFO] --scan-browser: passing {len(cookies)} cookie(s) to the browser; "
-              f"{len(_mine)} of them belong to {_host}"
-              + (f" ({_http} HttpOnly)" if _http else "") + ".")
-    elif session is not None:
+        if not restore:
+            print(f"[INFO] --scan-browser: passing {len(cookies)} cookie(s) to the browser; "
+                  f"{len(_mine)} of them belong to {_host}"
+                  + (f" ({_http} HttpOnly)" if _http else "") + ".")
+    elif session is not None and not restore:
         print("[INFO] --scan-browser: no cookies loaded — use --cookies FILE (or drop a cookie "
               ".json next to the script) if the page needs a login.")
     # Load previously harvested web storage (localStorage/sessionStorage) for this host, so a
@@ -11505,13 +11685,18 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         try:
             with open(_sf, encoding='utf-8') as f:
                 web_storage_restore = f.read()
-            print(f"[INFO] browser: restoring saved login state from "
-                  f"{os.path.basename(_sf)}.")
+            if not restore:
+                print(f"[INFO] browser: restoring saved login state from "
+                      f"{os.path.basename(_sf)}.")
         except OSError:
             pass
-    opts = {'click': bool(SCAN_BROWSER_CLICK), 'show': bool(SCAN_BROWSER_SHOW) or login_only,
+    opts = {'click': bool(SCAN_BROWSER_CLICK) and not restore,
+            'show': (bool(SCAN_BROWSER_SHOW) or login_only) and not restore,
             'profile': profile, 'cookies': cookies, 'cookie_txt': cookie_txt,
-            'login': bool(login_only), 'web_storage': web_storage_restore}
+            'login': bool(login_only), 'web_storage': web_storage_restore,
+            'restore': bool(restore), 'restore_wait': max(3, wait_s or 5) if restore else 0,
+            'browser_features': BROWSER_ENABLE_FEATURES or '',
+            'browser_extra_args': BROWSER_EXTRA_ARGS or ''}
     if opts['show'] and not login_only:
         print("[INFO] --scan-browser: a browser window will open — you can log in or press play "
               "in it if the page needs that; it closes on its own.")
@@ -11523,7 +11708,14 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
                            daemon=True)
         proc.start()
         # The worker keeps polling for up to the deadline, so allow for that plus startup.
-        budget = 3600 if login_only else max(150, max(4, wait_s) * 3 + 60)
+        # Restore mode is bounded and deterministic (inject + settle + close), so cap it tightly
+        # instead of the long scan budget — a stuck restore must never hang the whole command.
+        if restore:
+            budget = max(30, (wait_s or 6) + 30)
+        elif login_only:
+            budget = 3600
+        else:
+            budget = max(150, max(4, wait_s) * 3 + 60)
         import time as _pt
         deadline_p = _pt.time() + budget
         got = None
@@ -11642,7 +11834,7 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
         elif note.startswith('profile stored at') and verbose:
             print(f"[DBG] {note}")
     ck = data.get('cookies')
-    if cookies and isinstance(ck, dict):
+    if cookies and isinstance(ck, dict) and not restore:
         if verbose:
             for note in (data.get('cookie_notes') or []):
                 tqdm.write(f"[DBG] --scan-browser: {note}")
@@ -11658,10 +11850,18 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
                   + ".")
             print("       If the page turns out to be logged out, run --browser-login once: it "
                   "opens the site so you can sign in, and the session is remembered afterwards.")
-    if verbose:
+    if verbose and not restore:
         tqdm.write(f"[DBG] --scan-browser: {data.get('played', 0)} play attempt(s), "
                    f"{len(data.get('urls') or [])} media hit(s), "
                    f"{len(data.get('all') or [])} other request(s) observed")
+    if restore:
+        _cook = (data.get('cookies') or {})
+        _how = _cook.get('how') if isinstance(_cook, dict) else _cook
+        _sw = data.get('storage_written', 0)
+        _host = (urlparse(page_url).hostname or '').lower()
+        print(f"[INFO] --login-restore: {_host}: cookies {_how or 'set'}; "
+              f"{_sw} web-storage key(s) injected into the profile "
+              f"(cookies + localStorage persist; sessionStorage applies only within a run).")
     bcove = data.get('brightcove') or []
     # If the standard patterns found nothing, build candidates from the rendered-DOM hints: pair
     # each account id with each video id seen (the Playback API call simply fails for wrong pairs).
@@ -14334,6 +14534,7 @@ if __name__ == "__main__":
     parser.add_argument("--browser-login", "--login", dest="browser_login", type=str, default=None, metavar="URL", help="Open URL in the scan browser and leave the window open so you can sign in by hand, then close it. The session is kept in the browser profile, so later --scan-browser / --davka-login runs on that site are logged in. Use this when the site's login cookie is HttpOnly and cannot be injected from a cookie file.")
     parser.add_argument("--setup", action="store_true", help="Check and install everything the script needs, then exit: required Python modules (via pip) and the external tools ffmpeg + mp4decrypt (downloaded into the script's cache folder if missing, just like a normal run does). Run this once after copying the script to a new machine.")
     parser.add_argument("--test", action="store_true", help="Check that every dependency is present and print a tidy PASS/FAIL report (Python modules, ffmpeg, mp4decrypt, browser support), then exit. Installs nothing — use --setup for that.")
+    parser.add_argument("--login-restore", nargs="?", const="", default=None, metavar="URL", help="Rebuild the browser profile's logins from the saved login_*.json (+ .storage.json) files and exit — no manual sign-in. For each site a hidden browser window opens, the saved cookies and web-storage tokens are injected, the site is visited so it persists them into the profile, and the window closes. With a URL: restore only that site's saved login. Without: restore EVERY saved login file found. Use after deleting the .videoloader_browser profile folder. (HttpOnly cookies can't be injected into a page; a site whose login relies solely on one still needs a fresh --login.)")
     parser.add_argument("--clear-browser-cache", action="store_true", help="Delete the browser profile's CACHE directories (service workers, code cache, GPU cache) and exit, KEEPING the login/cookies. Fixes a site player that stopped loading in --davka-browser/--davka-login after long use (e.g. the kocowa 'server error') without having to delete the whole profile and log in again. Runs automatically once per run unless BROWSER_CACHE_AUTOCLEAN is off.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
@@ -14374,6 +14575,49 @@ if __name__ == "__main__":
             print("[INFO] browser: no cache directories found to clear (profile is clean or "
                   "missing).")
         sys.exit(0)
+
+    if args.login_restore is not None:
+        setup_console(USE_COLOR and not args.no_color)
+        _targets = _login_restore_targets(args.login_restore or None)
+        if not _targets:
+            if args.login_restore:
+                print(f"{CLR.RED}[ERROR]{CLR.RESET} --login-restore: no saved login_*.json found "
+                      f"for {args.login_restore}. Run --login {args.login_restore} first.")
+            else:
+                print(f"{CLR.RED}[ERROR]{CLR.RESET} --login-restore: no saved login_*.json files "
+                      f"found (looked in the current directory and next to the script).")
+            sys.exit(1)
+        if not _yt_pywebview_available():
+            print(f"{CLR.RED}[ERROR]{CLR.RESET} --login-restore needs the browser (pywebview). "
+                  f"Install it with:  \"{sys.executable}\" -m pip install pywebview")
+            sys.exit(1)
+        print(f"[INFO] --login-restore: restoring {len(_targets)} saved login(s) into the "
+              f"browser profile ({_browser_profile_dir()}).")
+        print("[INFO] --login-restore: cookies + localStorage are written to the profile and "
+              "persist. Note: some sites (e.g. kocowa) keep their auth token in sessionStorage, "
+              "which the browser does NOT persist between windows — for those the login is "
+              "re-applied automatically on every --davka-browser / --davka-login run from the "
+              "same login_*.storage.json, so you don't need this command for them.")
+        _fail = 0
+        for _url, _cf in _targets:
+            _sf = _find_login_storage_file(_url)
+            print(f"[INFO] --login-restore: {_url}  <- {os.path.basename(_cf)}"
+                  + (f" + {os.path.basename(_sf)}" if _sf else ""))
+            try:
+                _rs = get_cookies_session([_cf])
+                try:
+                    _res = _browser_collect_media(_url, args.verbose, wait_s=6, session=_rs,
+                                                  restore=True)
+                finally:
+                    _rs.close()
+            except Exception as _e:
+                _fail += 1
+                print(f"{CLR.YELLOW}[WARN]{CLR.RESET} --login-restore: {_url} failed: {_e}")
+        print(f"[INFO] --login-restore: done — {len(_targets) - _fail} processed"
+              + (f", {_fail} failed" if _fail else "")
+              + ". If a site still shows logged out, run --browser-login once for it. "
+                "(HttpOnly-cookie-only logins can't be injected into a page either.)")
+        sys.exit(0 if not _fail else 1)
 
     # Already applied from raw argv before the config fetch; repeating it is a no-op and keeps the
     # parsed flag as the single source of truth for anything added later.
