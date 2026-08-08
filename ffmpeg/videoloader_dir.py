@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.21.0"
+SCRIPT_VERSION = "3.21.1"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -4078,16 +4078,29 @@ def _primary_stream_from_post(post: dict) -> list:
     post_type = a.get('post_type')
     out = []
 
-    # 1) Patreon-hosted ("embedded") video on Mux: a signed HLS master URL.
+    # 1) Patreon-hosted ("embedded") video on Mux: a signed HLS master URL. Patreon has shipped
+    #    several shapes over time — ALL are kept working:
+    #      old:  post_file.url = https://stream.mux.com/<playback_id>.m3u8?token=…
+    #      old:  post_metadata.playback_data = {playback_id, playback_token}
+    #      NEW:  post_file.url = https://www.patreon.com/api/video/<id>/manifest.m3u8
+    #            (a normal HLS master served by Patreon itself, playable with the session
+    #            cookies; renditions live under the same /api/video/<id>/… path), with
+    #            post_file.viewer_playback_data = {playback_id, playback_token} as a fallback.
     pf = a.get('post_file') or {}
     pf_url = pf.get('url', '') or ''
     playback = ((a.get('post_metadata') or {}).get('playback_data') or {})
+    viewer_pb = (pf.get('viewer_playback_data') or {}) if isinstance(pf, dict) else {}
     mux_url = None
     if 'stream.mux.com' in pf_url:
+        mux_url = pf_url
+    elif re.search(r'patreon\.com/api/video/\d+/manifest\.m3u8', pf_url):
         mux_url = pf_url
     elif playback.get('playback_id') and playback.get('playback_token'):
         mux_url = (f"https://stream.mux.com/{playback['playback_id']}.m3u8"
                    f"?token={playback['playback_token']}")
+    elif viewer_pb.get('playback_id') and viewer_pb.get('playback_token'):
+        mux_url = (f"https://stream.mux.com/{viewer_pb['playback_id']}.m3u8"
+                   f"?token={viewer_pb['playback_token']}")
     if mux_url and post_type in (None, 'video_external_file', 'video_file', 'video'):
         title = (a.get('title') or str(post.get('id'))).strip()
         out.append({'source': 'mux', 'title': title, 'master_url': mux_url})
