@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.21.1"
+SCRIPT_VERSION = "3.21.5"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -9116,6 +9116,13 @@ def _add_hls_stream(job, key, murl, session, headers):
     return False
 
 
+# Sentinel: _build_hls_job found the finished file already on disk. This is a SKIP, not a
+# failure — counting it among "could not resolve" made a url-list retry pass declare every
+# already-downloaded file failed ("all N failed to resolve") and check the URL off while the one
+# genuinely missing episode stayed missing.
+_HLS_ALREADY_HAVE = 'ALREADY_HAVE'
+
+
 def _build_hls_job(video, session, out_dir, max_height, verbose):
     """Resolve a video (Vimeo/Mux/Twitch/scan) to its HLS segment lists, honouring --audio/--sub.
     Returns a ready _HlsJob, or None (also None when just listing tracks with a bare --audio/--sub)."""
@@ -9148,7 +9155,7 @@ def _build_hls_job(video, session, out_dir, max_height, verbose):
     out_path = os.path.join(out_dir, filename) if out_dir else filename
     if os.path.exists(out_path) or os.path.exists(os.path.splitext(out_path)[0] + '.mp4'):
         tqdm.write(f"[INFO] Already have {filename}, skipping.")
-        return None
+        return _HLS_ALREADY_HAVE
 
     job = _HlsJob(video, out_path, headers)
     os.makedirs(job.parts_dir, exist_ok=True)
@@ -9250,10 +9257,16 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
     listing_only = (AUDIO_SEL == 'SCAN' or SUB_SEL == 'SCAN')
     resolve_failures = []      # (title, reason) for videos that could not be resolved
     resolve_fail_lock = threading.Lock()
+    already_have = []          # titles skipped because the finished file already exists
 
     def _resolve(v):
         try:
             job = _build_hls_job(v, session, out_dir, max_height, verbose)
+            if job == _HLS_ALREADY_HAVE:
+                # The finished file is already on disk — a successful skip, NOT a failure.
+                with resolve_fail_lock:
+                    already_have.append(v.get('title') or '?')
+                return None
             if job is None and not listing_only:
                 with resolve_fail_lock:
                     resolve_failures.append((v.get('title') or '?',
@@ -9303,12 +9316,19 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
         _record_undownloaded(title, reason)
 
     if not jobs:
+        if already_have and not resolve_failures:
+            print(f"[INFO] Nothing to download: all {len(already_have)} native video(s) are "
+                  f"already present on disk.")
+            return {'ok': 0, 'fail': 0, 'total': 0, 'skipped': len(already_have)}
         if resolve_failures:
-            print(f"{CLR.YELLOW}[INFO]{CLR.RESET} Nothing downloaded: all "
-                  f"{len(resolve_failures)} native video(s) failed to resolve.")
+            _extra = (f" ({len(already_have)} already present, skipped)"
+                      if already_have else "")
+            print(f"{CLR.YELLOW}[INFO]{CLR.RESET} Nothing downloaded: "
+                  f"{len(resolve_failures)} native video(s) failed to resolve{_extra}.")
         else:
             print("[INFO] Nothing to download (native).")
-        return {'ok': 0, 'fail': len(resolve_failures), 'total': len(resolve_failures)}
+        return {'ok': 0, 'fail': len(resolve_failures), 'total': len(resolve_failures),
+                'skipped': len(already_have)}
 
     per_file_bars = len(jobs) <= PER_FILE_BAR_LIMIT
     _seg_workers = _hls_worker_count(max_connections)
@@ -9319,15 +9339,17 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
     overall = None
     if per_file_bars:
         for idx, job in enumerate(jobs):
-            done = sum(1 for (_k, _i, _u, p) in job.tasks if os.path.exists(p) and os.path.getsize(p) > 0)
-            job.bar = make_bar(total=max(len(job.tasks), 1), initial=done, unit='seg',
+            # NOTE: the bar counts PROCESSED TASKS, so it always starts at 0. Workers tick once
+            # per task even for parts already on disk from a previous attempt (those just verify
+            # and fly by). Seeding `initial` with the count of existing parts made n overrun the
+            # total on resume (initial + every task), at which point tqdm drops the total and
+            # shows "1819/?" — the resume looked broken although it was fine.
+            job.bar = make_bar(total=max(len(job.tasks), 1), unit='seg',
                                unit_scale=False, desc=os.path.basename(job.out_path),
                                position=idx, leave=True, mininterval=0.4)
     else:
         total_tasks = sum(len(j.tasks) for j in jobs)
-        done = sum(1 for j in jobs for (_k, _i, _u, p) in j.tasks
-                   if os.path.exists(p) and os.path.getsize(p) > 0)
-        overall = make_bar(total=max(total_tasks, 1), initial=done, unit='seg', unit_scale=False,
+        overall = make_bar(total=max(total_tasks, 1), unit='seg', unit_scale=False,
                            desc=f'{len(jobs)} videos', position=0)
 
     result = {'ok': 0, 'fail': 0}
@@ -9470,7 +9492,9 @@ def download_hls_pooled(videos, session, out_dir, max_connections, max_height, v
         total_failed += missing
         color = CLR.YELLOW
     print(f"\n{color}[INFO] Native videos done: {result['ok']} succeeded, {total_failed} failed, "
-          f"out of {total_attempted}.{CLR.RESET}")
+          f"out of {total_attempted}."
+          + (f" ({len(already_have)} already present, skipped.)" if already_have else "")
+          + f"{CLR.RESET}")
     for title, reason in failures:
         print(f"[WARN] {title}: {reason or 'failed'} (partial segments kept for resume).")
         # NB: these were already handed to _record_failed above, so they flow into the retry loop
@@ -11692,8 +11716,12 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
               ".json next to the script) if the page needs a login.")
     # Load previously harvested web storage (localStorage/sessionStorage) for this host, so a
     # token-based SPA login (kocowa etc.) is restored — cookies alone don't carry those.
+    # NEVER in --login windows though: --login means "give me a clean sign-in". Injecting the
+    # SAVED (possibly expired) tokens there boots the site half-logged-in with a dead session,
+    # the fresh login never happens cleanly, and closing the window harvests the SAME stale
+    # state right back into the jsons — the loop people used to break by deleting the files.
     web_storage_restore = ''
-    _sf = _find_login_storage_file(page_url)
+    _sf = None if login_only else _find_login_storage_file(page_url)
     if _sf:
         try:
             with open(_sf, encoding='utf-8') as f:
@@ -14548,6 +14576,7 @@ if __name__ == "__main__":
     parser.add_argument("--setup", action="store_true", help="Check and install everything the script needs, then exit: required Python modules (via pip) and the external tools ffmpeg + mp4decrypt (downloaded into the script's cache folder if missing, just like a normal run does). Run this once after copying the script to a new machine.")
     parser.add_argument("--test", action="store_true", help="Check that every dependency is present and print a tidy PASS/FAIL report (Python modules, ffmpeg, mp4decrypt, browser support), then exit. Installs nothing — use --setup for that.")
     parser.add_argument("--login-restore", nargs="?", const="", default=None, metavar="URL", help="Rebuild the browser profile's logins from the saved login_*.json (+ .storage.json) files and exit — no manual sign-in. For each site a hidden browser window opens, the saved cookies and web-storage tokens are injected, the site is visited so it persists them into the profile, and the window closes. With a URL: restore only that site's saved login. Without: restore EVERY saved login file found. Use after deleting the .videoloader_browser profile folder. (HttpOnly cookies can't be injected into a page; a site whose login relies solely on one still needs a fresh --login.)")
+    parser.add_argument("--clean", action="store_true", help="Delete the WHOLE browser profile folder (%%LOCALAPPDATA%%\\.videoloader_browser) and exit: cache AND cookies/logins/storage — a factory reset of the built-in browser. Saved login_*.json / login_*.storage.json files next to the script are NOT touched, so --davka-login keeps working and --login-restore can rebuild what it can. Use --clear-browser-cache instead to fix a broken player while KEEPING the login.")
     parser.add_argument("--clear-browser-cache", action="store_true", help="Delete the browser profile's CACHE directories (service workers, code cache, GPU cache) and exit, KEEPING the login/cookies. Fixes a site player that stopped loading in --davka-browser/--davka-login after long use (e.g. the kocowa 'server error') without having to delete the whole profile and log in again. Runs automatically once per run unless BROWSER_CACHE_AUTOCLEAN is off.")
     parser.add_argument("--scan-browser", action="store_true", help="Like --scan but loads the page in a real browser (pywebview) and lets JavaScript run first, so it also finds media added dynamically by players/scripts. Implies --scan; works with --select/--list/--res/--audio/--sub.")
     parser.add_argument("--audio", nargs='?', const='SCAN', default=None, metavar='N', help="For streams with multiple audio tracks (HLS): without a value, lists the tracks and exits; with a value picks them, e.g. --audio 1,3 (or 'all'). Default (no --audio) includes ALL audio tracks.")
@@ -14582,6 +14611,31 @@ if __name__ == "__main__":
         sys.exit(_run_setup(args.verbose))
     if args.test:
         sys.exit(_run_test(args.verbose))
+    if args.clean:
+        _base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
+        _prof = os.path.join(_base, '.videoloader_browser')   # don't call the helper: it mkdirs
+        if os.path.isdir(_prof):
+            _sz = 0
+            for _r, _d, _f in os.walk(_prof):
+                for _fn in _f:
+                    try:
+                        _sz += os.path.getsize(os.path.join(_r, _fn))
+                    except OSError:
+                        pass
+            try:
+                shutil.rmtree(_prof)
+                print(f"[INFO] --clean: deleted the whole browser profile {_prof} "
+                      f"({_sz / (1024 * 1024):.0f} MiB). Cookies/logins inside it are gone; "
+                      f"saved login_*.json files were NOT touched.")
+            except OSError as _e:
+                print(f"{CLR.RED}[ERROR]{CLR.RESET} --clean: could not delete {_prof}: {_e}. "
+                      f"Close any running browser window and try again.")
+                sys.exit(1)
+        else:
+            print("[INFO] --clean: nothing to delete (the browser profile folder does not "
+                  "exist).")
+        sys.exit(0)
+
     if args.clear_browser_cache:
         _n, _mib = _browser_clear_cache(verbose=True)
         if not _n:
@@ -14678,6 +14732,13 @@ if __name__ == "__main__":
         print("[INFO] --browser-login: a window opens on the site. Sign in by hand, then CLOSE "
               "the window. Your login cookies are captured and saved so later runs are logged "
               "in (this works even for HttpOnly/session-cookie logins).")
+        _old_cf = _find_login_cookie_file(args.browser_login)
+        if _old_cf or _find_login_storage_file(args.browser_login):
+            print("[INFO] --browser-login: saved login files for this site exist but are NOT "
+                  "loaded into this window (a clean sign-in on purpose — an expired saved "
+                  "session must not poison the fresh one). They are OVERWRITTEN with the new "
+                  "login when you close the window. If the site still looks broken inside the "
+                  "window, sign out on the site or run --clean first.")
         if profile_dir:
             print(f"[INFO] --browser-login: profile directory is {profile_dir}")
         # Snapshot the profile so we can tell afterwards whether anything was actually written.
