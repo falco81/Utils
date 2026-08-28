@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.21.5"
+SCRIPT_VERSION = "3.21.8"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -5863,6 +5863,7 @@ def _yt_webview_worker(html, conn):
     A separate process avoids pywebview single-start / main-thread limits."""
     try:
         import webview
+        _silence_pywebview_notify_spam()
     except Exception as e:
         try:
             conn.send({'error': 'pywebview not installed: {}'.format(e)})
@@ -10688,6 +10689,79 @@ _BROWSER_COLLECT_JS = r"""
 """
 
 
+import logging as _logging_mod
+
+
+class _NotifySpamFilter(_logging_mod.Filter):
+    """Drops pywebview's 'Exception occurred during on_script_notify' spam (foreign site
+    messages that fail the library's 3-part unpack). Everything else passes."""
+
+    def filter(self, record):
+        try:
+            if 'on_script_notify' in record.getMessage():
+                return False
+        except Exception:
+            pass
+        try:
+            if record.exc_info and record.exc_info[1] is not None \
+                    and 'not enough values to unpack' in str(record.exc_info[1]):
+                return False
+        except Exception:
+            pass
+        return True
+
+
+def _silence_pywebview_notify_spam():
+    """Some sites (oneplay.cz, …) call window.external.notify / WebView2 script-notify with
+    their OWN payloads (feature-probing for TV/embedded hosts). pywebview's edgechromium
+    handler blindly unpacks every such message into its 3-part API format and, when that fails,
+    prints a full '[pywebview] Exception occurred during on_script_notify' traceback — pure
+    console spam, once per message, nothing is actually wrong.
+
+    Two independent layers, because pywebview binds the CLR event delegate in ways a plain
+    class-attribute patch doesn't always intercept (the user's tracebacks showed the original
+    frames only, no wrapper):
+      1) a logging filter on the 'pywebview' logger — the spam is emitted via
+         logger.exception(...), so dropping records that mention on_script_notify silences it
+         no matter how the handler was invoked;
+      2) best-effort wrap of EdgeChrome.on_script_notify so the exception isn't even raised
+         where the binding does go through the class attribute."""
+    import logging as _lg
+    _pv_log = _lg.getLogger('pywebview')
+    if not any(isinstance(f, _NotifySpamFilter) for f in _pv_log.filters):
+        _pv_log.addFilter(_NotifySpamFilter())
+    # The message is emitted through the logger's HANDLERS too (pywebview attaches its own
+    # StreamHandler with the '[pywebview]' prefix); a logger-level filter runs before handlers,
+    # so the above is enough — but belt-and-braces, filter the handlers as well.
+    for _h in list(_pv_log.handlers):
+        if not any(isinstance(f, _NotifySpamFilter) for f in _h.filters):
+            _h.addFilter(_NotifySpamFilter())
+    # And the root handlers: if some pywebview build has no own handler and propagates, the
+    # record is emitted there. The filter's criteria are narrow (on_script_notify / that exact
+    # unpack error), so nothing else is affected.
+    for _h in list(_lg.getLogger().handlers):
+        if not any(isinstance(f, _NotifySpamFilter) for f in _h.filters):
+            _h.addFilter(_NotifySpamFilter())
+    try:
+        from webview.platforms import edgechromium as _ec
+        _cls = getattr(_ec, 'EdgeChrome', None)
+        _orig = getattr(_cls, 'on_script_notify', None)
+        if not _cls or not _orig or getattr(_orig, '_vd_safe', False):
+            return
+        import functools as _ft
+
+        @_ft.wraps(_orig)
+        def _safe(self, *a, **k):
+            try:
+                return _orig(self, *a, **k)
+            except (ValueError, TypeError, KeyError):
+                return None                     # a foreign message, not pywebview's — ignore
+        _safe._vd_safe = True
+        _cls.on_script_notify = _safe
+    except Exception:
+        pass
+
+
 _BROWSER_HOOK_JS = r"""
 (function(){
   // Installed as early as possible, and re-runnable: every call also covers frames that have
@@ -10823,6 +10897,7 @@ def _browser_worker(url, wait_s, conn, opts=None):
             (opts or {}).get('browser_extra_args', ''))
     try:
         import webview
+        _silence_pywebview_notify_spam()
     except Exception as e:
         try:
             conn.send({'error': 'pywebview not installed: {}'.format(e)})
@@ -10884,7 +10959,7 @@ def _browser_worker(url, wait_s, conn, opts=None):
             # the network-event handler (UI thread) — not from the scan loop, which on some builds
             # only gets to run when the window closes. This is what makes the URL show up live and
             # lets the parent close the window immediately.
-            if cls and cls[0] in ('mpd', 'hls'):
+            if cls and cls[0] in ('mpd', 'hls') and not login_only:
                 try:
                     conn.send({'partial': json.dumps({
                         'urls': holder['urls'], 'all': holder['all'],
@@ -11814,8 +11889,12 @@ def _browser_collect_media(page_url, verbose, wait_s=None, session=None, login_o
             if msg.get('partial'):
                 # The worker found a manifest and pushed it the moment the browser fetched it.
                 # Announce it live, and as soon as we have a NON-AD manifest, close the window and
-                # start downloading — in BOTH --davka-browser and --davka-login. Pre-roll ad
-                # manifests come from ad hosts, so we skip those and wait for the real stream.
+                # start downloading — in --davka-browser and --davka-login. NEVER in manual
+                # --login mode though: there the user may well play a video while signing in, and
+                # the window must stay open until THEY close it — killing it on the first
+                # manifest slammed the login window shut mid-use.
+                if login_only:
+                    continue
                 partial = msg['partial']
                 _announce(partial)
                 real = _first_non_ad_manifest(partial, session=session, page_url=page_url,
