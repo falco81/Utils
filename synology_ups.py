@@ -1005,26 +1005,62 @@ def print_full_help(pal):
         print('  ' + pal.info(cmd))
         print('      ' + pal.note(what))
 
-    section('WRITE ACCESS')
-    para('DSM only grants monitoring rights by default, so --set and --exec come '
-         'back as ACCESS-DENIED with the built-in account. Enable SSH in Control '
-         'Panel -> Terminal & SNMP, log in with an administrator account and add '
-         'your own upsd user:')
+    section('WRITE ACCESS - HOW TO SET IT UP')
+    para('Reading needs nothing beyond the network UPS server being switched on. '
+         'Changing anything does, and DSM does not grant it out of the box. This is '
+         'a one-off setup on the NAS.')
     print()
-    for line in ["  sudo tee -a /etc/ups/upsd.users > /dev/null <<'EOT'",
-                 '',
-                 '  [upsadmin]',
-                 '      password = choose-something',
-                 '      actions = SET',
-                 '      instcmds = ALL',
-                 '  EOT',
-                 '',
-                 '  sudo synosystemctl restart ups-usb']:
-        print('  ' + pal.info(line))
+    print('  ' + pal.warn('Why the built-in account is not enough'))
+    para('DSM ships with a upsd account called monuser, password secret, but it is '
+         'declared as "upsmon slave" - monitoring only. Using it gets you past the '
+         'login and straight into ACCESS-DENIED. You need your own account with SET '
+         'and instcmds rights.', indent=4)
     print()
-    para('On older DSM 7 releases the restart command is '
-         '"sudo synoservice --restart ups-usb". DSM updates overwrite upsd.users, so '
-         'if writing suddenly fails with ACCESS-DENIED, add the user again.')
+    print('  ' + pal.key('Step 1 - enable SSH on the NAS'))
+    para('In DSM open Control Panel -> Terminal & SNMP and tick "Enable SSH '
+         'service". Then log in from this machine with an account that has the '
+         'administrator role:', indent=4)
+    print('      ' + pal.info('ssh admin@192.168.1.10'))
+    print()
+    print('  ' + pal.key('Step 2 - add a upsd account'))
+    para('Append a new user to the end of upsd.users. On DSM 7 the file is at '
+         '/etc/ups/upsd.users, on DSM 6 at /usr/syno/etc/ups/upsd.users:', indent=4)
+    for line in ["sudo tee -a /etc/ups/upsd.users > /dev/null <<'EOT'",
+                 '',
+                 '[upsadmin]',
+                 '    password = choose-your-own',
+                 '    actions = SET',
+                 '    instcmds = ALL',
+                 'EOT']:
+        print('      ' + (pal.info(line) if line else ''))
+    para('actions = SET allows --set, instcmds = ALL allows --exec. Grant only one '
+         'of them if that is all you need. The name in brackets is what you pass to '
+         '--username; it has nothing to do with DSM user accounts.', indent=4)
+    print()
+    print('  ' + pal.key('Step 3 - restart the UPS service'))
+    para('upsd reads the file at startup, so it has to be restarted before the new '
+         'account exists:', indent=4)
+    print('      ' + pal.info('sudo synosystemctl restart ups-usb'))
+    para('On older DSM 7 releases the command is:', indent=4)
+    print('      ' + pal.info('sudo synoservice --restart ups-usb'))
+    para('This restarts the driver too, so for a few seconds the NAS loses contact '
+         'with the UPS and readings will be stale or unavailable.', indent=4)
+    print()
+    print('  ' + pal.key('Step 4 - use it'))
+    print('      ' + pal.info('synology_ups.py 192.168.1.10 --exec beeper.disable '
+                              '--username upsadmin'))
+    para('The password is asked for interactively and echoed as asterisks, so it '
+         'never lands in your shell history. Pass --password only in scripts. If '
+         'something is refused, the script translates the terse upsd error - '
+         'USERNAME-REQUIRED, ACCESS-DENIED, INVALID-VALUE and the rest - into a '
+         'sentence saying what to do about it.', indent=4)
+    print()
+    print('  ' + pal.warn('Keep in mind'))
+    para('DSM updates regenerate their UPS configuration and quietly drop this user. '
+         'If writing worked and later starts failing with ACCESS-DENIED, that is '
+         'why - repeat steps 2 and 3. Also note that bash history on DSM is kept in '
+         '/var/tmp/.bash_history, so clear it if you would rather the password not '
+         'sit there.', indent=4)
 
     section('WHAT SURVIVES A RESTART')
     para('This depends on the UPS, not on the NAS. Settings the UPS keeps in its own '
