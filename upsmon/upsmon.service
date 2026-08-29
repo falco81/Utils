@@ -1,0 +1,54 @@
+[Unit]
+Description=UPS monitoring daemon (NUT poller, history, localhost API)
+Documentation=file:/usr/local/lib/upsmon/INSTALL.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/upsmon/upsmon.py
+Restart=on-failure
+RestartSec=10
+
+# Nothing here needs privilege: the daemon only opens a TCP connection to the
+# NAS and writes its own database. It runs as its own user, and the web server
+# reaches it through the localhost API, never through the filesystem.
+User=upsmon
+Group=upsmon
+
+# /run/upsmon is recreated on every boot, which is where the API token lives.
+# 0750 plus nginx being a member of the upsmon group is what lets PHP read it.
+RuntimeDirectory=upsmon
+RuntimeDirectoryMode=0750
+StateDirectory=upsmon
+StateDirectoryMode=0750
+# StateDirectory already grants this, but naming it explicitly means a
+# hand-created /var/lib/upsmon with the wrong ownership fails loudly at start
+# rather than looking like a read-only database later.
+ReadWritePaths=/var/lib/upsmon
+
+# A poll every ten seconds and a small SQLite write every minute. These caps are
+# a backstop the daemon should never come near.
+CPUQuota=15%
+MemoryMax=150M
+Nice=10
+IOSchedulingClass=idle
+
+# It reads one config file and writes one directory. Everything else is closed.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target
