@@ -41,6 +41,7 @@ import sys
 import time
 from datetime import datetime
 
+__version__ = '1.0.0'
 DEFAULT_PORT = 3493
 
 # ---------------------------------------------------------------------------
@@ -365,6 +366,14 @@ DESCRIPTIONS = {
     'ups.timer.start': 'Start timer (seconds)',
     'ups.productid': 'USB product ID',
     'ups.vendorid': 'USB vendor ID',
+    'ups.mfr.date': 'Date the UPS was manufactured',
+    'ups.timer.reboot': 'Countdown to a pending reboot (s); 0 or -1 means none',
+    'battery.mfr.date': 'Battery date - on APC units this is the date the battery '
+                        'was last declared new, so set it when you replace one',
+    'battery.voltage.low': 'Battery voltage treated as empty (V)',
+    'battery.voltage.high': 'Battery voltage treated as full (V)',
+    'battery.protection': 'Deep discharge protection',
+    'battery.energysave': 'Energy saving mode',
     'ups.start.battery': 'Allow cold start from battery with no mains present',
     'output.frequency.nominal': 'Nominal output frequency (Hz)',
     'outlet.desc': 'Outlet description (label only, held by the driver)',
@@ -446,6 +455,14 @@ def describe_variable(name):
             qualifiers.append(QUALIFIER_WORDS[piece])
         else:
             qualifiers.append(piece.replace('-', ' '))
+
+    # "mfr" followed by "date" is a manufacturing date, not a manufacturer.
+    if measure == 'manufacturer' and 'date' in tail:
+        measure = 'manufacturing date'
+        qualifiers = [q for q in qualifiers if q != 'date']
+    elif measure == 'manufacturer' and 'time' in tail:
+        measure = 'manufacturing time'
+        qualifiers = [q for q in qualifiers if q != 'time']
 
     if measure is None and not qualifiers:
         return ''
@@ -680,12 +697,60 @@ def battery_age_text(pal, raw, life_years):
     return pal.ok('%s  (%s old)' % (raw, age))
 
 
-def print_writable(pal, client, ups):
+def console_width(default=100):
+    try:
+        import shutil
+        return shutil.get_terminal_size((default, 25)).columns
+    except Exception:
+        return default
+
+
+def print_command_rows(pal, rows):
+    """Print (command, dangerous, description) with the markers in one column."""
+    if not rows:
+        return
+    name_width = max(len(name) for name, _, _ in rows)
+    text_width = max(len(text) for _, _, text in rows)
+    any_danger = any(danger for _, danger, _ in rows)
+    marker = '[DANGEROUS]'
+    trailing_width = 2 + name_width + 3 + text_width + 2 + len(marker)
+    trailing = trailing_width <= console_width()
+
+    for name, danger, text in rows:
+        label = (pal.bad if danger else pal.info)(name.ljust(name_width))
+        if not any_danger:
+            print('  %s   %s' % (label, pal.note(text)))
+        elif trailing:
+            # Markers line up in a column past the longest description.
+            tail = pal.bad('  ' + marker) if danger else ''
+            body = pal.note(text.ljust(text_width)) if danger else pal.note(text)
+            print('  %s   %s%s' % (label, body, tail))
+        else:
+            # Narrow console: the marker goes between name and description.
+            flag = pal.bad(marker) if danger else ' ' * len(marker)
+            print('  %s  %s  %s' % (label, flag, pal.note(text)))
+
+
+def banner(pal, host=None, ups=None, server=None):
+    """One identifying line printed at the top of every command's output."""
+    bits = ['synology_ups.py v' + __version__]
+    if host:
+        bits.append('NAS: ' + host)
+    if ups:
+        bits.append('UPS: ' + ups)
+    if server:
+        bits.append('upsd: ' + server)
+    bits.append(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+    return pal.note('   |   '.join(bits))
+
+
+def print_writable(pal, client, ups, host=None):
     """Show every writable variable together with its accepted values."""
     rw = client.list_rw(ups)
     bar = '=' * 78
     print(pal.rule(bar))
     print('  ' + pal.title('Writable variables on "%s"' % ups))
+    print('  ' + banner(pal, host, ups))
     print(pal.rule(bar))
     if not rw:
         print('  ' + pal.warn('This UPS/driver exposes no writable variables.'))
@@ -706,13 +771,9 @@ def print_writable(pal, client, ups):
     print('\n' + pal.group('-- INSTANT COMMANDS ') + pal.rule('-' * 57))
     if not cmds:
         print('  ' + pal.warn('This UPS/driver exposes no instant commands.'))
-    for c in sorted(cmds):
-        danger = is_dangerous(c)
-        padded = c.ljust(26)
-        label = pal.bad(padded) if danger else pal.info(padded)
-        text = command_help(c, client.get_cmddesc(ups, c))
-        marker = pal.bad('  [DANGEROUS]') if danger else ''
-        print('  %s %s%s' % (label, pal.note(text), marker))
+    rows = [(c, is_dangerous(c), command_help(c, client.get_cmddesc(ups, c)))
+            for c in sorted(cmds)]
+    print_command_rows(pal, rows)
     print('\n' + pal.rule(bar))
     print('  ' + pal.note('Use --set VAR=VALUE to change a variable, '
                           '--exec COMMAND to run a command.'))
@@ -734,9 +795,7 @@ def print_report(pal, entry, host, life_years=4.0):
         entry_desc = ''
     header = 'UPS "%s"%s' % (ups, ('  -  ' + entry_desc) if entry_desc else '')
     print('  ' + pal.title(header))
-    print('  ' + pal.note('NAS: %s   |   upsd: %s   |   %s'
-                          % (host, entry['server'],
-                             datetime.now().strftime('%Y-%m-%d %H:%M:%S'))))
+    print('  ' + banner(pal, host, server=entry['server']))
     print(pal.rule(bar))
 
     # ---- summary ----
@@ -807,17 +866,16 @@ def print_report(pal, entry, host, life_years=4.0):
     if cmds:
         print('\n' + pal.group('-- SUPPORTED COMMANDS ') + pal.rule('-' * 55))
         cmd_desc = entry.get('command_descriptions', {})
-        for c in sorted(cmds):
-            danger = is_dangerous(c)
-            padded = c.ljust(26)
-            label = pal.bad(padded) if danger else pal.info(padded)
-            text = command_help(c, cmd_desc.get(c, ''))
-            marker = pal.bad('  [DANGEROUS]') if danger else ''
-            print('  %s %s%s' % (label, pal.note(text), marker))
+        print_command_rows(pal, [(c, is_dangerous(c), command_help(c, cmd_desc.get(c, '')))
+                                 for c in sorted(cmds)])
 
     print('\n' + pal.rule(bar))
-    print('  ' + pal.note('Variables: %d   |   writable: %d   |   commands: %d'
-                          % (len(variables), len(rw), len(cmds))))
+    if entry.get('commands_queried'):
+        cmd_text = 'commands: %d' % len(cmds)
+    else:
+        cmd_text = 'commands: not listed, add --commands'
+    print('  ' + pal.note('Variables: %d   |   writable: %d   |   %s'
+                          % (len(variables), len(rw), cmd_text)))
     print(pal.rule(bar))
 
 
@@ -866,6 +924,7 @@ def collect(args):
                 'vars': variables,
                 'rw': rw,
                 'commands': cmds,
+                'commands_queried': bool(args.commands),
                 'command_descriptions': command_descriptions,
                 'descriptions': descriptions,
             })
@@ -889,7 +948,9 @@ def print_full_help(pal):
             print(' ' * indent + line)
 
     print(pal.rule('=' * 78))
-    print('  ' + pal.title('synology_ups.py - read and control a UPS attached to a Synology NAS'))
+    print('  ' + pal.title('synology_ups.py - read and control a UPS attached to '
+                           'a Synology NAS'))
+    print('  ' + pal.note('version ' + __version__))
     print(pal.rule('=' * 78))
 
     section('USAGE')
@@ -962,6 +1023,20 @@ def print_full_help(pal):
     opt('--exec COMMAND',
         'Run an instant command, for example beeper.disable or '
         'test.battery.start.quick. Repeat the option to run several in order.')
+    para('When the command starts something that takes time - any battery test, a '
+         'panel test, a simulated failure, or a calibration - the script stays '
+         'connected afterwards and prints a line whenever the readings change, so '
+         'you can watch the battery voltage sag under load and see the verdict as '
+         'soon as the UPS reports it. It ends with the lowest voltage and charge '
+         'seen during the test, which says more about battery health than the '
+         'pass/fail result on its own. Ctrl+C stops watching; the test carries on '
+         'inside the UPS either way.')
+    opt('--no-follow', 'Return to the prompt immediately instead of watching.')
+    opt('--follow', 'Watch after any command, not just the ones that start a test.')
+    opt('--follow-seconds SECONDS',
+        'Give up watching after this long. The default depends on the command: two '
+        'minutes for a quick test, fifteen for a deep one, an hour for a '
+        'calibration.')
     opt('--yes',
         'Permit commands that would switch the outlets off. Without this, anything '
         'that would cut power to the NAS itself is refused, because the NAS would '
@@ -1326,6 +1401,217 @@ def resolve_credentials(pal, args):
     return username, password
 
 
+# Commands worth staying connected for: they start something that takes time
+# and changes readings while it runs.
+FOLLOWABLE_COMMANDS = {
+    'test.battery.start': 120,
+    'test.battery.start.quick': 120,
+    'test.battery.start.deep': 900,
+    'test.system.start': 120,
+    'test.panel.start': 60,
+    'test.failure.start': 300,
+    'calibrate.start': 3600,
+}
+
+# Values ups.test.result takes while a test is still running.
+RUNNING_RESULTS = ('in progress', 'pending', 'scheduled', 'running')
+BUSY_FLAGS = {'OB', 'DISCHRG', 'CAL', 'TEST'}
+
+
+def _test_running(variables, baseline_result):
+    result = variables.get('ups.test.result', '').lower()
+    if any(word in result for word in RUNNING_RESULTS):
+        return True
+    flags = set(variables.get('ups.status', '').split())
+    return bool(flags & BUSY_FLAGS)
+
+
+def follow_test(pal, client, ups, cmd, limit=None):
+    """Stay connected after starting a test and report what the UPS does."""
+    if limit is None:
+        limit = FOLLOWABLE_COMMANDS.get(cmd, 120)
+
+    watched = ['ups.status', 'battery.charge', 'battery.voltage',
+               'battery.runtime', 'ups.test.result']
+    started = time.time()
+    variables = client.list_vars(ups)
+    baseline_result = variables.get('ups.test.result', '')
+
+    is_test = cmd in FOLLOWABLE_COMMANDS
+    print('\n' + pal.title('Following %s' % cmd)
+          + pal.note('  -  Ctrl+C stops watching, the UPS carries on regardless'))
+    print('  ' + pal.key('%-7s %-16s %-8s %-9s %-10s %s'
+                         % ('time', 'status', 'charge', 'voltage', 'runtime',
+                            'test result')))
+
+    def row(elapsed, v):
+        runtime = v.get('battery.runtime', '')
+        pretty = human_runtime(runtime) or runtime
+        status = v.get('ups.status', '')
+        status_text = (pal.warn(status.ljust(16)) if set(status.split()) & BUSY_FLAGS
+                       else pal.ok(status.ljust(16)))
+        print('  %-7s %s %-8s %-9s %-10s %s'
+              % ('%ds' % elapsed, status_text,
+                 (v.get('battery.charge', '') + ' %'),
+                 (v.get('battery.voltage', '') + ' V'),
+                 pretty, pal.note(v.get('ups.test.result', ''))))
+
+    def snapshot(v):
+        return tuple(v.get(k, '') for k in watched)
+
+    last = None
+    last_print = 0.0
+    seen_running = False
+    min_voltage = None
+    min_charge = None
+    voltages_seen = set()
+    charges_seen = set()
+    busy_since = None
+    busy_until = None
+    discharge_seconds = 0.0
+    discharge_flags = {'OB', 'DISCHRG'}
+    last_sample = None
+    outcome = None
+
+    try:
+        while True:
+            elapsed = time.time() - started
+            variables = client.list_vars(ups)
+
+            try:
+                voltage = float(variables.get('battery.voltage', 'nan'))
+                min_voltage = voltage if min_voltage is None else min(min_voltage, voltage)
+                voltages_seen.add(voltage)
+            except ValueError:
+                pass
+            try:
+                charge = float(variables.get('battery.charge', 'nan'))
+                min_charge = charge if min_charge is None else min(min_charge, charge)
+                charges_seen.add(charge)
+            except ValueError:
+                pass
+
+            now = time.time()
+            if set(variables.get('ups.status', '').split()) & discharge_flags:
+                discharge_seconds += (now - last_sample) if last_sample else 0.0
+            last_sample = now
+
+            current = snapshot(variables)
+            if current != last or elapsed - last_print >= 5:
+                row(int(elapsed), variables)
+                last, last_print = current, elapsed
+
+            running = _test_running(variables, baseline_result)
+            if running:
+                if busy_since is None:
+                    busy_since = time.time()
+                busy_until = time.time()
+                seen_running = True
+            elif seen_running:
+                outcome = variables.get('ups.test.result', '')
+                break
+            elif elapsed > 20 and variables.get('ups.test.result', '') != baseline_result:
+                outcome = variables.get('ups.test.result', '')
+                break
+            elif elapsed > 20:
+                break
+
+            if elapsed >= limit:
+                if seen_running:
+                    print('  ' + pal.warn('Still running after %ds - no longer '
+                                          'watching. Check ups.test.result later.'
+                                          % int(limit)))
+                elif is_test:
+                    print('  ' + pal.warn('Nothing changed within %ds. The UPS may '
+                                          'have declined the test.' % int(limit)))
+                else:
+                    print('  ' + pal.note('Watched for %ds, nothing changed.'
+                                          % int(limit)))
+                return
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        print('\n  ' + pal.note('Stopped watching. The UPS carries on regardless.'))
+        return
+
+    elapsed = int(time.time() - started)
+    if outcome:
+        good = 'pass' in outcome.lower()
+        verdict = pal.ok(outcome) if good else pal.warn(outcome)
+        print('\n  ' + pal.title('Finished after %ds: ' % elapsed) + verdict)
+    else:
+        print('\n  ' + pal.warn('No change observed in %ds.' % elapsed))
+        print('  ' + pal.note('The UPS may have finished between polls - the driver '
+                              'only refreshes every few seconds. Current result: %s'
+                              % (baseline_result or 'not reported')))
+
+    on_battery = int(round(discharge_seconds))
+    if busy_since is not None and busy_until is not None:
+        print('  ' + pal.note('The test ran for about %ds.'
+                              % max(1, int(round(busy_until - busy_since)))))
+    if on_battery:
+        print('  ' + pal.note('Of that, the status showed a discharge for roughly '
+                              '%ds - the rest was the UPS recharging between '
+                              'stages.' % on_battery))
+    elif seen_running:
+        print('  ' + pal.note('The status never showed a discharge, so the switch '
+                              'to battery fell between polls.'))
+
+    if min_voltage is not None and len(voltages_seen) > 1:
+        note = 'Battery dipped to %.1f V' % min_voltage
+        if min_charge is not None and len(charges_seen) > 1:
+            note += ' and %d%%' % min_charge
+        print('  ' + pal.note(note + ' while under test.'))
+        nominal = variables.get('battery.voltage.nominal')
+        try:
+            if nominal and min_voltage < float(nominal) * 0.92:
+                print('  ' + pal.warn('That is well under the %s V nominal - worth '
+                                      'watching if it keeps dropping.' % nominal))
+        except ValueError:
+            pass
+    elif min_voltage is not None:
+        raw_pollfreq = variables.get('driver.parameter.pollfreq', '30')
+        try:
+            pollfreq = float(raw_pollfreq)
+        except ValueError:
+            pollfreq = 30.0
+        print('  ' + pal.note('battery.voltage stayed at %.1f V throughout.'
+                              % min_voltage))
+        if on_battery < pollfreq:
+            print('  ' + pal.note('The driver refreshes that value only every %s s, '
+                                  'and the load was on battery for less than that, '
+                                  'so the dip fell between two polls.' % raw_pollfreq))
+        else:
+            print('  ' + pal.note('The load was on battery for longer than the %s s '
+                                  'poll cycle, so the value should have moved. This '
+                                  'model may simply not report voltage changes to '
+                                  'the driver.' % raw_pollfreq))
+        print('  ' + pal.note('To judge the battery by voltage, watch a real '
+                              'discharge: run --watch 5 and pull the mains plug for '
+                              'a minute, or start test.battery.start.deep.'))
+
+
+def wait_for_value(client, ups, var, expected, variables=None, limit=None):
+    """Poll a variable until the driver reports the new value.
+
+    usbhid-ups only refreshes its cache every driver.parameter.pollinterval
+    seconds, so a value read back immediately after SET is still the old one.
+    """
+    if limit is None:
+        try:
+            interval = float((variables or {}).get(
+                'driver.parameter.pollinterval', 5))
+        except (TypeError, ValueError):
+            interval = 5.0
+        limit = max(6.0, interval * 3)
+    deadline = time.time() + limit
+    current = None
+    while True:
+        current = client.list_vars(ups).get(var, '<unknown>')
+        if current == expected or time.time() >= deadline:
+            return current
+        time.sleep(1.0)
+
+
 def run_write_actions(pal, args):
     """Handle --list-rw, --set and --exec."""
     username, password = resolve_credentials(pal, args)
@@ -1335,9 +1621,10 @@ def run_write_actions(pal, args):
         ups = resolve_ups(c, args.ups)
 
         if args.list_rw:
-            print_writable(pal, c, ups)
+            print_writable(pal, c, ups, args.host)
             return 0
 
+        print(banner(pal, args.host, ups))
         failed = False
         for item in args.set_vars:
             if '=' not in item:
@@ -1372,15 +1659,20 @@ def run_write_actions(pal, args):
                 except ValueError:
                     pass
             try:
-                before = c.list_vars(ups).get(var, '<unknown>')
+                variables = c.list_vars(ups)
+                before = variables.get(var, '<unknown>')
                 c.set_var(ups, var, value)
-                time.sleep(1.0)  # give the driver a moment to write it back
-                after = c.list_vars(ups).get(var, '<unknown>')
-                print(pal.ok('SET  ') + '%s: %s -> %s' % (var, before, pal.value(after)))
-                if after != value:
-                    print('     ' + pal.warn('The UPS reports "%s", not "%s". '
-                                             'It may have clamped or rejected the value.'
-                                             % (after, value)))
+                after = wait_for_value(c, ups, var, value, variables)
+                if after == value:
+                    print(pal.ok('SET  ') + '%s: %s -> %s'
+                          % (var, before, pal.value(after)))
+                else:
+                    print(pal.warn('SET  ') + '%s: accepted, but the UPS reports %s'
+                          % (var, pal.value(after)))
+                    print('     ' + pal.note(
+                        'Either the UPS adjusted the value to something it supports, '
+                        'or the driver has not polled it back yet. Check again with '
+                        '--list-rw in a few seconds.'))
             except NUTError as e:
                 failed = True
                 print(pal.bad('SET  ') + '%s failed: %s' % (var, e))
@@ -1396,6 +1688,8 @@ def run_write_actions(pal, args):
             try:
                 c.instcmd(ups, cmd)
                 print(pal.ok('EXEC ') + '%s accepted' % cmd)
+                if not args.no_follow and (cmd in FOLLOWABLE_COMMANDS or args.follow):
+                    follow_test(pal, c, ups, cmd, args.follow_seconds)
             except NUTError as e:
                 failed = True
                 print(pal.bad('EXEC ') + '%s failed: %s' % (cmd, e))
@@ -1415,6 +1709,8 @@ def main():
                         help='show the full manual with examples and explanations')
     parser.add_argument('--usage', action='store_true',
                         help='show the short option summary instead')
+    parser.add_argument('--version', action='version',
+                        version='synology_ups.py ' + __version__)
     parser.add_argument('host', help='IP address or hostname of the Synology NAS')
     parser.add_argument('-p', '--port', type=int, default=DEFAULT_PORT,
                         help='upsd port (default 3493)')
@@ -1444,6 +1740,14 @@ def main():
                              '(may be repeated)')
     parser.add_argument('--yes', action='store_true',
                         help='allow commands that would cut power to the load')
+    parser.add_argument('--follow', action='store_true',
+                        help='after --exec, keep watching the UPS even for commands '
+                             'that are not tests')
+    parser.add_argument('--no-follow', action='store_true',
+                        help='return to the prompt immediately after --exec')
+    parser.add_argument('--follow-seconds', type=float, metavar='SECONDS',
+                        help='how long to keep watching before giving up '
+                             '(default depends on the command)')
     parser.add_argument('--mask-char', default='*', metavar='CHAR',
                         help='character echoed for each password character (default *)')
     parser.add_argument('--no-mask', action='store_true',
