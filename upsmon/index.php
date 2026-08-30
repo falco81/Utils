@@ -387,7 +387,8 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
   /* ---- interactive charts ---- */
   .cwrap{position:relative}
   .cwrap svg{cursor:grab;touch-action:none}
-  .cwrap svg.dragging{cursor:grabbing}
+  .cwrap.dragging svg{cursor:grabbing}
+  .cwrap.dragging{user-select:none}
   .chint{position:absolute;top:6px;right:8px;font-size:11.5px;color:var(--tx-mut);
     background:rgba(13,17,23,.82);padding:3px 9px;border-radius:7px;pointer-events:none;
     opacity:0;transition:opacity .18s}
@@ -499,6 +500,10 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
     <div class="card full">
       <h2>Last 24 hours</h2>
       <div class="cwrap" id="chart-quick"></div>
+    </div>
+    <div class="card full">
+      <h2>Power drawn, last 24 hours</h2>
+      <div class="cwrap" id="chart-quick-power"></div>
     </div>
   </div>
 
@@ -917,7 +922,7 @@ function wireChart(id, view) {
 
   // ---- hover readout ----
   svg.addEventListener('mousemove', function (e) {
-    if (svg.classList.contains('dragging')) return;
+    if (container.classList.contains('dragging')) return;
     var ts = tsAt(e.clientX);
     var nearest = null, best = Infinity;
     view.rows.forEach(function (r) {
@@ -954,30 +959,51 @@ function wireChart(id, view) {
   });
 
   // ---- drag to pan ----
-  var dragFrom = null;
-  svg.addEventListener('pointerdown', function (e) {
-    dragFrom = { x: e.clientX, t0: state.from, t1: state.to };
-    svg.classList.add('dragging');
-    svg.setPointerCapture(e.pointerId);
-    tip.classList.remove('show');
-  });
-  svg.addEventListener('pointermove', function (e) {
+  // Redrawing replaces the whole <svg>, which would tear the listeners and the
+  // pointer capture out from under a drag in progress. So the drag is followed
+  // on the window instead: the element under the pointer can be rebuilt as
+  // often as we like and the gesture carries on regardless.
+  var dragFrom = null, dragFrame = null;
+
+  function onDragMove(e) {
     if (!dragFrom) return;
-    var box = svg.getBoundingClientRect();
-    var plotWidth = box.width * (view.W - view.padL - view.padR) / view.W;
+    e.preventDefault();
+    var plotWidth = dragFrom.width * (view.W - view.padL - view.padR) / view.W;
     var perPixel = (dragFrom.t1 - dragFrom.t0) / plotWidth;
     var shift = -(e.clientX - dragFrom.x) * perPixel;
     applyView(id, dragFrom.t0 + shift, dragFrom.t1 + shift);
-  });
-  function endDrag(e) {
+    // One redraw per displayed frame, no matter how fast the mouse reports.
+    if (dragFrame === null) {
+      dragFrame = requestAnimationFrame(function () {
+        dragFrame = null;
+        if (dragFrom) renderChart(id);
+      });
+    }
+  }
+
+  function endDrag() {
     if (!dragFrom) return;
     dragFrom = null;
-    svg.classList.remove('dragging');
-    try { svg.releasePointerCapture(e.pointerId); } catch (err) {}
+    if (dragFrame !== null) { cancelAnimationFrame(dragFrame); dragFrame = null; }
+    container.classList.remove('dragging');
+    window.removeEventListener('pointermove', onDragMove);
+    window.removeEventListener('pointerup', endDrag);
+    window.removeEventListener('pointercancel', endDrag);
     renderChart(id);
   }
-  svg.addEventListener('pointerup', endDrag);
-  svg.addEventListener('pointercancel', endDrag);
+
+  svg.addEventListener('pointerdown', function (e) {
+    if (e.button !== undefined && e.button !== 0) return;   // left button only
+    e.preventDefault();
+    dragFrom = { x: e.clientX, t0: state.from, t1: state.to,
+                 width: svg.getBoundingClientRect().width };
+    container.classList.add('dragging');
+    tip.classList.remove('show');
+    cross.setAttribute('opacity', '0');
+    window.addEventListener('pointermove', onDragMove);
+    window.addEventListener('pointerup', endDrag);
+    window.addEventListener('pointercancel', endDrag);
+  });
 
   // ---- wheel to zoom, anchored on the pointer ----
   svg.addEventListener('wheel', function (e) {
@@ -1274,15 +1300,25 @@ function applyPowerFallback(spec, rows) {
 }
 
 function loadQuickChart() {
+  // One request feeds both overview charts; they cover the same period.
   return api("history&range=24h&points=400").then(function (data) {
     var rows = (data && data.samples) || [];
     drawChart($("chart-quick"), {
-      rows: rows, min: 0, max: 100, digits: 0, unit: "percent · red bands are power failures",
+      rows: rows, min: 0, max: 100, digits: 0,
+      unit: "percent · red bands are power failures",
       series: [
         { key: "charge", label: "Battery charge", color: "var(--ok)" },
         { key: "load",   label: "Load",           color: "var(--load)" }
       ]
     });
+
+    var power = {
+      rows: rows, min: 0, digits: 0, unit: "watts",
+      series: [{ key: "realpower", label: "Power", color: "var(--warn)" }]
+    };
+    // Models that do not measure watts get the figure worked out from load.
+    applyPowerFallback(power, rows);
+    drawChart($("chart-quick-power"), power);
   });
 }
 
