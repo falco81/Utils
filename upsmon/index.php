@@ -188,6 +188,10 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
 <title><?= h($model) ?> — UPS status</title>
+<link rel="icon" href="favicon.svg" type="image/svg+xml" id="favicon">
+<link rel="alternate icon" href="favicon.ico" sizes="any">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<meta name="theme-color" content="#161b22">
 <style>
   :root{
     --bg:#0d1117; --panel:#161b22; --panel2:#1c222b; --line:#262c37;
@@ -283,6 +287,20 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
   .btn.danger:hover:not(:disabled){background:var(--crit-bg);border-color:var(--crit)}
   .btn.busy{opacity:.6;cursor:progress}
   .btnrow{display:flex;gap:9px;flex-wrap:wrap}
+  .btn.cmd{display:inline-flex;align-items:center;gap:9px;padding:10px 16px}
+  .btn.cmd svg{flex:0 0 auto;opacity:.85}
+  .btn.cmd:hover:not(:disabled) svg{opacity:1}
+
+  .hint{position:fixed;z-index:200;max-width:min(340px,88vw);
+    background:linear-gradient(160deg,#1b2230 0%,#141922 100%);
+    border:1px solid #2b3444;border-radius:12px;padding:11px 14px;
+    font-size:12.5px;line-height:1.5;color:var(--tx-dim);
+    box-shadow:0 14px 40px rgba(0,0,0,.55);
+    opacity:0;transform:translateY(4px);transition:opacity .14s,transform .14s;
+    pointer-events:none}
+  .hint.show{opacity:1;transform:none}
+  .hint b{color:var(--tx);font-weight:600;font-family:ui-monospace,Menlo,Consolas,monospace}
+  .hint em{color:var(--crit);font-style:normal}
   .btnhelp{color:var(--tx-mut);font-size:12.5px;margin:6px 0 16px}
 
   input[type=text],select{background:var(--bg);border:1px solid var(--line);color:var(--tx);
@@ -356,6 +374,13 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
   .pinerr{min-height:19px;margin:8px 0 16px;font-size:13px;color:var(--crit)}
   .pinrow{display:flex;gap:10px;justify-content:center}
   .pinrow .btn{min-width:108px;justify-content:center}
+  .pinicon.danger{color:var(--crit);
+    background:radial-gradient(circle at 50% 35%,rgba(248,81,73,.26),rgba(248,81,73,.07));
+    border-color:rgba(248,81,73,.34)}
+  .btn.primary.danger{background:var(--crit-bg);border-color:rgba(248,81,73,.45);
+    color:var(--crit)}
+  .btn.primary.danger:hover:not(:disabled){background:rgba(248,81,73,.2);
+    border-color:var(--crit)}
   .btn.primary{background:var(--info-bg);border-color:rgba(88,166,255,.4);color:var(--info)}
   .btn.primary:hover:not(:disabled){background:rgba(88,166,255,.2);border-color:var(--info)}
 
@@ -612,6 +637,24 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
 </div><!-- /wrap -->
 
 <!-- PIN dialog -->
+<div class="backdrop" id="askback" hidden>
+  <div class="pinbox" role="dialog" aria-modal="true" aria-labelledby="asktitle">
+    <div class="pinicon danger" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="26" height="26" fill="none" stroke="currentColor"
+           stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M12 3.8 2.6 19.2a1.4 1.4 0 0 0 1.2 2.1h16.4a1.4 1.4 0 0 0 1.2-2.1z"/>
+        <path d="M12 9.5v4.4"/><path d="M12 17.2h.01"/>
+      </svg>
+    </div>
+    <h3 id="asktitle">Are you sure?</h3>
+    <p class="pinwhat" id="askwhat"></p>
+    <div class="pinrow">
+      <button class="btn" id="askcancel">Cancel</button>
+      <button class="btn primary danger" id="askok">Confirm</button>
+    </div>
+  </div>
+</div>
+
 <div class="backdrop" id="pinback" hidden>
   <div class="pinbox" role="dialog" aria-modal="true" aria-labelledby="pintitle">
     <div class="pinicon" aria-hidden="true">
@@ -1039,6 +1082,7 @@ function renderSnapshot(snap) {
     ({ ok: "All good", warn: "Needs attention", crit: "Problem" }[snap.level] || "No data");
 
   $("stamp").textContent = snap.generated ? stamp(snap.generated) + " · " + ago(snap.generated) : "—";
+  setFavicon(snap.level || "unknown");
 
   // status
   var flags = (v["ups.status"] || "").split(" ").filter(Boolean);
@@ -1632,14 +1676,11 @@ function renderTestButtons() {
     return;
   }
   commands.forEach(function (c) {
-    var button = el("button", "btn" + (c.dangerous ? " danger" : ""), c.name);
-    button.title = c.help;
-    button.onclick = function () {
+    host.appendChild(commandButton(c, function (button) {
       runCommand(c, button);
       $("test-running").hidden = false;
       setTimeout(loadTests, 3000);
-    };
-    host.appendChild(button);
+    }));
   });
 }
 
@@ -1692,30 +1733,25 @@ function renderCommands(caps) {
     }
     var row = el("div", "btnrow");
     members.forEach(function (c) {
-      var button = el("button", "btn" + (c.dangerous ? " danger" : ""), c.name);
-      button.title = c.help;
+      var button = commandButton(c, function (b) { runCommand(c, b); });
       if (c.dangerous && !caps.allow_dangerous) button.disabled = true;
-      button.onclick = function () { runCommand(c, button); };
       row.appendChild(button);
     });
     host.appendChild(row);
-    var help = el("div", "btnhelp");
-    members.forEach(function (c) {
-      var line = el("div");
-      line.appendChild(el("strong", null, c.name + " — "));
-      line.appendChild(document.createTextNode(c.help));
-      help.appendChild(line);
-    });
-    host.appendChild(help);
   });
 }
 
 function runCommand(command, button) {
-  if (command.dangerous &&
-      !confirm(command.name + "\n\n" + command.help +
-               "\n\nThis will cut power to everything on the UPS. Continue?")) {
-    return;
-  }
+  var gate = command.dangerous
+    ? askConfirm("<b>" + command.name + "</b><br>" + command.help
+                 + "<br><br>This cuts power to everything plugged into the UPS, "
+                 + "which may include the machine showing this page.",
+                 { title: "Switch the power off?", confirmLabel: "Do it" })
+    : Promise.resolve(true);
+  gate.then(function (agreed) { if (agreed) startCommand(command, button); });
+}
+
+function startCommand(command, button) {
   var what = 'Run <b>' + command.name + '</b><br>' + command.help;
   button.disabled = true;
   button.classList.add("busy");
@@ -1744,22 +1780,262 @@ function runCommand(command, button) {
 }
 
 
+
+
+
+// ---------------------------------------------------------------------------
+// Favicon
+// ---------------------------------------------------------------------------
+// The tab is often the only part of this page anyone can see. Colouring the
+// icon by the verdict means a problem is visible without switching to it.
+var FAVICON_COLOURS = {
+  ok:      ["#3fb950", "#2ea043"],
+  warn:    ["#d29922", "#b8860b"],
+  crit:    ["#f85149", "#da3633"],
+  unknown: ["#6e7681", "#57606a"]
+};
+var faviconLevel = null;
+
+function faviconSvg(level) {
+  var colours = FAVICON_COLOURS[level] || FAVICON_COLOURS.unknown;
+  return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    + '<defs><linearGradient id="c" x1="0" y1="0" x2="0" y2="1">'
+    + '<stop offset="0" stop-color="' + colours[0] + '"/>'
+    + '<stop offset="1" stop-color="' + colours[1] + '"/></linearGradient>'
+    + '<mask id="b"><rect width="64" height="64" fill="#fff"/>'
+    + '<path d="M34.5 20 24 35h7l-2.5 11L39 31h-7z" fill="#000"/></mask></defs>'
+    + '<rect width="64" height="64" rx="14" fill="#161b22"/>'
+    + '<rect x="26" y="8" width="12" height="5" rx="2" fill="#8b94a3"/>'
+    + '<rect x="15" y="13" width="34" height="43" rx="7" fill="none" '
+    + 'stroke="#8b94a3" stroke-width="3.5"/>'
+    + '<rect x="19.5" y="17.5" width="25" height="34" rx="4" '
+    + 'fill="url(#c)" mask="url(#b)"/></svg>';
+}
+
+function setFavicon(level) {
+  if (level === faviconLevel) return;        // repainting costs a repaint
+  var link = $("favicon");
+  if (!link) return;
+  faviconLevel = level;
+  link.setAttribute("href",
+    "data:image/svg+xml," + encodeURIComponent(faviconSvg(level)));
+}
+
+// ---------------------------------------------------------------------------
+// Command buttons
+// ---------------------------------------------------------------------------
+// NUT command names are precise but unreadable on a button. Each gets a plain
+// label and an icon; the name and the explanation move into the hint that
+// appears if the pointer rests on it.
+var ICONS = {
+  test: '<path d="M9 3h6M10 3v5.2L4.8 18A2 2 0 0 0 6.5 21h11a2 2 0 0 0 1.7-3L14 8.2V3"/>',
+  stop: '<rect x="6" y="6" width="12" height="12" rx="2"/>',
+  bell: '<path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/>',
+  bellOff: '<path d="M18 8a6 6 0 0 0-9.3-5"/><path d="M6.3 6.3A6 6 0 0 0 6 8c0 7-3 8-3 8h13"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/><path d="M2 2l20 20"/>',
+  mute: '<path d="M18 8a6 6 0 1 0-12 0c0 7-3 8-3 8h18s-3-1-3-8"/><path d="M13.7 21a2 2 0 0 1-3.4 0"/><path d="M15 4l6 6"/>',
+  power: '<path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/>',
+  reboot: '<path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 4v5h-5"/>',
+  cancel: '<circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/>',
+  gauge: '<path d="M12 21a9 9 0 1 1 9-9"/><path d="M12 12l5-3"/>',
+  bypass: '<path d="M4 7h4l8 10h4"/><path d="M4 17h4l3-3.8"/><path d="M17 4l3 3-3 3"/><path d="M17 14l3 3-3 3"/>',
+  reset: '<path d="M3 12a9 9 0 1 0 3-6.7"/><path d="M3 4v5h5"/>',
+  panel: '<rect x="3" y="4" width="18" height="14" rx="2"/><path d="M7 20h10"/><path d="M7 9h5"/>',
+  chart: '<path d="M3 3v17a1 1 0 0 0 1 1h17"/><path d="M7 15l4-5 3.5 3L20 7"/>',
+  log:   '<path d="M5 3h14a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1z"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+  plug:  '<path d="M9 3v6M15 3v6"/><path d="M6 9h12v3a6 6 0 0 1-12 0z"/><path d="M12 18v3"/>',
+  trash: '<path d="M4 7h16"/><path d="M9 7V5a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/><path d="M6 7l1 13a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1l1-13"/><path d="M10 11v6M14 11v6"/>',
+  save:  '<path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><path d="M17 21v-8H7v8"/><path d="M7 3v5h8"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>'
+};
+
+function iconMarkup(key, size) {
+  return '<svg viewBox="0 0 24 24" width="' + (size || 17) + '" height="'
+       + (size || 17) + '" fill="none" stroke="currentColor" stroke-width="1.7" '
+       + 'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+       + ICONS[key] + '</svg>';
+}
+
+// name -> [label, icon]. Anything not listed falls back to the name itself.
+var COMMAND_UI = {
+  'test.battery.start':        ['Battery test',        'test'],
+  'test.battery.start.quick':  ['Quick test',          'test'],
+  'test.battery.start.deep':   ['Deep test',           'test'],
+  'test.battery.stop':         ['Stop the test',       'stop'],
+  'test.panel.start':          ['Panel test',          'panel'],
+  'test.panel.stop':           ['Stop panel test',     'stop'],
+  'test.system.start':         ['System test',         'test'],
+  'test.failure.start':        ['Simulate a failure',  'power'],
+  'test.failure.stop':         ['Stop simulating',     'stop'],
+  'calibrate.start':           ['Calibrate runtime',   'gauge'],
+  'calibrate.stop':            ['Stop calibrating',    'stop'],
+  'beeper.enable':             ['Alarm on',            'bell'],
+  'beeper.disable':            ['Alarm off',           'bellOff'],
+  'beeper.mute':               ['Mute until next time','mute'],
+  'beeper.toggle':             ['Toggle the alarm',    'bell'],
+  'beeper.on':                 ['Alarm on (legacy)',   'bell'],
+  'beeper.off':                ['Alarm off (legacy)',  'bellOff'],
+  'shutdown.stop':             ['Cancel shutdown',     'cancel'],
+  'shutdown.return':           ['Off until mains back','power'],
+  'shutdown.stayoff':          ['Off and stay off',    'power'],
+  'shutdown.reboot':           ['Reboot the UPS',      'reboot'],
+  'shutdown.reboot.graceful':  ['Reboot after a delay','reboot'],
+  'load.off':                  ['Outlets off',         'power'],
+  'load.on':                   ['Outlets on',          'power'],
+  'load.off.delay':            ['Outlets off shortly', 'power'],
+  'load.on.delay':             ['Outlets on shortly',  'power'],
+  'load.cycle':                ['Power cycle',         'reboot'],
+  'bypass.start':              ['Enter bypass',        'bypass'],
+  'bypass.stop':               ['Leave bypass',        'bypass'],
+  'reset.input.minmax':        ['Reset min/max',       'reset'],
+  'reset.watchdog':            ['Reset watchdog',      'reset'],
+  'driver.reload':             ['Reload the driver',   'reset']
+};
+
+function commandLabel(name) {
+  if (COMMAND_UI[name]) return COMMAND_UI[name][0];
+  // outlet.2.load.off -> "Load off (outlet 2)"
+  var outlet = /^outlet\.(\w+)\.(.+)$/.exec(name);
+  var base = outlet ? outlet[2] : name;
+  var words = base.replace(/\./g, " ").replace(/_/g, " ");
+  var label = words.charAt(0).toUpperCase() + words.slice(1);
+  return outlet ? label + " (outlet " + outlet[1] + ")" : label;
+}
+
+function commandIcon(name) {
+  var key = COMMAND_UI[name] && COMMAND_UI[name][1];
+  if (!key) {
+    if (/^test\./.test(name)) key = "test";
+    else if (/^beeper\./.test(name)) key = "bell";
+    else if (/^calibrate\./.test(name)) key = "gauge";
+    else if (/stop$|cancel/.test(name)) key = "cancel";
+    else if (/^reset\./.test(name)) key = "reset";
+    else key = "power";
+  }
+  return iconMarkup(key);
+}
+
+function commandButton(command, onclick) {
+  var button = el("button", "btn cmd" + (command.dangerous ? " danger" : ""));
+  button.innerHTML = commandIcon(command.name)
+    + '<span>' + commandLabel(command.name) + '</span>';
+  attachHint(button, '<b>' + command.name + '</b><br>' + command.help
+    + (command.dangerous ? '<br><em>Cuts power to everything on the UPS.</em>' : ''));
+  button.onclick = function () { onclick(button); };
+  return button;
+}
+
+// ---------------------------------------------------------------------------
+// Hints
+// ---------------------------------------------------------------------------
+// Deliberately slow. The label answers the everyday question; the exact NUT
+// name is only wanted when somebody stops to look for it, and a hint that
+// appears the moment the pointer crosses a button is just noise.
+var HINT_DELAY_MS = 5000;
+var HINT = { timer: null, node: null };
+
+function attachHint(element, html) {
+  element.addEventListener("mouseenter", function () {
+    clearTimeout(HINT.timer);
+    HINT.timer = setTimeout(function () { showHint(element, html); }, HINT_DELAY_MS);
+  });
+  element.addEventListener("mouseleave", hideHint);
+  element.addEventListener("blur", hideHint);
+  // Touch has no hover at all, and a long press is the closest equivalent.
+  element.addEventListener("touchstart", function () {
+    clearTimeout(HINT.timer);
+    HINT.timer = setTimeout(function () { showHint(element, html); }, 600);
+  }, { passive: true });
+  element.addEventListener("touchend", hideHint);
+}
+
+function showHint(element, html) {
+  hideHint();
+  var tip = el("div", "hint");
+  tip.innerHTML = html;
+  document.body.appendChild(tip);
+  var box = element.getBoundingClientRect();
+  var width = tip.offsetWidth, height = tip.offsetHeight;
+  var left = box.left + box.width / 2 - width / 2;
+  left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+  var top = box.top - height - 10;
+  if (top < 8) top = box.bottom + 10;          // no room above; drop below
+  tip.style.left = Math.round(left) + "px";
+  tip.style.top = Math.round(top) + "px";
+  requestAnimationFrame(function () { tip.classList.add("show"); });
+  HINT.node = tip;
+}
+
+function hideHint() {
+  clearTimeout(HINT.timer);
+  if (HINT.node && HINT.node.parentNode) {
+    HINT.node.parentNode.removeChild(HINT.node);
+  }
+  HINT.node = null;
+}
+
+window.addEventListener("scroll", hideHint, true);
+
+// ---------------------------------------------------------------------------
+// Confirmation dialog
+// ---------------------------------------------------------------------------
+// The browser's own confirm() looks nothing like the rest of the page and, on
+// some platforms, offers to suppress future ones — which would silently remove
+// the last guard in front of switching the power off.
+var ASK = { resolve: null };
+
+function askConfirm(what, options) {
+  options = options || {};
+  return new Promise(function (resolve) {
+    var box = $("askback");
+    if (!box) { resolve(window.confirm(what.replace(/<[^>]+>/g, ""))); return; }
+    $("asktitle").textContent = options.title || "Are you sure?";
+    $("askwhat").innerHTML = what;
+    $("askok").textContent = options.confirmLabel || "Confirm";
+    $("askok").classList.toggle("danger", options.danger !== false);
+    box.hidden = false;
+    ASK.resolve = function (answer) {
+      box.hidden = true;
+      ASK.resolve = null;
+      resolve(answer);
+    };
+    setTimeout(function () { $("askok").focus(); }, 40);
+  });
+}
+
+function wireConfirm() {
+  var ok = $("askok"), cancel = $("askcancel"), back = $("askback");
+  if (!ok || !cancel || !back) return;
+  ok.onclick = function () { if (ASK.resolve) ASK.resolve(true); };
+  cancel.onclick = function () { if (ASK.resolve) ASK.resolve(false); };
+  back.addEventListener("click", function (event) {
+    // Clicking the darkened area behind the card means "no".
+    if (event.target === back && ASK.resolve) ASK.resolve(false);
+  });
+  document.addEventListener("keydown", function (event) {
+    if (!ASK.resolve || back.hidden) return;
+    if (event.key === "Escape") { event.preventDefault(); ASK.resolve(false); }
+    if (event.key === "Enter") { event.preventDefault(); ASK.resolve(true); }
+  });
+}
+wireConfirm();
+
 // ---------------------------------------------------------------------------
 // Clearing recorded data
 // ---------------------------------------------------------------------------
 // Each scope names the tables it empties, so the button can say exactly how
 // many rows are about to go rather than asking for blind confirmation.
 var RESET_SCOPES = [
-  { scope: "history", label: "Charts",   tables: ["samples", "samples_hourly", "snapshots"],
+  { scope: "history", label: "Charts",   icon: "chart",
+    tables: ["samples", "samples_hourly", "snapshots"],
     help: "every recorded sample; the charts start again from nothing" },
-  { scope: "events",  label: "Events",   tables: ["events"],
+  { scope: "events",  label: "Events",   icon: "log", tables: ["events"],
     help: "the event log" },
-  { scope: "tests",   label: "Tests",    tables: ["tests"],
+  { scope: "tests",   label: "Tests",    icon: "test", tables: ["tests"],
     help: "the self-test history and its voltage trend" },
-  { scope: "outages", label: "Outages",  tables: ["outages"],
+  { scope: "outages", label: "Outages",  icon: "plug", tables: ["outages"],
     help: "the record of power failures" },
-  { scope: "all",     label: "Everything", tables: ["samples", "samples_hourly",
-    "snapshots", "events", "outages", "tests"], danger: true,
+  { scope: "all",     label: "Everything", icon: "trash", danger: true,
+    tables: ["samples", "samples_hourly", "snapshots", "events", "outages", "tests"],
     help: "all of the above, leaving an empty database" }
 ];
 
@@ -1797,10 +2073,15 @@ function renderResetCard(counts) {
   var buttons = $("reset-buttons");
   buttons.innerHTML = "";
   RESET_SCOPES.forEach(function (entry) {
-    var button = el("button", "btn" + (entry.danger ? " danger" : ""),
-                    "Clear " + entry.label.toLowerCase());
-    button.title = entry.help;
+    var button = el("button", "btn cmd" + (entry.danger ? " danger" : ""));
+    button.innerHTML = iconMarkup(entry.icon)
+      + '<span>Clear ' + entry.label.toLowerCase() + '</span>';
     button.disabled = !entry.count;
+    attachHint(button, '<b>' + entry.label + '</b><br>'
+      + (entry.count ? entry.count.toLocaleString() + ' row'
+                       + (entry.count === 1 ? '' : 's') + ' — ' : 'nothing to delete — ')
+      + entry.help
+      + (entry.danger ? '<br><em>Leaves the database empty.</em>' : ''));
     button.onclick = function () { resetData(entry, button); };
     buttons.appendChild(button);
   });
@@ -1808,20 +2089,39 @@ function renderResetCard(counts) {
 
 function resetData(entry, button) {
   var total = entry.count || 0;
-  if (!confirm("Clear " + entry.label.toLowerCase() + "?\n\n"
-               + total + " row(s) will be deleted: " + entry.help
-               + "\n\nThis cannot be undone.")) {
-    return;
-  }
   button.disabled = true;
   button.classList.add("busy");
 
-  withPin("Clear <b>" + entry.label.toLowerCase() + "</b><br>"
-          + total + " row(s), permanently", function (pin) {
+  // No separate confirmation step: the PIN dialog is the confirmation and it
+  // carries the same detail. Two dialogs in a row train people to dismiss the
+  // first without reading it.
+  var summary = entry.label.toLowerCase() + " — " + total.toLocaleString()
+              + " row" + (total === 1 ? "" : "s") + ": " + entry.help;
+  var what = "Clear <b>" + entry.label.toLowerCase() + "</b> — "
+           + total.toLocaleString() + " row" + (total === 1 ? "" : "s");
+
+  // With no PIN set there would be nothing between a stray click and an empty
+  // database, so in that case ask the plain question instead.
+  // Always ask, then ask for the PIN if one is set. Deleting history is
+  // irreversible, so it gets the same warning whether or not a PIN follows.
+  var gate = askConfirm("Clear <b>" + entry.label.toLowerCase() + "</b> — "
+                        + total.toLocaleString() + " row" + (total === 1 ? "" : "s")
+                        + "<br>" + entry.help
+                        + "<br><br>This cannot be undone.",
+                        { title: "Clear recorded data", confirmLabel: "Clear" });
+
+  gate.then(function (agreed) {
+    if (!agreed) {
+      button.disabled = false;
+      button.classList.remove("busy");
+      return { cancelled: true };
+    }
+    return withPin(what, function (pin) {
     return api("reset", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ scope: entry.scope, pin: pin })
+    });
     });
   }).then(function (reply) {
     if (!reply || reply.cancelled) return;
@@ -1878,7 +2178,12 @@ function renderWritable(caps) {
     tr.appendChild(cell);
 
     var action = el("td");
-    var button = el("button", "btn", "Save");
+    var button = el("button", "btn cmd", "");
+    button.innerHTML = iconMarkup("save") + '<span>Save</span>';
+    attachHint(button, '<b>' + name + '</b><br>'
+      + (field.description || 'Write this value into the UPS.')
+      + '<br>The UPS is asked, then read back — a few seconds, because the '
+      + 'driver refreshes its cache only periodically.');
     button.disabled = true;
     // Only offer to save once something has actually changed, so the button
     // never invites a pointless write (each one costs a PIN and a poll cycle).
@@ -2026,7 +2331,7 @@ function saveVariable(name, value, button, field, control) {
   var what = 'Change <b>' + name + '</b><br>from ' + field.value + ' to <b>' + value + '</b>';
   button.disabled = true;
   button.classList.add("busy");
-  button.textContent = "Saving…";
+  setButtonLabel(button, "Saving…");
 
   withPin(what, function (pin) {
     return api("set", {
@@ -2064,8 +2369,16 @@ function saveVariable(name, value, button, field, control) {
     // on the table being re-rendered would leave this button dead.
     button.disabled = false;
     button.classList.remove("busy");
-    button.textContent = "Save";
+    setButtonLabel(button, "Save");
   });
+}
+
+function setButtonLabel(button, text) {
+  // The label lives in a span next to the icon; replacing textContent would
+  // take the icon with it.
+  var span = button.querySelector("span");
+  if (span) span.textContent = text;
+  else button.textContent = text;
 }
 
 // ---------------------------------------------------------------------------
@@ -2132,6 +2445,7 @@ function refresh() {
       verdict.className = "pill crit";
       verdict.innerHTML = '<span class="dot"></span>' +
         (snap && snap.error ? "UPS unreachable" : "Daemon unreachable");
+      setFavicon("crit");
       return;
     }
     renderSnapshot(snap);
@@ -2140,6 +2454,7 @@ function refresh() {
     var verdict = $("verdict");
     verdict.className = "pill unknown";
     verdict.innerHTML = '<span class="dot"></span>Dashboard offline';
+    setFavicon("unknown");
   });
 }
 

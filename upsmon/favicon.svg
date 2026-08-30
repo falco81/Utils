@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img"
+     aria-label="UPS status">
+  <!--
+    A battery on charge. The bolt is cut out of the cell rather than drawn over
+    it, so the shape still reads at 16 px where a stroked bolt turns to mush.
+    The fill is swapped at runtime to match the dashboard's verdict: green when
+    all is well, amber for a warning, red for a problem.
+  -->
+  <defs>
+    <linearGradient id="cell" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3fb950"/>
+      <stop offset="1" stop-color="#2ea043"/>
+    </linearGradient>
+    <mask id="bolt">
+      <rect width="64" height="64" fill="#fff"/>
+      <path d="M36 21L24 37L31.5 37L28 50L40 33L32.5 33z" fill="#000"/>
+    </mask>
+  </defs>
+
+  <rect width="64" height="64" rx="13" fill="#161b22"/>
+  <rect x="25" y="5" width="14" height="6" rx="2.5" fill="#8b94a3"/>
+  <rect x="11" y="11" width="42" height="48" rx="8" fill="none"
+        stroke="#8b94a3" stroke-width="4"/>
+  <rect x="16" y="16" width="32" height="38" rx="4.5"
+        fill="url(#cell)" mask="url(#bolt)"/>
+</svg>

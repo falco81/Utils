@@ -1,0 +1,27 @@
+# /etc/logrotate.d/upsmon
+#
+# The daemon writes its own log alongside the journal. Rotated daily, two
+# weeks kept, which for a poll every ten seconds is a few megabytes at most.
+
+/var/log/upsmon/*.log {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    dateext
+
+    # Rotation runs as root, but the files belong to the daemon's own user;
+    # su tells logrotate to work as that user so ownership stays correct.
+    su upsmon upsmon
+    create 0640 upsmon upsmon
+
+    # The daemon holds the file open, so after logrotate renames it every
+    # further line would go to the renamed file. SIGHUP makes it reopen the
+    # new one. copytruncate would also work but can lose whatever is written
+    # between the copy and the truncate.
+    postrotate
+        /usr/bin/systemctl kill -s HUP upsmon.service 2>/dev/null || true
+    endscript
+}

@@ -298,6 +298,9 @@ actually change. An unknown key is reported rather than silently ignored — che
 |---|---|
 | `api_host` | keep this on `127.0.0.1`. The API can run commands on the UPS; it has no business listening on the network |
 | `api_port` | change only if something already uses 9848 |
+| `log_file` | the daemon's own log. Empty leaves everything to the journal |
+| `log_level` | `info`, or `debug` for poll-by-poll detail |
+| `log_to_journal` | whether to also write to stdout, which systemd captures. Leave it on: startup failures happen before the log file is open |
 | `token_file` | where the shared secret for privileged calls is written. `/run` is cleared at every boot, which is why it lives there. If SELinux objects, section 12 has an alternative |
 
 **Timing**
@@ -434,12 +437,57 @@ journalctl -u upsmon -f
 
 ---
 
+### Logging
+
+Everything goes to the journal, and from version 2.6.0 also to
+`/var/log/upsmon/upsmon.log`. The directory is created by systemd through
+`LogsDirectory=`, owned by the `upsmon` user, so nothing needs setting up by
+hand.
+
+```bash
+tail -f /var/log/upsmon/upsmon.log
+journalctl -u upsmon -f          # the same lines, through systemd
+```
+
+Install the rotation rules:
+
+```bash
+sudo install -m 644 deploy/upsmon.logrotate /etc/logrotate.d/upsmon
+sudo logrotate -d /etc/logrotate.d/upsmon      # dry run, changes nothing
+```
+
+Daily, fourteen kept, compressed. At a poll every ten seconds the daemon only
+writes when something happens, so this is a few hundred kilobytes a week.
+
+The rules end with `systemctl kill -s HUP upsmon.service`. That matters:
+renaming a file does not disturb a process that has it open, so without the
+signal every further line would go into the rotated copy. On the signal the
+daemon reopens the file, and it also notices on its own within one poll if a
+rotation happened without the signal arriving.
+
+To force a rotation and watch it work:
+
+```bash
+sudo logrotate -f /etc/logrotate.d/upsmon
+ls -l /var/log/upsmon/
+head -1 /var/log/upsmon/upsmon.log
+```
+
+The new file should begin with `log file reopened after rotation`.
+
+To turn the file off and keep only the journal, set `"log_file": ""` and
+restart.
+
 ## 9. Install the web interface
 
 ```bash
 sudo install -d -m 755 /var/www/upsmon
-sudo install -m 644 web/index.php      /var/www/upsmon/index.php
-sudo install -m 644 web/upsmon-api.php /var/www/upsmon/upsmon-api.php
+sudo install -m 644 web/index.php           /var/www/upsmon/index.php
+sudo install -m 644 web/upsmon-api.php      /var/www/upsmon/upsmon-api.php
+sudo install -m 644 web/favicon.svg         /var/www/upsmon/favicon.svg
+sudo install -m 644 web/favicon.ico         /var/www/upsmon/favicon.ico
+sudo install -m 644 web/favicon-32.png      /var/www/upsmon/favicon-32.png
+sudo install -m 644 web/apple-touch-icon.png /var/www/upsmon/apple-touch-icon.png
 ```
 
 ---
@@ -811,7 +859,11 @@ as such.
 (including changes made by something other than this dashboard), and every
 command run from here.
 
-**Control** — buttons for whatever commands your UPS reports, and one editable
+**Control** — buttons for whatever commands your UPS reports, each with a plain
+label and an icon rather than the raw NUT name. Rest the pointer on one for five
+seconds and a hint gives the exact command name and what it does; on a phone,
+press and hold. The delay is `HINT_DELAY_MS` near the top of the page script if
+you want it shorter. and one editable
 field per writable variable. The field matches what the UPS says it will accept:
 a dropdown when it publishes a list of values, a number box with the right limits
 when it publishes a range, a date picker for battery dates (written back in
@@ -1013,6 +1065,11 @@ real measurement, pull the mains plug for a minute with the History tab open.
 | `Address already in use` on port 9848 | the service is already running. Plain `upsmon` with no arguments starts a *second* daemon; from 2.0.4 it refuses and says so. Use `upsmon --status` to look at the UPS, `systemctl status upsmon` to look at the service |
 | journal says `refusing to start on defaults` | `/etc/upsmon/config.json` is not readable by the `upsmon` user: `sudo chown root:upsmon /etc/upsmon/config.json` |
 | daemon reports `cannot reach upsd at 127.0.0.1:3493` when the NAS is elsewhere | the config was not loaded at all. `upsmon --diag` shows the host actually in force |
+| a self test logged as a warning while it is still running | fixed in 2.5.1 — `In progress` is a stage, not a verdict, and is no longer an event |
+| `LB` or `RB` in the event log, appearing and clearing exactly one poll apart | a bad USB read, not a real alarm. Version 2.5.0 requires two consecutive polls before logging a flag; raise `flag_confirm_polls` if any still get through |
+| `battery.type changed outside upsmon: PbAc -> ` and back again | the driver publishes some values only on its slower full poll, so they vanish between reads. Fixed in 2.5.0 — a key that merely appears or disappears is no longer treated as a change |
+| the log file stops growing after a rotation | the `postrotate` signal never arrived. The daemon recovers within one poll and logs that it did; check that `/etc/logrotate.d/upsmon` still contains the `systemctl kill -s HUP` line |
+| `cannot write the log file ... Permission denied` | `/var/log/upsmon` is not owned by `upsmon`. `sudo install -d -m 750 -o upsmon -g upsmon /var/log/upsmon`, or let systemd make it with `LogsDirectory=` by restarting the service |
 | a setting reverts after a NAS reboot | that value lives in the driver, not the UPS — see the note below |
 
 Useful commands while diagnosing:
@@ -1067,11 +1124,20 @@ One row a minute, with the default retention:
 * hourly averages for two years — about 17 500 rows
 * roughly 5–8 MB, growing to perhaps 15 MB after a couple of years
 
+`upsmon --diag` reports the data file and the write-ahead log separately. SQLite
+lets that log reach about 4 MB before folding it back in, so on a fresh install
+the total looks large next to a database of a few hundred kilobytes — that is
+the log, not the data. The daemon folds it back on its hourly pass.
+
 The roll-up runs hourly inside the daemon; there is no cron job to add.
 
 ```bash
 upsmon --diag | grep -A2 database
 ```
+
+`upsmon --diag` also reports how many single-poll status glitches have been
+ignored since the daemon started, and how often they arrive. A handful a day is
+normal for USB HID. Dozens an hour suggests a marginal cable or port.
 
 To keep more or less, adjust `retain_full_days` and `retain_hourly_days`, then
 restart.
@@ -1097,7 +1163,8 @@ The schema is created with `IF NOT EXISTS`, so history survives upgrades.
 
 ### Log rotation
 
-None needed. Everything goes to the journal, which systemd already rotates.
+Handled by `/etc/logrotate.d/upsmon` — daily, fourteen kept, compressed. The
+journal is rotated by systemd separately, under its own size limits.
 
 ### Uninstalling
 
@@ -1105,7 +1172,8 @@ None needed. Everything goes to the journal, which systemd already rotates.
 sudo systemctl disable --now upsmon
 sudo rm -f /etc/systemd/system/upsmon.service /usr/local/bin/upsmon
 sudo rm -rf /usr/local/lib/upsmon /etc/upsmon /var/www/upsmon
-sudo rm -f /etc/nginx/conf.d/upsmon.conf
+sudo rm -f /etc/nginx/conf.d/upsmon.conf /etc/logrotate.d/upsmon
+sudo rm -rf /var/log/upsmon
 sudo systemctl daemon-reload && sudo systemctl reload nginx
 sudo semanage fcontext -d "/var/www/upsmon(/.*)?"
 sudo userdel upsmon

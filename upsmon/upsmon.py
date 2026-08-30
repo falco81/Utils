@@ -26,13 +26,14 @@ command line for testing:
 """
 
 # Bumped by hand with every change to this file.
-__version__ = '2.4.0'
+__version__ = '2.6.1'
 
 import argparse
 import getpass
 import json
 import os
 import re
+import signal
 import socket
 import sqlite3
 import secrets
@@ -78,6 +79,11 @@ DEFAULTS = {
     'sample_interval': 60,       # how often a sample is written to the database
     'sample_interval_battery': 10,   # ...while running on battery
     'aggregate_interval': 3600,  # how often old samples are rolled up
+    # A status flag must be seen this many polls running before it counts.
+    # usbhid-ups occasionally reports a single bad read - LB and RB appearing
+    # for exactly one poll and vanishing again - and without this the event log
+    # fills with alarms that never happened. 1 disables the debounce.
+    'flag_confirm_polls': 2,
 
     # --- retention ----------------------------------------------------------
     'retain_full_days': 14,      # full-resolution samples
@@ -92,6 +98,12 @@ DEFAULTS = {
     'runtime_warn_s': 300,
     'runtime_crit_s': 120,
     'battery_life_years': 4.0,
+
+    # --- logging ------------------------------------------------------------
+    # Empty disables the file and leaves everything to the journal.
+    'log_file': '/var/log/upsmon/upsmon.log',
+    'log_level': 'info',         # 'debug' adds poll-by-poll detail
+    'log_to_journal': True,      # also write to stdout, which systemd captures
 
     # --- safety -------------------------------------------------------------
     # Commands that cut power to the load are refused through the API unless
@@ -174,13 +186,90 @@ def _coerce(current, value):
     return str(value)
 
 
+LOG_HANDLE = None
+LOG_PATH = None
+
+
+def open_log(path=None):
+    """Open the log file for appending. Safe to call again to reopen it.
+
+    logrotate renames the file and creates a fresh one, then signals us; at
+    that point the old handle still points at the renamed file, so everything
+    written afterwards would land somewhere nobody looks.
+    """
+    global LOG_HANDLE, LOG_PATH
+    close_log()
+    path = path if path is not None else CONFIG.get('log_file')
+    if not path:
+        return None
+    try:
+        target = Path(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        LOG_HANDLE = open(str(target), 'a', encoding='utf-8')
+        LOG_PATH = target
+    except OSError as e:
+        LOG_HANDLE, LOG_PATH = None, None
+        sys.stderr.write('cannot write the log file %s: %s\n' % (path, e))
+    return LOG_HANDLE
+
+
+def ensure_log_current():
+    """Reopen if the file we hold is no longer the one at the configured path.
+
+    Renaming an open file does not break the handle, so a rotation whose signal
+    never arrived would leave us writing into the rotated copy indefinitely.
+    Comparing inodes catches that.
+    """
+    if not LOG_HANDLE or not LOG_PATH:
+        return False
+    try:
+        on_disk = os.stat(str(LOG_PATH)).st_ino
+        held = os.fstat(LOG_HANDLE.fileno()).st_ino
+        same = (on_disk == held)
+    except OSError:
+        same = False                # the path is gone entirely
+    if same:
+        return False
+    open_log()
+    log('log file reopened - it was rotated without a signal reaching us')
+    return True
+
+
+def close_log():
+    global LOG_HANDLE
+    if LOG_HANDLE:
+        try:
+            LOG_HANDLE.close()
+        except OSError:
+            pass
+    LOG_HANDLE = None
+
+
 def log(msg, level='info'):
-    if level == 'debug' and not DEBUG:
+    if level == 'debug' and not (DEBUG or CONFIG.get('log_level') == 'debug'):
         return
-    stamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    stream = sys.stderr if level in ('error', 'warn') else sys.stdout
-    stream.write('%s  %-5s %s\n' % (stamp, level, msg))
-    stream.flush()
+    line = '%s  %-5s %s' % (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), level, msg)
+
+    if LOG_HANDLE:
+        try:
+            LOG_HANDLE.write(line + '\n')
+            LOG_HANDLE.flush()
+        except (OSError, ValueError):
+            # The file went away underneath us - a rotation without the signal
+            # reaching us, or the filesystem filling up. Try once to get it
+            # back; never let logging take the daemon down.
+            try:
+                open_log()
+                if LOG_HANDLE:
+                    LOG_HANDLE.write(line + '\n')
+                    LOG_HANDLE.flush()
+            except Exception:
+                pass
+
+    if CONFIG.get('log_to_journal', True) or not LOG_HANDLE:
+        stream = sys.stderr if level in ('error', 'warn') else sys.stdout
+        stream.write(line + '\n')
+        stream.flush()
 
 
 # ---------------------------------------------------------------------------
@@ -1249,13 +1338,15 @@ class Storage(object):
             row = conn.execute('SELECT MIN(ts) a FROM samples_hourly').fetchone()
             out['first_hourly'] = row['a']
         try:
-            out['db_bytes'] = self.path.stat().st_size
+            out['file_bytes'] = self.path.stat().st_size
+            out['wal_bytes'] = 0
             for suffix in ('-wal', '-shm'):
                 extra = Path(str(self.path) + suffix)
                 if extra.exists():
-                    out['db_bytes'] += extra.stat().st_size
+                    out['wal_bytes'] += extra.stat().st_size
+            out['db_bytes'] = out['file_bytes'] + out['wal_bytes']
         except OSError:
-            out['db_bytes'] = None
+            out['db_bytes'] = out['file_bytes'] = out['wal_bytes'] = None
         return out
 
     # -- housekeeping -------------------------------------------------------
@@ -1340,6 +1431,10 @@ class Storage(object):
                          '(SELECT MAX(ts) FROM snapshots)',
                          (int(time.time()) - CONFIG['retain_hourly_days'] * 86400,))
             conn.commit()
+            try:
+                conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+            except sqlite3.Error:
+                pass                # a reader holds it open; next hour will do
             return len(rows)
 
 
@@ -1352,6 +1447,7 @@ class Daemon(object):
         return {'writable': {}, 'fields': {}, 'commands': [], 'fetched': 0}
 
     def __init__(self, storage=None):
+        open_log()
         self.store = storage or Storage()
         self.lock = threading.Lock()
         self.snapshot = {}
@@ -1365,7 +1461,10 @@ class Daemon(object):
         self.last_sample_at = 0.0
         self.last_aggregate_at = 0.0
         self.last_vars_signature = None
-        self.previous_flags = None
+        self.previous_flags = None     # last confirmed set, what events compare against
+        self.candidate_flags = None    # seen once, waiting to be seen again
+        self.candidate_seen = 0
+        self.suppressed_reads = 0    # single-poll flag glitches ignored
         self.previous_test_result = None
         self.outage_id = None
         self.capabilities = self._empty_capabilities()
@@ -1477,12 +1576,62 @@ class Daemon(object):
 
     def _detect_events(self, variables, now):
         """Turn changes in the UPS's own reporting into log entries."""
-        flags = status_flags(variables)
-        previous = self.previous_flags
-        self.previous_flags = flags
+        self._detect_status(variables, now)
+        self._detect_test_result(variables, now)
 
-        if previous is None:
+    def _confirmed_flags(self, variables):
+        """The status, once it has held still long enough to be believed.
+
+        A genuine event lasts minutes; a bad USB read lasts a single poll.
+        Returns None while a reading is still unconfirmed, so callers know to
+        leave everything as it was.
+        """
+        raw = status_flags(variables)
+        needed = max(1, int(CONFIG['flag_confirm_polls']))
+
+        if raw == self.candidate_flags:
+            self.candidate_seen += 1
+        else:
+            # The reading we were watching is being replaced. If it never held
+            # long enough to be believed, and it differed from the state we do
+            # believe, it was a bad read - count it and move on.
+            if (self.candidate_flags is not None
+                    and self.candidate_seen < needed
+                    and self.previous_flags is not None
+                    and self.candidate_flags != self.previous_flags):
+                self.suppressed_reads += 1
+                log('ignored a one-poll status reading: %s'
+                    % (' '.join(sorted(self.candidate_flags)) or '(none)'),
+                    level='debug')
+            self.candidate_flags = raw
+            self.candidate_seen = 1
+
+        if self.candidate_seen < needed:
+            if self.previous_flags is not None and raw != self.previous_flags:
+                log('status %s seen once, waiting for confirmation'
+                    % (' '.join(sorted(raw)) or '(none)'), level='debug')
+            return None
+        return raw
+
+    def _detect_status(self, variables, now):
+        confirmed = self._confirmed_flags(variables)
+        if confirmed is None:
             return
+
+        if self.previous_flags is None:
+            self.previous_flags = confirmed      # nothing to compare against yet
+            return
+
+        if confirmed == self.previous_flags:
+            # A reading that differed but never held: a bad read. Count it so
+            # --diag can show how often the driver produces them.
+            # An outage in progress still needs its running minimum updated.
+            if (confirmed & OUTAGE_FLAGS) and self.outage_id:
+                self.store.update_outage(self.outage_id, variables)
+            return
+
+        flags, previous = confirmed, self.previous_flags
+        self.previous_flags = flags
 
         for flag in sorted((flags - previous) - NOISY_FLAGS):
             level = ('crit' if flag in CRITICAL_FLAGS
@@ -1497,27 +1646,30 @@ class Daemon(object):
         was_on_battery = bool(previous & OUTAGE_FLAGS)
         if on_battery and not was_on_battery:
             self.outage_id = self.store.start_outage(self.ups_name, variables, now)
-        elif on_battery and self.outage_id:
-            self.store.update_outage(self.outage_id, variables)
         elif was_on_battery and not on_battery and self.outage_id:
             self.store.end_outage(self.outage_id, variables, now)
             self.outage_id = None
 
+    def _detect_test_result(self, variables, now):
+        """Self-test verdicts. Runs on every poll — a test finishes while the
+        status is sitting perfectly still, so this must not depend on it."""
         result = variables.get('ups.test.result')
-        if result and result != self.previous_test_result:
-            if self.previous_test_result is not None:
-                level = 'info' if 'pass' in result.lower() else 'warn'
-                self.store.add_event('test', 'self test result: %s' % result,
-                                     level, self.ups_name, now)
-                # A verdict that arrives while we are following our own test is
-                # that test; anything else the UPS decided to run by itself,
-                # and is worth a row of its own so the history is complete.
-                running = any(word in result.lower()
-                              for word in ('progress', 'pending', 'scheduled'))
-                if self.active_test_id is None and not running:
-                    self.store.record_test(self.ups_name, 'ups.self-test', 'ups',
-                                           result, variables, now)
-            self.previous_test_result = result
+        if not result or result == self.previous_test_result:
+            return
+        # "In progress" is a stage, not a verdict; logging it as a warning makes
+        # a perfectly normal test look like a fault.
+        running = any(word in result.lower()
+                      for word in ('progress', 'pending', 'scheduled'))
+        if self.previous_test_result is not None and not running:
+            level = 'info' if 'pass' in result.lower() else 'warn'
+            self.store.add_event('test', 'self test result: %s' % result,
+                                 level, self.ups_name, now)
+            # A verdict arriving while we follow our own test belongs to that
+            # test; anything else the UPS ran by itself and deserves its own row.
+            if self.active_test_id is None:
+                self.store.record_test(self.ups_name, 'ups.self-test', 'ups',
+                                       result, variables, now)
+        self.previous_test_result = result
 
     def _maybe_record(self, variables, now):
         on_battery = bool(status_flags(variables) & DISCHARGE_FLAGS)
@@ -1540,6 +1692,12 @@ class Daemon(object):
                         'ups.efficiency', 'input.current', 'ups.alarm'}
             stable = {k: v for k, v in variables.items() if k not in volatile}
             previous = self.store.latest_snapshot()
+            if previous:
+                # Merge rather than replace: a variable missing from this poll
+                # keeps its last known value instead of looking deleted.
+                merged = dict(previous['vars'])
+                merged.update(stable)
+                stable = merged
             if not previous or previous['vars'] != stable:
                 self.store.add_snapshot(self.ups_name, stable, now)
                 if previous:
@@ -1547,6 +1705,12 @@ class Daemon(object):
                         before = previous['vars'].get(key)
                         after = stable.get(key)
                         if before == after:
+                            continue
+                        # A key that merely appears or disappears is the driver
+                        # refreshing its cache, not somebody changing a setting.
+                        # usbhid-ups publishes some values only on its slower
+                        # full poll, so they come and go on their own.
+                        if before is None or after is None:
                             continue
                         # A change we made ourselves has already been logged by
                         # set_variable; only report changes made elsewhere.
@@ -1840,6 +2004,15 @@ class Daemon(object):
 
     # -- loops --------------------------------------------------------------
     def run(self):
+        # logrotate signals us after it has moved the file aside.
+        def reopen(signum, frame):
+            open_log()
+            log('log file reopened after rotation')
+        try:
+            signal.signal(signal.SIGHUP, reopen)
+        except (ValueError, AttributeError, OSError):
+            pass                      # not the main thread, or no SIGHUP here
+
         already = _running_instance()
         if already:
             log('another upsmon is already serving %s:%s (up %ss, UPS "%s")'
@@ -1863,6 +2036,7 @@ class Daemon(object):
         while True:
             start = time.time()
             try:
+                ensure_log_current()
                 self.poll()
                 if start - self.last_aggregate_at >= CONFIG['aggregate_interval']:
                     self.last_aggregate_at = start
@@ -2048,6 +2222,8 @@ class Daemon(object):
             'nut': '%s:%s' % (CONFIG['nut_host'], CONFIG['nut_port']),
             'last_contact_age': age,
             'consecutive_errors': self.consecutive_errors,
+            'suppressed_reads': self.suppressed_reads,
+            'log_file': str(LOG_PATH) if LOG_PATH else None,
             'last_error': self.last_error,
             'level': snap.get('level'),
             'database': stats,
@@ -2544,6 +2720,21 @@ def cmd_check(args, pal):
 
     problems += line('token file present', token_path().is_file(), str(token_path()))
 
+    log_path = CONFIG.get('log_file')
+    if log_path:
+        directory = Path(log_path).parent
+        if Path(log_path).exists():
+            ok_log, detail = writable_by_service_user(Path(log_path))
+        elif directory.exists():
+            ok_log, detail = writable_by_service_user(directory)
+            detail += ' (log not created yet)'
+        else:
+            ok_log, detail = False, '%s does not exist' % directory
+        if not ok_log:
+            detail += '  -> sudo install -d -m 750 -o %s -g %s %s' % (
+                SERVICE_USER, SERVICE_USER, directory)
+        problems += line('log file writable', ok_log, detail)
+
     if CONFIG_FILE.is_file():
         readable, detail = readable_by_service_user(CONFIG_FILE)
         if not readable:
@@ -2579,11 +2770,21 @@ def cmd_diag(args, pal):
                    % (CONFIG_FILE, 'present' if CONFIG_FILE.is_file() else 'absent, using defaults')))
     print(pal.note('  database    : %s' % DB_FILE))
     print(pal.note('  token file  : %s' % token_path()))
+    log_path = CONFIG.get('log_file')
+    if log_path:
+        try:
+            size = Path(log_path).stat().st_size
+            detail = '%s (%.1f KB)' % (log_path, size / 1024.0)
+        except OSError:
+            detail = '%s (not created yet)' % log_path
+    else:
+        detail = 'disabled, journal only'
+    print(pal.note('  log file    : %s' % detail))
     print()
     print(pal.group('settings in force'))
     for key in sorted(CONFIG):
         value = CONFIG[key]
-        if 'password' in key and value:
+        if value and ('password' in key or key == 'pin'):
             value = '(set)'
         marker = '' if value == DEFAULTS[key] else pal.value('  <- changed')
         print('  %-28s %s%s' % (key, value, marker))
@@ -2599,11 +2800,22 @@ def cmd_diag(args, pal):
         print('  %s in %.0f ms' % (pal.ok('responded'), elapsed))
         print('  uptime %ss, ups "%s", level %s'
               % (health.get('uptime'), health.get('ups'), health.get('level')))
+        suppressed = health.get('suppressed_reads')
+        if suppressed:
+            hours = (health.get('uptime') or 1) / 3600.0
+            print('  %d single-poll status glitch(es) ignored, %.1f per hour'
+                  % (suppressed, suppressed / max(hours, 0.01)))
         database = health.get('database', {})
         if database.get('db_bytes'):
-            print('  database %.2f MB, %s samples, %s hourly, %s events'
+            print('  database %.2f MB, %s samples, %s hourly, %s events, %s tests'
                   % (database['db_bytes'] / 1024.0 / 1024.0, database.get('samples'),
-                     database.get('samples_hourly'), database.get('events')))
+                     database.get('samples_hourly'), database.get('events'),
+                     database.get('tests')))
+            if database.get('wal_bytes'):
+                print('    %.2f MB of data plus a %.2f MB write-ahead log, which '
+                      'SQLite folds back in periodically'
+                      % (database.get('file_bytes', 0) / 1024.0 / 1024.0,
+                         database['wal_bytes'] / 1024.0 / 1024.0))
         first = database.get('first_hourly') or database.get('first_sample')
         if first:
             days = (time.time() - first) / 86400.0
@@ -2782,6 +2994,9 @@ an environment variable with a UPSMON_ prefix (UPSMON_NUT_HOST=10.0.0.5).
                         help='maximum rows for --history (default 200)')
     output.add_argument('--limit', type=int, default=50,
                         help='how many events to show (default 50)')
+    output.add_argument('--log-file', metavar='FILE',
+                        help='write the log here instead of the configured path; '
+                             'an empty string disables the file')
     output.add_argument('--no-color', action='store_true', help='no colour codes')
     output.add_argument('-v', '--verbose', action='store_true', help='debug logging')
     output.add_argument('--version', action='version',
@@ -2804,6 +3019,8 @@ def main(argv=None):
     if args.ups:
         CONFIG['ups_name'] = args.ups
     DEBUG = args.verbose
+    if args.log_file is not None:
+        CONFIG['log_file'] = args.log_file
 
     pal = Palette(colour_enabled(False if args.no_color else None))
     for problem in CONFIG_FATAL:

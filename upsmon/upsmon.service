@@ -22,10 +22,15 @@ RuntimeDirectory=upsmon
 RuntimeDirectoryMode=0750
 StateDirectory=upsmon
 StateDirectoryMode=0750
+# /var/log/upsmon, created with the right ownership. Without this the daemon
+# could not write there at all: ProtectSystem=strict makes everything else
+# read-only.
+LogsDirectory=upsmon
+LogsDirectoryMode=0750
 # StateDirectory already grants this, but naming it explicitly means a
 # hand-created /var/lib/upsmon with the wrong ownership fails loudly at start
 # rather than looking like a read-only database later.
-ReadWritePaths=/var/lib/upsmon
+ReadWritePaths=/var/lib/upsmon /var/log/upsmon
 
 # A poll every ten seconds and a small SQLite write every minute. These caps are
 # a backstop the daemon should never come near.

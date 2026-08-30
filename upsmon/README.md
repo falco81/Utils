@@ -70,7 +70,12 @@ Six tabs: **Overview** (status, charge, runtime, load, voltages, 24-hour chart),
 data — all PIN-protected), and **All variables**.
 
 It refreshes every five seconds, pauses when the browser tab is hidden, and can
-be paused by hand from the indicator in the corner.
+be paused by hand from the indicator in the corner. The tab icon is a battery
+coloured by the verdict, so a UPS in trouble shows up without switching to it.
+
+Command buttons carry a plain label and an icon rather than the raw NUT name;
+resting the pointer on one for five seconds reveals the exact command and what
+it does.
 
 ## Command line
 
@@ -124,4 +129,4 @@ The PHP was checked structurally rather than executed; no interpreter was
 available in the build environment. Run `php -l` on both files after copying them
 across.
 
-Current version: **2.4.0**
+Current version: **2.6.1**
