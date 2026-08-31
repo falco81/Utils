@@ -65,6 +65,51 @@ if (isset($_GET['api'])) {
         upsmon_relay('/api/tests?limit=' . $limit);
         exit;
     }
+    if ($what === 'plug') {
+        upsmon_relay('/api/plug');
+        exit;
+    }
+    if ($what === 'sensors') {
+        upsmon_relay('/api/sensors');
+        exit;
+    }
+    if ($what === 'plug-history') {
+        $range  = preg_replace('/[^0-9smhdwy.]/', '', (string) ($_GET['range'] ?? '24h'));
+        $points = max(50, min(3000, (int) ($_GET['points'] ?? 600)));
+        upsmon_relay('/api/plug-history?range=' . rawurlencode($range)
+                     . '&points=' . $points, 'GET', null, 30.0);
+        exit;
+    }
+    if ($what === 'sensor-history') {
+        $range  = preg_replace('/[^0-9smhdwy.]/', '', (string) ($_GET['range'] ?? '24h'));
+        $points = max(50, min(3000, (int) ($_GET['points'] ?? 600)));
+        upsmon_relay('/api/sensor-history?range=' . rawurlencode($range)
+                     . '&points=' . $points, 'GET', null, 30.0);
+        exit;
+    }
+    if ($what === 'plug-switch' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $in = json_decode((string) file_get_contents('php://input'), true);
+        $body = ['on' => !empty($in['on'])];
+        if (is_array($in) && isset($in['pin'])) {
+            $body['pin'] = (string) $in['pin'];
+        }
+        upsmon_relay('/api/plug/switch', 'POST', $body, 30.0);
+        exit;
+    }
+    if ($what === 'plug-reset' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+        $in = json_decode((string) file_get_contents('php://input'), true);
+        $body = [];
+        if (is_array($in) && isset($in['pin'])) {
+            $body['pin'] = (string) $in['pin'];
+        }
+        // Only the counter names the plug actually offers get through.
+        $allowed = ['aenergy', 'ret_aenergy', 'on_time', 'switch_on', 'on_above_thr'];
+        if (is_array($in) && isset($in['types']) && is_array($in['types'])) {
+            $body['types'] = array_values(array_intersect($in['types'], $allowed));
+        }
+        upsmon_relay('/api/plug/reset', 'POST', $body, 30.0);
+        exit;
+    }
     if ($what === 'outages') {
         upsmon_relay('/api/outages?limit=50');
         exit;
@@ -329,6 +374,38 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
   .offline{background:var(--crit-bg);border:1px solid rgba(248,81,73,.35);color:var(--crit);
      padding:13px 17px;border-radius:var(--r);margin-bottom:16px;font-weight:600}
   .muted{color:var(--tx-mut)}
+  h3.section{font-size:12px;letter-spacing:.9px;text-transform:uppercase;
+    color:var(--tx-mut);margin:26px 0 10px;font-weight:700}
+
+  /* the socket panel: state on the left, live figures on the right */
+  .card.socket{display:flex;align-items:center;gap:26px;flex-wrap:wrap;
+    padding:20px 22px}
+  .socket-state{display:flex;align-items:center;gap:16px;min-width:220px}
+  .socket-toggle{appearance:none;cursor:pointer;width:62px;height:62px;
+    border-radius:50%;display:grid;place-items:center;flex:0 0 auto;
+    border:2px solid var(--line);background:var(--panel2);color:var(--tx-mut);
+    transition:color .2s,border-color .2s,background .2s,box-shadow .2s}
+  .socket-toggle:hover:not(:disabled){border-color:var(--tx-dim)}
+  .socket-toggle:disabled{cursor:progress;opacity:.6}
+  .card.socket.on .socket-toggle{color:var(--ok);border-color:rgba(63,185,80,.55);
+    background:rgba(63,185,80,.12);box-shadow:0 0 0 6px rgba(63,185,80,.07)}
+  .card.socket.off .socket-toggle{color:var(--tx-mut);border-color:var(--line);
+    background:var(--panel2)}
+  /* readings that are real but no longer current */
+  .card.socket.stale .socket-figures{opacity:.45}
+  .card.socket.stale .socket-label{color:var(--warn)}
+  .card.socket.stale .socket-toggle{color:var(--warn);
+    border-color:rgba(210,153,34,.45);background:rgba(210,153,34,.10);box-shadow:none}
+  .socket-label{font-size:21px;font-weight:680;letter-spacing:-.2px}
+  .card.socket.on .socket-label{color:var(--ok)}
+  .card.socket.off .socket-label{color:var(--tx-dim)}
+  .socket-sub{font-size:13px;margin-top:3px}
+  .socket-figures{display:flex;gap:26px;flex-wrap:wrap;flex:1}
+  .socket-figures div{min-width:78px}
+  .socket-figures .k{font-size:11px;letter-spacing:.7px;text-transform:uppercase;
+    color:var(--tx-mut);font-weight:700}
+  .socket-figures .v{font-size:19px;font-weight:650;margin-top:3px}
+  @media (max-width:640px){ .card.socket{gap:18px} .socket-figures{gap:18px} }
   .refresh{appearance:none;background:none;border:0;padding:0;cursor:pointer;
     font:inherit;font-size:12px;color:var(--tx-mut);display:inline-flex;
     align-items:center;gap:6px}
@@ -489,11 +566,39 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
       <div class="value"><span id="v-input">—</span><span class="unit">V</span></div>
       <div class="sub" id="s-input"></div>
     </div>
+    <div class="card metric" id="m-plug-power" hidden>
+      <div class="label">Drawn now</div>
+      <div class="value"><span id="v-plug-power">—</span><span class="unit">W</span></div>
+      <div class="sub" id="s-plug-power"></div>
+    </div>
+    <div class="card metric" id="m-plug-energy" hidden>
+      <div class="label">Energy used</div>
+      <div class="value"><span id="v-plug-energy">—</span><span class="unit">kWh</span></div>
+      <div class="sub" id="s-plug-energy"></div>
+    </div>
     <div class="card metric" id="m-battv">
       <div class="label">Battery voltage</div>
       <div class="value"><span id="v-battv">—</span><span class="unit">V</span></div>
       <div class="sub" id="s-battv"></div>
     </div>
+  </div>
+
+  <div class="card socket" id="socket-card" hidden style="margin-top:14px">
+    <div class="socket-state">
+      <button class="socket-toggle" id="socket-toggle" type="button"
+              aria-label="Switch the socket">
+        <svg viewBox="0 0 24 24" width="30" height="30" fill="none"
+             stroke="currentColor" stroke-width="1.9" stroke-linecap="round"
+             stroke-linejoin="round" aria-hidden="true">
+          <path d="M12 3v9"/><path d="M6.3 6.3a8 8 0 1 0 11.4 0"/>
+        </svg>
+      </button>
+      <div>
+        <div class="socket-label" id="socket-label">—</div>
+        <div class="socket-sub muted" id="socket-sub"></div>
+      </div>
+    </div>
+    <div class="socket-figures" id="socket-figures"></div>
   </div>
 
   <div class="grid charts" style="margin-top:14px">
@@ -515,6 +620,10 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
     <div class="card">
       <h2>Battery</h2>
       <div id="battery-facts"></div>
+    </div>
+    <div class="card" id="sensor-card" hidden>
+      <h2>Sensors</h2>
+      <div id="sensor-facts"></div>
     </div>
     <div class="card">
       <h2>Recent events</h2>
@@ -545,6 +654,37 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
     <div class="card"><h2>Mains voltage</h2><div class="cwrap" id="chart-input"></div></div>
     <div class="card"><h2>Battery voltage</h2><div class="cwrap" id="chart-battv"></div></div>
     <div class="card"><h2>Power drawn</h2><div class="cwrap" id="chart-power"></div></div>
+  </div>
+
+  <div id="plug-charts" hidden>
+    <h3 class="section">Smart plug</h3>
+    <div class="grid charts">
+      <div class="card"><h2>Power drawn at the socket</h2><div class="cwrap" id="chart-plug-power"></div></div>
+      <div class="card"><h2>Energy used</h2><div class="cwrap" id="chart-plug-energy"></div></div>
+      <div class="card"><h2>Socket voltage</h2><div class="cwrap" id="chart-plug-voltage"></div></div>
+      <div class="card"><h2>Current</h2><div class="cwrap" id="chart-plug-current"></div></div>
+      <div class="card"><h2>Line frequency</h2><div class="cwrap" id="chart-plug-freq"></div></div>
+      <div class="card"><h2>Plug temperature</h2><div class="cwrap" id="chart-plug-temp"></div></div>
+      <div class="card"><h2>Power factor</h2><div class="cwrap" id="chart-plug-pf"></div></div>
+      <div class="card"><h2>Energy returned</h2><div class="cwrap" id="chart-plug-ret"></div></div>
+      <div class="card"><h2>Total runtime</h2><div class="cwrap" id="chart-plug-ontime"></div></div>
+      <div class="card"><h2>Switching cycles</h2><div class="cwrap" id="chart-plug-cycles"></div></div>
+      <div class="card"><h2>Active load runtime</h2><div class="cwrap" id="chart-plug-abovethr"></div></div>
+      <div class="card"><h2>Plug Wi-Fi signal</h2><div class="cwrap" id="chart-plug-rssi"></div></div>
+      <div class="card"><h2>Plug uptime</h2><div class="cwrap" id="chart-plug-uptime"></div></div>
+      <div class="card"><h2>Plug free memory</h2><div class="cwrap" id="chart-plug-ram"></div></div>
+    </div>
+  </div>
+
+  <div id="sensor-charts" hidden>
+    <h3 class="section">Sensors</h3>
+    <div class="grid charts">
+      <div class="card"><h2>Temperature</h2><div class="cwrap" id="chart-sensor-temp"></div></div>
+      <div class="card"><h2>Relative humidity</h2><div class="cwrap" id="chart-sensor-rh"></div></div>
+      <div class="card"><h2>Sensor battery</h2><div class="cwrap" id="chart-sensor-batt"></div></div>
+      <div class="card"><h2>Sensor signal</h2><div class="cwrap" id="chart-sensor-rssi"></div></div>
+      <div class="card"><h2>Sensor battery voltage</h2><div class="cwrap" id="chart-sensor-battv"></div></div>
+    </div>
   </div>
 
   <div class="card full" style="margin-top:14px">
@@ -611,6 +751,13 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
     <div id="commands" class="muted">loading…</div>
   </div>
 
+  <div class="card" id="plug-control" hidden style="margin-top:14px">
+    <h2>Smart plug</h2>
+    <p class="btnhelp" id="plug-control-help"></p>
+    <div class="btnrow" id="plug-buttons"></div>
+    <div id="plug-counters"></div>
+  </div>
+
   <div class="card" style="margin-top:14px">
     <h2>Recorded data</h2>
     <p class="btnhelp">Clearing history affects only what this machine has
@@ -636,6 +783,19 @@ $levelText = ['ok' => 'All good', 'warn' => 'Needs attention',
     <p class="btnhelp">Straight from the NUT driver, grouped by subject.
        <span class="tag rw">rw</span> marks the ones that can be changed.</p>
     <div id="all-vars" class="muted">loading…</div>
+  </div>
+
+  <div class="card" id="all-plug" hidden style="margin-top:14px">
+    <h2>Everything the smart plug reports</h2>
+    <p class="btnhelp">Straight from the plug's own RPC interface — the switch,
+       the meter, the system and the radios.</p>
+    <div id="plug-vars"></div>
+  </div>
+
+  <div class="card" id="all-sensors" hidden style="margin-top:14px">
+    <h2>Sensor readings</h2>
+    <p class="btnhelp">The most recent push from each device that reports here.</p>
+    <div id="sensor-vars"></div>
   </div>
 </section>
 
@@ -1109,6 +1269,11 @@ function renderSnapshot(snap) {
 
   $("stamp").textContent = snap.generated ? stamp(snap.generated) + " · " + ago(snap.generated) : "—";
   setFavicon(snap.level || "unknown");
+  renderPlug(snap.plug);
+  renderSensors(snap.sensors);
+  // The counter figures sit on the buttons, so the control card has to move
+  // with each snapshot rather than only when its tab is opened.
+  if (STATE.tab === "control") renderPlugControls();
 
   // status
   var flags = (v["ups.status"] || "").split(" ").filter(Boolean);
@@ -1234,6 +1399,79 @@ var CHARTS = [
   { id: "chart-power",   key: "realpower", label: "Power",   colour: "var(--warn)", unit: "watts", min: 0, digits: 0, derived: "power" }
 ];
 
+
+var PLUG_CHARTS = [
+  { id: "chart-plug-power",   key: "power",       label: "Power",      colour: "var(--warn)", unit: "watts", min: 0, digits: 0 },
+  { id: "chart-plug-energy",  key: "energy",      label: "Energy",     colour: "var(--ok)",   unit: "watt-hours, counting up until the counters are reset", digits: 0 },
+  { id: "chart-plug-voltage", key: "voltage",     label: "Voltage",    colour: "var(--info)", unit: "volts", digits: 0 },
+  { id: "chart-plug-current", key: "current",     label: "Current",    colour: "var(--batt)", unit: "amps", min: 0, digits: 2 },
+  { id: "chart-plug-freq",    key: "freq",        label: "Frequency",  colour: "var(--info)", unit: "hertz", digits: 2 },
+  { id: "chart-plug-temp",    key: "temperature", label: "Plug temp",  colour: "var(--load)", unit: "degrees C", digits: 1 },
+  { id: "chart-plug-pf",      key: "pf",          label: "Power factor", colour: "var(--tx-dim)", unit: "1.0 means the load draws current in step with the voltage", digits: 2 },
+  { id: "chart-plug-ret",     key: "energy_ret",  label: "Returned",   colour: "var(--ok)",   unit: "watt-hours fed back; zero unless something generates", min: 0, digits: 0 },
+  { id: "chart-plug-ontime",  key: "on_time",     label: "On time",    colour: "var(--info)", unit: "seconds the relay has been on, counting up", min: 0, digits: 0 },
+  { id: "chart-plug-cycles",  key: "switch_on",   label: "Cycles",     colour: "var(--batt)", unit: "times the relay has been switched on, counting up", min: 0, digits: 0 },
+  { id: "chart-plug-abovethr",key: "on_above_thr",label: "Above threshold", colour: "var(--load)", unit: "seconds spent above the load threshold set on the plug", min: 0, digits: 0 },
+  { id: "chart-plug-rssi",    key: "rssi",        label: "Signal",     colour: "var(--info)", unit: "dBm — closer to zero is stronger; below -80 is marginal", digits: 0 },
+  { id: "chart-plug-uptime",  key: "uptime",      label: "Uptime",     colour: "var(--ok)",   unit: "seconds since the plug last restarted; a drop means it rebooted", min: 0, digits: 0 },
+  { id: "chart-plug-ram",     key: "ram_free",    label: "Free RAM",   colour: "var(--tx-dim)", unit: "bytes free on the plug", min: 0, digits: 0 }
+];
+
+function loadPlugHistory(range) {
+  // Ask first, decide afterwards. Opening this tab straight from a bookmark
+  // gets here before the first status has arrived, and gating on the snapshot
+  // meant the whole section stayed hidden until the page was reloaded.
+  return api("plug-history&range=" + encodeURIComponent(range) + "&points=700")
+    .then(function (data) {
+      var rows = (data && data.samples) || [];
+      $("plug-charts").hidden = !rows.length;
+      if (!rows.length) return;
+      // The charts shade periods the socket was off, the same way the UPS
+      // charts shade a power failure — a flat line then has an explanation.
+      rows.forEach(function (r) { r.status = r.output ? "OL" : "OB"; });
+      PLUG_CHARTS.forEach(function (chart) {
+        var host = $(chart.id);
+        if (!host) return;
+        drawChart(host, {
+          rows: rows, min: chart.min, digits: chart.digits,
+          unit: chart.unit + " · red bands are when the socket was off",
+          series: [{ key: chart.key, label: chart.label, color: chart.colour }]
+        });
+      });
+    });
+}
+
+function loadSensorHistory(range) {
+  return api("sensor-history&range=" + encodeURIComponent(range) + "&points=700")
+    .then(function (data) {
+      var rows = (data && data.samples) || [];
+      var box = $("sensor-charts");
+      if (!rows.length) { box.hidden = true; return; }
+      box.hidden = false;
+      drawChart($("chart-sensor-temp"), {
+        rows: rows, digits: 1, unit: "degrees C",
+        series: [{ key: "temperature", label: "Temperature", color: "var(--load)" }]
+      });
+      drawChart($("chart-sensor-rh"), {
+        rows: rows, digits: 0, min: 0, max: 100, unit: "percent",
+        series: [{ key: "humidity", label: "Humidity", color: "var(--info)" }]
+      });
+      drawChart($("chart-sensor-batt"), {
+        rows: rows, digits: 0, min: 0, max: 100, unit: "percent remaining",
+        series: [{ key: "battery_pct", label: "Battery", color: "var(--ok)" }]
+      });
+      drawChart($("chart-sensor-rssi"), {
+        rows: rows, digits: 0,
+        unit: "dBm — closer to zero is stronger; below -80 is marginal",
+        series: [{ key: "rssi", label: "Signal", color: "var(--batt)" }]
+      });
+      drawChart($("chart-sensor-battv"), {
+        rows: rows, digits: 2, unit: "volts",
+        series: [{ key: "battery_v", label: "Battery voltage", color: "var(--warn)" }]
+      });
+    });
+}
+
 function loadHistory(range) {
   STATE.range = range;
   $("range-info").textContent = "loading…";
@@ -1258,6 +1496,12 @@ function loadHistory(range) {
       if (chart.derived === "power") applyPowerFallback(spec, rows);
       drawChart(host, spec);
     });
+
+    // The plug and the sensors cover the same period and are drawn from their
+    // own endpoints. They must be loaded here: this is the only place that
+    // knows the range the person picked.
+    loadPlugHistory(range);
+    loadSensorHistory(range);
     return rows;
   });
 }
@@ -1314,11 +1558,51 @@ function loadQuickChart() {
 
     var power = {
       rows: rows, min: 0, digits: 0, unit: "watts",
-      series: [{ key: "realpower", label: "Power", color: "var(--warn)" }]
+      series: [{ key: "realpower", label: "UPS", color: "var(--warn)" }]
     };
     // Models that do not measure watts get the figure worked out from load.
     applyPowerFallback(power, rows);
-    drawChart($("chart-quick-power"), power);
+
+    // The plug measures the same thing properly. Overlay it, and the estimate
+    // above can be judged against a real meter rather than trusted blindly.
+    if (STATE.snapshot && STATE.snapshot.plug) {
+      api("plug-history&range=24h&points=400").then(function (plugData) {
+        var plugRows = (plugData && plugData.samples) || [];
+        if (plugRows.length) {
+          power.rows = mergeSeries(power.rows, plugRows, "power", "plug_power");
+          power.series.push({ key: "plug_power", label: "Plug (measured)",
+                              color: "var(--ok)" });
+          power.unit += " · the plug measures, the UPS figure may be an estimate";
+        }
+        drawChart($("chart-quick-power"), power);
+      }).catch(function () { drawChart($("chart-quick-power"), power); });
+    } else {
+      drawChart($("chart-quick-power"), power);
+    }
+  });
+}
+
+// Two devices sample on their own schedules, so their timestamps never line
+// up. Rather than interpolating, each row of the base series takes the nearest
+// reading from the other within half a sampling gap; further apart and it is
+// left blank, which the chart draws as a break instead of inventing a line.
+function mergeSeries(base, extra, sourceKey, targetKey) {
+  if (!base.length || !extra.length) return base;
+  var span = extra.length > 1
+    ? (extra[extra.length - 1].ts - extra[0].ts) / (extra.length - 1) : 300;
+  var tolerance = Math.max(60, span * 1.5);
+  var index = 0;
+  return base.map(function (row) {
+    while (index < extra.length - 1 &&
+           Math.abs(extra[index + 1].ts - row.ts) <= Math.abs(extra[index].ts - row.ts)) {
+      index++;
+    }
+    var nearest = extra[index];
+    var copy = {};
+    for (var key in row) { if (row.hasOwnProperty(key)) copy[key] = row[key]; }
+    copy[targetKey] = (nearest && Math.abs(nearest.ts - row.ts) <= tolerance)
+      ? num(nearest[sourceKey]) : null;
+    return copy;
   });
 }
 
@@ -1734,6 +2018,7 @@ var COMMAND_GROUPS = [
 
 function loadCapabilities() {
   loadResetCounts();
+  renderPlugControls();
   return api("capabilities").then(function (data) {
     renderCommands(data || {});
     renderWritable(data || {});
@@ -1818,6 +2103,182 @@ function startCommand(command, button) {
 
 
 
+
+
+// ---------------------------------------------------------------------------
+// Smart plug
+// ---------------------------------------------------------------------------
+function renderPlug(plug) {
+  var card = $("socket-card");
+  var powerTile = $("m-plug-power"), energyTile = $("m-plug-energy");
+  if (!plug) {                          // no plug configured at all
+    card.hidden = powerTile.hidden = energyTile.hidden = true;
+    return;
+  }
+  card.hidden = false;
+
+  if (!plug.online || !plug.values) {
+    card.className = "card socket off";
+    $("socket-label").textContent = "Plug unreachable";
+    $("socket-sub").textContent = plug.error || "";
+    $("socket-figures").innerHTML = "";
+    $("socket-toggle").disabled = true;
+    powerTile.hidden = energyTile.hidden = true;
+    return;
+  }
+
+  var v = plug.values;
+  var on = !!v.output;
+  card.className = "card socket " + (on ? "on" : "off") + (plug.stale ? " stale" : "");
+  $("socket-toggle").disabled = !!plug.stale;
+  $("socket-label").textContent = on ? "Socket on" : "Socket off";
+
+  var info = plug.info || {};
+  var subtitle = [info.name || info.model, plug.host].filter(Boolean).join(" · ");
+  if (plug.stale) {
+    // The values below are real, just not fresh. Say so rather than throwing
+    // a whole panel away over one missed reading.
+    subtitle = (plug.from_history ? "from the last recorded reading, " : "last seen ")
+      + ago(plug.generated) + " — " + (plug.error || "no answer")
+      + (plug.retry_in ? ", retrying in " + plug.retry_in + "s" : "");
+  }
+  $("socket-sub").textContent = subtitle;
+
+  var figures = [
+    ["Power",   num(v.power)   === null ? "—" : fmt(v.power, 1) + " W"],
+    ["Voltage", num(v.voltage) === null ? "—" : fmt(v.voltage, 1) + " V"],
+    ["Current", num(v.current) === null ? "—" : fmt(v.current, 3) + " A"],
+    ["Factor",  num(v.pf)      === null ? "—" : fmt(v.pf, 2)],
+    ["Line",    num(v.freq)    === null ? "—" : fmt(v.freq, 1) + " Hz"],
+    ["Energy",  num(v.energy)  === null ? "—" : fmt(v.energy / 1000, 3) + " kWh"],
+    ["Plug temp", num(v.temperature) === null ? "—" : fmt(v.temperature, 1) + " °C"]
+  ];
+  if (num(v.on_time) !== null) figures.push(["On time", runtimeText(v.on_time)]);
+  if (num(v.switch_on) !== null) figures.push(["Switched", fmt(v.switch_on, 0) + "×"]);
+
+  var host = $("socket-figures");
+  host.innerHTML = "";
+  figures.forEach(function (pair) {
+    var box = el("div");
+    box.appendChild(el("div", "k", pair[0]));
+    box.appendChild(el("div", "v", pair[1]));
+    host.appendChild(box);
+  });
+
+  // The two headline numbers also go up with the UPS tiles, because that is
+  // where the eye lands first.
+  powerTile.hidden = num(v.power) === null;
+  if (!powerTile.hidden) {
+    $("v-plug-power").textContent = fmt(v.power, 1);
+    $("s-plug-power").textContent = on
+      ? [num(v.voltage) !== null ? fmt(v.voltage, 0) + " V" : "",
+         num(v.current) !== null ? fmt(v.current, 2) + " A" : ""]
+        .filter(Boolean).join(" · ")
+      : "socket is off";
+    powerTile.className = "card metric " + (on ? "" : "warn");
+  }
+  energyTile.hidden = num(v.energy) === null;
+  if (!energyTile.hidden) {
+    $("v-plug-energy").textContent = fmt(v.energy / 1000, 3);
+    var energyCounter = (plug.counters || []).filter(function (c) {
+      return c.type === "aenergy";
+    })[0];
+    $("s-plug-energy").textContent = counterSince(energyCounter);
+  }
+}
+
+function toggleSocket() {
+  var plug = STATE.snapshot && STATE.snapshot.plug;
+  if (!plug || !plug.online) return;
+  var on = !(plug.values && plug.values.output);
+  var button = $("socket-toggle");
+  button.disabled = true;
+
+  askConfirm("Switch the socket <b>" + (on ? "on" : "off") + "</b>"
+             + "<br>" + ((plug.info || {}).name || plug.host)
+             + (on ? "" : "<br><br>Everything plugged into it loses power."),
+             { title: on ? "Switch the socket on?" : "Switch the socket off?",
+               confirmLabel: on ? "Switch on" : "Switch off", danger: !on })
+    .then(function (agreed) {
+      if (!agreed) return { cancelled: true };
+      return withPin("Switch the socket <b>" + (on ? "on" : "off") + "</b>",
+        function (pin) {
+          return api("plug-switch", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ on: on, pin: pin })
+          });
+        });
+    }).then(function (reply) {
+      if (!reply || reply.cancelled) return;
+      toast(reply.message || reply.error || "no reply", !!reply.ok);
+      if (reply.ok && reply.plug) {
+        STATE.snapshot.plug = reply.plug;
+        renderPlug(reply.plug);
+        renderPlugControls();
+      }
+      refresh();
+      setTimeout(loadEvents, 1500);
+    }).catch(function (e) {
+      toast("request failed: " + e, false);
+    }).then(function () {
+      button.disabled = false;
+    });
+}
+
+function resetPlugCounters(button, types, what) {
+  what = what || "every counter";
+  button.disabled = true;
+  button.classList.add("busy");
+  askConfirm("Reset <b>" + what + "</b> on the plug<br>"
+             + "That running total starts again from zero. Readings already "
+             + "recorded here are kept.",
+             { title: "Reset the counter?", confirmLabel: "Reset" })
+    .then(function (agreed) {
+      if (!agreed) return { cancelled: true };
+      return withPin("Reset <b>" + what + "</b> on the plug", function (pin) {
+        return api("plug-reset", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pin: pin, types: types || [] })
+        });
+      });
+    }).then(function (reply) {
+      if (!reply || reply.cancelled) return;
+      toast(reply.message || reply.error || "no reply", !!reply.ok);
+      // The daemon re-reads the plug before answering and sends the result
+      // with it, so the new figures can go up straight away rather than
+      // waiting for the next poll to come round.
+      if (reply.plug) {
+        STATE.snapshot.plug = reply.plug;
+        renderPlug(reply.plug);
+      }
+      refresh();
+      setTimeout(loadEvents, 1500);
+    }).catch(function (e) {
+      toast("request failed: " + e, false);
+    }).then(function () {
+      button.disabled = false;
+      button.classList.remove("busy");
+      renderPlugControls();
+    });
+}
+
+function renderSensors(sensors) {
+  var card = $("sensor-card");
+  if (!sensors || !sensors.length) { card.hidden = true; return; }
+  card.hidden = false;
+  var rows = [];
+  sensors.forEach(function (s) {
+    var parts = [];
+    if (num(s.temperature) !== null) parts.push(fmt(s.temperature, 1) + " °C");
+    if (num(s.humidity) !== null) parts.push(fmt(s.humidity, 0) + " % RH");
+    if (num(s.battery_pct) !== null) parts.push("battery " + fmt(s.battery_pct, 0) + " %");
+    rows.push([s.source, parts.join(" · ") || "—"]);
+    rows.push(["", ago(s.ts)]);
+  });
+  renderKV($("sensor-facts"), rows);
+}
 
 // ---------------------------------------------------------------------------
 // Favicon
@@ -2070,8 +2531,15 @@ var RESET_SCOPES = [
     help: "the self-test history and its voltage trend" },
   { scope: "outages", label: "Outages",  icon: "plug", tables: ["outages"],
     help: "the record of power failures" },
+  { scope: "plug",    label: "Plug history", icon: "plug",
+    tables: ["plug_samples", "plug_hourly"],
+    help: "everything recorded from the smart plug" },
+  { scope: "sensor",  label: "Sensor history", icon: "chart",
+    tables: ["sensor_samples"],
+    help: "every reading pushed by a sensor" },
   { scope: "all",     label: "Everything", icon: "trash", danger: true,
-    tables: ["samples", "samples_hourly", "snapshots", "events", "outages", "tests"],
+    tables: ["samples", "samples_hourly", "snapshots", "events", "outages",
+             "tests", "plug_samples", "plug_hourly", "sensor_samples"],
     help: "all of the above, leaving an empty database" }
 ];
 
@@ -2178,6 +2646,104 @@ function resetData(entry, button) {
     button.disabled = false;
     loadResetCounts();
   });
+}
+
+
+function counterSince(counter) {
+  // Say when the total started. "At least since" is used when the date comes
+  // from the oldest reading rather than an observed reset, because the counter
+  // may well have been running before this machine started watching.
+  if (!counter || !counter.reset_at) return "the plug does not say since when";
+  var when = stamp(counter.reset_at) + " · " + ago(counter.reset_at);
+  return (counter.reset_exact ? "since " : "counting since at least ") + when;
+}
+
+function counterText(type, value) {
+  if (type === "aenergy" || type === "ret_aenergy") {
+    return value >= 1000 ? fmt(value / 1000, 2) + " kWh" : fmt(value, 1) + " Wh";
+  }
+  if (type === "switch_on") return fmt(value, 0) + "×";
+  return runtimeText(value);
+}
+
+function renderPlugControls() {
+  var host = $("plug-control");
+  var plug = STATE.snapshot && STATE.snapshot.plug;
+  if (!plug) { host.hidden = true; return; }
+  host.hidden = false;
+
+  var online = !!plug.online && !plug.stale;
+  var on = online && plug.values && !!plug.values.output;
+  var info = plug.info || {};
+  $("plug-control-help").textContent = plug.stale
+    ? "The plug last answered " + ago(plug.generated) + ": "
+      + (plug.error || "no answer") + ". Controls are disabled until it responds."
+    : online
+      ? [info.name, info.model, plug.host].filter(Boolean).join(" · ")
+        + " — switching the socket cuts power to whatever is plugged into it."
+      : "The plug is not answering: " + (plug.error || "unknown reason");
+
+  var buttons = $("plug-buttons");
+  buttons.innerHTML = "";
+
+  var toggle = el("button", "btn cmd" + (on ? " danger" : ""));
+  toggle.innerHTML = iconMarkup("power")
+    + '<span>' + (on ? "Switch the socket off" : "Switch the socket on") + '</span>';
+  toggle.disabled = !online;
+  attachHint(toggle, "<b>Switch." + (on ? "Set off" : "Set on") + "</b><br>"
+    + (on ? "Cuts power to everything plugged into this socket."
+          : "Restores power to the socket.")
+    + "<br>Asks for the PIN, the same as the UPS commands.");
+  toggle.onclick = toggleSocket;
+  buttons.appendChild(toggle);
+
+  // Everything below lives in its own container, emptied on each render.
+  // Appending straight into the card meant a second heading and a second row
+  // of buttons every time this ran.
+  var section = $("plug-counters");
+  section.innerHTML = "";
+
+  var counters = plug.counters || [];
+  if (!counters.length || !online) return;
+
+  var heading = el("h3", null, "Reset a counter");
+  heading.style.cssText = "font-size:12px;letter-spacing:.8px;text-transform:"
+    + "uppercase;color:var(--tx-mut);margin:20px 0 8px";
+  section.appendChild(heading);
+  section.appendChild(el("p", "btnhelp",
+    "These are the plug's own running totals, the same ones its web interface "
+    + "lists. Resetting one starts it from zero; the history recorded here is "
+    + "untouched either way."));
+
+  var row = el("div", "btnrow");
+  counters.forEach(function (counter) {
+    var button = el("button", "btn cmd");
+    // Showing the value turns a blind "did that work?" into something you can
+    // watch go to zero.
+    var reading = num(counter.value);
+    var shown = reading === null ? "" : " · " + counterText(counter.type, reading);
+    button.innerHTML = iconMarkup("reset")
+      + '<span>' + counter.label + shown + '</span>';
+    button.disabled = reading === 0;
+    attachHint(button, "<b>" + counter.type + "</b><br>" + counter.help
+      + "<br>" + (counter.reset_at
+                  ? counterSince(counter).replace(/^./, function (c) {
+                      return c.toUpperCase(); })
+                  : "Never reset from here, and the plug does not say when it was.")
+      + (reading === 0 ? "<br><em>Already at zero.</em>" : ""));
+    button.onclick = function () {
+      resetPlugCounters(button, [counter.type], counter.label.toLowerCase());
+    };
+    row.appendChild(button);
+  });
+
+  var all = el("button", "btn cmd danger");
+  all.innerHTML = iconMarkup("trash") + '<span>All counters</span>';
+  attachHint(all, "<b>Switch.ResetCounters</b><br>"
+    + "Every counter above, back to zero in one go.");
+  all.onclick = function () { resetPlugCounters(all, [], "every counter"); };
+  row.appendChild(all);
+  section.appendChild(row);
 }
 
 function renderWritable(caps) {
@@ -2471,6 +3037,108 @@ function renderAllVariables(snap) {
   });
 }
 
+
+// ---------------------------------------------------------------------------
+// All variables: the plug and the sensors
+// ---------------------------------------------------------------------------
+var PLUG_GROUP_TITLES = {
+  "switch": "Switch and meter", sys: "System", wifi: "Wi-Fi", cloud: "Cloud",
+  mqtt: "MQTT", ble: "Bluetooth", matter: "Matter", eth: "Ethernet",
+  temperature: "Temperature", aenergy: "Energy", ret_aenergy: "Energy returned",
+  counts: "Counters", other: "Other"
+};
+
+function plugGroupOf(name) {
+  // switch:0.apower and the like belong together under one heading.
+  var component = name.split(".")[0].split(":")[0];
+  if (PLUG_GROUP_TITLES[component]) return component;
+  var first = name.split(".")[0];
+  return PLUG_GROUP_TITLES[first] ? first : "other";
+}
+
+function renderPlugVariables(plug) {
+  var card = $("all-plug");
+  if (!plug || !plug.online || !plug.vars) { card.hidden = true; return; }
+  var names = Object.keys(plug.vars);
+  if (!names.length) { card.hidden = true; return; }
+  card.hidden = false;
+
+  var groups = {};
+  names.forEach(function (name) {
+    (groups[plugGroupOf(name)] = groups[plugGroupOf(name)] || []).push(name);
+  });
+
+  var host = $("plug-vars");
+  host.innerHTML = "";
+  Object.keys(groups).sort(function (a, b) {
+    if (a === "other") return 1;
+    if (b === "other") return -1;
+    return a.localeCompare(b);
+  }).forEach(function (group) {
+    var heading = el("h3", null, (PLUG_GROUP_TITLES[group] || group).toUpperCase());
+    heading.style.cssText = "font-size:12px;letter-spacing:.8px;color:var(--tx-mut);"
+      + "margin:20px 0 8px";
+    host.appendChild(heading);
+
+    var table = el("table");
+    var body = el("tbody");
+    groups[group].sort().forEach(function (name) {
+      var tr = el("tr");
+      var left = el("td");
+      left.appendChild(el("div", "mono", name));
+      var note = (plug.descriptions || {})[name];
+      if (note) left.appendChild(el("div", "muted", note));
+      tr.appendChild(left);
+
+      var raw = plug.vars[name];
+      var cell = el("td", "num");
+      if (raw === true || raw === false) {
+        cell.appendChild(el("span", "tag " + (raw ? "ok" : "warn"), raw ? "yes" : "no"));
+      } else {
+        cell.textContent = raw === null || raw === "" ? "—" : String(raw);
+        // Epoch seconds are unreadable as a number; say when it was.
+        if (/_ts$|unixtime/.test(name) && num(raw) > 1000000000) {
+          cell.appendChild(el("div", "muted", stamp(num(raw))));
+        }
+        if (/uptime|on_time/.test(name) && num(raw) !== null) {
+          cell.appendChild(el("div", "muted", runtimeText(raw)));
+        }
+      }
+      tr.appendChild(cell);
+      body.appendChild(tr);
+    });
+    table.appendChild(body);
+    host.appendChild(table);
+  });
+}
+
+function renderSensorVariables(sensors) {
+  var card = $("all-sensors");
+  if (!sensors || !sensors.length) { card.hidden = true; return; }
+  card.hidden = false;
+  var host = $("sensor-vars");
+  host.innerHTML = "";
+
+  sensors.forEach(function (s) {
+    var heading = el("h3", null, s.source);
+    heading.style.cssText = "font-size:12px;letter-spacing:.8px;color:var(--tx-mut);"
+      + "margin:20px 0 8px";
+    host.appendChild(heading);
+
+    var rows = [];
+    [["temperature", "Temperature", " °C", 1],
+     ["humidity", "Relative humidity", " %", 0],
+     ["battery_pct", "Battery", " %", 0],
+     ["battery_v", "Battery voltage", " V", 2],
+     ["rssi", "Signal", " dBm", 0]].forEach(function (field) {
+      if (num(s[field[0]]) === null) return;
+      rows.push([field[1], fmt(s[field[0]], field[3]) + field[2]]);
+    });
+    rows.push(["Last push", stamp(s.ts) + " · " + ago(s.ts)]);
+    renderKV(host.appendChild(el("div")), rows);
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Wiring
 // ---------------------------------------------------------------------------
@@ -2485,7 +3153,11 @@ function refresh() {
       return;
     }
     renderSnapshot(snap);
-    if (STATE.tab === "all") renderAllVariables(snap);
+    if (STATE.tab === "all") {
+      renderAllVariables(snap);
+      renderPlugVariables(snap.plug);
+      renderSensorVariables(snap.sensors);
+    }
   }).catch(function () {
     var verdict = $("verdict");
     verdict.className = "pill unknown";
@@ -2510,13 +3182,18 @@ function showTab(name) {
   if (name === "tests") { LAST.tests = Date.now(); loadTests(); }
   if (name === "events") { LAST.events = Date.now(); loadEvents(); }
   if (name === "control") { LAST.capabilities = Date.now(); loadCapabilities(); }
-  if (name === "all" && STATE.snapshot) renderAllVariables(STATE.snapshot);
+  if (name === "all" && STATE.snapshot) {
+    renderAllVariables(STATE.snapshot);
+    renderPlugVariables(STATE.snapshot.plug);
+    renderSensorVariables(STATE.snapshot.sensors);
+  }
   try { history.replaceState(null, "", "#" + name); } catch (e) {}
 }
 
 document.querySelectorAll(".tabs button").forEach(function (button) {
   button.onclick = function () { showTab(button.dataset.tab); };
 });
+if ($("socket-toggle")) $("socket-toggle").onclick = toggleSocket;
 document.querySelectorAll("#ranges button").forEach(function (button) {
   button.onclick = function () {
     document.querySelectorAll("#ranges button").forEach(function (other) {

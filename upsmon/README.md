@@ -8,6 +8,9 @@ other host running Network UPS Tools.
 * `deploy/` — systemd unit, sample configuration, nginx server block
 * `INSTALL.md` — the full AlmaLinux 9 walkthrough
 
+It also watches a Shelly smart plug and any sensor that pushes readings to it,
+so the power actually being drawn is measured rather than estimated.
+
 ## How the pieces fit
 
 ```
@@ -89,6 +92,10 @@ upsmon --set battery.charge.low=20
 upsmon --history 7d                   # recorded samples as a table
 upsmon --events                       # the event log
 upsmon --tests                        # the self-test history
+upsmon --plug                         # everything the smart plug reports
+upsmon --plug-on / --plug-off         # switch the socket
+upsmon --sensors                      # readings pushed by battery sensors
+upsmon shelly plug dump               # the full Shelly toolkit, by role
 upsmon --reset-data [what]            # erase recorded data
 upsmon --check                        # is the whole system healthy
 upsmon --diag                         # settings, API latency, database size
@@ -114,6 +121,11 @@ Read endpoints are open on the loopback; the two that change something require
 | `GET /api/capabilities` | writable variables and supported commands |
 | `POST /api/command` | `{"command": "beeper.disable"}` |
 | `POST /api/set` | `{"var": "battery.charge.low", "value": "20"}` |
+| `GET /api/plug` | the plug's current state, every field it reports |
+| `GET /api/plug-history` | plug samples: power, energy, voltage, current, counters |
+| `GET /api/sensors`, `/api/sensor-history` | what sensors have pushed |
+| `POST /api/plug/switch` | `{"on": false}` |
+| `POST /api/plug/reset` | `{"types": ["aenergy"]}`, or `[]` for every counter |
 | `POST /api/reset` | `{"scope": "all / history / events / tests / outages"}` |
 
 ## What was verified
@@ -129,4 +141,4 @@ The PHP was checked structurally rather than executed; no interpreter was
 available in the build environment. Run `php -l` on both files after copying them
 across.
 
-Current version: **2.6.1**
+Current version: **3.4.4**

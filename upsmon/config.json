@@ -10,6 +10,20 @@
   "log_file": "/var/log/upsmon/upsmon.log",
   "log_level": "info",
   "log_to_journal": true,
+
+  "plug_host": "",
+  "plug_password": "",
+  "plug_switch_id": 0,
+  "plug_poll_interval": 15,
+  "plug_min_request_gap": 1.0,
+  "plug_sample_interval": 60,
+
+  "sensor_host": "",
+  "sensor_password": "",
+
+  "sensor_listen": false,
+  "sensor_listen_host": "0.0.0.0",
+  "sensor_listen_port": 8088,
   "poll_interval": 10,
   "sample_interval": 60,
   "sample_interval_battery": 10,

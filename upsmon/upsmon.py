@@ -14,19 +14,19 @@ API and guarded by a token, so the web user never holds upsd credentials.
 Runs as a systemd service, but every function is also available from the
 command line for testing:
 
-    upsmon.py --status            one-off report, straight from the UPS
-    upsmon.py --oneshot           one collection into the database, then exit
-    upsmon.py --list-rw           what this UPS lets you change
-    upsmon.py --set VAR=VALUE     change a writable variable
-    upsmon.py --exec COMMAND      run an instant command
-    upsmon.py --check             health check against the running daemon
-    upsmon.py --diag              API latency, database size, config in force
-    upsmon.py --history 24h       recent samples as a table
-    upsmon.py                     run the daemon in the foreground
+    upsmon --status            one-off report, straight from the UPS
+    upsmon --oneshot           one collection into the database, then exit
+    upsmon --list-rw           what this UPS lets you change
+    upsmon --set VAR=VALUE     change a writable variable
+    upsmon --exec COMMAND      run an instant command
+    upsmon --check             health check against the running daemon
+    upsmon --diag              API latency, database size, config in force
+    upsmon --history 24h       recent samples as a table
+    upsmon                     run the daemon in the foreground
 """
 
 # Bumped by hand with every change to this file.
-__version__ = '2.6.1'
+__version__ = '3.4.4'
 
 import argparse
 import getpass
@@ -104,6 +104,35 @@ DEFAULTS = {
     'log_file': '/var/log/upsmon/upsmon.log',
     'log_level': 'info',         # 'debug' adds poll-by-poll detail
     'log_to_journal': True,      # also write to stdout, which systemd captures
+
+    # --- smart plug (Shelly Gen2+) ------------------------------------------
+    # Empty host disables everything below. The plug speaks JSON-RPC over plain
+    # HTTP on the LAN; no cloud account is involved and enabling it here does
+    # not interfere with the Shelly app, Matter or anything else already using
+    # the device.
+    'plug_host': '',
+    'plug_password': '',          # only if one is set in the plug's web UI
+    'plug_switch_id': 0,          # which relay; single-socket plugs are always 0
+    'plug_poll_interval': 15,
+    # Gen3 firmware with authentication on answers 429 when requests arrive
+    # too close together, and the two a poll needs would otherwise go out
+    # milliseconds apart. Spacing them costs nothing and stops the flapping.
+    'plug_min_request_gap': 1.0,
+    'plug_sample_interval': 60,
+    'plug_timeout': 5.0,
+
+    # --- pushed sensor readings ---------------------------------------------
+    # Battery sensors such as the Shelly H&T sleep between measurements, so
+    # nothing can poll them. They push instead: point their webhook here.
+    # A sensor can also be addressed directly, which works whenever it happens
+    # to be awake - always, if it runs on USB power.
+    'sensor_host': '',
+    'sensor_password': '',
+
+    'sensor_listen': False,
+    'sensor_listen_host': '0.0.0.0',
+    'sensor_listen_port': 8088,
+    'sensor_retain_days': 730,
 
     # --- safety -------------------------------------------------------------
     # Commands that cut power to the load are refused through the API unless
@@ -461,6 +490,278 @@ def connect_ups(authenticate=False, username=None, password=None):
         client.login(user, pw or '')
     name = client.resolve_ups(CONFIG['ups_name'])
     return client, name
+
+
+
+# ---------------------------------------------------------------------------
+# Shelly Gen2+ RPC
+# ---------------------------------------------------------------------------
+class PlugError(Exception):
+    pass
+
+
+class ShellyRPC(object):
+    """Minimal JSON-RPC client for a Shelly Gen2+ device, standard library only.
+
+    The published clients use `requests`, which this daemon deliberately does
+    without. That means implementing HTTP digest authentication by hand: Shelly
+    answers the first request with 401 and a challenge, and expects SHA-256
+    digest with qop=auth. urllib's own digest handler predates SHA-256 on the
+    Python that AlmaLinux 9 ships, so it cannot be relied on here.
+    """
+
+    # One challenge is reused for every later call, with the nonce counter
+    # stepping on each time. Re-authenticating from scratch doubles the number
+    # of HTTP requests, and a Gen3 plug answers 429 when that adds up.
+    _challenges = {}
+    _last_request = {}
+    _pace = threading.Lock()
+
+    def __init__(self, host=None, password=None, timeout=None):
+        self.host = host or CONFIG['plug_host']
+        self.password = password if password is not None else CONFIG['plug_password']
+        self.timeout = float(timeout or CONFIG['plug_timeout'])
+        self.retry_after = 0.0
+
+    @property
+    def url(self):
+        return 'http://%s/rpc' % self.host
+
+    def call(self, method, params=None):
+        if not self.host:
+            raise PlugError('no plug configured (set plug_host)')
+        payload = {'id': 1, 'method': method}
+        if params:
+            payload['params'] = params
+        body = json.dumps(payload).encode('utf-8')
+
+        # Send the credentials straight away when we already hold a challenge.
+        known = self._challenges.get(self.host)
+        auth = self._digest_header(known, 'POST', '/rpc') if known else None
+        status, reply, headers = self._post(body, auth)
+
+        if status == 401:
+            challenge = headers.get('WWW-Authenticate', '')
+            if not self.password:
+                raise PlugError('the plug requires a password; set plug_password')
+            self._challenges[self.host] = self._parse_challenge(challenge)
+            status, reply, headers = self._post(
+                body, self._digest_header(self._challenges[self.host], 'POST', '/rpc'))
+            if status == 401:
+                self._challenges.pop(self.host, None)
+                raise PlugError('the plug rejected the password')
+        if status == 429:
+            retry = headers.get('Retry-After')
+            self.retry_after = to_float(retry) or 0
+            # Wait it out and try again, up to three times. Each command-line
+            # run starts with no memory of when the last request went out, so
+            # invocations a second apart trip the limit through no fault of the
+            # caller's - and a device that counts refused requests too needs
+            # more than one pause to let the window clear.
+            attempt = getattr(self, '_retries', 0)
+            if attempt < 3:
+                self._retries = attempt + 1
+                delay = min(max(self.retry_after, 2.0) * (attempt + 1), 15.0)
+                log('the plug asked us to wait; retrying in %.0fs' % delay,
+                    level='debug')
+                time.sleep(delay)
+                try:
+                    return self.call(method, params)
+                finally:
+                    self._retries = attempt
+            raise PlugError('the plug is rate limiting us (HTTP 429)'
+                            + (' - it asks for %s seconds' % retry if retry else ''))
+        if status != 200:
+            raise PlugError('the plug answered HTTP %s' % status)
+
+        try:
+            result = json.loads(reply.decode('utf-8'))
+        except ValueError:
+            raise PlugError('the plug did not return JSON - is it a Gen2+ device?')
+        if 'error' in result:
+            error = result['error']
+            raise PlugError('RPC error %s: %s'
+                            % (error.get('code'), error.get('message')))
+        return result.get('result')
+
+    def _wait_turn(self):
+        """Keep a minimum gap between requests to the same device."""
+        gap = float(CONFIG.get('plug_min_request_gap') or 0)
+        if gap <= 0:
+            return
+        with self._pace:
+            previous = self._last_request.get(self.host, 0.0)
+            delay = previous + gap - time.time()
+            if delay > 0:
+                time.sleep(min(delay, gap))
+            self._last_request[self.host] = time.time()
+
+    def _post(self, body, auth=None):
+        import urllib.request
+        import urllib.error
+        self._wait_turn()
+        request = urllib.request.Request(self.url, data=body, method='POST')
+        request.add_header('Content-Type', 'application/json')
+        if auth:
+            request.add_header('Authorization', auth)
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return response.status, response.read(), dict(response.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), dict(e.headers)
+        except OSError as e:
+            raise PlugError('cannot reach the plug at %s (%s)' % (self.host, e))
+
+    @staticmethod
+    def _parse_challenge(header):
+        fields = dict(re.findall(r'(\w+)="?([^",]+)"?', header))
+        fields['nc'] = 0
+        return fields
+
+    def _digest_header(self, fields, method, path):
+        """Answer a digest challenge. Shelly uses SHA-256 with qop=auth."""
+        import hashlib
+        algorithm = (fields.get('algorithm') or 'SHA-256').upper()
+        digest = hashlib.sha256 if 'SHA-256' in algorithm else hashlib.md5
+
+        def h(text):
+            return digest(text.encode('utf-8')).hexdigest()
+
+        realm = fields.get('realm', '')
+        nonce = fields.get('nonce', '')
+        fields['nc'] = int(fields.get('nc', 0)) + 1
+        nc = '%08x' % fields['nc']
+        cnonce = secrets.token_hex(8)
+        # The username is always "admin" on these devices; the web UI does not
+        # offer any other, and the password field alone is what it configures.
+        ha1 = h('admin:%s:%s' % (realm, self.password))
+        ha2 = h('%s:%s' % (method, path))
+        response = h('%s:%s:%s:%s:auth:%s' % (ha1, nonce, nc, cnonce, ha2))
+        return ('Digest username="admin", realm="%s", nonce="%s", uri="%s", '
+                'algorithm=%s, qop=auth, nc=%s, cnonce="%s", response="%s"'
+                % (realm, nonce, path, algorithm, nc, cnonce, response))
+
+    # -- the calls this daemon makes ---------------------------------------
+    def switch_status(self):
+        return self.call('Switch.GetStatus', {'id': int(CONFIG['plug_switch_id'])})
+
+    def device_status(self):
+        return self.call('Shelly.GetStatus')
+
+    def device_info(self):
+        return self.call('Shelly.GetDeviceInfo')
+
+    def set_output(self, on):
+        return self.call('Switch.Set', {'id': int(CONFIG['plug_switch_id']),
+                                        'on': bool(on)})
+
+    def toggle(self):
+        return self.call('Switch.Toggle', {'id': int(CONFIG['plug_switch_id'])})
+
+    def reset_counters(self, types=None):
+        """Reset counters. Without a type the plug resets every one it has.
+
+        Firmware differs on what it will accept here, so the batch is tried
+        first and each type separately afterwards. Whether it worked is decided
+        by reading the counters back, not by the reply.
+        """
+        params = {'id': int(CONFIG['plug_switch_id'])}
+        if types:
+            params['type'] = list(types)
+        try:
+            return self.call('Switch.ResetCounters', params)
+        except PlugError:
+            # Older firmware rejects a batch outright when it contains one type
+            # it does not know, rather than ignoring that one. Retry each on its
+            # own and keep whatever the device accepts.
+            accepted = []
+            for one in (types or PLUG_COUNTER_TYPES):
+                try:
+                    self.call('Switch.ResetCounters',
+                              {'id': int(CONFIG['plug_switch_id']), 'type': [one]})
+                    accepted.append(one)
+                except PlugError:
+                    continue
+            if not accepted:
+                raise
+            return {'reset': accepted}
+
+
+def describe_plug_field(path):
+    """Fall back to something readable for fields not in the table."""
+    tail = re.sub(r'^[a-z_0-9]+:\d+\.', '', path)
+    if tail in PLUG_DESCRIPTIONS:
+        return PLUG_DESCRIPTIONS[tail]
+    return tail.replace('.', ' ').replace('_', ' ').capitalize()
+
+
+def flatten(obj, prefix=''):
+    """Turn a nested RPC reply into dotted paths: aenergy.total, sys.uptime."""
+    flat = {}
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            flat.update(flatten(value, '%s.%s' % (prefix, key) if prefix else str(key)))
+    elif isinstance(obj, list):
+        if obj and all(isinstance(item, (int, float)) for item in obj):
+            flat[prefix] = obj
+        else:
+            for index, item in enumerate(obj):
+                flat.update(flatten(item, '%s.%d' % (prefix, index)))
+    else:
+        flat[prefix] = obj
+    return flat
+
+
+# What Switch.ResetCounters accepts, in the order the plug's own web UI lists
+# them. Sending no type at all resets everything, which is what "all" does.
+PLUG_COUNTERS = [
+    {'type': 'aenergy',      'label': 'Active energy',
+     'help': 'the kilowatt-hours consumed since the last reset'},
+    {'type': 'ret_aenergy',  'label': 'Returned energy',
+     'help': 'energy fed back to the grid; always zero on a plain socket'},
+    {'type': 'on_time',      'label': 'Total runtime',
+     'help': 'how long the relay has been switched on, in total'},
+    {'type': 'switch_on',    'label': 'Switching cycles',
+     'help': 'how many times the relay has been switched on'},
+    {'type': 'on_above_thr', 'label': 'Active load runtime',
+     'help': 'time spent above the active load threshold set on the plug'},
+]
+PLUG_COUNTER_TYPES = [c['type'] for c in PLUG_COUNTERS]
+
+
+PLUG_DESCRIPTIONS = {
+    'output': 'Relay output',
+    'apower': 'Active power (W)',
+    'voltage': 'Voltage (V)',
+    'current': 'Current (A)',
+    'pf': 'Power factor',
+    'freq': 'Line frequency (Hz)',
+    'aenergy.total': 'Energy consumed since the counters were reset (Wh)',
+    'aenergy.by_minute': 'Energy in each of the last three minutes (mWh)',
+    'aenergy.minute_ts': 'Timestamp of the last minute counted',
+    'ret_aenergy.total': 'Energy returned to the grid (Wh)',
+    'temperature.tC': 'Plug temperature (deg C)',
+    'temperature.tF': 'Plug temperature (deg F)',
+    'counts.on_time': 'Total runtime — time the relay has been on (s)',
+    'counts.switch_on': 'Switching cycles — times the relay has been switched on',
+    'counts.on_above_thr': 'Active load runtime — time above the plug threshold (s)',
+    'counts.on_time_rst_ts': 'When the runtime counter was last reset',
+    'counts.switch_on_rst_ts': 'When the cycle counter was last reset',
+    'counts.on_above_thr_rst_ts': 'When the load-runtime counter was last reset',
+    'aenergy.total_rst_ts': 'When the energy counter was last reset',
+    'sys.uptime': 'Plug uptime (s)',
+    'sys.mac': 'MAC address',
+    'sys.available_updates.stable.version': 'Firmware update waiting',
+    'wifi.rssi': 'Wi-Fi signal (dBm)',
+    'wifi.sta_ip': 'Plug IP address',
+    'wifi.ssid': 'Wi-Fi network',
+    'cloud.connected': 'Shelly Cloud',
+    'mqtt.connected': 'MQTT broker',
+    'tC': 'Temperature (deg C)',
+    'rh': 'Relative humidity (%)',
+    'battery.V': 'Sensor battery (V)',
+    'battery.percent': 'Sensor battery (%)',
+}
 
 
 # ---------------------------------------------------------------------------
@@ -1010,6 +1311,52 @@ CREATE TABLE IF NOT EXISTS tests (
 );
 CREATE INDEX IF NOT EXISTS tests_started ON tests (started);
 
+CREATE TABLE IF NOT EXISTS plug_samples (
+    ts          INTEGER PRIMARY KEY,
+    output      INTEGER,       -- 1 on, 0 off
+    power       REAL,          -- W
+    voltage     REAL,
+    current     REAL,          -- A
+    pf          REAL,
+    freq        REAL,
+    energy      REAL,          -- Wh, cumulative since the counters were reset
+    energy_ret  REAL,
+    temperature REAL,          -- the plug's own, deg C
+    on_time     INTEGER,       -- seconds switched on, cumulative
+    switch_on   INTEGER,       -- times switched on, cumulative
+    on_above_thr INTEGER,      -- seconds above the plug's load threshold
+    rssi        REAL,          -- Wi-Fi signal, dBm
+    uptime      INTEGER,
+    ram_free    INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS plug_hourly (
+    ts          INTEGER PRIMARY KEY,
+    samples     INTEGER,
+    power       REAL,
+    power_max   REAL,
+    voltage     REAL,
+    current     REAL,
+    freq        REAL,
+    temperature REAL,
+    energy      REAL,          -- the reading at the end of the hour
+    energy_used REAL,          -- and how much was used during it
+    on_seconds  INTEGER
+);
+
+CREATE TABLE IF NOT EXISTS sensor_samples (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts          INTEGER NOT NULL,
+    source      TEXT NOT NULL,   -- which device pushed it
+    temperature REAL,
+    humidity    REAL,
+    battery_v   REAL,
+    battery_pct REAL,
+    rssi        REAL,
+    raw         TEXT
+);
+CREATE INDEX IF NOT EXISTS sensor_ts ON sensor_samples (ts);
+
 CREATE TABLE IF NOT EXISTS meta (
     key     TEXT PRIMARY KEY,
     value   TEXT
@@ -1030,6 +1377,20 @@ VAR_FOR_COLUMN = {
     'temperature': 'ups.temperature',
     'realpower': 'ups.realpower',
 }
+
+
+def thin(rows, points):
+    """Reduce a series to at most `points` rows, keeping the first and last."""
+    if not points or len(rows) <= points:
+        return rows
+    step = len(rows) / float(points)
+    picked, i = [], 0.0
+    while int(i) < len(rows):
+        picked.append(rows[int(i)])
+        i += step
+    if picked[-1] is not rows[-1]:
+        picked.append(rows[-1])
+    return picked
 
 
 class StorageError(Exception):
@@ -1067,8 +1428,49 @@ class Storage(object):
                 # WAL keeps the dashboard's reads from blocking the writer.
                 conn.execute('PRAGMA journal_mode=WAL')
                 conn.execute('PRAGMA synchronous=NORMAL')
+            self.migrate()
         except sqlite3.OperationalError as e:
             raise StorageError(self._explain(e))
+
+    # Columns added to tables that already existed in an earlier version.
+    # CREATE TABLE IF NOT EXISTS leaves an existing table exactly as it was, so
+    # a new column has to be added deliberately or every insert fails.
+    MIGRATIONS = {
+        'plug_samples': [('on_above_thr', 'INTEGER'), ('rssi', 'REAL'),
+                         ('uptime', 'INTEGER'), ('ram_free', 'INTEGER')],
+        'plug_hourly': [('on_above_thr', 'INTEGER'), ('rssi', 'REAL')],
+        'sensor_samples': [('rssi', 'REAL'), ('raw', 'TEXT')],
+        'samples': [('input_hz', 'REAL'), ('temperature', 'REAL'),
+                    ('realpower', 'REAL')],
+        'tests': [('on_battery_s', 'INTEGER'), ('voltage_min', 'REAL')],
+    }
+
+    def migrate(self):
+        """Bring a database made by an earlier version up to date."""
+        added = []
+        with self.lock:
+            conn = self.connection()
+            for table, columns in self.MIGRATIONS.items():
+                try:
+                    existing = {row['name'] for row in
+                                conn.execute('PRAGMA table_info(%s)' % table)}
+                except sqlite3.OperationalError:
+                    continue                # the table itself is new; skip
+                if not existing:
+                    continue
+                for name, kind in columns:
+                    if name in existing:
+                        continue
+                    try:
+                        conn.execute('ALTER TABLE %s ADD COLUMN %s %s'
+                                     % (table, name, kind))
+                        added.append('%s.%s' % (table, name))
+                    except sqlite3.OperationalError:
+                        pass                # already there under a race
+            conn.commit()
+        if added:
+            log('database updated: added %s' % ', '.join(added))
+        return added
 
     def _explain(self, error):
         """SQLite's wording hides the actual problem, which is always ownership."""
@@ -1118,6 +1520,104 @@ class Storage(object):
             conn.execute(sql, [row[c] for c in columns])
             conn.commit()
         return ts
+
+    PLUG_COLUMNS = ['output', 'power', 'voltage', 'current', 'pf', 'freq',
+                    'energy', 'energy_ret', 'temperature', 'on_time', 'switch_on',
+                    'on_above_thr', 'rssi', 'uptime', 'ram_free']
+
+    def add_plug_sample(self, values, ts=None):
+        ts = int(ts or time.time())
+        columns = ['ts'] + self.PLUG_COLUMNS
+        row = [ts] + [values.get(c) for c in self.PLUG_COLUMNS]
+        with self.lock:
+            conn = self.connection()
+            conn.execute('INSERT OR REPLACE INTO plug_samples (%s) VALUES (%s)'
+                         % (', '.join(columns), ', '.join('?' * len(columns))), row)
+            conn.commit()
+        return ts
+
+    def add_sensor_sample(self, source, values, raw=None, ts=None):
+        ts = int(ts or time.time())
+        with self.lock:
+            conn = self.connection()
+            conn.execute('INSERT INTO sensor_samples '
+                         '(ts, source, temperature, humidity, battery_v, '
+                         'battery_pct, rssi, raw) VALUES (?,?,?,?,?,?,?,?)',
+                         (ts, source, values.get('temperature'), values.get('humidity'),
+                          values.get('battery_v'), values.get('battery_pct'),
+                          values.get('rssi'), raw))
+            conn.commit()
+        return ts
+
+    def counter_restarted_at(self, column):
+        """When a counter last went backwards, which is what a reset looks like.
+
+        These totals only ever climb, so a fall between two samples is a reset.
+        Returns (timestamp, exact) - exact is False when no fall was found and
+        the answer is simply the oldest reading we hold, meaning the counter has
+        been running at least that long.
+        """
+        with self.lock:
+            rows = self.connection().execute(
+                'SELECT ts, %s AS value FROM plug_samples WHERE %s IS NOT NULL '
+                'ORDER BY ts' % (column, column)).fetchall()
+        if not rows:
+            return None, False
+        previous = None
+        found = None
+        for row in rows:
+            if previous is not None and row['value'] < previous:
+                found = row['ts']
+            previous = row['value']
+        return (found, True) if found else (rows[0]['ts'], False)
+
+    def latest_plug_sample(self):
+        with self.lock:
+            row = self.connection().execute(
+                'SELECT * FROM plug_samples ORDER BY ts DESC LIMIT 1').fetchone()
+        return dict(row) if row else None
+
+    def plug_series(self, since, until=None, points=600):
+        until = int(until or time.time())
+        cutoff = int(time.time()) - CONFIG['retain_full_days'] * 86400
+        rows = []
+        with self.lock:
+            conn = self.connection()
+            if since < cutoff:
+                for record in conn.execute(
+                        'SELECT ts, power, power_max, voltage, current, freq, '
+                        'temperature, energy, energy_used, on_seconds, samples '
+                        'FROM plug_hourly WHERE ts >= ? AND ts < ? ORDER BY ts',
+                        (int(since), min(cutoff, until))):
+                    row = dict(record)
+                    row['output'] = 1 if (row.get('on_seconds') or 0) > 0 else 0
+                    row['hourly'] = 1
+                    rows.append(row)
+            sql = ('SELECT ts, output, power, voltage, current, pf, freq, energy, '
+                   'energy_ret, temperature, on_time, switch_on, on_above_thr, '
+                   'rssi, uptime, ram_free FROM plug_samples '
+                   'WHERE ts >= ? AND ts <= ? ORDER BY ts')
+            rows.extend(dict(r) for r in conn.execute(
+                sql, (max(int(since), cutoff if since < cutoff else int(since)), until)))
+        return thin(rows, points)
+
+    def sensor_series(self, since, until=None, points=600, source=None):
+        until = int(until or time.time())
+        sql = ('SELECT ts, source, temperature, humidity, battery_v, battery_pct, '
+               'rssi FROM sensor_samples WHERE ts >= ? AND ts <= ?')
+        args = [int(since), until]
+        if source:
+            sql += ' AND source = ?'
+            args.append(source)
+        with self.lock:
+            rows = [dict(r) for r in self.connection().execute(sql + ' ORDER BY ts', args)]
+        return thin(rows, points)
+
+    def sensor_sources(self):
+        with self.lock:
+            return [dict(r) for r in self.connection().execute(
+                'SELECT source, COUNT(*) samples, MAX(ts) last FROM sensor_samples '
+                'GROUP BY source ORDER BY last DESC')]
 
     def add_snapshot(self, ups, variables, ts=None):
         ts = int(ts or time.time())
@@ -1282,16 +1782,7 @@ class Storage(object):
                 args.append(ups)
             rows.extend(dict(r) for r in conn.execute(sql + ' ORDER BY ts', args))
 
-        if points and len(rows) > points:
-            step = len(rows) / float(points)
-            picked, i = [], 0.0
-            while int(i) < len(rows):
-                picked.append(rows[int(i)])
-                i += step
-            if picked[-1] is not rows[-1]:
-                picked.append(rows[-1])
-            rows = picked
-        return rows
+        return thin(rows, points)
 
     def events(self, limit=200, since=None, ups=None):
         sql = 'SELECT id, ts, ups, kind, level, detail FROM events'
@@ -1330,7 +1821,8 @@ class Storage(object):
             conn = self.connection()
             out = {}
             for name in ('samples', 'samples_hourly', 'events', 'snapshots',
-                         'outages', 'tests'):
+                         'outages', 'tests', 'plug_samples', 'plug_hourly',
+                         'sensor_samples'):
                 out[name] = conn.execute('SELECT COUNT(*) c FROM %s' % name).fetchone()['c']
             row = conn.execute('SELECT MIN(ts) a, MAX(ts) b FROM samples').fetchone()
             out['first_sample'] = row['a']
@@ -1352,8 +1844,10 @@ class Storage(object):
     # -- housekeeping -------------------------------------------------------
     RESET_SCOPES = {
         'all': ['samples', 'samples_hourly', 'snapshots', 'events', 'outages',
-                'tests'],
+                'tests', 'plug_samples', 'plug_hourly', 'sensor_samples'],
         'history': ['samples', 'samples_hourly', 'snapshots'],
+        'plug': ['plug_samples', 'plug_hourly'],
+        'sensor': ['sensor_samples'],
         'events': ['events'],
         'outages': ['outages'],
         'tests': ['tests'],
@@ -1422,6 +1916,33 @@ class Storage(object):
                       r['output_v'], r['battery_v'], r['battery_v_min'],
                       r['input_hz'], r['temperature'], r['realpower'],
                       int(r['on_batt']) * interval))
+            # the plug's own history, rolled up the same way
+            plug_done = conn.execute(
+                'SELECT COALESCE(MAX(ts), 0) m FROM plug_hourly').fetchone()['m']
+            plug_rows = conn.execute("""
+                SELECT (ts / 3600) * 3600 AS hour, COUNT(*) n,
+                       AVG(power) power, MAX(power) power_max,
+                       AVG(voltage) voltage, AVG(current) current,
+                       AVG(freq) freq, AVG(temperature) temperature,
+                       MAX(energy) energy, MAX(energy) - MIN(energy) energy_used,
+                       SUM(CASE WHEN output = 1 THEN 1 ELSE 0 END) on_count
+                FROM plug_samples WHERE ts < ? AND ts > ? GROUP BY hour
+            """, (cutoff, plug_done)).fetchall()
+            plug_interval = max(1, CONFIG['plug_sample_interval'])
+            for r in plug_rows:
+                conn.execute("""
+                    INSERT OR REPLACE INTO plug_hourly (ts, samples, power, power_max,
+                        voltage, current, freq, temperature, energy, energy_used,
+                        on_seconds) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                """, (r['hour'], r['n'], r['power'], r['power_max'], r['voltage'],
+                      r['current'], r['freq'], r['temperature'], r['energy'],
+                      r['energy_used'], int(r['on_count']) * plug_interval))
+            conn.execute('DELETE FROM plug_samples WHERE ts < ?', (cutoff,))
+            conn.execute('DELETE FROM plug_hourly WHERE ts < ?',
+                         (int(time.time()) - CONFIG['retain_hourly_days'] * 86400,))
+            conn.execute('DELETE FROM sensor_samples WHERE ts < ?',
+                         (int(time.time()) - CONFIG['sensor_retain_days'] * 86400,))
+
             conn.execute('DELETE FROM samples WHERE ts < ?', (cutoff,))
             conn.execute('DELETE FROM samples_hourly WHERE ts < ?',
                          (int(time.time()) - CONFIG['retain_hourly_days'] * 86400,))
@@ -1470,6 +1991,18 @@ class Daemon(object):
         self.capabilities = self._empty_capabilities()
         self.recent_writes = {}      # var -> when we wrote it, to avoid double logging
         self.active_test_id = None   # set while we are following a test we began
+        self.plug = None             # snapshot of the smart plug, if configured
+        self.plug_error = None
+        self.plug_info = None
+        self.last_plug_poll = 0.0
+        self.last_plug_sample = 0.0
+        self.plug_output = None      # last confirmed relay state, for events
+        self.last_device_status = 0.0
+        self.device_status_cache = {}
+        self.plug_backoff_until = 0.0
+        self.plug_failures = 0
+        self.last_sensor_poll = 0.0
+        self.sensors = {}            # newest reading per pushing device
         self.pin_failures = 0
         self.pin_locked_until = 0.0
         self._control_lock = threading.Lock()
@@ -1766,6 +2299,9 @@ class Daemon(object):
             'allow_dangerous': CONFIG['allow_dangerous_commands'],
             'pin_required': self.pin_required(),
             'outage': self.store.open_outage(),
+            'plug': self.plug_snapshot(),
+            'sensors': sorted(self.sensors.values(),
+                              key=lambda s: s.get('source') or ''),
         }
         with self.lock:
             self.snapshot = snapshot
@@ -1812,6 +2348,326 @@ class Daemon(object):
 
     def pin_required(self):
         return bool(str(CONFIG.get('pin') or '').strip())
+
+    def plug_snapshot(self):
+        """What the dashboard needs about the plug, or why there is nothing."""
+        if not CONFIG['plug_host']:
+            return None
+        if self.plug is None:
+            # A restart empties the in-memory snapshot, and if the first poll
+            # is refused the panel would sit blank for a minute with a database
+            # full of readings behind it. Show the last one, plainly marked.
+            return self.plug_from_history()
+        snapshot = dict(self.plug)
+        snapshot['error'] = self.plug_error
+        # A missed poll should not blank a panel full of perfectly good
+        # readings. Keep showing them, marked as stale, and say why.
+        snapshot['online'] = True
+        snapshot['stale'] = self.plug_error is not None
+        snapshot['age'] = int(time.time() - snapshot.get('generated', time.time()))
+        if self.plug_backoff_until > time.time():
+            snapshot['retry_in'] = int(self.plug_backoff_until - time.time())
+        return snapshot
+
+    # -- the smart plug ------------------------------------------------------
+    def poll_plug(self, force=False):
+        """Read the plug and record it. Failure here never disturbs the UPS."""
+        if not CONFIG['plug_host']:
+            return None
+        now = time.time()
+        if not force and now - self.last_plug_poll < CONFIG['plug_poll_interval']:
+            return self.plug
+        if not force and now < self.plug_backoff_until:
+            return self.plug
+        self.last_plug_poll = now
+
+        rpc = ShellyRPC()
+        try:
+            switch = rpc.switch_status()
+            # The system, Wi-Fi and cloud sections change slowly and cost a
+            # whole extra request each time. Once a minute is plenty, and a
+            # Gen3 plug starts answering 429 if asked for everything at every
+            # poll.
+            if now - self.last_device_status >= 60 or not self.device_status_cache:
+                self.device_status_cache = rpc.device_status()
+                self.last_device_status = now
+            device = self.device_status_cache
+            if self.plug_info is None:
+                self.plug_info = rpc.device_info()
+                self.store.set_meta('plug_info', json.dumps(self.plug_info))
+        except PlugError as e:
+            self.plug_failures += 1
+            # One missed poll is noise; three in a row is worth recording. The
+            # log was filling with lost/restored pairs from a plug that was
+            # only ever briefly busy.
+            if self.plug_failures == 3:
+                self.store.add_event('plug', 'lost contact with the plug: %s' % e,
+                                     'warn')
+            self.plug_error = str(e)
+            first_ever = self.plug_info is None and self.plug is None
+            if '429' in str(e) and not first_ever:
+                # Being told to slow down is not a fault. Wait for as long as
+                # the device asked, or a minute, rather than hammering it and
+                # staying blocked.
+                asked = getattr(rpc, 'retry_after', 0) or 0
+                self.plug_backoff_until = now + max(asked or 0, 60)
+                log('plug is rate limiting; backing off for %ds'
+                    % int(self.plug_backoff_until - now),
+                    level='warn' if self.plug_failures == 3 else 'debug')
+            elif '429' in str(e):
+                # Straight after a restart, try again on the next tick rather
+                # than waiting a minute with nothing to show.
+                self.plug_backoff_until = now + max(CONFIG['plug_poll_interval'], 5)
+                log('plug is rate limiting on the first poll; trying again shortly',
+                    level='debug')
+            else:
+                log('plug poll failed: %s' % e,
+                    level='warn' if self.plug_failures <= 3 else 'debug')
+            return None
+
+        if self.plug_failures >= 3:
+            self.store.add_event('plug', 'contact with the plug restored', 'info')
+        self.plug_failures = 0
+        self.last_sensor_poll = 0.0
+        self.plug_error = None
+
+        flat = flatten(switch)
+        flat.update(flatten(device))
+        values = {
+            'output': 1 if switch.get('output') else 0,
+            'power': to_float(switch.get('apower')),
+            'voltage': to_float(switch.get('voltage')),
+            'current': to_float(switch.get('current')),
+            'pf': to_float(switch.get('pf')),
+            'freq': to_float(switch.get('freq')),
+            'energy': to_float((switch.get('aenergy') or {}).get('total')),
+            'energy_ret': to_float((switch.get('ret_aenergy') or {}).get('total')),
+            'temperature': to_float((switch.get('temperature') or {}).get('tC')),
+            'on_time': to_float((switch.get('counts') or {}).get('on_time')),
+            'switch_on': to_float((switch.get('counts') or {}).get('switch_on')),
+            'on_above_thr': to_float((switch.get('counts') or {}).get('on_above_thr')),
+            'rssi': to_float(flat.get('wifi.rssi')),
+            'uptime': to_float(flat.get('sys.uptime')),
+            'ram_free': to_float(flat.get('sys.ram_free')),
+        }
+
+        # The relay changing state is worth an event; nobody wants to trawl a
+        # chart to find out when something switched off.
+        if self.plug_output is not None and values['output'] != self.plug_output:
+            self.store.add_event('plug', 'socket switched %s'
+                                 % ('on' if values['output'] else 'off'),
+                                 'info' if values['output'] else 'warn')
+        self.plug_output = values['output']
+
+        if now - self.last_plug_sample >= CONFIG['plug_sample_interval']:
+            self.store.add_plug_sample(values, now)
+            self.last_plug_sample = now
+
+        self.plug = {
+            'generated': int(now),
+            'online': True,
+            'host': CONFIG['plug_host'],
+            'values': values,
+            'vars': {k: v for k, v in flat.items() if not isinstance(v, (dict, list))},
+            'descriptions': {k: PLUG_DESCRIPTIONS.get(k, describe_plug_field(k))
+                             for k in flat},
+            'info': self.plug_info or {},
+            'counters': [dict(c, value=self._counter_value(flat, c['type']),
+                              reset_at=self._counter_reset_at(flat, c['type'])[0],
+                              reset_exact=self._counter_reset_at(flat, c['type'])[1])
+                         for c in PLUG_COUNTERS],
+        }
+        return self.plug
+
+    COUNTER_RESET_FIELDS = {
+        'aenergy': 'aenergy.total_rst_ts',
+        'ret_aenergy': 'ret_aenergy.total_rst_ts',
+        'on_time': 'counts.on_time_rst_ts',
+        'switch_on': 'counts.switch_on_rst_ts',
+        'on_above_thr': 'counts.on_above_thr_rst_ts',
+    }
+
+    COUNTER_COLUMNS = {'aenergy': 'energy', 'ret_aenergy': 'energy_ret',
+                       'on_time': 'on_time', 'switch_on': 'switch_on',
+                       'on_above_thr': 'on_above_thr'}
+
+    def _counter_reset_at(self, flat, counter):
+        """When this counter started counting, and how sure we are.
+
+        Three sources, in order of authority: the timestamp the plug publishes,
+        a reset made from here, and failing both, the recorded history - these
+        totals only climb, so a fall in the chart is a reset. If none of that
+        applies, the oldest reading still gives a date the counter has been
+        running since, which beats telling somebody nothing at all.
+        """
+        reported = to_float(flat.get(self.COUNTER_RESET_FIELDS.get(counter, '')))
+        if reported and reported > 1000000000:
+            return int(reported), True
+        remembered = self.store.get_meta('plug_reset_' + counter)
+        if remembered:
+            return int(remembered), True
+        column = self.COUNTER_COLUMNS.get(counter)
+        if column:
+            found, exact = self.store.counter_restarted_at(column)
+            if found:
+                return int(found), exact
+        return None, False
+
+    def plug_from_history(self):
+        """Build a stale snapshot out of the newest stored sample."""
+        row = self.store.latest_plug_sample()
+        if not row:
+            return {'online': False, 'host': CONFIG['plug_host'],
+                    'error': self.plug_error or 'no reading yet'}
+
+        values = {key: row.get(key) for key in Storage.PLUG_COLUMNS}
+        info = {}
+        remembered = self.store.get_meta('plug_info')
+        if remembered:
+            try:
+                info = json.loads(remembered)
+            except ValueError:
+                info = {}
+        counters = [dict(c,
+                         value={'aenergy': row.get('energy'),
+                                'ret_aenergy': row.get('energy_ret'),
+                                'on_time': row.get('on_time'),
+                                'switch_on': row.get('switch_on'),
+                                'on_above_thr': row.get('on_above_thr')}[c['type']],
+                         reset_at=self._counter_reset_at({}, c['type'])[0],
+                         reset_exact=self._counter_reset_at({}, c['type'])[1])
+                    for c in PLUG_COUNTERS]
+        return {
+            'generated': row['ts'],
+            'online': True,
+            'stale': True,
+            'from_history': True,
+            'age': int(time.time() - row['ts']),
+            'host': CONFIG['plug_host'],
+            'error': self.plug_error or 'waiting for the first reading since restart',
+            'values': values,
+            'vars': {},
+            'descriptions': {},
+            'info': info,
+            'counters': counters,
+        }
+
+    @staticmethod
+    def _counter_value(flat, counter):
+        """Where each resettable counter lives in the status reply."""
+        return to_float(flat.get({
+            'aenergy': 'aenergy.total',
+            'ret_aenergy': 'ret_aenergy.total',
+            'on_time': 'counts.on_time',
+            'switch_on': 'counts.switch_on',
+            'on_above_thr': 'counts.on_above_thr',
+        }[counter]))
+
+    def set_plug_output(self, on):
+        try:
+            ShellyRPC().set_output(on)
+        except PlugError as e:
+            return False, str(e)
+        # Claim the new state before re-reading, or the poll would see a change
+        # it did not cause and log the same switch a second time.
+        self.plug_output = 1 if on else 0
+        self.poll_plug(force=True)
+        self.store.add_event('plug', 'socket switched %s from the dashboard'
+                             % ('on' if on else 'off'),
+                             'info' if on else 'warn')
+        return True, 'socket switched %s' % ('on' if on else 'off')
+
+    def read_plug_counters(self, attempts=2):
+        """The current value of each resettable counter, straight from the plug.
+
+        Raises rather than returning nothing: a verification built on an empty
+        reading would be worse than no verification at all.
+        """
+        last = None
+        for attempt in range(attempts):
+            try:
+                flat = flatten(ShellyRPC().switch_status())
+                break
+            except PlugError as e:
+                last = e
+                time.sleep(1.5)
+        else:
+            raise last or PlugError('could not read the counters')
+        return {
+            'aenergy': to_float(flat.get('aenergy.total')),
+            'ret_aenergy': to_float(flat.get('ret_aenergy.total')),
+            'on_time': to_float(flat.get('counts.on_time')),
+            'switch_on': to_float(flat.get('counts.switch_on')),
+            'on_above_thr': to_float(flat.get('counts.on_above_thr')),
+        }
+
+    def reset_plug_counters(self, types=None):
+        """Reset counters and check they actually moved.
+
+        The plug answers a reset with success whether or not it understood the
+        counter name, so taking its word for it means reporting a reset that
+        never happened. Read the values back and compare.
+        """
+        wanted = [t for t in (types or []) if t in PLUG_COUNTER_TYPES]
+        try:
+            before = self.read_plug_counters()
+        except PlugError as e:
+            return False, 'could not read the counters first: %s' % e
+
+        try:
+            ShellyRPC().reset_counters(wanted or None)
+        except PlugError as e:
+            return False, str(e)
+
+        time.sleep(1.0)                     # the plug needs a moment to settle
+        try:
+            after = self.read_plug_counters()
+        except PlugError as e:
+            # The reset probably worked; we simply cannot say so honestly.
+            self.store.add_event('plug', 'reset requested but the result could '
+                                 'not be checked: %s' % e, 'warn')
+            return True, ('the reset was sent, but the plug did not answer when '
+                          'asked to confirm it — check the counters in a moment')
+        checked = wanted or PLUG_COUNTER_TYPES
+        labels = {c['type']: c['label'] for c in PLUG_COUNTERS}
+
+        cleared, unchanged, already = [], [], []
+        for counter in checked:
+            was, now = before.get(counter), after.get(counter)
+            if was is None and now is None:
+                continue                    # this model does not have it
+            if now is not None and now == 0:
+                (already if was in (0, None) else cleared).append(labels[counter])
+            elif was is not None and now is not None and now < was:
+                cleared.append(labels[counter])
+            else:
+                unchanged.append(labels[counter])
+
+        # Record when each counter was cleared before rebuilding the snapshot,
+        # so the dashboard shows the new date at once rather than a poll later.
+        # The plug's own *_rst_ts fields are used when it publishes them; this
+        # is the fallback for models that report 0 or omit them.
+        stamped = int(time.time())
+        for counter in checked:
+            if labels[counter] in cleared:
+                self.store.set_meta('plug_reset_' + counter, stamped)
+        self.poll_plug(force=True)
+
+        if cleared:
+            message = 'reset ' + ', '.join(c.lower() for c in cleared)
+            if unchanged:
+                message += ('; the plug did not clear '
+                            + ', '.join(u.lower() for u in unchanged))
+            self.store.add_event('plug', message, 'info')
+            return True, message
+        if already and not unchanged:
+            message = ', '.join(a.lower() for a in already) + ' was already at zero'
+            return True, message
+        message = ('the plug accepted the request but nothing changed: '
+                   + ', '.join(u.lower() for u in unchanged or checked)
+                   + '. This firmware may not support resetting those.')
+        self.store.add_event('plug', message, 'warn')
+        return False, message
 
     # -- control ------------------------------------------------------------
     def run_command(self, cmd):
@@ -2002,6 +2858,140 @@ class Daemon(object):
                 return current
             time.sleep(1.0)
 
+    def poll_sensor(self, force=False):
+        """Read a sensor that has an address of its own.
+
+        A battery H&T is asleep almost always, so this usually fails and that
+        is not an error - the webhook is what carries its readings. On USB
+        power it answers every time and gives a proper history without needing
+        webhooks at all.
+        """
+        if not CONFIG['sensor_host']:
+            return None
+        now = time.time()
+        if not force and now - self.last_sensor_poll < CONFIG['plug_poll_interval']:
+            return None
+        self.last_sensor_poll = now
+
+        try:
+            rpc = ShellyRPC(CONFIG['sensor_host'], CONFIG['sensor_password'])
+            flat = flatten(rpc.call('Shelly.GetStatus'))
+        except PlugError as e:
+            log('sensor poll: %s' % e, level='debug')
+            return None
+
+        def pick(*names):
+            for name in names:
+                for key, value in flat.items():
+                    if key == name or key.endswith('.' + name):
+                        number = to_float(value)
+                        if number is not None:
+                            return number
+            return None
+
+        values = {
+            'temperature': pick('tC'),
+            'humidity': pick('rh'),
+            'battery_v': pick('battery.V', 'V'),
+            'battery_pct': pick('battery.percent', 'percent'),
+            'rssi': pick('rssi'),
+        }
+        if all(v is None for v in values.values()):
+            return None
+
+        source = CONFIG['sensor_host']
+        self.store.add_sensor_sample(source, values, json.dumps(
+            {k: v for k, v in flat.items() if not isinstance(v, (dict, list))}), now)
+        entry = dict(values)
+        entry['ts'] = int(now)
+        entry['source'] = source
+        entry['polled'] = True
+        self.sensors[source] = entry
+        return entry
+
+    # -- pushed sensor readings ---------------------------------------------
+    def serve_sensors(self):
+        """Receive webhook pushes from battery sensors that cannot be polled.
+
+        A Shelly H&T sleeps between measurements and is unreachable almost all
+        the time, so it pushes instead. Point its webhook at this port:
+
+          http://<this-host>:8088/?t=${ev.tC}&rh=${ev.rh}
+        """
+        daemon = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _accept(self, fields, raw):
+                source = (fields.get('id') or fields.get('device')
+                          or self.client_address[0])
+                values = {
+                    'temperature': to_float(fields.get('t') or fields.get('tC')
+                                            or fields.get('temperature')),
+                    'humidity': to_float(fields.get('rh') or fields.get('humidity')),
+                    'battery_v': to_float(fields.get('bv') or fields.get('battery')),
+                    'battery_pct': to_float(fields.get('bp') or fields.get('percent')),
+                    'rssi': to_float(fields.get('rssi')),
+                }
+                if all(v is None for v in values.values()):
+                    self.send_response(400)
+                    self.send_header('Content-Length', '0')
+                    self.end_headers()
+                    return
+                now = time.time()
+                daemon.store.add_sensor_sample(source, values, raw, now)
+                previous = daemon.sensors.get(source)
+                entry = dict(values)
+                entry['ts'] = int(now)
+                entry['source'] = source
+                daemon.sensors[source] = entry
+                if previous is None:
+                    daemon.store.add_event('sensor', 'first reading from %s' % source,
+                                           'info')
+                log('sensor %s: %s' % (source, raw), level='debug')
+                self.send_response(200)
+                self.send_header('Content-Length', '0')
+                self.end_headers()
+
+            def do_GET(self):
+                query = parse_qs(urlparse(self.path).query)
+                fields = {k: v[0] for k, v in query.items() if v}
+                self._accept(fields, json.dumps(fields))
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length') or 0)
+                raw = self.rfile.read(length).decode('utf-8', 'replace') if length else ''
+                fields = {}
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        fields = {k: v for k, v in flatten(parsed).items()}
+                except ValueError:
+                    fields = {k: v[0] for k, v in parse_qs(raw).items() if v}
+                # A Shelly webhook body nests the reading; flatten finds it
+                # wherever the firmware decided to put it.
+                short = {}
+                for key, value in fields.items():
+                    short[key.rsplit('.', 1)[-1]] = value
+                short.update(fields)
+                self._accept(short, raw)
+
+        try:
+            server = ThreadingHTTPServer(
+                (CONFIG['sensor_listen_host'], int(CONFIG['sensor_listen_port'])),
+                Handler)
+        except OSError as e:
+            log('cannot listen for sensor pushes on %s:%s - %s'
+                % (CONFIG['sensor_listen_host'], CONFIG['sensor_listen_port'], e),
+                level='error')
+            return
+        server.daemon_threads = True
+        log('listening for sensor pushes on http://%s:%s/'
+            % (CONFIG['sensor_listen_host'], CONFIG['sensor_listen_port']))
+        server.serve_forever()
+
     # -- loops --------------------------------------------------------------
     def run(self):
         # logrotate signals us after it has moved the file aside.
@@ -2032,12 +3022,26 @@ class Daemon(object):
         api = threading.Thread(target=self.serve, daemon=True)
         api.start()
 
+        if CONFIG['plug_host']:
+            log('smart plug at %s, polled every %ss'
+                % (CONFIG['plug_host'], CONFIG['plug_poll_interval']))
+        if CONFIG['sensor_listen']:
+            threading.Thread(target=self.serve_sensors, daemon=True).start()
+
         self.poll()
         while True:
             start = time.time()
             try:
                 ensure_log_current()
                 self.poll()
+                try:
+                    self.poll_plug()
+                except Exception as e:      # the plug must never stop the UPS
+                    log('plug error: %s' % e, level='error')
+                try:
+                    self.poll_sensor()
+                except Exception as e:
+                    log('sensor error: %s' % e, level='error')
                 if start - self.last_aggregate_at >= CONFIG['aggregate_interval']:
                     self.last_aggregate_at = start
                     rolled = self.store.aggregate()
@@ -2080,7 +3084,33 @@ class Daemon(object):
                 sent = self.headers.get('X-Upsmon-Token', '')
                 return secrets.compare_digest(sent, daemon.token)
 
+            def handle_request(self, method):
+                """Route one request, turning any failure into a plain answer.
+
+                Without this an unexpected error inside an endpoint escapes
+                into the socket server, which prints an entire traceback per
+                request. A browser polling every five seconds then buries the
+                journal in identical stack traces and the actual cause scrolls
+                away.
+                """
+                try:
+                    return method()
+                except BrokenPipeError:
+                    raise
+                except Exception as e:
+                    log('%s %s failed: %s: %s'
+                        % (self.command, self.path, type(e).__name__, e),
+                        level='error')
+                    self._send(500, {'ok': False,
+                                     'error': '%s: %s' % (type(e).__name__, e)})
+
             def do_GET(self):
+                self.handle_request(self._get)
+
+            def do_POST(self):
+                self.handle_request(self._post)
+
+            def _get(self):
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = parse_qs(parsed.query)
@@ -2101,6 +3131,37 @@ class Daemon(object):
                 elif path in ('/events', '/api/events'):
                     limit = min(1000, int(query.get('limit', ['100'])[0] or 100))
                     self._send(200, {'events': daemon.store.events(limit)})
+                elif path in ('/plug', '/api/plug'):
+                    self._send(200, daemon.plug_snapshot()
+                               or {'configured': False,
+                                   'error': 'no plug configured'})
+                elif path in ('/sensors', '/api/sensors'):
+                    self._send(200, {
+                        'listening': bool(CONFIG['sensor_listen']),
+                        'endpoint': 'http://%s:%s/' % (CONFIG['sensor_listen_host'],
+                                                       CONFIG['sensor_listen_port']),
+                        'latest': sorted(daemon.sensors.values(),
+                                         key=lambda s: s.get('source') or ''),
+                        'sources': daemon.store.sensor_sources(),
+                    })
+                elif path in ('/plug-history', '/api/plug-history'):
+                    span = parse_span(query.get('range', ['24h'])[0])
+                    points = min(5000, int(query.get('points', ['600'])[0] or 600))
+                    self._send(200, {
+                        'range': span,
+                        'samples': daemon.store.plug_series(time.time() - span,
+                                                            points=points),
+                    })
+                elif path in ('/sensor-history', '/api/sensor-history'):
+                    span = parse_span(query.get('range', ['24h'])[0])
+                    points = min(5000, int(query.get('points', ['600'])[0] or 600))
+                    self._send(200, {
+                        'range': span,
+                        'sources': daemon.store.sensor_sources(),
+                        'samples': daemon.store.sensor_series(
+                            time.time() - span, points=points,
+                            source=(query.get('source', [''])[0] or None)),
+                    })
                 elif path in ('/tests', '/api/tests'):
                     limit = min(500, int(query.get('limit', ['50'])[0] or 50))
                     self._send(200, {'tests': daemon.store.tests(limit)})
@@ -2124,7 +3185,7 @@ class Daemon(object):
                 else:
                     self._send(404, {'ok': False, 'error': 'no such endpoint'})
 
-            def do_POST(self):
+            def _post(self):
                 parsed = urlparse(self.path)
                 path = parsed.path
                 query = parse_qs(parsed.query)
@@ -2170,6 +3231,33 @@ class Daemon(object):
                         'ok': ok, 'message': message, 'var': var,
                         'value': daemon.capabilities['writable'].get(var),
                     })
+                elif path in ('/plug/switch', '/api/plug/switch'):
+                    if not CONFIG['plug_host']:
+                        self._send(400, {'ok': False, 'error': 'no plug configured'})
+                        return
+                    wanted = payload.get('on')
+                    allowed, why = daemon.check_pin(payload.get('pin'))
+                    if not allowed:
+                        self._send(403, {'ok': False, 'error': why, 'pin_error': True,
+                                         'locked': time.time() < daemon.pin_locked_until})
+                        return
+                    ok, message = daemon.set_plug_output(bool(wanted))
+                    self._send(200 if ok else 400,
+                               {'ok': ok, 'message': message,
+                                'plug': daemon.plug_snapshot()})
+                elif path in ('/plug/reset', '/api/plug/reset'):
+                    if not CONFIG['plug_host']:
+                        self._send(400, {'ok': False, 'error': 'no plug configured'})
+                        return
+                    allowed, why = daemon.check_pin(payload.get('pin'))
+                    if not allowed:
+                        self._send(403, {'ok': False, 'error': why, 'pin_error': True,
+                                         'locked': time.time() < daemon.pin_locked_until})
+                        return
+                    ok, message = daemon.reset_plug_counters(payload.get('types'))
+                    self._send(200 if ok else 400,
+                               {'ok': ok, 'message': message,
+                                'plug': daemon.plug_snapshot()})
                 elif path in ('/reset', '/api/reset'):
                     scope = (payload.get('scope')
                              or query.get('scope', ['all'])[0] or 'all')
@@ -2224,6 +3312,11 @@ class Daemon(object):
             'consecutive_errors': self.consecutive_errors,
             'suppressed_reads': self.suppressed_reads,
             'log_file': str(LOG_PATH) if LOG_PATH else None,
+            'plug': ({'host': CONFIG['plug_host'],
+                      'online': self.plug_error is None and self.plug is not None,
+                      'error': self.plug_error} if CONFIG['plug_host'] else None),
+            'sensors': {'listening': bool(CONFIG['sensor_listen']),
+                        'devices': len(self.sensors)},
             'last_error': self.last_error,
             'level': snap.get('level'),
             'database': stats,
@@ -2268,6 +3361,214 @@ def parse_span(text):
     unit = match.group(2) or 's'
     return int(value * {'s': 1, 'm': 60, 'h': 3600, 'd': 86400,
                         'w': 604800, 'y': 31536000}[unit])
+
+
+
+# ---------------------------------------------------------------------------
+# Shelly command line
+# ---------------------------------------------------------------------------
+# Everything the standalone reader could do, addressed by role rather than by
+# IP: "plug" and "sensor" resolve to the hosts and passwords already in the
+# configuration, so nothing has to be typed twice or pasted into a shell.
+SHELLY_DEVICES = {
+    'plug':      ('plug_host', 'plug_password'),
+    'sensor':    ('sensor_host', 'sensor_password'),
+    'temp':      ('sensor_host', 'sensor_password'),
+    'tempmeter': ('sensor_host', 'sensor_password'),
+    'ht':        ('sensor_host', 'sensor_password'),
+}
+
+
+def shelly_for(role):
+    """Build a client for 'plug' or 'sensor' from the configuration."""
+    if role not in SHELLY_DEVICES:
+        raise PlugError('unknown device "%s" - use plug or sensor' % role)
+    host_key, password_key = SHELLY_DEVICES[role]
+    host = CONFIG.get(host_key)
+    if not host:
+        raise PlugError('no address configured for the %s - set %s in %s'
+                        % (role, host_key, CONFIG_FILE))
+    return ShellyRPC(host, CONFIG.get(password_key))
+
+
+SHELLY_COMPONENTS = ('Shelly.GetStatus', 'Shelly.GetConfig', 'Shelly.GetDeviceInfo',
+                     'Sys.GetStatus', 'Wifi.GetStatus', 'Cloud.GetStatus',
+                     'MQTT.GetStatus', 'BLE.GetConfig', 'Matter.GetStatus',
+                     'Switch.GetStatus', 'Temperature.GetStatus',
+                     'Humidity.GetStatus', 'DevicePower.GetStatus')
+
+
+def shelly_everything(rpc):
+    """Ask for every component the device might have; skip what it lacks."""
+    out = {}
+    for method in SHELLY_COMPONENTS:
+        params = None
+        if method.split('.')[0] in ('Switch', 'Temperature', 'Humidity', 'DevicePower'):
+            params = {'id': int(CONFIG['plug_switch_id'])
+                      if method.startswith('Switch') else 0}
+        try:
+            result = rpc.call(method, params)
+        except PlugError as e:
+            if not is_missing_component(e):
+                raise                # a rate limit or a dead network, not absence
+            continue                 # not present on this model, which is normal
+        if result is not None:
+            out[method] = result
+    return out
+
+
+def shelly_print_flat(pal, flat, title=None):
+    if title:
+        print(pal.group(title))
+    width = max([len(k) for k in flat] + [10])
+    for key in sorted(flat):
+        value = flat[key]
+        if isinstance(value, list):
+            value = ', '.join(str(v) for v in value)
+        text = 'ON' if value is True else 'OFF' if value is False else str(value)
+        painter = (pal.ok if value is True else pal.bad if value is False
+                   else pal.note if value is None or value == '' else pal.value)
+        print('  %s : %s' % (pal.key(key.ljust(width)), painter(text)))
+        note = PLUG_DESCRIPTIONS.get(re.sub(r'^[a-z_0-9]+:\d+\.', '', key))
+        if note:
+            print('  %s   %s' % (' ' * width, pal.note(note)))
+
+
+# ---- mDNS discovery -------------------------------------------------------
+def shelly_discover(pal, seconds=4.0):
+    """Find Shelly devices by asking _shelly._tcp.local over multicast DNS.
+
+    The published tool uses the zeroconf package for this. One query and a few
+    seconds of listening is all it takes, so it is done here with a socket
+    rather than adding a dependency to a daemon that has none.
+    """
+    import struct
+
+    def encode_name(name):
+        out = b''
+        for label in name.split('.'):
+            if label:
+                out += bytes([len(label)]) + label.encode('ascii')
+        return out + b'\x00'
+
+    def read_name(data, offset, depth=0):
+        parts = []
+        while offset < len(data) and depth < 20:
+            length = data[offset]
+            if length == 0:
+                offset += 1
+                break
+            if length & 0xC0 == 0xC0:          # a compression pointer
+                pointer = struct.unpack('!H', data[offset:offset + 2])[0] & 0x3FFF
+                parts.append(read_name(data, pointer, depth + 1)[0])
+                offset += 2
+                break
+            parts.append(data[offset + 1:offset + 1 + length].decode('ascii', 'replace'))
+            offset += 1 + length
+        return '.'.join(p for p in parts if p), offset
+
+    query = (struct.pack('!HHHHHH', 0, 0, 1, 0, 0, 0)
+             + encode_name('_shelly._tcp.local') + struct.pack('!HH', 12, 1))
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
+    sock.settimeout(0.5)
+    try:
+        sock.bind(('', 0))
+        sock.sendto(query, ('224.0.0.251', 5353))
+    except OSError as e:
+        print(pal.bad('cannot send the multicast query: %s' % e))
+        sock.close()
+        return {}
+
+    found = {}
+    deadline = time.time() + seconds
+    while time.time() < deadline:
+        try:
+            data, addr = sock.recvfrom(9000)
+        except socket.timeout:
+            continue
+        except OSError:
+            break
+        try:
+            counts = struct.unpack('!HHHHHH', data[:12])
+            offset = 12
+            for _ in range(counts[2]):          # skip the questions
+                _, offset = read_name(data, offset)
+                offset += 4
+            names = []
+            for _ in range(counts[3] + counts[4] + counts[5]):
+                name, offset = read_name(data, offset)
+                rtype, _cls, _ttl, length = struct.unpack('!HHIH', data[offset:offset + 10])
+                offset += 10
+                if rtype == 12:                 # PTR
+                    target, _ = read_name(data, offset)
+                    names.append(target)
+                offset += length
+        except (struct.error, IndexError):
+            names = []
+        entry = found.setdefault(addr[0], {'ip': addr[0], 'names': set()})
+        for name in names:
+            if 'shelly' in name.lower():
+                entry['names'].add(name.split('.')[0])
+    sock.close()
+    return {ip: {'ip': ip, 'names': sorted(v['names'])}
+            for ip, v in found.items() if v['names']}
+
+
+# ---- WebSocket, for live pushes -------------------------------------------
+def _ws_send(sock, payload):
+    """Send one masked text frame, as a client must."""
+    import struct
+    data = payload.encode('utf-8')
+    header = bytes([0x81])
+    mask = secrets.token_bytes(4)
+    if len(data) < 126:
+        header += bytes([0x80 | len(data)])
+    elif len(data) < 65536:
+        header += bytes([0x80 | 126]) + struct.pack('!H', len(data))
+    else:
+        header += bytes([0x80 | 127]) + struct.pack('!Q', len(data))
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+    sock.sendall(header + mask + masked)
+
+
+def _ws_frames(sock):
+    """Yield the payload of each text frame arriving on an open socket."""
+    import struct
+    buffer = b''
+
+    def need(count):
+        nonlocal buffer
+        while len(buffer) < count:
+            chunk = sock.recv(65536)
+            if not chunk:
+                raise ConnectionError('the connection closed')
+            buffer += chunk
+        taken, buffer = buffer[:count], buffer[count:]
+        return taken
+
+    while True:
+        first, second = need(2)
+        opcode = first & 0x0F
+        masked = second & 0x80
+        length = second & 0x7F
+        if length == 126:
+            length = struct.unpack('!H', need(2))[0]
+        elif length == 127:
+            length = struct.unpack('!Q', need(8))[0]
+        mask = need(4) if masked else None
+        payload = need(length) if length else b''
+        if mask:
+            payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        if opcode == 0x8:                       # close
+            return
+        if opcode == 0x9:                       # ping, answer with a pong
+            sock.sendall(bytes([0x8A, 0x00]))
+            continue
+        if opcode in (0x1, 0x2) and payload:
+            yield payload.decode('utf-8', 'replace')
 
 
 # ---------------------------------------------------------------------------
@@ -2889,6 +4190,128 @@ def cmd_events(args, pal):
     return 0
 
 
+def cmd_plug(args, pal):
+    """Read or switch the smart plug, with or without the daemon running."""
+    if not CONFIG['plug_host']:
+        print(pal.warn('no plug configured - set plug_host in %s' % CONFIG_FILE))
+        return 1
+
+    # Switching goes through the daemon when there is one, so the action lands
+    # in the same event log as everything else.
+    if args.plug_on or args.plug_off or args.plug_reset:
+        status, _ = api_call('/api/health', timeout=2.0)
+        if status == 200:
+            pin = CONFIG.get('pin') or ''
+            if args.plug_reset:
+                types = ([] if args.plug_reset == 'all'
+                         else [t.strip() for t in args.plug_reset.split(',')])
+                path, body = '/api/plug/reset', {'pin': pin, 'types': types}
+            else:
+                path, body = '/api/plug/switch', {'on': bool(args.plug_on), 'pin': pin}
+            code, reply = api_call(path, 'POST', body, timeout=20.0)
+            ok = code == 200 and reply.get('ok')
+            print((pal.ok('PLUG ') if ok else pal.bad('PLUG '))
+                  + (reply.get('message') or reply.get('error') or 'no reply'))
+            return 0 if ok else 1
+        try:
+            rpc = ShellyRPC()
+            if args.plug_reset:
+                types = ([] if args.plug_reset == 'all'
+                         else [t.strip() for t in args.plug_reset.split(',')])
+                rpc.reset_counters(types or None)
+                print(pal.ok('PLUG ') + 'reset %s'
+                      % (', '.join(types) if types else 'every counter'))
+            else:
+                rpc.set_output(bool(args.plug_on))
+                print(pal.ok('PLUG ') + 'socket switched %s'
+                      % ('on' if args.plug_on else 'off'))
+            return 0
+        except PlugError as e:
+            print(pal.bad('PLUG ') + str(e), file=sys.stderr)
+            return 2
+
+    try:
+        rpc = ShellyRPC()
+        switch = rpc.switch_status()
+        device = rpc.device_status()
+        info = rpc.device_info()
+    except PlugError as e:
+        print(pal.bad('ERROR: ') + str(e), file=sys.stderr)
+        return 2
+
+    flat = flatten(switch)
+    flat.update(flatten(device))
+    if args.json:
+        print(json.dumps({'info': info, 'switch': switch, 'device': device}, indent=2))
+        return 0
+
+    bar = '=' * 78
+    print(pal.rule(bar))
+    print('  ' + pal.title('%s  %s' % (info.get('model', 'plug'), info.get('name', ''))))
+    print('  ' + pal.note('upsmon v%s   |   %s   |   firmware %s   |   %s'
+                          % (__version__, CONFIG['plug_host'], info.get('ver', '?'),
+                             datetime.now().strftime('%Y-%m-%d %H:%M:%S'))))
+    print(pal.rule(bar))
+    on = bool(switch.get('output'))
+    print('  %-12s: %s' % ('Socket', pal.ok('ON') if on else pal.bad('OFF')))
+    for key, label, unit in (('apower', 'Power', ' W'), ('voltage', 'Voltage', ' V'),
+                             ('current', 'Current', ' A'), ('pf', 'Power factor', ''),
+                             ('freq', 'Frequency', ' Hz')):
+        if switch.get(key) is not None:
+            print('  %-12s: %s%s' % (label, pal.value(str(switch[key])), unit))
+    energy = to_float((switch.get('aenergy') or {}).get('total'))
+    if energy is not None:
+        print('  %-12s: %s Wh   %s' % ('Energy', pal.value('%.1f' % energy),
+                                       pal.note('(%.3f kWh)' % (energy / 1000.0))))
+    temp = to_float((switch.get('temperature') or {}).get('tC'))
+    if temp is not None:
+        painter = pal.bad if temp >= 70 else pal.warn if temp >= 55 else pal.value
+        print('  %-12s: %s degC' % ('Plug temp', painter('%.1f' % temp)))
+    print(pal.rule(bar))
+
+    width = max([len(k) for k in flat] + [10])
+    for key in sorted(flat):
+        value = flat[key]
+        if isinstance(value, list):
+            value = ', '.join(str(v) for v in value)
+        print('  %s : %s' % (pal.key(key.ljust(width)), pal.value(str(value))))
+        note = PLUG_DESCRIPTIONS.get(re.sub(r'^[a-z_0-9]+:\d+\.', '', key))
+        if note:
+            print('  %s   %s' % (' ' * width, pal.note(note)))
+    print('\n' + pal.rule(bar))
+    print('  ' + pal.note('%d values' % len(flat)))
+    print(pal.rule(bar))
+    return 0
+
+
+def cmd_sensors(args, pal):
+    store = Storage(readonly=True)
+    rows = store.sensor_series(time.time() - parse_span(args.history or '7d'),
+                               points=args.limit)
+    sources = store.sensor_sources()
+    if args.json:
+        print(json.dumps({'sources': sources, 'samples': rows}, indent=2))
+        return 0
+    if not sources:
+        print(pal.warn('no sensor has pushed anything yet'))
+        print(pal.note('  point the sensor webhook at http://%s:%s/?t=${ev.tC}&rh=${ev.rh}'
+                       % (CONFIG['sensor_listen_host'], CONFIG['sensor_listen_port'])))
+        return 0
+    print(pal.group('  devices'))
+    for s in sources:
+        print('    %-20s %5d reading(s), last %s'
+              % (s['source'], s['samples'],
+                 datetime.fromtimestamp(s['last']).strftime('%Y-%m-%d %H:%M:%S')))
+    print()
+    print(pal.group('  %-19s %-18s %8s %8s %8s' % ('time', 'source', 'degC', 'RH %', 'batt %')))
+    for row in rows[-args.limit:]:
+        print('  %-19s %-18s %8s %8s %8s'
+              % (datetime.fromtimestamp(row['ts']).strftime('%Y-%m-%d %H:%M:%S'),
+                 row['source'], _fmt(row.get('temperature'), 1),
+                 _fmt(row.get('humidity'), 1), _fmt(row.get('battery_pct'), 0)))
+    return 0
+
+
 def cmd_tests(args, pal):
     store = Storage(readonly=True)
     rows = store.tests(args.limit)
@@ -2923,9 +4346,491 @@ def _fmt(value, digits):
     return ('%%.%df' % digits) % value
 
 
+
+# ---------------------------------------------------------------------------
+# Shelly subcommands
+# ---------------------------------------------------------------------------
+def shelly_main(argv, pal):
+    """upsmon shelly <plug|sensor> <command> — the whole reader, by role."""
+    parser = argparse.ArgumentParser(
+        prog='upsmon shelly',
+        description='Talk to the Shelly devices named in the configuration. '
+                    'The address and password come from there, so only the role '
+                    'and the command are needed.',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+  upsmon shelly plug info                identity and firmware
+  upsmon shelly plug dump                every value the device reports
+  upsmon shelly plug dump --json
+  upsmon shelly plug poll --interval 5   a live table of the numbers
+  upsmon shelly plug watch               the same, pushed rather than polled
+  upsmon shelly plug on / off / toggle
+  upsmon shelly plug reset-counters              every counter
+  upsmon shelly plug reset-counters aenergy      just the energy total
+  upsmon shelly plug reboot --wait
+  upsmon shelly plug ble status
+  upsmon shelly plug matter off --reboot
+  upsmon shelly plug call Switch.GetStatus '{"id":0}'
+  upsmon shelly sensor dump              the thermometer, when it is awake
+  upsmon shelly listen --port 8088       receive pushes from a sleeping sensor
+  upsmon shelly serve --port 8089        accept an outbound websocket
+  upsmon shelly discover                 find devices on the LAN
+""")
+    parser.add_argument('device', nargs='?', default='plug',
+                        help='plug or sensor (also temp, tempmeter, ht)')
+    parser.add_argument('command', nargs='?', default='dump')
+    parser.add_argument('rest', nargs='*', help='arguments for the command')
+    parser.add_argument('--json', action='store_true', help='machine-readable output')
+    parser.add_argument('--interval', type=float, default=5.0,
+                        help='seconds between readings for poll (default 5)')
+    parser.add_argument('--count', type=int, help='stop after this many readings')
+    parser.add_argument('--csv', metavar='FILE', help='also append readings to a CSV')
+    parser.add_argument('--port', type=int, help='port for listen and serve')
+    parser.add_argument('--wait', action='store_true',
+                        help='wait for the device to come back after a reboot')
+    parser.add_argument('--reboot', action='store_true',
+                        help='reboot after changing a radio setting')
+    parser.add_argument('--seconds', type=float, default=4.0,
+                        help='how long discover listens (default 4)')
+    parser.add_argument('--no-color', action='store_true')
+    args = parser.parse_args(argv)
+
+    # "upsmon shelly discover" and "listen" need no device, so a command given
+    # in the device position is taken as the command.
+    if args.device not in SHELLY_DEVICES:
+        args.rest = ([args.command] if args.command != 'dump' else []) + args.rest
+        args.command = args.device
+        args.device = 'plug'
+
+    handler = {
+        'discover': shelly_cmd_discover, 'info': shelly_cmd_info,
+        'dump': shelly_cmd_dump, 'poll': shelly_cmd_poll,
+        'watch': shelly_cmd_watch, 'listen': shelly_cmd_listen,
+        'serve': shelly_cmd_serve, 'on': shelly_cmd_switch,
+        'off': shelly_cmd_switch, 'toggle': shelly_cmd_switch,
+        'reset-counters': shelly_cmd_reset, 'call': shelly_cmd_call,
+        'reboot': shelly_cmd_reboot, 'ble': shelly_cmd_radio,
+        'matter': shelly_cmd_radio,
+    }.get(args.command)
+
+    if handler is None:
+        print(pal.bad('unknown command "%s"' % args.command), file=sys.stderr)
+        parser.print_help()
+        return 2
+    try:
+        return handler(args, pal)
+    except PlugError as e:
+        print(pal.bad('ERROR: ') + str(e), file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print('\nstopped.')
+        return 0
+
+
+def shelly_cmd_discover(args, pal):
+    print(pal.note('asking the network for Shelly devices, %.0fs...' % args.seconds))
+    found = shelly_discover(pal, args.seconds)
+    if args.json:
+        print(json.dumps(list(found.values()), indent=2))
+        return 0
+    if not found:
+        print(pal.warn('nothing answered'))
+        print(pal.note('  mDNS does not cross subnets, and some networks block it. '
+                       'If the device is elsewhere, address it by IP in the config.'))
+        return 1
+    for entry in sorted(found.values(), key=lambda e: e['ip']):
+        print('  %s  %s' % (pal.value(entry['ip'].ljust(15)),
+                            pal.note(', '.join(entry['names']))))
+    print(pal.note('  %d device(s)' % len(found)))
+    return 0
+
+
+def shelly_cmd_info(args, pal):
+    rpc = shelly_for(args.device)
+    info = rpc.call('Shelly.GetDeviceInfo')
+    if args.json:
+        print(json.dumps(info, indent=2))
+        return 0
+    shelly_print_flat(pal, flatten(info), '  %s' % rpc.host)
+    return 0
+
+
+def shelly_cmd_dump(args, pal):
+    rpc = shelly_for(args.device)
+    everything = shelly_everything(rpc)
+    if not everything:
+        raise PlugError('the device answered nothing we recognise')
+    if args.json:
+        print(json.dumps(everything, indent=2))
+        return 0
+    info = everything.get('Shelly.GetDeviceInfo', {})
+    bar = '=' * 78
+    print(pal.rule(bar))
+    print('  ' + pal.title('%s  %s' % (info.get('model', args.device),
+                                       info.get('name', ''))))
+    print('  ' + pal.note('upsmon v%s   |   %s   |   firmware %s   |   %s'
+                          % (__version__, rpc.host, info.get('ver', '?'),
+                             datetime.now().strftime('%Y-%m-%d %H:%M:%S'))))
+    print(pal.rule(bar))
+    for method in sorted(everything):
+        flat = flatten(everything[method])
+        if not flat:
+            continue
+        print('\n' + pal.group('-- %s ' % method)
+              + pal.rule('-' * max(1, 74 - len(method))))
+        shelly_print_flat(pal, flat)
+    print('\n' + pal.rule(bar))
+    return 0
+
+
+# What a live table should show first. Timestamps and component ids are
+# numbers too, and picking those over the actual measurements made the poll
+# output useless.
+POLL_PREFERRED = ['apower', 'voltage', 'current', 'pf', 'freq', 'aenergy.total',
+                  'ret_aenergy.total', 'temperature.tC', 'tC', 'rh',
+                  'battery.percent', 'battery.V', 'wifi.rssi', 'sys.uptime']
+POLL_SKIP = re.compile(r'(_ts$|\.id$|^id$|minute_ts|\.0$|ram_|fs_)')
+
+
+def shelly_numeric(flat):
+    numeric = [k for k, v in flat.items()
+               if isinstance(v, (int, float)) and not isinstance(v, bool)
+               and not POLL_SKIP.search(k)]
+    def rank(key):
+        tail = re.sub(r'^[a-z_0-9]+:\d+\.', '', key)
+        for index, wanted in enumerate(POLL_PREFERRED):
+            if tail == wanted:
+                return (0, index)
+        return (1, key)
+    return sorted(numeric, key=rank)
+
+
+def shelly_cmd_poll(args, pal):
+    rpc = shelly_for(args.device)
+    import csv as csv_module
+    handle = open(args.csv, 'a', newline='', encoding='utf-8') if args.csv else None
+    writer = csv_module.writer(handle) if handle else None
+
+    columns, printed, count = None, 0, 0
+    try:
+        while True:
+            try:
+                status = rpc.call('Switch.GetStatus', {'id': int(CONFIG['plug_switch_id'])}) \
+                    if args.device == 'plug' else rpc.call('Shelly.GetStatus')
+                flat = flatten(status)
+            except PlugError as e:
+                # A battery sensor is asleep most of the time; say so and retry
+                # rather than giving up, which is what makes poll usable at all.
+                print(pal.note('%s  %s' % (datetime.now().strftime('%H:%M:%S'), e)))
+                time.sleep(args.interval)
+                continue
+
+            if columns is None:
+                columns = shelly_numeric(flat)[:8]
+                if writer and handle.tell() == 0:
+                    writer.writerow(['timestamp'] + columns)
+            if printed % 20 == 0:
+                print(pal.group('  %-8s ' % 'time'
+                                + ' '.join(c.rsplit('.', 1)[-1][:10].rjust(11)
+                                           for c in columns)))
+            print('  %-8s ' % datetime.now().strftime('%H:%M:%S')
+                  + ' '.join(pal.value(('%g' % flat[c] if isinstance(flat.get(c), float)
+                                        else str(flat.get(c, '-'))).rjust(11))
+                             for c in columns))
+            if writer:
+                writer.writerow([datetime.now().isoformat(timespec='seconds')]
+                                + [flat.get(c) for c in columns])
+                handle.flush()
+            printed += 1
+            count += 1
+            if args.count and count >= args.count:
+                return 0
+            time.sleep(args.interval)
+    finally:
+        if handle:
+            handle.close()
+
+
+def shelly_cmd_watch(args, pal):
+    """Subscribe to the device's own notifications instead of polling."""
+    import base64
+    rpc = shelly_for(args.device)
+    host = rpc.host.split(':')[0]
+    port = int(rpc.host.split(':')[1]) if ':' in rpc.host else 80
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+
+    if CONFIG.get(SHELLY_DEVICES[args.device][1]):
+        print(pal.warn('this device has a password set. The websocket channel '
+                       'does not carry that authentication - use poll instead.'))
+        return 1
+
+    try:
+        sock = socket.create_connection((host, port), 10)
+    except OSError as e:
+        raise PlugError('cannot reach %s (%s)' % (rpc.host, e))
+    request = ('GET /rpc HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\n'
+               'Connection: Upgrade\r\nSec-WebSocket-Key: %s\r\n'
+               'Sec-WebSocket-Version: 13\r\n\r\n' % (rpc.host, key))
+    sock.sendall(request.encode())
+    reply = b''
+    while b'\r\n\r\n' not in reply:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise PlugError('the device closed the connection during the handshake')
+        reply += chunk
+    if b'101' not in reply.split(b'\r\n')[0]:
+        raise PlugError('the device refused the websocket upgrade')
+
+    print(pal.note('connected to %s - press Ctrl+C to stop' % rpc.host))
+    _ws_send(sock, json.dumps({'id': 1, 'src': 'upsmon',
+                               'method': 'Shelly.GetStatus'}))
+    try:
+        for message in _ws_frames(sock):
+            try:
+                body = json.loads(message)
+            except ValueError:
+                continue
+            payload = body.get('params') or body.get('result') or {}
+            flat = flatten(payload)
+            if not flat:
+                continue
+            stamp = datetime.now().strftime('%H:%M:%S')
+            if args.json:
+                print(json.dumps({'ts': stamp, 'data': payload}))
+                continue
+            print(pal.note('  ' + stamp) + '  ' + body.get('method', 'result'))
+            shelly_print_flat(pal, flat)
+    except (ConnectionError, OSError) as e:
+        print(pal.warn('connection lost: %s' % e))
+    finally:
+        sock.close()
+    return 0
+
+
+def shelly_cmd_listen(args, pal):
+    """Print webhook pushes as they arrive, without touching the database."""
+    port = args.port or int(CONFIG['sensor_listen_port'])
+    host = CONFIG['sensor_listen_host']
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *ignored):
+            pass
+
+        def _show(self, payload):
+            print('%s  %s  %s'
+                  % (pal.note(datetime.now().strftime('%H:%M:%S')),
+                     pal.info(self.client_address[0]), pal.value(payload)))
+            self.send_response(200)
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+
+        def do_GET(self):
+            query = parse_qs(urlparse(self.path).query)
+            fields = {k: v[0] for k, v in query.items() if v}
+            self._show(json.dumps(fields) if fields else self.path)
+
+        def do_POST(self):
+            length = int(self.headers.get('Content-Length') or 0)
+            self._show(self.rfile.read(length).decode('utf-8', 'replace'))
+
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(pal.note('listening on http://%s:%s/ - point the sensor webhook here, '
+                   'Ctrl+C to stop' % (host, port)))
+    print(pal.note('nothing is recorded; this only shows what arrives. The daemon '
+                   'stores pushes when sensor_listen is on.'))
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+    return 0
+
+
+def shelly_cmd_serve(args, pal):
+    """Accept an outbound websocket from a device configured to call us."""
+    import base64
+    import hashlib
+    port = args.port or 8089
+    guid = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11'
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(('0.0.0.0', port))
+    listener.listen(4)
+    print(pal.note('waiting for a device to connect to ws://<this-host>:%d/ - '
+                   'Ctrl+C to stop' % port))
+    try:
+        while True:
+            client, address = listener.accept()
+            request = b''
+            while b'\r\n\r\n' not in request:
+                chunk = client.recv(4096)
+                if not chunk:
+                    break
+                request += chunk
+            match = re.search(rb'Sec-WebSocket-Key:\s*(\S+)', request, re.I)
+            if not match:
+                client.close()
+                continue
+            accept = base64.b64encode(
+                hashlib.sha1(match.group(1) + guid.encode()).digest()).decode()
+            client.sendall(('HTTP/1.1 101 Switching Protocols\r\n'
+                            'Upgrade: websocket\r\nConnection: Upgrade\r\n'
+                            'Sec-WebSocket-Accept: %s\r\n\r\n' % accept).encode())
+            print(pal.ok('  connected: ') + address[0])
+            try:
+                for message in _ws_frames(client):
+                    stamp = datetime.now().strftime('%H:%M:%S')
+                    try:
+                        body = json.loads(message)
+                    except ValueError:
+                        print('  %s  %s' % (pal.note(stamp), message))
+                        continue
+                    flat = flatten(body.get('params') or body)
+                    print('  %s  %s' % (pal.note(stamp),
+                                        body.get('method', 'message')))
+                    shelly_print_flat(pal, flat)
+            except (ConnectionError, OSError):
+                pass
+            finally:
+                client.close()
+                print(pal.note('  disconnected: %s' % address[0]))
+    finally:
+        listener.close()
+    return 0
+
+
+def shelly_cmd_switch(args, pal):
+    rpc = shelly_for(args.device)
+    switch_id = int(CONFIG['plug_switch_id'])
+    if args.command == 'toggle':
+        rpc.call('Switch.Toggle', {'id': switch_id})
+    else:
+        rpc.call('Switch.Set', {'id': switch_id, 'on': args.command == 'on'})
+    state = rpc.call('Switch.GetStatus', {'id': switch_id})
+    on = bool(state.get('output'))
+    print(pal.ok('  socket is ON') if on else pal.bad('  socket is OFF'))
+    if state.get('apower') is not None:
+        print(pal.note('  drawing %s W' % state['apower']))
+    return 0
+
+
+def shelly_cmd_reset(args, pal):
+    """reset-counters [type ...] — no type means every counter the plug has."""
+    rpc = shelly_for(args.device)
+    switch_id = int(CONFIG['plug_switch_id'])
+    types = [t for arg in args.rest for t in arg.split(',') if t]
+    unknown = [t for t in types if t not in PLUG_COUNTER_TYPES]
+    if unknown:
+        print(pal.bad('  unknown counter: %s' % ', '.join(unknown)))
+        print(pal.note('  choose from: %s' % ', '.join(PLUG_COUNTER_TYPES)))
+        return 1
+
+    rpc.reset_counters(types or None)
+    state = rpc.call('Switch.GetStatus', {'id': switch_id})
+    print(pal.ok('  reset %s' % (', '.join(types) if types else 'every counter')))
+    flat = flatten(state)
+    for key in ('aenergy.total', 'ret_aenergy.total', 'counts.on_time',
+                'counts.switch_on', 'counts.on_above_thr'):
+        if key in flat:
+            print(pal.note('    %-22s %s' % (key, flat[key])))
+    return 0
+
+
+def shelly_cmd_call(args, pal):
+    if not args.rest:
+        raise PlugError('give a method, e.g. call Switch.GetStatus \'{"id":0}\'')
+    rpc = shelly_for(args.device)
+    method = args.rest[0]
+    params = None
+    if len(args.rest) > 1:
+        try:
+            params = json.loads(args.rest[1])
+        except ValueError:
+            raise PlugError('the parameters must be JSON: %s' % args.rest[1])
+    result = rpc.call(method, params)
+    if args.json or not isinstance(result, dict):
+        print(json.dumps(result, indent=2))
+        return 0
+    shelly_print_flat(pal, flatten(result), '  %s' % method)
+    return 0
+
+
+def shelly_cmd_reboot(args, pal):
+    rpc = shelly_for(args.device)
+    rpc.call('Shelly.Reboot')
+    print(pal.ok('  reboot requested'))
+    if not args.wait:
+        return 0
+    print(pal.note('  waiting for it to come back...'))
+    deadline = time.time() + 60
+    time.sleep(3)
+    while time.time() < deadline:
+        try:
+            info = rpc.call('Shelly.GetDeviceInfo')
+            print(pal.ok('  back after %ds' % int(60 - (deadline - time.time())))
+                  + pal.note('  firmware %s' % info.get('ver')))
+            return 0
+        except PlugError:
+            time.sleep(2)
+    print(pal.warn('  it has not answered within 60s'))
+    return 1
+
+
+def is_missing_component(error):
+    """Did the device say it does not have this, or did something else fail?"""
+    text = str(error).lower()
+    if 'rate limiting' in text or '429' in text or 'cannot reach' in text:
+        return False
+    return ('unknown method' in text or 'no handler' in text
+            or '-105' in text or 'not found' in text or '404' in text)
+
+
+def shelly_cmd_radio(args, pal):
+    """ble and matter: status, on, off — both are a config flag plus a reboot."""
+    rpc = shelly_for(args.device)
+    component = 'BLE' if args.command == 'ble' else 'Matter'
+    action = (args.rest[0] if args.rest else 'status').lower()
+
+    if action == 'status':
+        try:
+            config = rpc.call('%s.GetConfig' % component)
+        except PlugError as e:
+            # Only a refusal to recognise the method means the component is
+            # missing. A rate limit or a network problem is a different thing
+            # entirely and saying otherwise sends people looking in the wrong
+            # place.
+            if is_missing_component(e):
+                raise PlugError('%s is not available on this device' % component)
+            raise
+        enabled = bool(config.get('enable'))
+        print('  %s is %s' % (component, pal.ok('enabled') if enabled
+                              else pal.bad('disabled')))
+        try:
+            shelly_print_flat(pal, flatten(rpc.call('%s.GetStatus' % component)))
+        except PlugError:
+            pass
+        return 0
+
+    if action not in ('on', 'off'):
+        raise PlugError('use %s status, %s on or %s off'
+                        % (args.command, args.command, args.command))
+    rpc.call('%s.SetConfig' % component, {'config': {'enable': action == 'on'}})
+    config = rpc.call('%s.GetConfig' % component)
+    settled = bool(config.get('enable'))
+    if settled != (action == 'on'):
+        print(pal.warn('  the device did not accept the change'))
+        return 1
+    print(pal.ok('  %s %s' % (component, 'enabled' if settled else 'disabled')))
+    if args.reboot:
+        return shelly_cmd_reboot(args, pal)
+    print(pal.note('  a reboot is needed for this to take effect: '
+                   'upsmon shelly %s reboot --wait' % args.device))
+    return 0
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
-        prog='upsmon.py',
+        prog='upsmon',
         description='UPS monitoring daemon and command line tool (upsmon %s).'
                     % __version__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2933,19 +4838,42 @@ def build_parser():
 Run with no arguments to start the daemon in the foreground - that is what the
 systemd unit does. Everything else below is for testing and day-to-day use.
 
-  upsmon.py --status                    full report straight from the UPS
-  upsmon.py --status --json             the same as JSON
-  upsmon.py --oneshot                   one collection into the database
-  upsmon.py --list-rw                   what this UPS lets you change
-  upsmon.py --set battery.charge.low=20
-  upsmon.py --exec test.battery.start.quick
-  upsmon.py --check                     is the whole system healthy
-  upsmon.py --diag                      settings, API latency, database size
-  upsmon.py --history 7d                recent samples as a table
-  upsmon.py --events                    what the daemon has logged
-  upsmon.py --tests                     the self-test history
-  upsmon.py --reset-data                erase all history and events
-  upsmon.py --reset-data events         erase only the event log
+  upsmon --status                    full report straight from the UPS
+  upsmon --status --json             the same as JSON
+  upsmon --oneshot                   one collection into the database
+  upsmon --list-rw                   what this UPS lets you change
+  upsmon --set battery.charge.low=20
+  upsmon --exec test.battery.start.quick
+  upsmon --check                     is the whole system healthy
+  upsmon --diag                      settings, API latency, database size
+  upsmon --history 7d                recent samples as a table
+  upsmon --events                    what the daemon has logged
+  upsmon --tests                     the self-test history
+  upsmon --plug                      everything the smart plug reports
+  upsmon --plug-off                  switch the socket off
+  upsmon --sensors                   readings pushed by battery sensors
+
+Every command the standalone Shelly reader had is available under "shelly",
+addressed by role rather than by IP - the address and password come from the
+configuration:
+
+  upsmon shelly plug info            identity and firmware
+  upsmon shelly plug dump            every value the device reports
+  upsmon shelly plug poll            a live table of the numbers
+  upsmon shelly plug watch           the same, pushed rather than polled
+  upsmon shelly plug on|off|toggle
+  upsmon shelly plug reset-counters
+  upsmon shelly plug reboot --wait
+  upsmon shelly plug ble status
+  upsmon shelly plug matter off --reboot
+  upsmon shelly plug call Switch.GetStatus '{"id":0}'
+  upsmon shelly sensor dump          the thermometer, while it is awake
+  upsmon shelly listen               show pushes as they arrive
+  upsmon shelly serve                accept an outbound websocket
+  upsmon shelly discover             find Shelly devices on the LAN
+  upsmon shelly --help               all of it, with the options
+  upsmon --reset-data                erase all history and events
+  upsmon --reset-data events         erase only the event log
 
 Configuration lives in /etc/upsmon/config.json; every key can also be given as
 an environment variable with a UPSMON_ prefix (UPSMON_NUT_HOST=10.0.0.5).
@@ -2978,6 +4906,17 @@ an environment variable with a UPSMON_ prefix (UPSMON_NUT_HOST=10.0.0.5).
                          help='print the event log')
     actions.add_argument('--tests', action='store_true',
                          help='print the self-test history')
+    actions.add_argument('--plug', action='store_true',
+                         help='print everything the smart plug reports')
+    actions.add_argument('--plug-on', action='store_true',
+                         help='switch the socket on')
+    actions.add_argument('--plug-off', action='store_true',
+                         help='switch the socket off')
+    actions.add_argument('--plug-reset', nargs='?', const='all', metavar='COUNTER',
+                         help='reset a plug counter: all (the default), aenergy, '
+                              'ret_aenergy, on_time, switch_on or on_above_thr')
+    actions.add_argument('--sensors', action='store_true',
+                         help='print the latest pushed sensor readings')
     actions.add_argument('--aggregate', action='store_true',
                          help='roll old samples into hourly averages now')
     actions.add_argument('--reset-data', nargs='?', const='all', metavar='WHAT',
@@ -3000,14 +4939,29 @@ an environment variable with a UPSMON_ prefix (UPSMON_NUT_HOST=10.0.0.5).
     output.add_argument('--no-color', action='store_true', help='no colour codes')
     output.add_argument('-v', '--verbose', action='store_true', help='debug logging')
     output.add_argument('--version', action='version',
-                        version='upsmon.py ' + __version__)
+                        version='upsmon ' + __version__)
     return parser
 
 
 def main(argv=None):
     global DEBUG, CONFIG_FILE
+    arguments = list(sys.argv[1:] if argv is None else argv)
+
+    # "upsmon shelly ..." is a world of its own, with its own options. Routing
+    # it before the main parser keeps both readable.
+    if arguments and arguments[0] == 'shelly':
+        for index, value in enumerate(arguments):
+            if value == '--config' and index + 1 < len(arguments):
+                CONFIG_FILE = Path(arguments[index + 1])
+        load_config()
+        for problem in CONFIG_FATAL:
+            print('CONFIG: %s' % problem, file=sys.stderr)
+        pal = Palette(colour_enabled(False if '--no-color' in arguments else None))
+        return shelly_main([a for a in arguments[1:]
+                            if a != '--config' and not a.endswith('config.json')], pal)
+
     parser = build_parser()
-    args = parser.parse_args(argv)
+    args = parser.parse_args(arguments)
 
     if args.config:
         CONFIG_FILE = Path(args.config)
@@ -3045,6 +4999,10 @@ def main(argv=None):
             return cmd_events(args, pal)
         if args.tests:
             return cmd_tests(args, pal)
+        if args.plug or args.plug_on or args.plug_off or args.plug_reset:
+            return cmd_plug(args, pal)
+        if args.sensors:
+            return cmd_sensors(args, pal)
         if args.reset_data:
             return cmd_reset(args, pal)
         if args.aggregate:

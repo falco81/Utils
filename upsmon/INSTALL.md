@@ -197,7 +197,7 @@ upsmon --version
 ```
 
 ```
-upsmon.py 2.0.0
+upsmon 3.4.1
 ```
 
 ---
@@ -329,6 +329,64 @@ change anything on the UPS.
 | `load_warn`, `load_crit` | load percentage, same idea, inverted |
 | `runtime_warn_s`, `runtime_crit_s` | remaining runtime in seconds, applied only while on battery |
 | `battery_life_years` | expected battery life, used to age `battery.date` or `battery.mfr.date` when the UPS reports one. 4 suits sealed lead-acid |
+
+**Smart plug (optional)**
+
+A Shelly Gen2+ plug can be watched alongside the UPS, which is worth doing when
+the UPS itself does not measure the watts being drawn. Leave `plug_host` empty
+and none of this happens.
+
+| option | meaning |
+|---|---|
+| `plug_host` | the plug's IP address. Empty disables everything below |
+| `plug_password` | only if you set one in the plug's web UI. The username is always `admin` and cannot be changed |
+| `plug_switch_id` | which relay; single-socket plugs are always 0 |
+| `plug_poll_interval` | how often the plug is read |
+| `plug_min_request_gap` | the smallest gap between two requests to the plug. Gen3 firmware with authentication on answers 429 when they arrive closer together than about a second; 0 disables the pacing |
+| `plug_sample_interval` | how often a reading goes into the database |
+
+The local RPC API stays available while the plug is signed in to the Shelly app,
+connected to Shelly Cloud and commissioned into Apple Home over Matter. Nothing
+here interferes with any of that.
+
+**Pushed sensor readings (optional)**
+
+Battery sensors such as the Shelly H&T sleep between measurements, so nothing
+can poll them — they push instead.
+
+| option | meaning |
+|---|---|
+| `sensor_host` | address the sensor directly. A battery H&T is asleep most of the time so this usually fails, which is harmless — on USB power it answers every poll and fills the charts without any webhook |
+| `sensor_password` | if one is set on the sensor |
+| `sensor_listen` | switch the listener on |
+| `sensor_listen_host` | which address to listen on. `0.0.0.0` for every interface, or pin it to one |
+| `sensor_listen_port` | which port |
+| `sensor_retain_days` | how long pushed readings are kept |
+
+Create the webhook on the sensor once, pointing at this machine:
+
+```bash
+curl -X POST http://<sensor-ip>/rpc -H 'Content-Type: application/json' -d '{
+  "id":1,"method":"Webhook.Create","params":{
+    "cid":0,"enable":true,"event":"temperature.change",
+    "urls":["http://<this-host>:8088/?t=${ev.tC}"]}}'
+
+curl -X POST http://<sensor-ip>/rpc -H 'Content-Type: application/json' -d '{
+  "id":1,"method":"Webhook.Create","params":{
+    "cid":0,"enable":true,"event":"humidity.change",
+    "urls":["http://<this-host>:8088/?rh=${ev.rh}"]}}'
+```
+
+`t`, `tC`, `temperature`, `rh`, `humidity`, `bv`, `bp` and `rssi` are all
+understood, in the query string or in a JSON body. A push carrying none of them
+is rejected with 400 rather than stored as an empty row.
+
+Open the port if the sensor is on another subnet:
+
+```bash
+sudo firewall-cmd --permanent --add-port=8088/tcp
+sudo firewall-cmd --reload
+```
 
 **Safety**
 
@@ -829,17 +887,22 @@ thirty. An idle dashboard therefore costs one small request every five seconds
 rather than a year of history on every tick.
 
 **Overview** — status, charge, runtime, load, mains and battery voltage, each
-turning amber or red at your thresholds. Then 24 hours of charge and load with
-red bands over any period spent on battery, the device and battery facts, and the
+turning amber or red at your thresholds. Then two charts over the last 24 hours — charge with load, and the power being
+drawn — both with red bands over any period spent on battery, and both draggable
+and zoomable like the ones under History, the device and battery facts, and the
 latest events. Refreshes every five seconds.
 
-**History** — six charts from 6 hours to a year: charge, runtime, load, mains
+**History** — for the UPS, six charts from 6 hours to a year: charge, runtime, load, mains
 voltage, battery voltage, power drawn. Not every model measures the watts
 actually being drawn; when yours does not, that chart is worked out from the
 load percentage against the nameplate rating and labelled as an estimate. Recent data comes from full-resolution
 samples, older data from the hourly roll-up, so a year-long chart costs a few
-hundred points rather than half a million. Underneath, every power failure with
-its duration and how far the battery fell.
+hundred points rather than half a million. Underneath, if a plug is configured, ten more from it — power, energy, voltage,
+current, frequency, its own temperature, power factor, returned energy, runtime
+and switching cycles, plus load runtime, Wi-Fi signal, uptime and free memory —
+then whatever a sensor has reported: temperature, humidity, battery percentage,
+battery voltage and signal. Last of all, every power failure with its duration
+and how far the battery fell.
 
 Every chart is interactive. **Drag** to pan, **scroll** to zoom around the
 pointer, **pinch** on a touch screen, **double-click** to go back to the full
@@ -859,7 +922,12 @@ as such.
 (including changes made by something other than this dashboard), and every
 command run from here.
 
-**Control** — buttons for whatever commands your UPS reports, each with a plain
+**Control** — when a plug is configured, a card for it: switch the socket, and
+a button for each counter the plug keeps — active energy, returned energy, total
+runtime, switching cycles and active load runtime — plus one that clears them
+all. These are the same counters the plug's own web interface lists, and each
+asks for confirmation and then the PIN. Below that, buttons for whatever
+commands your UPS reports, each with a plain
 label and an icon rather than the raw NUT name. Rest the pointer on one for five
 seconds and a hint gives the exact command name and what it does; on a phone,
 press and hold. The delay is `HINT_DELAY_MS` near the top of the page script if
@@ -975,6 +1043,49 @@ upsmon --history 7d                   # recorded samples as a table
 upsmon --history 30d --points 40      # coarser
 upsmon --events                       # the event log
 upsmon --tests                        # the self-test history
+upsmon --plug                         # everything the smart plug reports
+upsmon --plug-off / --plug-on         # switch the socket
+upsmon --plug-reset                   # reset the plug's energy counters
+upsmon --sensors                      # readings pushed by battery sensors
+```
+
+### Talking to the Shelly devices directly
+
+Everything the standalone Shelly reader could do is available under `shelly`,
+addressed by role rather than by IP — the address and password come from the
+configuration, so neither has to be typed or pasted into a shell:
+
+```bash
+upsmon shelly plug info               # identity and firmware
+upsmon shelly plug dump               # every value the device reports
+upsmon shelly plug dump --json
+upsmon shelly plug poll --interval 5 --csv plug.csv
+upsmon shelly plug watch              # pushed by the device, no polling
+upsmon shelly plug on | off | toggle
+upsmon shelly plug reset-counters              # every counter
+upsmon shelly plug reset-counters aenergy     # just the energy total
+upsmon shelly plug reboot --wait
+upsmon shelly plug ble status
+upsmon shelly plug matter off --reboot
+upsmon shelly plug call Switch.GetStatus '{"id":0}'
+
+upsmon shelly sensor dump             # the thermometer, while it is awake
+upsmon shelly listen --port 8088      # show pushes as they arrive
+upsmon shelly serve --port 8089       # accept an outbound websocket
+upsmon shelly discover                # find Shelly devices on the LAN
+```
+
+`plug` and `sensor` are the two roles; `temp`, `tempmeter` and `ht` also mean
+the sensor. `discover` and `listen` need no role at all.
+
+Three things worth knowing. `watch` uses the device's websocket, which carries
+no authentication — with a password set it says so and points you at `poll`.
+`discover` uses multicast DNS, which does not cross subnets. And `ble` and
+`matter` only take effect after a reboot, which `--reboot` will do for you.
+
+Switching the socket this way bypasses the PIN, because anyone who can run this
+command is already on the machine and could edit the configuration anyway. The
+dashboard is what the PIN protects.
 upsmon --check                        # is the whole system healthy
 upsmon --diag                         # settings, API latency, database size
 upsmon --oneshot                      # one collection into the database, then exit
@@ -1070,6 +1181,14 @@ real measurement, pull the mains plug for a minute with the History tab open.
 | `battery.type changed outside upsmon: PbAc -> ` and back again | the driver publishes some values only on its slower full poll, so they vanish between reads. Fixed in 2.5.0 — a key that merely appears or disappears is no longer treated as a change |
 | the log file stops growing after a rotation | the `postrotate` signal never arrived. The daemon recovers within one poll and logs that it did; check that `/etc/logrotate.d/upsmon` still contains the `systemctl kill -s HUP` line |
 | `cannot write the log file ... Permission denied` | `/var/log/upsmon` is not owned by `upsmon`. `sudo install -d -m 750 -o upsmon -g upsmon /var/log/upsmon`, or let systemd make it with `LogsDirectory=` by restarting the service |
+| a `shelly` command fails with 429 when run repeatedly | each run starts with no memory of the last one, so quick successive commands can trip the limit. From 3.4.2 the client waits and retries up to three times, and never reports a rate limit as a missing component |
+| the plug answers HTTP 429 | it is rate limiting. Three things address it: the authentication challenge is reused rather than renegotiated, the slow-changing sections are read once a minute, and requests are spaced by `plug_min_request_gap`. Together those take a poll from six requests to two, a second apart. If it still happens, raise the gap to 2 and `plug_poll_interval` to 30 |
+| the plug panel is greyed out right after a restart | the first poll has not landed yet. From 3.4.3 the panel is filled from the last recorded reading and says `from the last recorded reading` until a fresh one arrives, rather than sitting blank |
+| the plug panel shows values greyed out | they are real but not current: a poll was missed. The reason and the age are printed under the socket state, and the controls stay disabled until it answers again |
+| a counter will not reset | the plug answers every reset with success whether or not it understood the counter name, so upsmon reads the values back and reports what actually changed. `the plug accepted the request but nothing changed` means that firmware does not support resetting that particular counter — the plug's own web interface will not clear it either |
+| the plug is not answering | `upsmon --plug`. A password set in the plug's web UI needs `plug_password`; the username is always `admin` |
+| plug readings stop but the UPS is fine | the plug dropped off Wi-Fi. The daemon logs one event either way and carries on watching the UPS — a plug failure never affects UPS monitoring |
+| a sensor pushes nothing | check the webhook with `Webhook.List` on the sensor, and that the port is open. `upsmon --sensors` shows what has arrived |
 | a setting reverts after a NAS reboot | that value lives in the driver, not the UPS — see the note below |
 
 Useful commands while diagnosing:
@@ -1083,7 +1202,10 @@ sudo -u apache curl -s 127.0.0.1:9848/api/health   # ...as the web user sees it
 ```
 
 A failed poll is logged once, not once per attempt, and recovery is logged too,
-so a flapping network appears as pairs of lines rather than thousands.
+so a flapping network appears as pairs of lines rather than thousands. An error
+inside an API endpoint answers the caller with a short message and logs one
+line — a dashboard polling every five seconds would otherwise fill the journal
+with identical stack traces and push the actual cause out of view.
 
 **On `attempt to write a readonly database`:** SQLite says "readonly" when the
 *directory* cannot be written, which is not what the wording suggests. The cause
@@ -1159,7 +1281,11 @@ sudo systemctl restart upsmon
 upsmon --check
 ```
 
-The schema is created with `IF NOT EXISTS`, so history survives upgrades.
+The schema is created with `IF NOT EXISTS`, so history survives upgrades. When
+a version adds a column, the daemon adds it to the existing tables on startup
+and says so in the log — `database updated: added plug_samples.rssi, …`. An
+error like `table plug_samples has no column named …` means the daemon was not
+restarted after the file was replaced.
 
 ### Log rotation
 

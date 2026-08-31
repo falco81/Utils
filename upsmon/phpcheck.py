@@ -20,6 +20,9 @@ BUILTINS = {
     'set_time_limit', 'sprintf', 'str_repeat', 'stream_context_create', 'strcasecmp',
     'strlen', 'substr', 'timezone_identifiers_list', 'trim', 'unset', 'empty',
     'list', 'exit', 'die', 'print', 'return', 'declare', 'strict_types',
+    'array_intersect', 'array_values', 'array_map', 'array_filter', 'array_keys',
+    'array_merge', 'str_replace', 'round', 'floor', 'ceil', 'abs',
+    'strtolower', 'strtoupper', 'ucfirst', 'sort', 'usort', 'ksort',
 }
 KEYWORDS = {
     'if', 'else', 'elseif', 'for', 'foreach', 'while', 'do', 'switch', 'case',
@@ -167,6 +170,21 @@ def analyse(path):
     unknown = sorted(called - defined - BUILTINS - KEYWORDS)
     if unknown:
         problems.append('unknown calls: ' + ', '.join(unknown))
+
+    # A function defined and never called is usually a wiring mistake: the
+    # plug and sensor chart loaders were silently orphaned this way once, and
+    # nothing complained because the code itself was perfectly valid.
+    js_blocks = re.findall(r'<script>(.*?)</script>', src, re.S)
+    for block in js_blocks:
+        defined_js = set(re.findall(r'^function (\w+)', block, re.M))
+        for name in sorted(defined_js):
+            # Count every mention, not just calls: a handler is often passed
+            # by name, as in onclick = toggleSocket.
+            uses = len(re.findall(r'(?<![\w.])' + name + r'\b', block))
+            if uses <= 1:          # only the definition itself
+                problems.append('JavaScript function %s() is never called '
+                                '(unused loaders are usually a wiring mistake)'
+                                % name)
 
     # version
     for pattern, message in TOO_NEW:
