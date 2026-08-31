@@ -26,16 +26,19 @@ command line for testing:
 """
 
 # Bumped by hand with every change to this file.
-__version__ = '3.4.4'
+__version__ = '3.6.5'
 
 import argparse
 import getpass
+import errno
 import json
 import os
 import re
+import shutil
 import signal
 import socket
 import sqlite3
+import select
 import secrets
 import sys
 import threading
@@ -517,11 +520,14 @@ class ShellyRPC(object):
     _last_request = {}
     _pace = threading.Lock()
 
-    def __init__(self, host=None, password=None, timeout=None):
+    def __init__(self, host=None, password=None, timeout=None, label='the plug'):
         self.host = host or CONFIG['plug_host']
         self.password = password if password is not None else CONFIG['plug_password']
         self.timeout = float(timeout or CONFIG['plug_timeout'])
         self.retry_after = 0.0
+        # A sensor is not a plug, and saying so in every error message saves
+        # somebody checking the wrong device.
+        self.label = label
 
     @property
     def url(self):
@@ -529,7 +535,7 @@ class ShellyRPC(object):
 
     def call(self, method, params=None):
         if not self.host:
-            raise PlugError('no plug configured (set plug_host)')
+            raise PlugError('no device configured (set plug_host)')
         payload = {'id': 1, 'method': method}
         if params:
             payload['params'] = params
@@ -543,13 +549,13 @@ class ShellyRPC(object):
         if status == 401:
             challenge = headers.get('WWW-Authenticate', '')
             if not self.password:
-                raise PlugError('the plug requires a password; set plug_password')
+                raise PlugError('%s requires a password; set the password for it' % self.label)
             self._challenges[self.host] = self._parse_challenge(challenge)
             status, reply, headers = self._post(
                 body, self._digest_header(self._challenges[self.host], 'POST', '/rpc'))
             if status == 401:
                 self._challenges.pop(self.host, None)
-                raise PlugError('the plug rejected the password')
+                raise PlugError('%s rejected the password' % self.label)
         if status == 429:
             retry = headers.get('Retry-After')
             self.retry_after = to_float(retry) or 0
@@ -569,15 +575,15 @@ class ShellyRPC(object):
                     return self.call(method, params)
                 finally:
                     self._retries = attempt
-            raise PlugError('the plug is rate limiting us (HTTP 429)'
+            raise PlugError('%s is rate limiting us (HTTP 429)' % self.label
                             + (' - it asks for %s seconds' % retry if retry else ''))
         if status != 200:
-            raise PlugError('the plug answered HTTP %s' % status)
+            raise PlugError('%s answered HTTP %s' % (self.label, status))
 
         try:
             result = json.loads(reply.decode('utf-8'))
         except ValueError:
-            raise PlugError('the plug did not return JSON - is it a Gen2+ device?')
+            raise PlugError('%s did not return JSON - is it a Gen2+ device?' % self.label)
         if 'error' in result:
             error = result['error']
             raise PlugError('RPC error %s: %s'
@@ -610,7 +616,7 @@ class ShellyRPC(object):
         except urllib.error.HTTPError as e:
             return e.code, e.read(), dict(e.headers)
         except OSError as e:
-            raise PlugError('cannot reach the plug at %s (%s)' % (self.host, e))
+            raise PlugError('cannot reach %s at %s (%s)' % (self.label, self.host, e))
 
     @staticmethod
     def _parse_challenge(header):
@@ -2874,7 +2880,8 @@ class Daemon(object):
         self.last_sensor_poll = now
 
         try:
-            rpc = ShellyRPC(CONFIG['sensor_host'], CONFIG['sensor_password'])
+            rpc = ShellyRPC(CONFIG['sensor_host'], CONFIG['sensor_password'],
+                            label='the sensor')
             flat = flatten(rpc.call('Shelly.GetStatus'))
         except PlugError as e:
             log('sensor poll: %s' % e, level='debug')
@@ -3364,6 +3371,154 @@ def parse_span(text):
 
 
 
+
+# ---------------------------------------------------------------------------
+# What the RPC methods are for
+# ---------------------------------------------------------------------------
+# A device lists its methods but says nothing about them, which leaves a wall
+# of 164 names. These are the ones worth knowing, each with a line explaining
+# it and, where it takes parameters, something that can be pasted straight in.
+# Anything absent from here still works with "call"; it simply has no note.
+RPC_METHODS = {
+    # -- identity and housekeeping -----------------------------------------
+    'Shelly.GetDeviceInfo': ('Model, name, firmware version and MAC.', None),
+    'Shelly.GetStatus': ('Every component\'s current state in one reply.', None),
+    'Shelly.GetConfig': ('Every component\'s configuration in one reply.', None),
+    'Shelly.ListMethods': ('The list this command is built on.', None),
+    'Shelly.GetComponents': ('Which components exist, with their keys.',
+                             '{"offset":0}'),
+    'Shelly.Reboot': ('Restart the device. Takes about ten seconds.', None),
+    'Shelly.CheckForUpdate': ('Ask Shelly whether newer firmware exists.', None),
+    'Shelly.Update': ('Install firmware. "stable" or "beta".',
+                      '{"stage":"stable"}'),
+    'Shelly.Identify': ('Flash the LED so you can tell which device it is.', None),
+    'Shelly.DetectLocation': ('Set the timezone from the public IP address.', None),
+    'Shelly.ListTimezones': ('Every timezone name the device accepts.', None),
+    'Shelly.SetAuth': ('Set or clear the web password. The username is always '
+                       'admin; a null password removes authentication.',
+                       '{"user":"admin","realm":"shellyplug-xxxx","ha1":"..."}'),
+    'Shelly.FactoryReset': ('Erase everything, including the Wi-Fi settings. '
+                            'The device comes back as an access point.', None),
+    'Shelly.ResetWiFiConfig': ('Forget the Wi-Fi settings only.', None),
+
+    # -- the switch ---------------------------------------------------------
+    'Switch.GetStatus': ('Power, voltage, current, energy, temperature and '
+                         'relay state.', '{"id":0}'),
+    'Switch.GetConfig': ('Name, auto-off timers, limits, initial state.',
+                         '{"id":0}'),
+    'Switch.SetConfig': ('Change any of those.',
+                         '{"id":0,"config":{"auto_off":true,"auto_off_delay":300}}'),
+    'Switch.Set': ('Switch the relay. "toggle_after" turns it back after N '
+                   'seconds.', '{"id":0,"on":false}'),
+    'Switch.Toggle': ('Flip the relay to the other state.', '{"id":0}'),
+    'Switch.ResetCounters': ('Reset the running totals. Without "type", all of '
+                             'them.', '{"id":0,"type":["aenergy"]}'),
+
+    # -- system, network, radios -------------------------------------------
+    'Sys.GetStatus': ('Uptime, free memory, filesystem, time, restart flag.', None),
+    'Sys.GetConfig': ('Device name, timezone, location, debug settings.', None),
+    'Sys.SetConfig': ('Change them.',
+                      '{"config":{"device":{"name":"UPS socket"}}}'),
+    'Sys.SetTime': ('Set the clock by hand, for a device with no internet.',
+                    '{"unixtime":1788195638}'),
+    'Wifi.GetStatus': ('Address, SSID, signal strength, connection state.', None),
+    'Wifi.GetConfig': ('Both configured networks and the access point.', None),
+    'Wifi.SetConfig': ('Change them. Getting this wrong takes the device off '
+                       'the network.',
+                       '{"config":{"sta":{"ssid":"net","pass":"secret","enable":true}}}'),
+    'Wifi.Scan': ('List the networks the device can see.', None),
+    'Wifi.ListAPClients': ('Who is connected to its own access point.', None),
+    'Cloud.GetStatus': ('Whether it is talking to Shelly Cloud.', None),
+    'Cloud.SetConfig': ('Turn the cloud connection on or off.',
+                        '{"config":{"enable":false}}'),
+    'Mqtt.GetStatus': ('Whether it is connected to an MQTT broker.', None),
+    'Mqtt.SetConfig': ('Point it at a broker.',
+                       '{"config":{"enable":true,"server":"10.0.0.2:1883"}}'),
+    'BLE.GetConfig': ('Bluetooth radio and RPC-over-Bluetooth switches.', None),
+    'BLE.SetConfig': ('Turn either on or off. Needs a reboot.',
+                      '{"config":{"enable":true,"rpc":{"enable":true}}}'),
+    'BLE.StartPairing': ('Accept a Bluetooth pairing for a while.', None),
+    'BLE.ListPairedDevices': ('What is already paired.', None),
+    'Matter.GetStatus': ('Whether Matter is on and commissionable.', None),
+    'Matter.GetSetupCode': ('The pairing code a Matter controller needs.', None),
+    'Matter.SetConfig': ('Turn Matter on or off. Needs a reboot.',
+                         '{"config":{"enable":true}}'),
+    'Matter.FactoryReset': ('Forget every Matter fabric it has joined.', None),
+    'WS.GetConfig': ('Outbound websocket: where it connects out to.', None),
+    'WS.SetConfig': ('Point it at a listener - what "shelly serve" accepts.',
+                     '{"config":{"enable":true,"server":"ws://10.0.0.9:8089"}}'),
+
+    # -- automation on the device itself -----------------------------------
+    'Webhook.Create': ('Call a URL when something happens. This is how a '
+                       'sleeping sensor reports.',
+                       '{"cid":0,"enable":true,"event":"temperature.change",'
+                       '"urls":["http://10.0.0.9:8088/?t=${ev.tC}"]}'),
+    'Webhook.List': ('Every webhook currently set.', None),
+    'Webhook.ListSupported': ('Which events this device can trigger on.', None),
+    'Webhook.Delete': ('Remove one by id.', '{"id":1}'),
+    'Webhook.DeleteAll': ('Remove all of them.', None),
+    'Schedule.Create': ('Run something on a cron schedule, on the device.',
+                        '{"enable":true,"timespec":"0 0 22 * * *",'
+                        '"calls":[{"method":"Switch.Set","params":{"id":0,"on":false}}]}'),
+    'Schedule.List': ('Every schedule currently set.', None),
+    'Schedule.Delete': ('Remove one by id.', '{"id":1}'),
+    'Script.List': ('Scripts stored on the device.', None),
+    'Script.Create': ('Make an empty script slot.', '{"name":"watchdog"}'),
+    'Script.PutCode': ('Upload JavaScript into a slot.',
+                       '{"id":1,"code":"print(1);"}'),
+    'Script.Start': ('Run it.', '{"id":1}'),
+    'Script.Stop': ('Stop it.', '{"id":1}'),
+    'KVS.Set': ('Store a value on the device, for scripts to read.',
+                '{"key":"note","value":"UPS socket"}'),
+    'KVS.Get': ('Read one back.', '{"key":"note"}'),
+    'KVS.List': ('Every key stored.', None),
+    'KVS.Delete': ('Remove one.', '{"key":"note"}'),
+    'HTTP.GET': ('Make the device fetch a URL itself.',
+                 '{"url":"http://10.0.0.9/ping"}'),
+    'HTTP.POST': ('And post to one.',
+                  '{"url":"http://10.0.0.9/hook","body":"{}"}'),
+    'RPC.Ping': ('Check the device is answering at all.', None),
+    'plugs_ui.GetConfig': ('The LED ring: colours, brightness, night mode.', None),
+    'plugs_ui.SetConfig': ('Change them.',
+                           '{"config":{"leds":{"mode":"power"}}}'),
+}
+
+# Components whose methods are all variations on a theme, so the group can be
+# summarised rather than repeating a note against each entry.
+RPC_COMPONENTS = {
+    'Shelly': 'the device as a whole: identity, status, firmware, reboot',
+    'Switch': 'the relay and its meter',
+    'Sys': 'clock, name, timezone, memory',
+    'Wifi': 'network settings and signal',
+    'Cloud': 'the Shelly Cloud connection',
+    'Mqtt': 'the MQTT broker connection',
+    'BLE': 'the Bluetooth radio and RPC over Bluetooth',
+    'Matter': 'Matter, for Apple Home and other controllers',
+    'WS': 'the outbound websocket this tool can receive with "serve"',
+    'Webhook': 'call a URL when something happens on the device',
+    'Schedule': 'run something on a timer, on the device itself',
+    'Script': 'JavaScript stored and run on the device',
+    'KVS': 'a small key-value store for scripts',
+    'HTTP': 'make the device fetch or post a URL itself',
+    'OTA': 'firmware upload, used by Shelly.Update',
+    'KNX': 'the KNX building-automation protocol',
+    'BTHome': 'Bluetooth sensors reporting through this device',
+    'BTHomeDevice': 'one such sensor',
+    'BTHomeSensor': 'one measurement from such a sensor',
+    'BTHomeControl': 'Bluetooth buttons and remotes',
+    'Virtual': 'virtual components for scripts and the app UI',
+    'Boolean': 'a virtual on/off value',
+    'Number': 'a virtual number',
+    'Text': 'a virtual string',
+    'Enum': 'a virtual choice',
+    'Group': 'a virtual group of components',
+    'Button': 'a virtual button',
+    'LNM': 'local network messaging between Shelly devices',
+    'plugs_ui': 'the LED ring on the plug',
+    'RPC': 'the RPC channel itself',
+}
+
+
 # ---------------------------------------------------------------------------
 # Shelly command line
 # ---------------------------------------------------------------------------
@@ -3379,16 +3534,25 @@ SHELLY_DEVICES = {
 }
 
 
-def shelly_for(role):
-    """Build a client for 'plug' or 'sensor' from the configuration."""
+def shelly_for(role, args=None):
+    """Build a client for 'plug' or 'sensor', or for an address given directly."""
+    label = 'the sensor' if role in ('sensor', 'temp', 'tempmeter', 'ht') \
+        else 'the plug'
+    override_host = getattr(args, 'host', None) if args else None
+    override_password = getattr(args, 'password', None) if args else None
+    if override_host:
+        return ShellyRPC(override_host, override_password or '', label=label)
+
     if role not in SHELLY_DEVICES:
         raise PlugError('unknown device "%s" - use plug or sensor' % role)
     host_key, password_key = SHELLY_DEVICES[role]
     host = CONFIG.get(host_key)
     if not host:
-        raise PlugError('no address configured for the %s - set %s in %s'
-                        % (role, host_key, CONFIG_FILE))
-    return ShellyRPC(host, CONFIG.get(password_key))
+        raise PlugError('no address configured for the %s - set %s in %s, '
+                        'or give --host' % (role, host_key, CONFIG_FILE))
+    password = override_password if override_password is not None \
+        else CONFIG.get(password_key)
+    return ShellyRPC(host, password, label=label)
 
 
 SHELLY_COMPONENTS = ('Shelly.GetStatus', 'Shelly.GetConfig', 'Shelly.GetDeviceInfo',
@@ -3435,12 +3599,48 @@ def shelly_print_flat(pal, flat, title=None):
 
 
 # ---- mDNS discovery -------------------------------------------------------
-def shelly_discover(pal, seconds=4.0):
-    """Find Shelly devices by asking _shelly._tcp.local over multicast DNS.
+def local_ipv4_addresses():
+    """Every IPv4 address this machine holds, one per interface.
 
-    The published tool uses the zeroconf package for this. One query and a few
-    seconds of listening is all it takes, so it is done here with a socket
-    rather than adding a dependency to a daemon that has none.
+    A multi-homed host routes 224.0.0.251 out one interface only - whichever
+    the default route uses. On a machine with several VLANs that is usually not
+    the one the device or its proxy is on, so the query has to be sent out of
+    each of them deliberately.
+    """
+    import fcntl
+    import struct
+    addresses = []
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        for _, name in socket.if_nameindex():
+            try:
+                packed = fcntl.ioctl(sock.fileno(), 0x8915,   # SIOCGIFADDR
+                                     struct.pack('256s', name.encode()[:15]))
+                address = socket.inet_ntoa(packed[20:24])
+            except OSError:
+                continue
+            if not address.startswith('127.'):
+                addresses.append((name, address))
+    except (OSError, AttributeError):
+        pass
+    finally:
+        sock.close()
+    return addresses
+
+
+def shelly_discover(pal, seconds=4.0):
+    """Find Shelly devices by asking over multicast DNS.
+
+    Two sockets, deliberately. Answers to a multicast query come back two ways:
+    to the group on port 5353, and - when the question asks for it - by unicast
+    to whatever port the query went out from.
+
+    Binding 5353 alone is not enough and can be worse than useless: avahi-daemon
+    usually holds it already, and with SO_REUSEPORT a unicast datagram to that
+    port is delivered to exactly one of the sockets bound to it. That is as
+    likely to be avahi as us. So the query is sent from a socket on a port
+    nobody else has, which is where the unicast reply then arrives, while a
+    second socket joins the group to catch the multicast one.
     """
     import struct
 
@@ -3458,7 +3658,7 @@ def shelly_discover(pal, seconds=4.0):
             if length == 0:
                 offset += 1
                 break
-            if length & 0xC0 == 0xC0:          # a compression pointer
+            if length & 0xC0 == 0xC0:
                 pointer = struct.unpack('!H', data[offset:offset + 2])[0] & 0x3FFF
                 parts.append(read_name(data, pointer, depth + 1)[0])
                 offset += 2
@@ -3467,54 +3667,162 @@ def shelly_discover(pal, seconds=4.0):
             offset += 1 + length
         return '.'.join(p for p in parts if p), offset
 
-    query = (struct.pack('!HHHHHH', 0, 0, 1, 0, 0, 0)
-             + encode_name('_shelly._tcp.local') + struct.pack('!HH', 12, 1))
+    services = ['_shelly._tcp.local', '_http._tcp.local',
+                '_services._dns-sd._udp.local']
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
-    sock.settimeout(0.5)
+    # The querying socket, on a port of our own.
+    asker = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    asker.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 4)
+    asker.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 1)
+    asker.settimeout(0.2)
     try:
-        sock.bind(('', 0))
-        sock.sendto(query, ('224.0.0.251', 5353))
+        asker.bind(('', 0))
     except OSError as e:
-        print(pal.bad('cannot send the multicast query: %s' % e))
-        sock.close()
+        print(pal.bad('cannot open a socket for the query: %s' % e))
+        return {}
+
+    # And a listener on the group, for replies sent the multicast way.
+    listener = None
+    try:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        if hasattr(socket, 'SO_REUSEPORT'):
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        listener.bind(('', 5353))
+        listener.settimeout(0.2)
+    except OSError:
+        if listener:
+            listener.close()
+        listener = None
+
+    interfaces = local_ipv4_addresses()
+
+    # Join the group on each interface by name. INADDR_ANY leaves the choice to
+    # the kernel, which picks one - on a host with several VLANs that is
+    # usually not the one the answer arrives on.
+    joined = 0
+    if listener:
+        targets = [address for _, address in interfaces] or ['0.0.0.0']
+        for address in targets:
+            try:
+                listener.setsockopt(
+                    socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                    struct.pack('4s4s', socket.inet_aton('224.0.0.251'),
+                                socket.inet_aton(address)))
+                joined += 1
+            except OSError as e:
+                log('could not join the multicast group on %s: %s' % (address, e),
+                    level='debug')
+        if not joined:
+            listener.close()
+            listener = None
+    shelly_discover.joined = joined
+    shelly_discover.interfaces = interfaces
+    shelly_discover.query_port = asker.getsockname()[1]
+
+    sent = 0
+    for service in services:
+        # Two questions, differing only in the top bit of the class.
+        #
+        # 0x8001 asks for a unicast answer, which is what gets a reply back
+        # through a router that will not carry multicast.
+        #
+        # 0x0001 asks for the ordinary multicast answer, and that is the one an
+        # avahi reflector can work with: a reflector repeats multicast between
+        # interfaces and does nothing at all with unicast replies. On a network
+        # where the only path is a reflector, asking for unicast quietly
+        # guarantees no answer.
+        for qclass in (0x8001, 0x0001):
+            query = (struct.pack('!HHHHHH', 0, 0, 1, 0, 0, 0)
+                     + encode_name(service) + struct.pack('!HH', 12, qclass))
+            # Out of every interface, not just whichever the default route picks.
+            for name, address in (interfaces or [(None, None)]):
+                try:
+                    if address:
+                        asker.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF,
+                                         socket.inet_aton(address))
+                    asker.sendto(query, ('224.0.0.251', 5353))
+                    sent += 1
+                except OSError as e:
+                    log('mDNS query out of %s failed: %s'
+                        % (name or 'default', e), level='debug')
+    if not sent:
+        print(pal.bad('could not send the query out of any interface'))
+        asker.close()
+        if listener:
+            listener.close()
         return {}
 
     found = {}
+    addresses = {}
+    sockets = [s for s in (asker, listener) if s]
     deadline = time.time() + seconds
     while time.time() < deadline:
-        try:
-            data, addr = sock.recvfrom(9000)
-        except socket.timeout:
+        ready, _, _ = select.select(sockets, [], [], 0.3)
+        for sock in ready:
+            try:
+                data, addr = sock.recvfrom(9000)
+            except (socket.timeout, OSError):
+                continue
+
+            names = []
+            try:
+                counts = struct.unpack('!HHHHHH', data[:12])
+                offset = 12
+                for _ in range(counts[2]):
+                    _, offset = read_name(data, offset)
+                    offset += 4
+                for _ in range(counts[3] + counts[4] + counts[5]):
+                    name, offset = read_name(data, offset)
+                    rtype, _cls, _ttl, length = struct.unpack(
+                        '!HHIH', data[offset:offset + 10])
+                    offset += 10
+                    body = data[offset:offset + length]
+                    if rtype == 12:                   # PTR
+                        target, _ = read_name(data, offset)
+                        names.append(target)
+                    elif rtype == 33 and length > 6:  # SRV
+                        target, _ = read_name(data, offset + 6)
+                        names.append(target)
+                    elif rtype == 1 and length == 4:  # A
+                        addresses[name.split('.')[0].lower()] = socket.inet_ntoa(body)
+                    offset += length
+            except (struct.error, IndexError):
+                pass
+
+            entry = found.setdefault(addr[0], {'ip': addr[0], 'names': set()})
+            for name in names:
+                short = name.split('.')[0]
+                # A name beginning with an underscore is a service type, not a
+                # device: enumerating _services._dns-sd._udp.local answers with
+                # "_shelly._tcp.local", which is the question, not a device.
+                if short.startswith('_'):
+                    continue
+                if 'shelly' in short.lower():
+                    entry['names'].add(short)
+
+    asker.close()
+    if listener:
+        listener.close()
+
+    # Prefer the address a device published for itself over the packet's source,
+    # which is the proxy when one is in the way.
+    result = {}
+    for entry in found.values():
+        if not entry['names']:
             continue
-        except OSError:
-            break
-        try:
-            counts = struct.unpack('!HHHHHH', data[:12])
-            offset = 12
-            for _ in range(counts[2]):          # skip the questions
-                _, offset = read_name(data, offset)
-                offset += 4
-            names = []
-            for _ in range(counts[3] + counts[4] + counts[5]):
-                name, offset = read_name(data, offset)
-                rtype, _cls, _ttl, length = struct.unpack('!HHIH', data[offset:offset + 10])
-                offset += 10
-                if rtype == 12:                 # PTR
-                    target, _ = read_name(data, offset)
-                    names.append(target)
-                offset += length
-        except (struct.error, IndexError):
-            names = []
-        entry = found.setdefault(addr[0], {'ip': addr[0], 'names': set()})
-        for name in names:
-            if 'shelly' in name.lower():
-                entry['names'].add(name.split('.')[0])
-    sock.close()
-    return {ip: {'ip': ip, 'names': sorted(v['names'])}
-            for ip, v in found.items() if v['names']}
+        for name in entry['names']:
+            ip = addresses.get(name.lower(), entry['ip'])
+            record = result.setdefault(ip, {'ip': ip, 'names': {},
+                                            'via': entry['ip'] if ip != entry['ip'] else None})
+            # Devices answer with the same name in different case depending on
+            # which record it came from; keep one of each, preferring the form
+            # the device uses for its own hostname.
+            record['names'].setdefault(name.lower(), name)
+            if name.islower():
+                record['names'][name.lower()] = name
+    return {ip: {'ip': ip, 'names': sorted(r['names'].values()), 'via': r['via']}
+            for ip, r in result.items()}
 
 
 # ---- WebSocket, for live pushes -------------------------------------------
@@ -4350,73 +4658,224 @@ def _fmt(value, digits):
 # ---------------------------------------------------------------------------
 # Shelly subcommands
 # ---------------------------------------------------------------------------
-def shelly_main(argv, pal):
-    """upsmon shelly <plug|sensor> <command> — the whole reader, by role."""
+def shelly_build_parser():
+    """One subparser per command, so each has its own --help like any tool."""
     parser = argparse.ArgumentParser(
         prog='upsmon shelly',
-        description='Talk to the Shelly devices named in the configuration. '
-                    'The address and password come from there, so only the role '
-                    'and the command are needed.',
+        description='Talk to the Shelly devices named in the configuration over '
+                    'their local RPC API. No pairing and no cloud: the device '
+                    'answers on plain HTTP while it stays connected to the '
+                    'Shelly app, the cloud and Apple Home over Matter.',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-  upsmon shelly plug info                identity and firmware
-  upsmon shelly plug dump                every value the device reports
-  upsmon shelly plug dump --json
-  upsmon shelly plug poll --interval 5   a live table of the numbers
-  upsmon shelly plug watch               the same, pushed rather than polled
-  upsmon shelly plug on / off / toggle
-  upsmon shelly plug reset-counters              every counter
-  upsmon shelly plug reset-counters aenergy      just the energy total
-  upsmon shelly plug reboot --wait
-  upsmon shelly plug ble status
-  upsmon shelly plug matter off --reboot
-  upsmon shelly plug call Switch.GetStatus '{"id":0}'
-  upsmon shelly sensor dump              the thermometer, when it is awake
-  upsmon shelly listen --port 8088       receive pushes from a sleeping sensor
-  upsmon shelly serve --port 8089        accept an outbound websocket
-  upsmon shelly discover                 find devices on the LAN
-""")
-    parser.add_argument('device', nargs='?', default='plug',
-                        help='plug or sensor (also temp, tempmeter, ht)')
-    parser.add_argument('command', nargs='?', default='dump')
-    parser.add_argument('rest', nargs='*', help='arguments for the command')
-    parser.add_argument('--json', action='store_true', help='machine-readable output')
-    parser.add_argument('--interval', type=float, default=5.0,
-                        help='seconds between readings for poll (default 5)')
-    parser.add_argument('--count', type=int, help='stop after this many readings')
-    parser.add_argument('--csv', metavar='FILE', help='also append readings to a CSV')
-    parser.add_argument('--port', type=int, help='port for listen and serve')
-    parser.add_argument('--wait', action='store_true',
-                        help='wait for the device to come back after a reboot')
-    parser.add_argument('--reboot', action='store_true',
-                        help='reboot after changing a radio setting')
-    parser.add_argument('--seconds', type=float, default=4.0,
-                        help='how long discover listens (default 4)')
-    parser.add_argument('--no-color', action='store_true')
-    args = parser.parse_args(argv)
+addressing a device
+  upsmon shelly plug info            the plug from the configuration
+  upsmon shelly sensor dump          the sensor; temp, tempmeter and ht also work
+  upsmon shelly info                 with no role, the plug is assumed
+  upsmon shelly --host 10.0.0.5 info  something not in the configuration at all
 
-    # "upsmon shelly discover" and "listen" need no device, so a command given
-    # in the device position is taken as the command.
-    if args.device not in SHELLY_DEVICES:
-        args.rest = ([args.command] if args.command != 'dump' else []) + args.rest
-        args.command = args.device
-        args.device = 'plug'
+commands at a glance
+  reading        discover, info, dump, methods, poll, watch, listen, serve
+  controlling    on, off, toggle, reset-counters, reboot
+  configuring    config, matter, ble
+  anything else  call
+
+quoting JSON
+  Linux and PowerShell:  call Switch.SetConfig '{"id":0,"config":{"power_limit":2900}}'
+  cmd.exe:               call Switch.SetConfig "{\\"id\\":0,\\"config\\":{\\"power_limit\\":2900}}"
+
+Run 'upsmon shelly COMMAND --help' for the options of one command.
+""")
+    # These are accepted before the command and after it, because insisting on
+    # one position is exactly the kind of thing that makes a tool annoying.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--host', metavar='ADDR',
+                        help='address of the device, overriding the configuration')
+    common.add_argument('--password', metavar='PASS',
+                        help='password if the device has one; the username is '
+                             'always admin and cannot be changed')
+    common.add_argument('--no-color', action='store_true',
+                        help='plain output with no colour codes')
+    common.add_argument('--json', action='store_true',
+                        help='machine-readable output where the command has any')
+    for action in common._actions:
+        parser._add_action(action)
+
+    subs = parser.add_subparsers(dest='command', metavar='COMMAND')
+
+    def add(name, help_text, description=None, epilog=None):
+        return subs.add_parser(
+            name, help=help_text, description=description or help_text,
+            epilog=epilog, parents=[common],
+            formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    found = add('discover', 'find Shelly devices on the network',
+                'Ask the local network for Shelly devices over multicast DNS. '
+                'This does not cross subnets, and some networks block it.')
+    found.add_argument('--seconds', type=float, default=4.0,
+                       help='how long to listen (default 4)')
+
+    add('info', 'identity, firmware and auth state',
+        'A short summary: model, name, firmware version, generation, and '
+        'whether authentication and Matter are switched on.')
+
+    add('dump', 'everything the device exposes, in one go',
+        'Every component the device has, each with every field it reports. '
+        'Use --json to get the replies exactly as the device sent them.')
+
+    methods = add('methods', 'list every RPC method the device supports',
+                  'Asks the device for its own method list, and explains the '
+                  'ones worth knowing. Useful before reaching for "call": '
+                  'whatever appears here can be invoked, and nothing else can.',
+                  epilog="""
+examples
+  upsmon shelly plug methods                 everything, with notes
+  upsmon shelly plug methods Switch          just one component
+  upsmon shelly plug methods --examples      with a ready-made call for each
+  upsmon shelly plug methods Webhook --examples --described
+""")
+    methods.add_argument('component', nargs='?',
+                         help='only this component: Switch, Wifi, Webhook ...')
+    methods.add_argument('--examples', action='store_true',
+                         help='print a ready-made call under each method')
+    methods.add_argument('--described', action='store_true',
+                         help='hide methods there is nothing useful to say about')
+
+    config = add('config', 'read or change a component configuration',
+                 'With no arguments, the whole device configuration. With a '
+                 'component, just that one. With a component and a JSON object, '
+                 'the settings in that object are written.',
+                 epilog="""
+examples
+  upsmon shelly plug config                       everything
+  upsmon shelly plug config switch:0              one component
+  upsmon shelly plug config sys                   the system section
+  upsmon shelly plug config switch:0 '{"auto_off": true, "auto_off_delay": 60}'
+  upsmon shelly plug config ble '{"enable": true}'
+
+A write is checked by reading the value back, so a setting the firmware quietly
+ignores is reported rather than assumed to have taken.
+""")
+    config.add_argument('component', nargs='?',
+                        help='switch:0, sys, wifi, ble, matter, cloud, mqtt ...')
+    config.add_argument('settings', nargs='?',
+                        help='JSON object of settings to write')
+    config.add_argument('--reboot', action='store_true',
+                        help='restart the device afterwards, which some '
+                             'settings need before they take effect')
+
+    poll = add('poll', 'read the device on a timer, optionally to CSV',
+               'A live table of the numbers the device reports. A sleeping '
+               'battery device is retried rather than treated as an error.')
+    poll.add_argument('--interval', type=float, default=5.0,
+                      help='seconds between readings (default 5)')
+    poll.add_argument('--count', type=int, help='stop after this many readings')
+    poll.add_argument('--csv', metavar='FILE', help='append readings to a CSV file')
+
+    add('watch', 'live push updates over websocket',
+        'Subscribe to the device\'s own notifications instead of polling it. '
+        'The websocket carries no authentication, so this does not work on a '
+        'device with a password set - use poll there.')
+
+    listen = add('listen', 'receive webhooks from a sleeping battery device',
+                 'Print pushes as they arrive. Nothing is recorded; the daemon '
+                 'stores them when sensor_listen is on.')
+    listen.add_argument('--port', type=int, help='port to listen on')
+
+    serve = add('serve', 'accept outbound websocket pushes from devices',
+                'For a device configured to connect out to us rather than be '
+                'polled.')
+    serve.add_argument('--port', type=int, default=8089, help='port (default 8089)')
+
+    add('on', 'switch the relay on')
+    add('off', 'switch the relay off')
+    add('toggle', 'flip the relay to the other state')
+
+    reset = add('reset-counters', 'reset the plug\'s running totals',
+                'With no type, every counter the device has. The values are '
+                'read back afterwards, so a counter the firmware refuses to '
+                'clear is reported rather than assumed reset.',
+                epilog="""
+counter types
+  aenergy        active energy, the kilowatt-hour total
+  ret_aenergy    energy returned to the grid
+  on_time        total runtime, how long the relay has been on
+  switch_on      switching cycles
+  on_above_thr   active load runtime, time above the plug's threshold
+""")
+    reset.add_argument('types', nargs='*', help='which counters; none means all')
+
+    reboot = add('reboot', 'restart the device')
+    reboot.add_argument('--wait', action='store_true',
+                        help='wait for it to come back and report the firmware')
+
+    matter = add('matter', 'Matter on, off, status, or the pairing code',
+                 'Matter has to be enabled before a controller can commission '
+                 'the device, and the change needs a reboot.')
+    matter.add_argument('action', nargs='?', default='status',
+                        choices=['status', 'on', 'off', 'code'])
+    matter.add_argument('--reboot', action='store_true',
+                        help='restart afterwards so the change takes effect')
+
+    ble = add('ble', 'Bluetooth radio and BLE RPC on, off or status',
+              'The radio and the RPC-over-Bluetooth service are separate '
+              'switches. Both need a reboot to take effect.')
+    ble.add_argument('action', nargs='?', default='status',
+                     choices=['status', 'on', 'off', 'rpc-on', 'rpc-off'])
+    ble.add_argument('--reboot', action='store_true',
+                     help='restart afterwards so the change takes effect')
+
+    call = add('call', 'invoke any RPC method directly',
+               'For anything the commands above do not cover. Run "methods" '
+               'first to see what this device accepts.',
+               epilog="""
+examples
+  upsmon shelly plug call Shelly.GetStatus
+  upsmon shelly plug call Switch.GetStatus '{"id":0}'
+  upsmon shelly plug call Switch.SetConfig '{"id":0,"config":{"power_limit":2900}}'
+""")
+    call.add_argument('method', help='for example Switch.GetStatus')
+    call.add_argument('params', nargs='?', help='JSON object of parameters')
+
+    return parser
+
+
+def shelly_main(argv, pal):
+    """upsmon shelly [role] <command> - the whole toolkit, addressed by role."""
+    arguments = list(argv)
+
+    # The role comes before the command, which argparse subparsers cannot
+    # express. Take it off the front first; everything after is ordinary.
+    role = 'plug'
+    for index, value in enumerate(arguments):
+        if value.startswith('-'):
+            continue
+        if value in SHELLY_DEVICES:
+            role = value
+            arguments.pop(index)
+        break
+
+    parser = shelly_build_parser()
+    args = parser.parse_args(arguments)
+    args.device = role
+    if not args.command:
+        parser.print_help()
+        return 0
+    if args.no_color:
+        pal = Palette(False)
 
     handler = {
         'discover': shelly_cmd_discover, 'info': shelly_cmd_info,
-        'dump': shelly_cmd_dump, 'poll': shelly_cmd_poll,
+        'dump': shelly_cmd_dump, 'methods': shelly_cmd_methods,
+        'config': shelly_cmd_config, 'poll': shelly_cmd_poll,
         'watch': shelly_cmd_watch, 'listen': shelly_cmd_listen,
         'serve': shelly_cmd_serve, 'on': shelly_cmd_switch,
         'off': shelly_cmd_switch, 'toggle': shelly_cmd_switch,
         'reset-counters': shelly_cmd_reset, 'call': shelly_cmd_call,
         'reboot': shelly_cmd_reboot, 'ble': shelly_cmd_radio,
         'matter': shelly_cmd_radio,
-    }.get(args.command)
+    }[args.command]
 
-    if handler is None:
-        print(pal.bad('unknown command "%s"' % args.command), file=sys.stderr)
-        parser.print_help()
-        return 2
     try:
         return handler(args, pal)
     except PlugError as e:
@@ -4435,18 +4894,180 @@ def shelly_cmd_discover(args, pal):
         return 0
     if not found:
         print(pal.warn('nothing answered'))
-        print(pal.note('  mDNS does not cross subnets, and some networks block it. '
-                       'If the device is elsewhere, address it by IP in the config.'))
+        for line in discovery_diagnosis(pal):
+            print(line)
+        print()
+        print(pal.note('  Nothing here depends on discovery. Give the address '
+                       'directly and everything else works:'))
+        print(pal.note('    upsmon shelly --host 172.16.16.12 info'))
+        print(pal.note('  or set plug_host in %s.' % CONFIG_FILE))
         return 1
     for entry in sorted(found.values(), key=lambda e: e['ip']):
-        print('  %s  %s' % (pal.value(entry['ip'].ljust(15)),
-                            pal.note(', '.join(entry['names']))))
+        line = '  %s  %s' % (pal.value(entry['ip'].ljust(15)),
+                             pal.note(', '.join(entry['names'])))
+        if entry.get('via'):
+            line += pal.note('  (relayed by %s)' % entry['via'])
+        print(line)
     print(pal.note('  %d device(s)' % len(found)))
     return 0
 
 
+def discovery_diagnosis(pal):
+    """Why an empty result is usually the local machine's own doing.
+
+    On a stock AlmaLinux 9 the firewall drops inbound multicast DNS until the
+    service is allowed, and a reply to a multicast query is not something
+    connection tracking will let back in on its own. That is the first thing to
+    check, and the tool can check it rather than leaving it to guesswork.
+    """
+    lines = []
+
+    interfaces = getattr(shelly_discover, 'interfaces', [])
+    if interfaces:
+        lines.append(pal.note('  The query went out of %d interface(s): %s'
+                              % (len(interfaces),
+                                 ', '.join('%s (%s)' % (n, a) for n, a in interfaces))))
+        if len(interfaces) == 1:
+            lines.append(pal.note('    If the device is reached through a VLAN '
+                                  'this machine has no address on, only a proxy '
+                                  'can carry the query there.'))
+    joined = getattr(shelly_discover, 'joined', 0)
+    if not joined:
+        lines.append(pal.warn('  Could not join the multicast group on port 5353.'))
+        lines.append(pal.note('    Only a unicast reply can reach us, and an '
+                              'avahi reflector does not forward those - it '
+                              'repeats multicast between interfaces and nothing '
+                              'else. Check what holds the port:'))
+        lines.append(pal.key('      ss -lunp | grep 5353'))
+    else:
+        lines.append(pal.note('  Joined the multicast group on %d interface(s), '
+                              'and asked for both a unicast and a multicast '
+                              'answer.' % joined))
+        lines.append(pal.note('    A reflector can only carry the multicast one, '
+                              'so that path is covered.'))
+
+    blocked = firewalld_blocks_mdns()
+    if blocked is True:
+        lines.append(pal.bad('  firewalld is running and mDNS is not allowed in '
+                             'the active zone.'))
+        lines.append(pal.note('    Replies to a multicast query are dropped, '
+                              'because connection tracking has nothing to match '
+                              'them against. Allow the service:'))
+        lines.append(pal.key('      sudo firewall-cmd --permanent --add-service=mdns'))
+        lines.append(pal.key('      sudo firewall-cmd --reload'))
+    elif blocked is False:
+        lines.append(pal.ok('  firewalld allows mDNS, so the firewall is not the '
+                            'problem here.'))
+    else:
+        lines.extend(iptables_diagnosis(pal))
+
+    lines.append(pal.note('  Multicast DNS does not cross subnets on its own. A '
+                          'proxy or repeater between VLANs forwards it, but many '
+                          'forward only the query and not the reply.'))
+    if shutil.which('avahi-browse'):
+        lines.append(pal.note('  avahi is installed here, so it can be asked the '
+                              'same question independently:'))
+        lines.append(pal.key('      avahi-browse -art | grep -i shelly'))
+        lines.append(pal.note('    If that finds nothing either, the replies are '
+                              'not reaching this machine at all and the cause is '
+                              'in the network, not here.'))
+    lines.append(pal.note('  Strict reverse-path filtering also drops replies '
+                          'that arrive from another VLAN. Check with:'))
+    lines.append(pal.key('      sysctl net.ipv4.conf.all.rp_filter'))
+    lines.append(pal.note('    2 (loose) or 0 tolerates it; 1 (strict) will not.'))
+    return lines
+
+
+def iptables_diagnosis(pal):
+    """The same question for a machine running iptables directly.
+
+    Two rules are needed, not one. Answers arrive at port 5353 when we hold it,
+    and at whatever port the query went out from when avahi already has 5353 -
+    the unicast-response bit is what makes that second case work, and it needs
+    a rule of its own because connection tracking will not match a reply to a
+    multicast destination.
+    """
+    import subprocess
+    lines = []
+    try:
+        rules = subprocess.run(['iptables', '-S', 'INPUT'],
+                               capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return lines
+    if rules.returncode != 0:
+        if 'permission' in (rules.stderr or '').lower():
+            lines.append(pal.note('  Run as root to have the firewall checked '
+                                  'as well.'))
+        return lines
+
+    text = rules.stdout
+    # A chain whose policy is ACCEPT but which ends in a catch-all REJECT is
+    # every bit as closed as one with a DROP policy. Looking only at the policy
+    # was wrong.
+    policy_drops = any(line.startswith('-P INPUT') and 'ACCEPT' not in line
+                       for line in text.split('\n'))
+    catch_all = any(('-j REJECT' in line or '-j DROP' in line)
+                    and '-p ' not in line and '--dport' not in line
+                    for line in text.split('\n'))
+    policy_drops = policy_drops or catch_all
+    accepts_5353 = any('5353' in line and '-j ACCEPT' in line
+                       for line in text.split('\n'))
+    accepts_group = any('224.0.0.251' in line and '-j ACCEPT' in line
+                        for line in text.split('\n'))
+
+    if not policy_drops:
+        lines.append(pal.ok('  iptables accepts by default, so the firewall is '
+                            'not blocking this.'))
+        return lines
+    if accepts_5353:
+        lines.append(pal.ok('  iptables already allows mDNS both ways, so the '
+                            'firewall is not the problem.'))
+        return lines
+
+    if accepts_group:
+        lines.append(pal.warn('  iptables allows the multicast group but not a '
+                              'unicast reply.'))
+        lines.append(pal.note('    A proxy answers from port 5353 to whatever '
+                              'port the query went out from, which the existing '
+                              'rule does not cover. Add:'))
+        lines.append(pal.key('      iptables -I INPUT -p udp --sport 5353 -j ACCEPT'))
+    else:
+        lines.append(pal.bad('  iptables drops by default and nothing allows mDNS.'))
+        lines.append(pal.note('    Two rules, because answers arrive two ways:'))
+        lines.append(pal.key('      iptables -I INPUT -p udp --dport 5353 -j ACCEPT'))
+        lines.append(pal.note('        replies to the multicast group, when we '
+                              'hold port 5353'))
+        lines.append(pal.key('      iptables -I INPUT -p udp --sport 5353 -j ACCEPT'))
+        lines.append(pal.note('        unicast replies to a temporary port, which '
+                              'is what a proxy sends and what avahi leaves us with'))
+
+    lines.append(pal.note('    Then make it survive a reboot:'))
+    lines.append(pal.key('      service iptables save'))
+    lines.append(pal.note('        or iptables-save > /etc/sysconfig/iptables'))
+    return lines
+
+
+def firewalld_blocks_mdns():
+    """True, False, or None when firewalld is not running or not installed."""
+    import subprocess
+    try:
+        state = subprocess.run(['firewall-cmd', '--state'],
+                               capture_output=True, text=True, timeout=5)
+        if state.returncode != 0:
+            return None
+        allowed = subprocess.run(['firewall-cmd', '--query-service=mdns'],
+                                 capture_output=True, text=True, timeout=5)
+        if 'yes' in allowed.stdout:
+            return False
+        ports = subprocess.run(['firewall-cmd', '--list-ports'],
+                               capture_output=True, text=True, timeout=5)
+        return '5353/udp' not in ports.stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
 def shelly_cmd_info(args, pal):
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     info = rpc.call('Shelly.GetDeviceInfo')
     if args.json:
         print(json.dumps(info, indent=2))
@@ -4456,7 +5077,7 @@ def shelly_cmd_info(args, pal):
 
 
 def shelly_cmd_dump(args, pal):
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     everything = shelly_everything(rpc)
     if not everything:
         raise PlugError('the device answered nothing we recognise')
@@ -4505,8 +5126,156 @@ def shelly_numeric(flat):
     return sorted(numeric, key=rank)
 
 
+def shelly_cmd_methods(args, pal):
+    """Everything this device will answer, straight from the device."""
+    rpc = shelly_for(args.device, args)
+    try:
+        result = rpc.call('Shelly.ListMethods')
+    except PlugError as e:
+        if is_missing_component(e):
+            raise PlugError('this device does not publish a method list; it is '
+                            'probably older than Gen2 firmware 0.14')
+        raise
+    methods = sorted((result or {}).get('methods', []))
+    if args.component:
+        wanted = args.component.lower().rstrip('.')
+        methods = [m for m in methods if m.split('.')[0].lower() == wanted]
+        if not methods:
+            print(pal.warn('no component called "%s" on this device'
+                           % args.component))
+            return 1
+
+    if args.json:
+        if args.described:
+            print(json.dumps({m: {'description': RPC_METHODS[m][0],
+                                  'example': RPC_METHODS[m][1]}
+                              for m in methods if m in RPC_METHODS}, indent=2))
+        else:
+            print(json.dumps(methods, indent=2))
+        return 0
+    if not methods:
+        print(pal.warn('the device returned an empty list'))
+        return 1
+
+    groups = {}
+    for method in methods:
+        groups.setdefault(method.split('.')[0], []).append(method)
+
+    described = 0
+    for component in sorted(groups):
+        note = RPC_COMPONENTS.get(component, '')
+        heading = '-- %s ' % component
+        print('\n' + pal.group(heading) + pal.rule('-' * max(1, 70 - len(heading))))
+        if note:
+            print('  ' + pal.note(note))
+        for method in groups[component]:
+            entry = RPC_METHODS.get(method)
+            if not entry and args.described:
+                continue
+            print('  ' + pal.value(method))
+            if entry:
+                described += 1
+                print('      ' + pal.note(entry[0]))
+                if entry[1] and args.examples:
+                    print('      ' + pal.key('upsmon shelly %s call %s %s'
+                                             % (args.device, method,
+                                                shell_quote(entry[1]))))
+                elif not entry[1] and args.examples:
+                    print('      ' + pal.key('upsmon shelly %s call %s'
+                                             % (args.device, method)))
+
+    print('\n' + pal.rule('=' * 74))
+    print(pal.note('  %d method(s) across %d component(s); %d of them described '
+                   'here.' % (len(methods), len(groups), described)))
+    if not args.examples:
+        print(pal.note('  --examples adds a ready-made call for each one, '
+                       '--described hides the rest.'))
+    print(pal.note('  Anything listed can be used with "call", described or not.'))
+    return 0
+
+
+def shell_quote(text):
+    """Quote a JSON argument for a shell, or leave it for cmd.exe to mangle."""
+    if os.name == 'nt':
+        return '"' + text.replace('"', '\\"') + '"'
+    return "'" + text + "'"
+
+
+def shelly_cmd_config(args, pal):
+    """Read a configuration, or write one and check it took."""
+    rpc = shelly_for(args.device, args)
+
+    if not args.component:
+        config = rpc.call('Shelly.GetConfig')
+        if args.json:
+            print(json.dumps(config, indent=2))
+            return 0
+        flat = flatten(config)
+        for component in sorted({k.split('.')[0] for k in flat}):
+            section = {k: v for k, v in flat.items()
+                       if k == component or k.startswith(component + '.')}
+            print('\n' + pal.group('-- %s ' % component)
+                  + pal.rule('-' * max(1, 70 - len(component))))
+            shelly_print_flat(pal, section)
+        print('\n' + pal.note('  %d setting(s). Give a component to narrow it, '
+                              'and a JSON object to change it.' % len(flat)))
+        return 0
+
+    # Reading one component: Switch.GetConfig wants an id, Sys.GetConfig does not.
+    component = args.component
+    name, _, index = component.partition(':')
+    method_base = name[0].upper() + name[1:] if name.islower() else name
+    params = {'id': int(index)} if index.isdigit() else None
+
+    if not args.settings:
+        config = rpc.call('%s.GetConfig' % method_base, params)
+        if args.json:
+            print(json.dumps(config, indent=2))
+            return 0
+        shelly_print_flat(pal, flatten(config), '  %s' % component)
+        return 0
+
+    try:
+        settings = json.loads(args.settings)
+    except ValueError:
+        raise PlugError('the settings must be a JSON object: %s' % args.settings)
+    if not isinstance(settings, dict):
+        raise PlugError('the settings must be a JSON object, not a %s'
+                        % type(settings).__name__)
+
+    before = flatten(rpc.call('%s.GetConfig' % method_base, params))
+    write = dict(params or {})
+    write['config'] = settings
+    result = rpc.call('%s.SetConfig' % method_base, write)
+    after = flatten(rpc.call('%s.GetConfig' % method_base, params))
+
+    # Firmware accepts a whole config object and silently drops keys it does
+    # not know, so say which ones actually changed rather than assuming.
+    applied, ignored = [], []
+    for key, wanted in flatten(settings).items():
+        now = after.get(key)
+        (applied if now == wanted else ignored).append(
+            '%s=%s' % (key, now if now is not None else 'absent'))
+    for key in applied:
+        print(pal.ok('  set   ') + key)
+    for key in ignored:
+        print(pal.warn('  kept  ') + key
+              + pal.note('  (the device did not take the new value)'))
+
+    changed = [k for k in after if before.get(k) != after.get(k)]
+    if not applied and not changed:
+        print(pal.warn('  nothing changed'))
+        return 1
+    if (result or {}).get('restart_required') or args.reboot:
+        if args.reboot:
+            return shelly_cmd_reboot(args, pal)
+        print(pal.note('  the device says a restart is needed: '
+                       'upsmon shelly %s reboot --wait' % args.device))
+    return 0
+
+
 def shelly_cmd_poll(args, pal):
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     import csv as csv_module
     handle = open(args.csv, 'a', newline='', encoding='utf-8') if args.csv else None
     writer = csv_module.writer(handle) if handle else None
@@ -4554,7 +5323,7 @@ def shelly_cmd_poll(args, pal):
 def shelly_cmd_watch(args, pal):
     """Subscribe to the device's own notifications instead of polling."""
     import base64
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     host = rpc.host.split(':')[0]
     port = int(rpc.host.split(':')[1]) if ':' in rpc.host else 80
     key = base64.b64encode(secrets.token_bytes(16)).decode()
@@ -4633,7 +5402,20 @@ def shelly_cmd_listen(args, pal):
             length = int(self.headers.get('Content-Length') or 0)
             self._show(self.rfile.read(length).decode('utf-8', 'replace'))
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    try:
+        server = ThreadingHTTPServer((host, port), Handler)
+    except OSError as e:
+        if e.errno == errno.EADDRINUSE:
+            running = 'the daemon is probably already listening there' \
+                if port == int(CONFIG['sensor_listen_port']) \
+                and CONFIG['sensor_listen'] else 'something else has that port'
+            print(pal.bad('port %s on %s is already in use' % (port, host)))
+            print(pal.note('  %s. Either stop it, or watch on a spare port and '
+                           'point a webhook at that:' % running))
+            print(pal.note('    upsmon shelly listen --port %d' % (port + 1)))
+            return 1
+        print(pal.bad('cannot listen on %s:%s - %s' % (host, port, e)))
+        return 1
     print(pal.note('listening on http://%s:%s/ - point the sensor webhook here, '
                    'Ctrl+C to stop' % (host, port)))
     print(pal.note('nothing is recorded; this only shows what arrives. The daemon '
@@ -4654,7 +5436,14 @@ def shelly_cmd_serve(args, pal):
 
     listener = socket.socket()
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    listener.bind(('0.0.0.0', port))
+    try:
+        listener.bind(('0.0.0.0', port))
+    except OSError as e:
+        print(pal.bad('cannot listen on port %s - %s' % (port, e)))
+        if e.errno == errno.EADDRINUSE:
+            print(pal.note('  try another: upsmon shelly serve --port %d'
+                           % (port + 1)))
+        return 1
     listener.listen(4)
     print(pal.note('waiting for a device to connect to ws://<this-host>:%d/ - '
                    'Ctrl+C to stop' % port))
@@ -4700,7 +5489,7 @@ def shelly_cmd_serve(args, pal):
 
 
 def shelly_cmd_switch(args, pal):
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     switch_id = int(CONFIG['plug_switch_id'])
     if args.command == 'toggle':
         rpc.call('Switch.Toggle', {'id': switch_id})
@@ -4716,9 +5505,9 @@ def shelly_cmd_switch(args, pal):
 
 def shelly_cmd_reset(args, pal):
     """reset-counters [type ...] — no type means every counter the plug has."""
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     switch_id = int(CONFIG['plug_switch_id'])
-    types = [t for arg in args.rest for t in arg.split(',') if t]
+    types = [t for arg in args.types for t in arg.split(',') if t]
     unknown = [t for t in types if t not in PLUG_COUNTER_TYPES]
     if unknown:
         print(pal.bad('  unknown counter: %s' % ', '.join(unknown)))
@@ -4737,16 +5526,14 @@ def shelly_cmd_reset(args, pal):
 
 
 def shelly_cmd_call(args, pal):
-    if not args.rest:
-        raise PlugError('give a method, e.g. call Switch.GetStatus \'{"id":0}\'')
-    rpc = shelly_for(args.device)
-    method = args.rest[0]
+    rpc = shelly_for(args.device, args)
+    method = args.method
     params = None
-    if len(args.rest) > 1:
+    if args.params:
         try:
-            params = json.loads(args.rest[1])
+            params = json.loads(args.params)
         except ValueError:
-            raise PlugError('the parameters must be JSON: %s' % args.rest[1])
+            raise PlugError('the parameters must be JSON: %s' % args.params)
     result = rpc.call(method, params)
     if args.json or not isinstance(result, dict):
         print(json.dumps(result, indent=2))
@@ -4756,7 +5543,7 @@ def shelly_cmd_call(args, pal):
 
 
 def shelly_cmd_reboot(args, pal):
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     rpc.call('Shelly.Reboot')
     print(pal.ok('  reboot requested'))
     if not args.wait:
@@ -4787,9 +5574,9 @@ def is_missing_component(error):
 
 def shelly_cmd_radio(args, pal):
     """ble and matter: status, on, off — both are a config flag plus a reboot."""
-    rpc = shelly_for(args.device)
+    rpc = shelly_for(args.device, args)
     component = 'BLE' if args.command == 'ble' else 'Matter'
-    action = (args.rest[0] if args.rest else 'status').lower()
+    action = (args.action or 'status').lower()
 
     if action == 'status':
         try:
@@ -4805,10 +5592,54 @@ def shelly_cmd_radio(args, pal):
         enabled = bool(config.get('enable'))
         print('  %s is %s' % (component, pal.ok('enabled') if enabled
                               else pal.bad('disabled')))
+        if component == 'BLE':
+            over_ble = bool((config.get('rpc') or {}).get('enable'))
+            print('  %s is %s' % ('RPC over Bluetooth',
+                                  pal.ok('enabled') if over_ble else pal.bad('disabled')))
         try:
             shelly_print_flat(pal, flatten(rpc.call('%s.GetStatus' % component)))
         except PlugError:
             pass
+        return 0
+
+    if action == 'code':
+        if component != 'Matter':
+            raise PlugError('only matter has a pairing code')
+        try:
+            status = rpc.call('Matter.GetStatus')
+        except PlugError as e:
+            if is_missing_component(e):
+                raise PlugError('this device does not support Matter')
+            raise
+        code = status.get('setup_code') or status.get('manual_pairing_code')
+        payload = status.get('setup_payload') or status.get('qr_code')
+        if not code and not payload:
+            raise PlugError('the device did not return a pairing code. Matter '
+                            'has to be enabled and the device not yet '
+                            'commissioned for one to exist.')
+        if code:
+            print('  manual pairing code : ' + pal.value(str(code)))
+        if payload:
+            print('  setup payload       : ' + pal.value(str(payload)))
+        print(pal.note('  a controller needs one of these to commission the device'))
+        return 0
+
+    # ble rpc-on / rpc-off switches RPC over Bluetooth, which is a separate
+    # setting from the radio itself.
+    if action in ('rpc-on', 'rpc-off'):
+        if component != 'BLE':
+            raise PlugError('only ble has an rpc switch')
+        rpc.call('BLE.SetConfig', {'config': {'rpc': {'enable': action == 'rpc-on'}}})
+        config = rpc.call('BLE.GetConfig')
+        settled = bool((config.get('rpc') or {}).get('enable'))
+        if settled != (action == 'rpc-on'):
+            print(pal.warn('  the device did not accept the change'))
+            return 1
+        print(pal.ok('  BLE RPC %s' % ('enabled' if settled else 'disabled')))
+        if args.reboot:
+            return shelly_cmd_reboot(args, pal)
+        print(pal.note('  a reboot is needed for this to take effect: '
+                       'upsmon shelly %s reboot --wait' % args.device))
         return 0
 
     if action not in ('on', 'off'):
@@ -4859,19 +5690,24 @@ configuration:
 
   upsmon shelly plug info            identity and firmware
   upsmon shelly plug dump            every value the device reports
+  upsmon shelly plug methods         every RPC method it supports
+  upsmon shelly plug config          the whole configuration
+  upsmon shelly plug config switch:0 '{"auto_off": true}'
   upsmon shelly plug poll            a live table of the numbers
   upsmon shelly plug watch           the same, pushed rather than polled
   upsmon shelly plug on|off|toggle
   upsmon shelly plug reset-counters
   upsmon shelly plug reboot --wait
   upsmon shelly plug ble status
-  upsmon shelly plug matter off --reboot
+  upsmon shelly plug matter code     the pairing code, if Matter is on
   upsmon shelly plug call Switch.GetStatus '{"id":0}'
   upsmon shelly sensor dump          the thermometer, while it is awake
   upsmon shelly listen               show pushes as they arrive
   upsmon shelly serve                accept an outbound websocket
   upsmon shelly discover             find Shelly devices on the LAN
-  upsmon shelly --help               all of it, with the options
+  upsmon shelly --host 10.0.0.5 info a device not in the configuration
+  upsmon shelly --help               the command list
+  upsmon shelly config --help        the options of one command
   upsmon --reset-data                erase all history and events
   upsmon --reset-data events         erase only the event log
 

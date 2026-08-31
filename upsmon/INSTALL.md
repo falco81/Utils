@@ -894,7 +894,12 @@ voltage, battery voltage, power drawn. Not every model measures the watts
 actually being drawn; when yours does not, that chart is worked out from the
 load percentage against the nameplate rating and labelled as an estimate. Recent data comes from full-resolution
 samples, older data from the hourly roll-up, so a year-long chart costs a few
-hundred points rather than half a million. Underneath, if a plug is configured, ten more from it — power, energy, voltage,
+hundred points rather than half a million. A power failure means the UPS reported `OB` — running on battery because the
+mains went away. A self test drains the battery too but keeps reporting `OL`,
+on line, so it is deliberately not counted as an outage; it appears under Tests
+instead.
+
+Underneath, if a plug is configured, ten more from it — power, energy, voltage,
 current, frequency, its own temperature, power factor, returned energy, runtime
 and switching cycles, plus load runtime, Wi-Fi signal, uptime and free memory —
 then whatever a sensor has reported: temperature, humidity, battery percentage,
@@ -1128,6 +1133,13 @@ That second half is not an error in upsmon — it means the firmware does not
 support resetting that counter, and the plug's own web interface will not clear
 it either.
 
+Each counter also shows the date it started from. That comes from the plug's own
+timestamp where it publishes one, otherwise from a reset made through upsmon,
+and otherwise from the recorded history — these totals only climb, so a fall in
+the chart is a reset. When none of that applies, the oldest reading gives a date
+the counter has been running at least since, and the dashboard says
+`counting since at least` rather than `since` to make the difference plain.
+
 ### Rate limiting
 
 Gen3 firmware with authentication enabled answers HTTP 429 when requests arrive
@@ -1168,6 +1180,22 @@ Open the port if the sensor is on another subnet:
 ```bash
 sudo firewall-cmd --permanent --add-port=8088/tcp
 sudo firewall-cmd --reload
+```
+
+If you also want `upsmon shelly discover` to work, allow multicast DNS while you
+are here — inbound mDNS is dropped by default, which makes discovery look broken:
+
+```bash
+sudo firewall-cmd --permanent --add-service=mdns
+sudo firewall-cmd --reload
+```
+
+On a machine running iptables directly:
+
+```bash
+iptables -I INPUT -p udp --dport 5353 -j ACCEPT
+iptables -I INPUT -p udp --sport 5353 -j ACCEPT
+service iptables save
 ```
 
 Create the webhooks on the sensor once. It only wakes briefly, so press its
@@ -1244,56 +1272,327 @@ rather than by IP — the address and password come from the configuration, so
 neither has to be typed or pasted into a shell.
 
 ```
-upsmon shelly <plug|sensor> <command> [options]
+upsmon shelly [role] <command> [options]
 ```
 
 `plug` and `sensor` are the two roles; `temp`, `tempmeter` and `ht` also mean the
-sensor. `discover` and `listen` need no role at all.
+sensor, and with no role at all the plug is assumed. `discover` and `listen` need
+no role.
+
+Each command has its own help page, as in any tool:
+
+```bash
+upsmon shelly --help            # the command list
+upsmon shelly config --help     # the options and examples for one command
+```
+
+**Reading**
 
 | command | what it does |
 |---|---|
-| `info` | identity, model, firmware version |
-| `dump` | every value the device reports, grouped by component. `--json` for the raw reply |
-| `poll` | a live table of the numbers. `--interval 5`, `--count 20`, `--csv file.csv` |
-| `watch` | the same, pushed by the device over its websocket rather than polled |
-| `on`, `off`, `toggle` | switch the socket |
-| `reset-counters [type…]` | reset counters; no type means every one the plug has |
-| `call METHOD [JSON]` | any RPC method at all, for anything not covered above |
-| `reboot [--wait]` | restart the device, optionally waiting for it to come back |
-| `ble status\|on\|off` | Bluetooth, with `--reboot` to apply immediately |
-| `matter status\|on\|off` | Matter, same |
+| `discover [--seconds N]` | find Shelly devices on the LAN over multicast DNS |
+| `info` | identity, model, firmware, whether authentication and Matter are on |
+| `dump` | every value the device exposes, grouped by component |
+| `methods` | every RPC method this device supports — check here before using `call` |
+| `poll [--interval N] [--count N] [--csv FILE]` | a live table, optionally to a spreadsheet |
+| `watch` | the same, pushed over the device's websocket rather than polled |
 | `listen [--port N]` | show webhook pushes as they arrive, recording nothing |
 | `serve [--port N]` | accept an outbound websocket from a device configured to call us |
-| `discover [--seconds N]` | find Shelly devices on the LAN over multicast DNS |
+
+**Controlling**
+
+| command | what it does |
+|---|---|
+| `on`, `off`, `toggle` | switch the relay |
+| `reset-counters [type…]` | reset counters; no type means every one the device has |
+| `reboot [--wait]` | restart it, optionally waiting for it to come back |
+
+**Configuring**
+
+| command | what it does |
+|---|---|
+| `config` | the whole device configuration |
+| `config COMPONENT` | one component: `switch:0`, `sys`, `wifi`, `ble`, `cloud`, `mqtt` |
+| `config COMPONENT '{JSON}'` | write those settings, then read them back to check |
+| `matter status\|on\|off\|code` | Matter, and the pairing code a controller needs |
+| `ble status\|on\|off\|rpc-on\|rpc-off` | the Bluetooth radio and RPC over Bluetooth, separately |
+| `call METHOD ['{JSON}']` | any RPC method at all |
+
+`--reboot` on `config`, `matter` and `ble` restarts the device afterwards, which
+several of those settings need before they take effect.
+
+**Options that work with any command**
+
+| option | what it does |
+|---|---|
+| `--host ADDR` | address a device that is not in the configuration at all |
+| `--password PASS` | its password; the username is always `admin` and cannot be changed |
+| `--json` | machine-readable output, where the command has any |
+| `--no-color` | plain text |
+
+They are accepted before the command or after it, so neither of these is wrong:
 
 ```bash
-upsmon shelly plug info
+upsmon shelly --json plug dump
 upsmon shelly plug dump --json
-upsmon shelly plug poll --interval 5 --csv plug.csv
-upsmon shelly plug off
-upsmon shelly plug reset-counters aenergy
-upsmon shelly plug call Switch.GetStatus '{"id":0}'
-upsmon shelly sensor dump
-upsmon shelly discover
 ```
 
-The counter types are `aenergy`, `ret_aenergy`, `on_time`, `switch_on` and
-`on_above_thr` — active energy, returned energy, total runtime, switching cycles
-and active load runtime, in the order the plug's own web interface lists them.
+**Examples**
 
-Four things are worth knowing. `watch` uses the device's websocket, which
-carries no authentication, so with a password set it says so and points you at
-`poll` instead. `discover` uses multicast DNS, which does not cross subnets. And
-`ble` and `matter` only take effect after a reboot, which `--reboot` will do for
-you. Repeated commands in quick succession can trip the plug's rate limit; the
-client waits and retries up to three times rather than failing.
+```bash
+upsmon shelly discover
+upsmon shelly plug info
+upsmon shelly plug methods
+upsmon shelly plug config switch:0
+upsmon shelly plug config switch:0 '{"auto_off": true, "auto_off_delay": 300}'
+upsmon shelly plug config sys '{"device": {"name": "UPS socket"}}' --reboot
+upsmon shelly plug poll --interval 5 --csv plug.csv
+upsmon shelly plug reset-counters aenergy
+upsmon shelly plug ble rpc-off --reboot
+upsmon shelly plug call Switch.SetConfig '{"id":0,"config":{"power_limit":2900}}'
+upsmon shelly --host 10.0.0.5 --password secret info
+```
+
+On `cmd.exe`, single quotes do not work; write the JSON as
+`"{\\"id\\":0}"` instead. PowerShell and Linux shells take the simpler form.
+
+Counter types for `reset-counters` are `aenergy`, `ret_aenergy`, `on_time`,
+`switch_on` and `on_above_thr` — active energy, returned energy, total runtime,
+switching cycles and active load runtime, in the order the plug's own web
+interface lists them.
+
+**Things that are not obvious**
+
+A `config` write is checked by reading the value back. Firmware accepts a whole
+configuration object and silently drops keys it does not recognise, so upsmon
+reports which settings actually took:
+
+```
+  set   auto_off=True
+  kept  nonsense_key=absent  (the device did not take the new value)
+```
+
+`watch` uses the device's websocket, which carries no authentication — with a
+password set it says so and points you at `poll`.
+
+`discover` uses multicast DNS, and on a stock AlmaLinux 9 it will find nothing
+until the firewall is told to allow it. A reply to a multicast query is not
+something connection tracking can match against the outgoing packet, so it is
+dropped as unsolicited and the query appears to go unanswered.
+
+With firewalld:
+
+```bash
+sudo firewall-cmd --permanent --add-service=mdns
+sudo firewall-cmd --reload
+```
+
+With iptables, two rules rather than one, because answers arrive two ways:
+
+```bash
+iptables -I INPUT -p udp --dport 5353 -j ACCEPT   # to the multicast group
+iptables -I INPUT -p udp --sport 5353 -j ACCEPT   # unicast, from a proxy
+service iptables save                             # or iptables-save > /etc/sysconfig/iptables
+```
+
+The second rule is the one people miss. The query always goes out from a port of
+its own rather than from 5353, so a device or proxy answering by unicast replies
+there — which the first rule does not cover.
+
+That is deliberate. `avahi-daemon` usually holds 5353, and with `SO_REUSEPORT` a
+unicast datagram to a shared port is delivered to exactly one of the sockets
+bound to it — as likely avahi as us. Asking from a port nobody else has removes
+that coin toss; a second socket joins the multicast group for replies sent the
+other way.
+
+**If the path between VLANs is an avahi reflector**, the multicast answer is the
+only one that can reach you. A reflector repeats multicast packets between its
+interfaces and does nothing with unicast, so a device that honours a
+unicast-response request answers straight to the reflector and the reply goes
+nowhere. `discover` therefore asks both ways — one question with the
+unicast-response bit set for routed paths, one without it for reflected ones —
+and joins the multicast group on every interface rather than letting the kernel
+pick one.
+
+On a machine with several VLANs the query is sent out of every interface, not
+just whichever one the default route happens to use. `discover` lists the
+interfaces it used when it finds nothing, which shows at once whether the
+device's network was among them.
+
+`discover` checks both firewalls itself and prints the rules you are missing
+when nothing comes back.
+
+Two other things stop it working. Multicast does not cross subnets on its own —
+a proxy or repeater between VLANs forwards it, but many forward only the query
+and not the reply. And strict reverse-path filtering drops replies arriving from
+another VLAN:
+
+```bash
+sysctl net.ipv4.conf.all.rp_filter      # 1 is strict, 2 is loose, 0 is off
+```
+
+If the device sits behind a proxy and the reply does come through, the address
+shown is the one the device published for itself, with the relay noted
+separately. Nothing else depends on
+discovery: give `--host` or set the address in the configuration and everything
+works. When a proxy does relay a reply, the address shown is the one the device
+published for itself, with the relay noted separately. Repeated commands in quick succession can trip the
+device's rate limit; the client waits and retries up to three times rather than
+failing.
 
 Switching the socket this way bypasses the PIN, because anyone who can run the
 command is already on the machine and could edit the configuration anyway. The
 PIN protects the dashboard.
 
-There are shorter forms for the things you do most, which go through the running
-daemon and therefore land in the same event log as the dashboard:
+### RPC methods worth knowing
+
+A Shelly device publishes around 164 RPC methods and says nothing about any of
+them. `methods` explains the ones that matter:
+
+```bash
+upsmon shelly plug methods                    # every method, with notes
+upsmon shelly plug methods Switch             # just one component
+upsmon shelly plug methods --examples         # with a ready-made call under each
+upsmon shelly plug methods Webhook --examples --described
+```
+
+```
+-- Switch ------------------------------------------------------------
+  the relay and its meter
+  Switch.SetConfig
+      Change the name, auto-off timers, limits and initial state.
+      upsmon shelly plug call Switch.SetConfig '{"id":0,"config":{"auto_off":true}}'
+```
+
+`--described` hides the ones there is nothing useful to say about, which turns
+164 lines into the two dozen you are likely to want. Anything listed works with
+`call` whether it is described or not.
+
+The same notes, for reading away from the terminal:
+
+**Finding out what it is doing**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `Shelly.GetDeviceInfo` | Model, name, firmware version and MAC. | — |
+| `Shelly.GetStatus` | Every component's current state in one reply. | — |
+| `Shelly.GetConfig` | Every component's configuration in one reply. | — |
+| `Shelly.GetComponents` | Which components exist, with their keys. | `{"offset":0}` |
+| `Switch.GetStatus` | Power, voltage, current, energy, temperature and relay state. | `{"id":0}` |
+| `Sys.GetStatus` | Uptime, free memory, filesystem, time, restart flag. | — |
+| `Wifi.GetStatus` | Address, SSID, signal strength, connection state. | — |
+| `RPC.Ping` | Check the device is answering at all. | — |
+
+**The socket**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `Switch.Set` | Switch the relay. "toggle_after" turns it back after N seconds. | `{"id":0,"on":false}` |
+| `Switch.Toggle` | Flip the relay to the other state. | `{"id":0}` |
+| `Switch.GetConfig` | Name, auto-off timers, limits, initial state. | `{"id":0}` |
+| `Switch.SetConfig` | Change any of those. | `{"id":0,"config":{"auto_off":true,"auto_off_delay":300}}` |
+| `Switch.ResetCounters` | Reset the running totals. Without "type", all of them. | `{"id":0,"type":["aenergy"]}` |
+
+**Naming, time and firmware**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `Sys.GetConfig` | Device name, timezone, location, debug settings. | — |
+| `Sys.SetConfig` | Change them. | `{"config":{"device":{"name":"UPS socket"}}}` |
+| `Sys.SetTime` | Set the clock by hand, for a device with no internet. | `{"unixtime":1788195638}` |
+| `Shelly.Identify` | Flash the LED so you can tell which device it is. | — |
+| `Shelly.CheckForUpdate` | Ask Shelly whether newer firmware exists. | — |
+| `Shelly.Update` | Install firmware. "stable" or "beta". | `{"stage":"stable"}` |
+| `Shelly.Reboot` | Restart the device. Takes about ten seconds. | — |
+| `Shelly.DetectLocation` | Set the timezone from the public IP address. | — |
+| `Shelly.ListTimezones` | Every timezone name the device accepts. | — |
+
+**Network and radios**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `Wifi.GetConfig` | Both configured networks and the access point. | — |
+| `Wifi.SetConfig` | Change them. Getting this wrong takes the device off the network. | `{"config":{"sta":{"ssid":"net","pass":"secret","enable":true}}}` |
+| `Wifi.Scan` | List the networks the device can see. | — |
+| `Wifi.ListAPClients` | Who is connected to its own access point. | — |
+| `Cloud.GetStatus` | Whether it is talking to Shelly Cloud. | — |
+| `Cloud.SetConfig` | Turn the cloud connection on or off. | `{"config":{"enable":false}}` |
+| `Mqtt.GetStatus` | Whether it is connected to an MQTT broker. | — |
+| `Mqtt.SetConfig` | Point it at a broker. | `{"config":{"enable":true,"server":"10.0.0.2:1883"}}` |
+| `BLE.GetConfig` | Bluetooth radio and RPC-over-Bluetooth switches. | — |
+| `BLE.SetConfig` | Turn either on or off. Needs a reboot. | `{"config":{"enable":true,"rpc":{"enable":true}}}` |
+| `Matter.GetStatus` | Whether Matter is on and commissionable. | — |
+| `Matter.GetSetupCode` | The pairing code a Matter controller needs. | — |
+| `Matter.SetConfig` | Turn Matter on or off. Needs a reboot. | `{"config":{"enable":true}}` |
+| `WS.GetConfig` | Outbound websocket: where it connects out to. | — |
+| `WS.SetConfig` | Point it at a listener - what "shelly serve" accepts. | `{"config":{"enable":true,"server":"ws://10.0.0.9:8089"}}` |
+
+**Making the device do things by itself**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `Webhook.Create` | Call a URL when something happens. This is how a sleeping sensor reports. | `{"cid":0,"enable":true,"event":"temperature.change","urls":["http://10.0.0.9:8088/?t=${ev.tC}"]}` |
+| `Webhook.List` | Every webhook currently set. | — |
+| `Webhook.ListSupported` | Which events this device can trigger on. | — |
+| `Webhook.Delete` | Remove one by id. | `{"id":1}` |
+| `Schedule.Create` | Run something on a cron schedule, on the device. | `{"enable":true,"timespec":"0 0 22 * * *","calls":[{"method":"Switch.Set","params":{"id":0,"on":false}}]}` |
+| `Schedule.List` | Every schedule currently set. | — |
+| `Schedule.Delete` | Remove one by id. | `{"id":1}` |
+| `Script.List` | Scripts stored on the device. | — |
+| `Script.Create` | Make an empty script slot. | `{"name":"watchdog"}` |
+| `Script.PutCode` | Upload JavaScript into a slot. | `{"id":1,"code":"print(1);"}` |
+| `Script.Start` | Run it. | `{"id":1}` |
+| `Script.Stop` | Stop it. | `{"id":1}` |
+| `KVS.Set` | Store a value on the device, for scripts to read. | `{"key":"note","value":"UPS socket"}` |
+| `KVS.Get` | Read one back. | `{"key":"note"}` |
+| `KVS.List` | Every key stored. | — |
+| `HTTP.GET` | Make the device fetch a URL itself. | `{"url":"http://10.0.0.9/ping"}` |
+| `HTTP.POST` | And post to one. | `{"url":"http://10.0.0.9/hook","body":"{}"}` |
+
+**Odds and ends**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `plugs_ui.GetConfig` | The LED ring: colours, brightness, night mode. | — |
+| `plugs_ui.SetConfig` | Change them. | `{"config":{"leds":{"mode":"power"}}}` |
+| `BLE.StartPairing` | Accept a Bluetooth pairing for a while. | — |
+| `BLE.ListPairedDevices` | What is already paired. | — |
+| `KVS.Delete` | Remove one. | `{"key":"note"}` |
+| `Webhook.DeleteAll` | Remove all of them. | — |
+| `Shelly.ListMethods` | The list this command is built on. | — |
+
+**Destructive, and rarely what you want**
+
+| method | what it does | example parameters |
+|---|---|---|
+| `Shelly.SetAuth` | Set or clear the web password. The username is always admin; a null password removes authentication. | `{"user":"admin","realm":"shellyplug-xxxx","ha1":"..."}` |
+| `Shelly.FactoryReset` | Erase everything, including the Wi-Fi settings. The device comes back as an access point. | — |
+| `Shelly.ResetWiFiConfig` | Forget the Wi-Fi settings only. | — |
+| `Matter.FactoryReset` | Forget every Matter fabric it has joined. | — |
+
+Two conventions run through all of it. A component with more than one instance
+takes an `id` — `{"id":0}` for the only switch on a plug. And every `SetConfig`
+takes its settings nested under `config`, alongside that id:
+
+```bash
+upsmon shelly plug call Switch.SetConfig '{"id":0,"config":{"power_limit":2900}}'
+```
+
+which is exactly what the `config` command does for you, with the added check
+that the setting really took:
+
+```bash
+upsmon shelly plug config switch:0 '{"power_limit": 2900}'
+```
+
+Several settings need a reboot before the device acts on them — `ble`, `matter`
+and some of `wifi`. `--reboot` does that for you, and `Sys.GetStatus` reports
+`restart_required` when one is outstanding.
+
+**Shorter forms for the everyday things**
+
+These go through the running daemon, so they land in the same event log as the
+dashboard:
 
 ```bash
 upsmon --plug                  # the full report
@@ -1375,6 +1674,10 @@ upsmon --events | tail -3
                         battery dipped to 13.0 V
 ```
 
+The command returns as soon as the UPS accepts it, but the daemon keeps watching
+in the background until the verdict arrives, which is where those figures come
+from. Closing the browser or the terminal does not interrupt that.
+
 That voltage figure says more about battery health than pass/fail does — a tired
 battery still passes a short test. Watch it across months.
 
@@ -1420,6 +1723,8 @@ real measurement, pull the mains plug for a minute with the History tab open.
 | the plug panel is greyed out right after a restart | the first poll has not landed yet. From 3.4.4 the panel is filled from the last recorded reading and says `from the last recorded reading` until a fresh one arrives, rather than sitting blank |
 | the plug panel shows values greyed out | they are real but not current: a poll was missed. The reason and the age are printed under the socket state, and the controls stay disabled until it answers again |
 | a counter will not reset | the plug answers every reset with success whether or not it understood the counter name, so upsmon reads the values back and reports what actually changed. `the plug accepted the request but nothing changed` means that firmware does not support resetting that particular counter — the plug's own web interface will not clear it either |
+| `upsmon shelly discover` finds nothing on AlmaLinux | the firewall drops inbound mDNS by default. Run `discover` as root and it names the rules you are missing, for firewalld or iptables. Discovery is a convenience — `--host` and `plug_host` work regardless |
+| `upsmon shelly listen` says the port is in use | the daemon is already listening there when `sensor_listen` is on. Use `--port` with a spare one; nothing is recorded either way |
 | the plug is not answering | `upsmon --plug`. A password set in the plug's web UI needs `plug_password`; the username is always `admin` |
 | plug readings stop but the UPS is fine | the plug dropped off Wi-Fi. The daemon logs one event either way and carries on watching the UPS — a plug failure never affects UPS monitoring |
 | a sensor pushes nothing | check the webhook with `Webhook.List` on the sensor, and that the port is open. `upsmon --sensors` shows what has arrived |
@@ -1492,7 +1797,19 @@ add.
 upsmon --diag | grep -A2 database
 ```
 
-`upsmon --diag` reports the data file and the write-ahead log separately. SQLite
+`upsmon --diag` also reports how many single-poll status glitches have been
+ignored since the daemon started, and how often they arrive:
+
+```
+2 single-poll status glitch(es) ignored, 0.4 per hour
+```
+
+`usbhid-ups` occasionally returns one bad read — `LB` and `RB` appearing for
+exactly one poll and vanishing again — and `flag_confirm_polls` makes the daemon
+wait for a second consecutive reading before believing it. A handful a day is
+normal for USB HID; dozens an hour suggests a marginal cable or port.
+
+It reports the data file and the write-ahead log separately, too. SQLite
 lets that log reach about 4 MB before folding it back in, so on a fresh install
 the total looks large next to a database of a few hundred kilobytes — that is
 the log, not the data. The daemon folds it back on its hourly pass.
