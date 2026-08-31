@@ -29,6 +29,23 @@ The daemon is the only thing that talks to the UPS. PHP relays JSON and holds no
 credentials; the two endpoints that change something send a token read from a
 file the browser never sees. Nothing in the chain needs root.
 
+## What it watches
+
+**The UPS**, over the network from a Synology NAS or any host running Network
+UPS Tools: status, charge, remaining runtime, load, voltages, every variable the
+driver publishes, self tests and power failures.
+
+**A Shelly smart plug**, optionally: the watts actually being drawn, voltage,
+current, power factor, frequency, its own temperature, the energy total and the
+runtime and switching counters. The socket can be switched and its counters
+reset from the dashboard.
+
+**Sensors**, optionally: anything that pushes a reading to the listener, or a
+Shelly sensor addressed directly. Temperature, humidity, battery and signal.
+
+Each part is independent. A plug that stops answering never disturbs UPS
+monitoring, and none of it is needed for the UPS side to work.
+
 ## Why it is built this way
 
 **SQLite in three layers.** Full-resolution samples for a fortnight, hourly
@@ -53,6 +70,20 @@ cache every few seconds, so a value read straight after a write is still the old
 one. The daemon polls until the UPS confirms, then reports what was actually
 accepted — including when the UPS clamped the value to something else.
 
+**A reset is verified, not assumed.** The plug answers `Switch.ResetCounters`
+with success whether or not it understood the counter name, so the values are
+read back and compared. Firmware that quietly ignores a counter is reported as
+exactly that rather than as a reset that worked.
+
+**Requests to the plug are paced.** Gen3 firmware with authentication answers
+429 when they arrive closer together than about a second, and the digest
+challenge is reused rather than renegotiated on every call. Together those take
+a poll from six HTTP requests to two.
+
+**A missed reading does not blank the panel.** The last values stay on screen,
+greyed out and dated, and after a restart they come from the recorded history
+until a fresh reading lands.
+
 **Tests are followed to their verdict.** Starting a self test from the dashboard
 returns immediately, but the daemon keeps watching and records how long the test
 ran, how long the load was genuinely on battery, and how far the battery voltage
@@ -66,11 +97,15 @@ does; nothing here is specific to a model.
 
 ## The dashboard
 
-Six tabs: **Overview** (status, charge, runtime, load, voltages, 24-hour chart),
-**History** (six charts from 6 hours to a year, plus every power failure),
-**Tests** (self-test verdicts with a battery-voltage trend across tests),
-**Events**, **Control** (commands, writable settings, and clearing recorded
-data — all PIN-protected), and **All variables**.
+Six tabs. **Overview**: status, charge, runtime, load and voltages, the plug's
+live figures with a switch for the socket, two 24-hour charts, and whatever the
+sensors last reported. **History**: six charts for the UPS from 6 hours to a
+year, fourteen more from the plug, five from the sensors, and every power
+failure.
+**Tests**: self-test verdicts with a battery-voltage trend. **Events**.
+**Control**: UPS commands, writable settings, the socket, a reset button for
+each plug counter, and clearing recorded data — all behind the same PIN.
+**All variables**: everything the UPS, the plug and the sensors report.
 
 It refreshes every five seconds, pauses when the browser tab is hidden, and can
 be paused by hand from the indicator in the corner. The tab icon is a battery
@@ -126,19 +161,25 @@ Read endpoints are open on the loopback; the two that change something require
 | `GET /api/sensors`, `/api/sensor-history` | what sensors have pushed |
 | `POST /api/plug/switch` | `{"on": false}` |
 | `POST /api/plug/reset` | `{"types": ["aenergy"]}`, or `[]` for every counter |
+| `POST /api/poll` | read the UPS now rather than waiting for the next tick |
 | `POST /api/reset` | `{"scope": "all / history / events / tests / outages"}` |
 
 ## What was verified
 
-Against a mock upsd replaying a real APC Back-UPS BX1200MI: every endpoint, token
-authentication, refusal of power-cutting commands, control actions through both
-the daemon and a direct connection, self-test following, a staged mains failure
-with correct outage recording, hourly roll-up and year-long charts, 60 concurrent
-dashboard polls (median 27 ms), and recovery after the UPS disappeared mid-flight
-— which logs one pair of events rather than one per failed poll.
+Against mocks that replay real devices — an APC Back-UPS BX1200MI over NUT and a
+Shelly Plug M Gen3 over RPC, including one that insists on SHA-256 digest
+authentication and refuses requests less than a second apart:
 
-The PHP was checked structurally rather than executed; no interpreter was
-available in the build environment. Run `php -l` on both files after copying them
-across.
+* every API endpoint, token authentication, and refusal of power-cutting commands
+* control actions through the daemon and through a direct connection
+* self-test following, and a staged mains failure with correct outage recording
+* hourly roll-up, year-long charts, and migrating a database made by an older version
+* the plug: switching, per-counter resets including firmware that only pretends
+  to clear them, rate-limit backoff, and recovery after the plug disappears
+* 60 concurrent dashboard polls, median 27 ms
+
+The PHP is checked structurally rather than executed; no interpreter was
+available in the build environment. Run `php -l` on both files after copying
+them across, and see `test/README.md` for the checks used during development.
 
 Current version: **3.4.4**

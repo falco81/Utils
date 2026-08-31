@@ -31,7 +31,7 @@ the connection; PHP only relays JSON. Neither runs as root.
 8. [Start the service](#8-start-the-service)
 9. [Install the web interface](#9-install-the-web-interface)
 10. [Configure php-fpm](#10-configure-php-fpm)
-11. [Configure nginx](#11-configure-nginx)
+11. [Configure nginx with TLS](#11-configure-nginx-with-tls)
 12. [SELinux](#12-selinux)
 13. [Firewall](#13-firewall)
 14. [Open the dashboard](#14-open-the-dashboard)
@@ -214,7 +214,7 @@ Mode `640` owned `root:upsmon` means the daemon can read it, root can edit it,
 and nothing else can see it. That matters once you put upsd credentials in it.
 
 **Get the ownership right, and check it.** A `cp` instead of that `install` line
-leaves the file `root:root`, the daemon cannot read it, and from version 2.0.3 it
+leaves the file `root:root`, the daemon cannot read it, and from version 3.4.4 it
 refuses to start rather than silently falling back to defaults and looking for a
 UPS on 127.0.0.1:
 
@@ -342,6 +342,7 @@ and none of this happens.
 | `plug_password` | only if you set one in the plug's web UI. The username is always `admin` and cannot be changed |
 | `plug_switch_id` | which relay; single-socket plugs are always 0 |
 | `plug_poll_interval` | how often the plug is read |
+| `plug_timeout` | how long to wait for the plug before giving up on a request |
 | `plug_min_request_gap` | the smallest gap between two requests to the plug. Gen3 firmware with authentication on answers 429 when they arrive closer together than about a second; 0 disables the pacing |
 | `plug_sample_interval` | how often a reading goes into the database |
 
@@ -497,7 +498,7 @@ journalctl -u upsmon -f
 
 ### Logging
 
-Everything goes to the journal, and from version 2.6.0 also to
+Everything goes to the journal, and from version 3.4.4 also to
 `/var/log/upsmon/upsmon.log`. The directory is created by systemd through
 `LogsDirectory=`, owned by the `upsmon` user, so nothing needs setting up by
 hand.
@@ -1099,6 +1100,8 @@ sudo -u upsmon upsmon --reset-data events   # only the event log
 sudo -u upsmon upsmon --reset-data history  # only the charts
 sudo -u upsmon upsmon --reset-data outages  # only the power-failure list
 sudo -u upsmon upsmon --reset-data tests    # only the self-test history
+sudo -u upsmon upsmon --reset-data plug     # only the smart plug history
+sudo -u upsmon upsmon --reset-data sensor   # only the pushed sensor readings
 ```
 
 It lists what it is about to delete and asks before doing it; `--yes` skips the
@@ -1113,6 +1116,26 @@ after a wipe that comparison refers to rows that no longer exist:
 ```bash
 sudo systemctl restart upsmon
 ```
+
+A few options apply to most of the commands above:
+
+| option | what it does |
+|---|---|
+| `--config FILE` | read a different configuration file |
+| `--host`, `--port`, `--ups` | override the NUT address or UPS name for this run |
+| `--log-file FILE` | write the log somewhere else; an empty string turns the file off |
+| `--json` | machine-readable output, where the command has any |
+| `--limit N` | how many rows `--events` and `--sensors` print |
+| `--points N` | how many rows `--history` prints |
+| `--no-color` | plain text, no escape codes |
+| `-v` | debug logging, including the polls that are normally silent |
+| `--aggregate` | roll old samples into hourly averages now instead of waiting for the hourly pass |
+| `--yes` | answer confirmations, for scripts |
+
+Under `shelly`, `--interval` and `--count` control `poll`, `--seconds` controls
+how long `discover` listens, `--csv FILE` appends readings to a spreadsheet,
+`--wait` waits for a device to come back after `reboot`, and `--port` picks the
+port for `listen` and `serve`.
 
 `--set` and `--exec` use the running daemon when there is one, so they get the
 same permission handling and land in the same event log as the dashboard. With
@@ -1177,13 +1200,13 @@ real measurement, pull the mains plug for a minute with the History tab open.
 | journal says `refusing to start on defaults` | `/etc/upsmon/config.json` is not readable by the `upsmon` user: `sudo chown root:upsmon /etc/upsmon/config.json` |
 | daemon reports `cannot reach upsd at 127.0.0.1:3493` when the NAS is elsewhere | the config was not loaded at all. `upsmon --diag` shows the host actually in force |
 | a self test logged as a warning while it is still running | fixed in 2.5.1 — `In progress` is a stage, not a verdict, and is no longer an event |
-| `LB` or `RB` in the event log, appearing and clearing exactly one poll apart | a bad USB read, not a real alarm. Version 2.5.0 requires two consecutive polls before logging a flag; raise `flag_confirm_polls` if any still get through |
+| `LB` or `RB` in the event log, appearing and clearing exactly one poll apart | a bad USB read, not a real alarm. Version 3.4.4 requires two consecutive polls before logging a flag; raise `flag_confirm_polls` if any still get through |
 | `battery.type changed outside upsmon: PbAc -> ` and back again | the driver publishes some values only on its slower full poll, so they vanish between reads. Fixed in 2.5.0 — a key that merely appears or disappears is no longer treated as a change |
 | the log file stops growing after a rotation | the `postrotate` signal never arrived. The daemon recovers within one poll and logs that it did; check that `/etc/logrotate.d/upsmon` still contains the `systemctl kill -s HUP` line |
 | `cannot write the log file ... Permission denied` | `/var/log/upsmon` is not owned by `upsmon`. `sudo install -d -m 750 -o upsmon -g upsmon /var/log/upsmon`, or let systemd make it with `LogsDirectory=` by restarting the service |
-| a `shelly` command fails with 429 when run repeatedly | each run starts with no memory of the last one, so quick successive commands can trip the limit. From 3.4.2 the client waits and retries up to three times, and never reports a rate limit as a missing component |
+| a `shelly` command fails with 429 when run repeatedly | each run starts with no memory of the last one, so quick successive commands can trip the limit. From 3.4.4 the client waits and retries up to three times, and never reports a rate limit as a missing component |
 | the plug answers HTTP 429 | it is rate limiting. Three things address it: the authentication challenge is reused rather than renegotiated, the slow-changing sections are read once a minute, and requests are spaced by `plug_min_request_gap`. Together those take a poll from six requests to two, a second apart. If it still happens, raise the gap to 2 and `plug_poll_interval` to 30 |
-| the plug panel is greyed out right after a restart | the first poll has not landed yet. From 3.4.3 the panel is filled from the last recorded reading and says `from the last recorded reading` until a fresh one arrives, rather than sitting blank |
+| the plug panel is greyed out right after a restart | the first poll has not landed yet. From 3.4.4 the panel is filled from the last recorded reading and says `from the last recorded reading` until a fresh one arrives, rather than sitting blank |
 | the plug panel shows values greyed out | they are real but not current: a poll was missed. The reason and the age are printed under the socket state, and the controls stay disabled until it answers again |
 | a counter will not reset | the plug answers every reset with success whether or not it understood the counter name, so upsmon reads the values back and reports what actually changed. `the plug accepted the request but nothing changed` means that firmware does not support resetting that particular counter — the plug's own web interface will not clear it either |
 | the plug is not answering | `upsmon --plug`. A password set in the plug's web UI needs `plug_password`; the username is always `admin` |
@@ -1240,29 +1263,31 @@ driver restarts. Test it: set the value, reboot the NAS, read it back.
 
 ### Size
 
-One row a minute, with the default retention:
+With the default retention, and a plug and a sensor both configured:
 
-* full-resolution samples for 14 days — about 20 000 rows
-* hourly averages for two years — about 17 500 rows
-* roughly 5–8 MB, growing to perhaps 15 MB after a couple of years
+| what | interval | kept | rows |
+|---|---|---|---|
+| UPS samples | 60 s | 14 days | about 20 000 |
+| UPS hourly averages | — | 2 years | about 17 500 |
+| plug samples | 60 s | 14 days | about 20 000 |
+| plug hourly averages | — | 2 years | about 17 500 |
+| sensor readings | on push | 2 years | a few thousand |
+
+Around 10–15 MB in total, perhaps 30 MB after a couple of years with everything
+switched on. The roll-up runs hourly inside the daemon; there is no cron job to
+add.
+
+```bash
+upsmon --diag | grep -A2 database
+```
 
 `upsmon --diag` reports the data file and the write-ahead log separately. SQLite
 lets that log reach about 4 MB before folding it back in, so on a fresh install
 the total looks large next to a database of a few hundred kilobytes — that is
 the log, not the data. The daemon folds it back on its hourly pass.
 
-The roll-up runs hourly inside the daemon; there is no cron job to add.
-
-```bash
-upsmon --diag | grep -A2 database
-```
-
-`upsmon --diag` also reports how many single-poll status glitches have been
-ignored since the daemon started, and how often they arrive. A handful a day is
-normal for USB HID. Dozens an hour suggests a marginal cable or port.
-
-To keep more or less, adjust `retain_full_days` and `retain_hourly_days`, then
-restart.
+To keep more or less, adjust `retain_full_days`, `retain_hourly_days` and
+`sensor_retain_days`, then restart.
 
 ### Backup
 
