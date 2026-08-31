@@ -36,9 +36,11 @@ the connection; PHP only relays JSON. Neither runs as root.
 13. [Firewall](#13-firewall)
 14. [Open the dashboard](#14-open-the-dashboard)
 15. [Enable control actions](#15-enable-control-actions-optional)
-16. [Day-to-day use](#16-day-to-day-use)
-17. [Troubleshooting](#17-troubleshooting)
-18. [Maintenance](#18-maintenance)
+16. [Watching a smart plug](#16-watching-a-smart-plug-optional)
+17. [Sensor readings](#17-sensor-readings-optional)
+18. [Day-to-day use](#18-day-to-day-use)
+19. [Troubleshooting](#19-troubleshooting)
+20. [Maintenance](#20-maintenance)
 
 Files you should have to hand:
 
@@ -330,11 +332,8 @@ change anything on the UPS.
 | `runtime_warn_s`, `runtime_crit_s` | remaining runtime in seconds, applied only while on battery |
 | `battery_life_years` | expected battery life, used to age `battery.date` or `battery.mfr.date` when the UPS reports one. 4 suits sealed lead-acid |
 
-**Smart plug (optional)**
-
-A Shelly Gen2+ plug can be watched alongside the UPS, which is worth doing when
-the UPS itself does not measure the watts being drawn. Leave `plug_host` empty
-and none of this happens.
+**Smart plug (optional)** — section 16 covers this properly; the options are
+listed here for completeness. Leave `plug_host` empty and none of it happens.
 
 | option | meaning |
 |---|---|
@@ -350,10 +349,7 @@ The local RPC API stays available while the plug is signed in to the Shelly app,
 connected to Shelly Cloud and commissioned into Apple Home over Matter. Nothing
 here interferes with any of that.
 
-**Pushed sensor readings (optional)**
-
-Battery sensors such as the Shelly H&T sleep between measurements, so nothing
-can poll them — they push instead.
+**Sensor readings (optional)** — section 17 covers this properly.
 
 | option | meaning |
 |---|---|
@@ -1026,7 +1022,198 @@ The dashboard then asks for confirmation before each one.
 
 ---
 
-## 16. Day-to-day use
+## 16. Watching a smart plug (optional)
+
+A UPS reports load as a percentage of its rating, and many models — the APC
+Back-UPS among them — never report the watts actually being drawn. A Shelly
+smart plug in front of the load measures them properly, and once it is
+configured the dashboard shows the real figure beside the UPS estimate.
+
+Nothing here is required. Leave `plug_host` empty and the daemon behaves exactly
+as it did before.
+
+### What you need
+
+* a Shelly Gen2 or Gen3 device with a switch and a meter — Plug S, Plug M,
+  Plug Plus, Plug MG3 and the metering relays all work
+* its IP address on the same network as this machine
+* the password, if you set one in the plug's web interface
+
+The local RPC interface stays available while the plug is signed in to the
+Shelly app, connected to Shelly Cloud and commissioned into Apple Home over
+Matter. Nothing here interferes with any of that, and none of it needs the
+cloud.
+
+### Configure it
+
+```bash
+sudo vi /etc/upsmon/config.json
+```
+
+```json
+  "plug_host": "172.16.16.12",
+  "plug_password": "",
+  "plug_switch_id": 0,
+  "plug_poll_interval": 15,
+  "plug_sample_interval": 60,
+  "plug_min_request_gap": 1.0,
+```
+
+The username is always `admin` on these devices and cannot be changed, so only
+the password is configurable. `plug_switch_id` is 0 on any single-socket plug.
+
+Check it before restarting anything:
+
+```bash
+upsmon shelly plug info
+```
+
+```
+  172.16.16.12
+  app     : PlugMG3
+  model   : S3PL-30110EU
+  name    : PlugUPS
+  ver     : 2.0.0
+```
+
+Then restart and watch it start polling:
+
+```bash
+sudo systemctl restart upsmon
+journalctl -u upsmon -f
+```
+
+```
+info  smart plug at 172.16.16.12, polled every 15s
+```
+
+### What gets recorded
+
+Every poll stores the power drawn, voltage, current, power factor, frequency,
+the plug's own temperature, the energy total, energy returned, total runtime,
+switching cycles, time above the plug's load threshold, Wi-Fi signal, uptime and
+free memory. The history is rolled into hourly averages on the same schedule as
+the UPS data.
+
+### What appears in the dashboard
+
+**Overview** gains two tiles — the watts being drawn and the energy total — and
+a panel showing the socket state with a switch. The 24-hour power chart draws
+the plug's measurement over the UPS estimate, so one can be judged against the
+other.
+
+**History** gains fourteen charts from the plug.
+
+**Control** gains a card for switching the socket and a button for each counter
+the plug keeps, with its current value on the button. Both are behind the same
+PIN as the UPS commands.
+
+**All variables** gains a section with everything the plug reports, grouped by
+subsystem.
+
+### About the counters
+
+The plug keeps five running totals, the same ones its own web interface lists:
+active energy, returned energy, total runtime, switching cycles and active load
+runtime. Each can be reset on its own or all at once.
+
+The plug answers a reset with success whether or not it understood the counter
+name, so upsmon reads the values back and reports what actually changed:
+
+```
+reset active energy; the plug did not clear active load runtime
+```
+
+That second half is not an error in upsmon — it means the firmware does not
+support resetting that counter, and the plug's own web interface will not clear
+it either.
+
+### Rate limiting
+
+Gen3 firmware with authentication enabled answers HTTP 429 when requests arrive
+too close together. Three things keep that at bay: the authentication challenge
+is reused rather than renegotiated on every call, the slow-changing sections are
+read once a minute rather than every poll, and requests are spaced by
+`plug_min_request_gap`. A poll therefore costs two HTTP requests a second apart.
+
+If 429 still appears in the log, raise the gap to 2 and the poll interval to 30.
+
+A plug that stops answering never disturbs UPS monitoring. The panel keeps the
+last readings, greyed out and dated, and the daemon carries on watching the UPS.
+
+## 17. Sensor readings (optional)
+
+Battery-powered sensors such as the Shelly H&T sleep between measurements and
+are unreachable almost all the time, so they cannot be polled — they push
+instead. A sensor on USB power can be polled as well, or instead.
+
+### Pushed readings
+
+```json
+  "sensor_listen": true,
+  "sensor_listen_host": "0.0.0.0",
+  "sensor_listen_port": 8088,
+  "sensor_retain_days": 730,
+```
+
+`0.0.0.0` listens on every interface; give a specific address to pin it to one.
+Restart, and the log confirms it:
+
+```
+info  listening for sensor pushes on http://0.0.0.0:8088/
+```
+
+Open the port if the sensor is on another subnet:
+
+```bash
+sudo firewall-cmd --permanent --add-port=8088/tcp
+sudo firewall-cmd --reload
+```
+
+Create the webhooks on the sensor once. It only wakes briefly, so press its
+button first to bring it up:
+
+```bash
+curl -X POST http://<sensor-ip>/rpc -H 'Content-Type: application/json' -d '{
+  "id":1,"method":"Webhook.Create","params":{
+    "cid":0,"enable":true,"event":"temperature.change",
+    "urls":["http://<this-host>:8088/?t=${ev.tC}"]}}'
+
+curl -X POST http://<sensor-ip>/rpc -H 'Content-Type: application/json' -d '{
+  "id":1,"method":"Webhook.Create","params":{
+    "cid":0,"enable":true,"event":"humidity.change",
+    "urls":["http://<this-host>:8088/?rh=${ev.rh}"]}}'
+```
+
+`t`, `tC`, `temperature`, `rh`, `humidity`, `bv`, `bp` and `rssi` are all
+understood, in the query string or in a JSON body. A push carrying none of them
+is rejected with 400 rather than stored as an empty row.
+
+Watch what arrives without recording any of it:
+
+```bash
+upsmon shelly listen --port 8088
+```
+
+### Polling a sensor directly
+
+```json
+  "sensor_host": "172.16.16.13",
+  "sensor_password": "",
+```
+
+On USB power this answers every poll and fills the charts without any webhook at
+all. On battery it will usually be asleep, which is ignored quietly — the
+webhook is what carries its readings.
+
+### What you get
+
+`upsmon --sensors` lists what has arrived. The dashboard shows the latest
+reading from each device on the Overview, five charts under History —
+temperature, humidity, battery percentage, battery voltage and signal — and a
+section under All variables.
+
+## 18. Day-to-day use
 
 Everything the web interface does is available from the shell:
 
@@ -1050,46 +1237,70 @@ upsmon --plug-reset                   # reset the plug's energy counters
 upsmon --sensors                      # readings pushed by battery sensors
 ```
 
-### Talking to the Shelly devices directly
+### The Shelly command line
 
-Everything the standalone Shelly reader could do is available under `shelly`,
-addressed by role rather than by IP — the address and password come from the
-configuration, so neither has to be typed or pasted into a shell:
+Everything the standalone Shelly reader could do is built in, addressed by role
+rather than by IP — the address and password come from the configuration, so
+neither has to be typed or pasted into a shell.
 
-```bash
-upsmon shelly plug info               # identity and firmware
-upsmon shelly plug dump               # every value the device reports
-upsmon shelly plug dump --json
-upsmon shelly plug poll --interval 5 --csv plug.csv
-upsmon shelly plug watch              # pushed by the device, no polling
-upsmon shelly plug on | off | toggle
-upsmon shelly plug reset-counters              # every counter
-upsmon shelly plug reset-counters aenergy     # just the energy total
-upsmon shelly plug reboot --wait
-upsmon shelly plug ble status
-upsmon shelly plug matter off --reboot
-upsmon shelly plug call Switch.GetStatus '{"id":0}'
-
-upsmon shelly sensor dump             # the thermometer, while it is awake
-upsmon shelly listen --port 8088      # show pushes as they arrive
-upsmon shelly serve --port 8089       # accept an outbound websocket
-upsmon shelly discover                # find Shelly devices on the LAN
+```
+upsmon shelly <plug|sensor> <command> [options]
 ```
 
-`plug` and `sensor` are the two roles; `temp`, `tempmeter` and `ht` also mean
-the sensor. `discover` and `listen` need no role at all.
+`plug` and `sensor` are the two roles; `temp`, `tempmeter` and `ht` also mean the
+sensor. `discover` and `listen` need no role at all.
 
-Three things worth knowing. `watch` uses the device's websocket, which carries
-no authentication — with a password set it says so and points you at `poll`.
-`discover` uses multicast DNS, which does not cross subnets. And `ble` and
-`matter` only take effect after a reboot, which `--reboot` will do for you.
+| command | what it does |
+|---|---|
+| `info` | identity, model, firmware version |
+| `dump` | every value the device reports, grouped by component. `--json` for the raw reply |
+| `poll` | a live table of the numbers. `--interval 5`, `--count 20`, `--csv file.csv` |
+| `watch` | the same, pushed by the device over its websocket rather than polled |
+| `on`, `off`, `toggle` | switch the socket |
+| `reset-counters [type…]` | reset counters; no type means every one the plug has |
+| `call METHOD [JSON]` | any RPC method at all, for anything not covered above |
+| `reboot [--wait]` | restart the device, optionally waiting for it to come back |
+| `ble status\|on\|off` | Bluetooth, with `--reboot` to apply immediately |
+| `matter status\|on\|off` | Matter, same |
+| `listen [--port N]` | show webhook pushes as they arrive, recording nothing |
+| `serve [--port N]` | accept an outbound websocket from a device configured to call us |
+| `discover [--seconds N]` | find Shelly devices on the LAN over multicast DNS |
 
-Switching the socket this way bypasses the PIN, because anyone who can run this
+```bash
+upsmon shelly plug info
+upsmon shelly plug dump --json
+upsmon shelly plug poll --interval 5 --csv plug.csv
+upsmon shelly plug off
+upsmon shelly plug reset-counters aenergy
+upsmon shelly plug call Switch.GetStatus '{"id":0}'
+upsmon shelly sensor dump
+upsmon shelly discover
+```
+
+The counter types are `aenergy`, `ret_aenergy`, `on_time`, `switch_on` and
+`on_above_thr` — active energy, returned energy, total runtime, switching cycles
+and active load runtime, in the order the plug's own web interface lists them.
+
+Four things are worth knowing. `watch` uses the device's websocket, which
+carries no authentication, so with a password set it says so and points you at
+`poll` instead. `discover` uses multicast DNS, which does not cross subnets. And
+`ble` and `matter` only take effect after a reboot, which `--reboot` will do for
+you. Repeated commands in quick succession can trip the plug's rate limit; the
+client waits and retries up to three times rather than failing.
+
+Switching the socket this way bypasses the PIN, because anyone who can run the
 command is already on the machine and could edit the configuration anyway. The
-dashboard is what the PIN protects.
-upsmon --check                        # is the whole system healthy
-upsmon --diag                         # settings, API latency, database size
-upsmon --oneshot                      # one collection into the database, then exit
+PIN protects the dashboard.
+
+There are shorter forms for the things you do most, which go through the running
+daemon and therefore land in the same event log as the dashboard:
+
+```bash
+upsmon --plug                  # the full report
+upsmon --plug-on               # switch the socket on
+upsmon --plug-off              # and off
+upsmon --plug-reset aenergy    # reset one counter, or all with no argument
+upsmon --sensors               # what sensors have pushed
 ```
 
 ### Starting the history again
@@ -1174,7 +1385,7 @@ real measurement, pull the mains plug for a minute with the History tab open.
 
 ---
 
-## 17. Troubleshooting
+## 19. Troubleshooting
 
 | symptom | what to do |
 |---|---|
@@ -1259,7 +1470,7 @@ driver restarts. Test it: set the value, reboot the NAS, read it back.
 
 ---
 
-## 18. Maintenance
+## 20. Maintenance
 
 ### Size
 
