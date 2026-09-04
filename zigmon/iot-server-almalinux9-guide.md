@@ -578,7 +578,71 @@ Verified: unplug the SLZB-06, the journal shows a crash and a retry every
 15 s, plug it back in and it comes up. Paired devices survive (the network
 lives in the coordinator and in `data/database.db`).
 
-### 9.4 Pairing Shelly BLU H&T ZB and BLU Button Tough 1 ZB
+### 9.4 Upgrading Zigbee2MQTT
+
+The repository's own `update.sh` does not work with this installation, and
+its failure is quiet rather than loud. Two reasons: the repository belongs to
+`z2m` while you are root, so git refuses it as "dubious ownership"; and the
+clone is `--depth 1`, so there are no tags for the script to read a version
+from. It then compares an empty string, prints `No update available` and
+changes nothing. Use the steps below instead.
+
+**1. Stop it and copy the data out.** `data/` holds `database.db` and the
+network keys — without them every device has to be paired again.
+
+```bash
+systemctl stop zigbee2mqtt
+cp -a /opt/zigbee2mqtt/app/data /root/z2m-data.bak-$(date +%F)
+cp /opt/zigbee2mqtt/app/data/configuration.yaml /root/z2m-configuration.yaml.bak
+cd /opt/zigbee2mqtt/app && sudo -u z2m HOME=/opt/zigbee2mqtt git rev-parse HEAD   # note it down, this is the way back
+```
+
+**2. Fetch the new version.** A shallow clone cannot `git pull` in the usual
+way; fetch one commit deep and move onto it.
+
+```bash
+cd /opt/zigbee2mqtt/app
+sudo -u z2m HOME=/opt/zigbee2mqtt git fetch --depth 1 origin master
+sudo -u z2m HOME=/opt/zigbee2mqtt git reset --hard origin/master
+```
+
+**3. Build**, with the two commands from §9.1. `HOME=` matters here as much
+as it did during installation — without it pnpm writes into root's home and
+leaves the tree half owned by the wrong user.
+
+```bash
+sudo -u z2m HOME=/opt/zigbee2mqtt /usr/local/bin/pnpm install --frozen-lockfile
+sudo -u z2m HOME=/opt/zigbee2mqtt /usr/local/bin/pnpm run build
+```
+
+If `--frozen-lockfile` complains that the lockfile and `package.json`
+disagree, run it once without that flag.
+
+**4. Start it again.**
+
+```bash
+chown -R z2m:z2m /opt/zigbee2mqtt
+systemctl start zigbee2mqtt
+journalctl -u zigbee2mqtt -f            # wait for "Zigbee2MQTT started"
+```
+
+**5. Check.**
+
+```bash
+zigmon --check                          # the bridge should be online again
+zigmon --map
+```
+
+Running the git commands as `z2m` is what settles the ownership complaint —
+`git config --global --add safe.directory`, which git suggests, is the wrong
+fix here and would only paper over running as the wrong user.
+
+**Going back.** `git reset --hard <the commit from step 1>` followed by the
+two pnpm commands, or restore `data/` from the copy.
+
+Node stays as it is: Zigbee2MQTT 2.x wants Node 20 or 22, and §1 installs 20.
+
+### 9.5 Pairing Shelly BLU H&T ZB and BLU Button Tough 1 ZB
 
 1. `https://red.falco81.net/zigbee` → **Permit join** (or the zigmon Control tab).
 2. On the device, **press the button five times quickly**. Out of the box
@@ -826,7 +890,7 @@ Everything that actually went wrong on the way, and the fix:
 | `settings.js` never appears | `node-red --help` does not write it | run it for real with `timeout 10` (§4.1) |
 | Zigbee2MQTT frontend: 401 on `site-….webmanifest` in the console | browsers fetch the manifest without Basic Auth | the `webmanifest` location in §6; cosmetic otherwise |
 | Zigbee2MQTT dies when the SLZB-06 drops off the network and stays dead | systemd start limit | `StartLimitIntervalSec=0`, `Restart=always` (§9.3) |
-| Shelly BLU device will not pair | it is in Bluetooth mode | five quick presses, not a long hold (§9.4) |
+| Shelly BLU device will not pair | it is in Bluetooth mode | five quick presses, not a long hold (§9.5) |
 | button presses "get lost" | frontend shows changes only; single/double/triple timing; or RF (§12) | `mosquitto_sub` on the device topic; then the debug log's RSSI |
 | sensor reports only on the second press | −89 dBm, no router | router between them (§12) |
 | SLZB-06 Settings shows a different channel and PAN | that page is the internal hub mode, unused as coordinator | ignore it; `bridge/info` → `network.channel` is the truth (§8) |
@@ -839,10 +903,12 @@ Everything that actually went wrong on the way, and the fix:
 | `zigmon shelly … ble off` but the plug still advertises | needs a reboot; or Matter enabled and not commissioned | `ble off --reboot`, then `matter off --reboot` (§11.3) |
 | browser: 403 on the zigmon site | your subnet is not in an `allow` line | `/etc/nginx/conf.d/zigmon.conf`, `systemctl reload nginx` |
 | `sudo` cannot find `zigmon` | `/usr/local/bin` again | `sudo /usr/local/bin/zigmon --check` |
+| Zigbee2MQTT `./update.sh`: "dubious ownership", then `No update available` | run as root over a `z2m`-owned, shallow clone; the version check silently reads nothing | do not use it — §9.4 |
 
 **Maintenance.** Back up `/root/z2m-configuration.yaml.bak`,
 `/opt/zigbee2mqtt/app/data/database.db`, `/etc/zigmon/config.json` and
 `/var/lib/zigmon/history.db` (`sqlite3 … ".backup"` while it runs), plus
 `/var/lib/nodered`. Upgrade zigmon with `./install.sh --upgrade`; upgrade
-Zigbee2MQTT with `git pull` and the two pnpm commands from §9.1 as the `z2m`
-user, then `systemctl restart zigbee2mqtt`.
+Zigbee2MQTT with the steps in §9.4 — not with the repository's `update.sh`,
+which cannot read a version out of this clone and says so only by claiming
+there is nothing to do.
