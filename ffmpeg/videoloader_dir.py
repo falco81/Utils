@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.22.0"
+SCRIPT_VERSION = "3.22.1"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -1605,8 +1605,11 @@ def get_collection_info(collection_id: str, session: requests.Session, verbose: 
 def extract_patreon_tag_filter(input_str: str):
     """Return (creator_slug, tag) for a creator page filtered by tag, else None.
 
-    Patreon's own UI produces these when you click a tag on a creator's page:
+    Patreon's own UI produces these when you click a tag on a creator's page. Several path
+    shapes have shipped over time and ALL are accepted:
         https://www.patreon.com/ohmygeona?filters%5Btag%5D=Crash+Course+in+Romance
+        https://www.patreon.com/c/ohmygeona?filters%5Btag%5D=...        (the 'c' form)
+        https://www.patreon.com/cw/jeffavenue/posts?filters%5Btag%5D=... (the 'cw' form, 2026)
     which is filters[tag]=... once decoded. Collection and single-post URLs are left alone so
     they keep taking their existing, more specific paths."""
     if 'patreon.com' not in input_str:
@@ -1621,7 +1624,9 @@ def extract_patreon_tag_filter(input_str: str):
     if not tag:
         return None
     parts = [p for p in (pu.path or '').split('/') if p]
-    if parts and parts[0] == 'c':          # /c/<creator> is the newer form
+    # /c/<creator> and /cw/<creator> ("creator world") are the newer wrappers — the real slug is
+    # the segment after them. Trailing sections like /posts are not part of the slug either.
+    while parts and parts[0] in ('c', 'cw'):
         parts = parts[1:]
     if not parts or parts[0] in ('posts', 'collection', 'api'):
         return None
@@ -1633,29 +1638,39 @@ def extract_patreon_tag_filter(input_str: str):
 _CAMPAIGN_ID_PATTERNS = (
     re.compile(r'card-teaser-image/creator/(\d+)'),
     re.compile(r'patreon-media/p/campaign/(\d+)/'),
+    # Newer "creator world" pages are JS-rendered and may only mention the id in embedded JSON
+    # or in the API links they preload. Both are unambiguous when present.
+    re.compile(r'"campaign_id"\s*:\s*"?(\d{4,10})'),
+    re.compile(r'/api/campaigns/(\d{4,10})'),
 )
 
 
 def get_campaign_id_for_creator(slug: str, session: requests.Session, verbose: bool = False):
     """Best-effort campaign id for a creator page, or None."""
-    try:
-        r = session.get(f"https://www.patreon.com/{slug}",
-                        headers={'Referer': PATREON_REFERER, 'User-Agent': USER_AGENT},
-                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
-        html = r.text or ''
-    except requests.RequestException as e:
-        if verbose:
-            print(f"[WARN] Patreon: could not open the creator page ({type(e).__name__}).")
-        html = ''
-    if html:
-        counts = Counter()
-        for pat in _CAMPAIGN_ID_PATTERNS:
-            counts.update(pat.findall(html))
-        if counts:
-            cid = counts.most_common(1)[0][0]
+    # The classic vanity page first, then the 2026 "creator world" path — a creator may only
+    # resolve under one of them, and the id is read from whichever answers.
+    html = ''
+    for _page in (f"https://www.patreon.com/{slug}",
+                  f"https://www.patreon.com/cw/{slug}/posts",
+                  f"https://www.patreon.com/c/{slug}"):
+        try:
+            r = session.get(_page,
+                            headers={'Referer': PATREON_REFERER, 'User-Agent': USER_AGENT},
+                            timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+            html = r.text or ''
+        except requests.RequestException as e:
             if verbose:
-                print(f"[INFO] Patreon: creator '{slug}' is campaign {cid}.")
-            return cid
+                print(f"[WARN] Patreon: could not open {_page} ({type(e).__name__}).")
+            html = ''
+        if html:
+            counts = Counter()
+            for pat in _CAMPAIGN_ID_PATTERNS:
+                counts.update(pat.findall(html))
+            if counts:
+                cid = counts.most_common(1)[0][0]
+                if verbose:
+                    print(f"[INFO] Patreon: creator '{slug}' is campaign {cid}.")
+                return cid
     # Fallback: the vanity lookup endpoint.
     try:
         r = session.get("https://www.patreon.com/api/campaigns",
