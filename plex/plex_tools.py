@@ -1721,8 +1721,27 @@ class PlexClient:
             params["title"] = query
         j = self.get_json(f"/library/sections/{section_key}/all", params)
         return [{"ratingKey": m.get("ratingKey"), "title": m.get("title"),
-                 "year": m.get("year"), "type": m.get("type"), "guid": m.get("guid")}
+                 "year": m.get("year"), "type": m.get("type"), "guid": m.get("guid"),
+                 "rating": m.get("rating"), "audienceRating": m.get("audienceRating")}
                 for m in j.get("MediaContainer", {}).get("Metadata", [])]
+
+    def items_at_level(self, section_key, type_num):
+        """Every item of a given library level (1=movie, 2=show, 3=season, 4=episode)
+        with the fields the Ratings tool needs: current rating, and the parent/
+        grandparent links that carry the external ids for seasons & episodes."""
+        j = self.get_json(f"/library/sections/{section_key}/all", {"type": type_num})
+        out = []
+        for m in j.get("MediaContainer", {}).get("Metadata", []):
+            out.append({
+                "rk": str(m.get("ratingKey")), "title": m.get("title"), "year": m.get("year"),
+                "type": m.get("type"), "guid": m.get("guid"),
+                "rating": m.get("rating"), "audienceRating": m.get("audienceRating"),
+                "index": m.get("index"), "parentIndex": m.get("parentIndex"),
+                "parentTitle": m.get("parentTitle"), "parentRatingKey": m.get("parentRatingKey"),
+                "grandparentTitle": m.get("grandparentTitle"),
+                "grandparentRatingKey": m.get("grandparentRatingKey"),
+            })
+        return out
 
     def get_metadata(self, rating_key):
         j = self.get_json(f"/library/metadata/{rating_key}")
@@ -1948,6 +1967,21 @@ class PlexClient:
         return [{"rk": str(m.get("ratingKey")), "title": m.get("title"),
                  "year": m.get("year"), "type": m.get("type")}
                 for m in j.get("MediaContainer", {}).get("Metadata", []) or []]
+
+    def set_rating(self, section_key, type_num, rating_key, rating=None, audience=None, lock=False):
+        """Write the critic (rating) and/or audience rating back to an item. By default
+        the field is NOT locked; pass lock=True to also lock it so a future Plex refresh
+        won't overwrite it (PUT the section /all endpoint, like the Plex web edit)."""
+        params = {"type": type_num, "id": rating_key}
+        if rating is not None:
+            params["rating.value"] = f"{float(rating):.1f}"
+            params["rating.locked"] = "1" if lock else "0"
+        if audience is not None:
+            params["audienceRating.value"] = f"{float(audience):.1f}"
+            params["audienceRating.locked"] = "1" if lock else "0"
+        if len(params) == 2:      # nothing to write
+            return None
+        return self.put(f"/library/sections/{section_key}/all", params)
 
     def edit_labels(self, section_key, sec_type, rating_keys, add=(), remove=(), type_num=None):
         """Add/remove labels on one or more items in a single request:
@@ -6078,6 +6112,694 @@ def watchlist_flow(client, args):
             _pause_to_menu()
 
 
+# ---------------------------------------------------------------------------
+# Ratings flow (fill in / update critic & audience ratings from online databases)
+# ---------------------------------------------------------------------------
+# Inspired by plex_ratings_sync.py: match each movie/show by its external ids
+# (imdb / tmdb / tvdb guids), look up a score from TMDB / OMDb(IMDb) / TVmaze /
+# Trakt, and write it back to Plex, locking the field so a refresh won't wipe it.
+def _to_score(val):
+    """A rating as a float in (0, 10], else None."""
+    try:
+        f = float(val)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 else None
+
+
+def _current_rating(md, kind):
+    """The item's real current rating for kind='critic'/'audience': the scalar field
+    if set, otherwise the matching entry from the Rating[] array (what Plex shows as the
+    IMDb/RT/TMDB badges). So the tool can tell an item that truly has no rating from one
+    that only carries the badges — its scalar 'rating' field is often empty even though
+    a badge is shown."""
+    scalar = md.get("rating") if kind == "critic" else md.get("audienceRating")
+    v = _to_score(scalar)
+    if v is not None:
+        return v
+    for r in (md.get("Rating") or []):
+        val = _to_score(r.get("value"))
+        if val is None:
+            continue
+        rtype = r.get("type") or "critic"
+        if (kind == "audience") == (rtype == "audience"):
+            return val
+    return None
+
+
+def _ext_get_json(url, headers=None, timeout=20):
+    """GET an external JSON API. Returns the parsed object, or None on any error
+    (404/timeout/non-JSON) so callers can just treat a miss as 'no rating'."""
+    h = {"User-Agent": f"{PRODUCT}/ratings", "Accept": "application/json"}
+    if headers:
+        h.update(headers)
+    try:
+        st, text = http_raw("GET", url, headers=h, verify=True, timeout=timeout)
+    except Exception:
+        return None
+    if st >= 400:
+        return None
+    try:
+        return json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return None
+
+
+def _extract_ext_guids(md):
+    """{'tmdb': '123', 'imdb': 'tt...', 'tvdb': '456'} from a Plex metadata dict,
+    read from both the legacy `guid` string and the `Guid` array."""
+    out = {}
+    for m in re.finditer(r"(tmdb|imdb|tvdb|themoviedb|thetvdb)://([^?/\s]+)",
+                         md.get("guid") or ""):
+        key = m.group(1).replace("themoviedb", "tmdb").replace("thetvdb", "tvdb")
+        out[key] = m.group(2)
+    for g in (md.get("Guid") or []):
+        gid = g.get("id") or ""
+        if "://" in gid:
+            src, val = gid.split("://", 1)
+            out[src.lower()] = val
+    return out
+
+
+class _RateLimiter:
+    """Paces external calls to <= `calls` per `period` seconds (single-threaded)."""
+
+    def __init__(self, calls, period):
+        self.calls, self.period, self.stamps = calls, period, []
+
+    def wait(self):
+        now = time.time()
+        self.stamps = [t for t in self.stamps if now - t < self.period]
+        if len(self.stamps) >= self.calls:
+            time.sleep(max(0.0, self.period - (now - self.stamps[0]) + 0.01))
+            now = time.time()
+            self.stamps = [t for t in self.stamps if now - t < self.period]
+        self.stamps.append(time.time())
+
+
+class _TMDB:
+    name = "tmdb"
+    BASE = "https://api.themoviedb.org/3"
+
+    def __init__(self, key, lang="en-US"):
+        self.key, self.lang, self.rl, self.cache = key, lang, _RateLimiter(40, 1.0), {}
+
+    def _get(self, path, **params):
+        params["api_key"] = self.key
+        params.setdefault("language", self.lang)
+        self.rl.wait()
+        return _ext_get_json(f"{self.BASE}{path}?{urllib.parse.urlencode(params)}")
+
+    def _id(self, guids, want):
+        if guids.get("tmdb"):
+            return guids["tmdb"]
+        for src, ext in (("imdb", "imdb_id"), ("tvdb", "tvdb_id")):
+            if not guids.get(src):
+                continue
+            ck = (src, guids[src])
+            if ck not in self.cache:
+                d = self._get(f"/find/{guids[src]}", external_source=ext) or {}
+                res = (d.get("movie_results") if want == "movie" else d.get("tv_results")) or []
+                self.cache[ck] = str(res[0]["id"]) if res else None
+            if self.cache[ck]:
+                return self.cache[ck]
+        return None
+
+    def show(self, guids):
+        sid = self._id(guids, "tv")
+        return _to_score((self._get(f"/tv/{sid}") or {}).get("vote_average")) if sid else None
+
+    def movie(self, guids):
+        mid = self._id(guids, "movie")
+        return _to_score((self._get(f"/movie/{mid}") or {}).get("vote_average")) if mid else None
+
+    def episode(self, guids, season, number):
+        sid = self._id(guids, "tv")
+        if not sid:
+            return None
+        d = self._get(f"/tv/{sid}/season/{season}/episode/{number}") or {}
+        return _to_score(d.get("vote_average"))
+
+    def season(self, guids, season):
+        sid = self._id(guids, "tv")
+        if not sid:
+            return None
+        d = self._get(f"/tv/{sid}/season/{season}") or {}
+        vals = [v for v in (_to_score(e.get("vote_average")) for e in d.get("episodes", [])) if v]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+
+class _OMDb:
+    name = "imdb"
+    BASE = "http://www.omdbapi.com/"
+
+    def __init__(self, key):
+        self.key, self.rl, self.cache = key, _RateLimiter(10, 1.0), {}
+
+    def _raw(self, guids, season=None, number=None):
+        """The full OMDb response for an item (cached), so IMDb and Rotten Tomatoes can
+        be read from the same call. Returns the dict, or None."""
+        imdb = guids.get("imdb")
+        if not imdb:
+            return None
+        ck = (imdb, season, number)
+        if ck not in self.cache:
+            params = {"i": imdb, "apikey": self.key}
+            if season is not None:
+                params["Season"] = season
+            if number is not None:
+                params["Episode"] = number
+            self.rl.wait()
+            d = _ext_get_json(f"{self.BASE}?{urllib.parse.urlencode(params)}")
+            self.cache[ck] = d if (d and d.get("Response") == "True") else None
+        return self.cache[ck]
+
+    def show(self, guids):
+        return _to_score((self._raw(guids) or {}).get("imdbRating"))
+
+    movie = show
+
+    def episode(self, guids, season, number):
+        return _to_score((self._raw(guids, season, number) or {}).get("imdbRating"))
+
+    def season(self, guids, season):
+        return None
+
+
+class _OMDbRT:
+    """Rotten Tomatoes (Tomatometer, a critic %) read from the same OMDb responses, so
+    it costs no extra requests. OMDb only carries RT at the movie/series level."""
+    name = "rottentomatoes"
+
+    def __init__(self, omdb):
+        self._omdb = omdb
+
+    @staticmethod
+    def _rt(d):
+        for r in ((d or {}).get("Ratings") or []):
+            if r.get("Source") == "Rotten Tomatoes":
+                m = re.match(r"\s*(\d+(?:\.\d+)?)\s*%", str(r.get("Value") or ""))
+                if m:
+                    return _to_score(float(m.group(1)) / 10.0)
+        return None
+
+    def show(self, guids):
+        return self._rt(self._omdb._raw(guids))
+
+    movie = show
+
+    def episode(self, guids, season, number):
+        return self._rt(self._omdb._raw(guids, season, number))
+
+    def season(self, guids, season):
+        return None
+
+
+class _TVmaze:
+    name = "tvmaze"
+    BASE = "https://api.tvmaze.com"
+
+    def __init__(self):
+        self.rl, self.cache = _RateLimiter(15, 10.0), {}
+
+    def _get(self, path, **params):
+        url = self.BASE + path + (f"?{urllib.parse.urlencode(params)}" if params else "")
+        self.rl.wait()
+        return _ext_get_json(url)
+
+    def _id(self, guids):
+        for src, param in (("tvdb", "thetvdb"), ("imdb", "imdb")):
+            if not guids.get(src):
+                continue
+            ck = (src, guids[src])
+            if ck not in self.cache:
+                d = self._get("/lookup/shows", **{param: guids[src]}) or {}
+                self.cache[ck] = str(d["id"]) if d.get("id") else None
+            if self.cache[ck]:
+                return self.cache[ck]
+        return None
+
+    def show(self, guids):
+        sid = self._id(guids)
+        if not sid:
+            return None
+        d = self._get(f"/shows/{sid}") or {}
+        return _to_score((d.get("rating") or {}).get("average"))
+
+    def movie(self, guids):
+        return None       # TVmaze is TV only
+
+    def episode(self, guids, season, number):
+        sid = self._id(guids)
+        if not sid:
+            return None
+        d = self._get(f"/shows/{sid}/episodebynumber", season=season, number=number) or {}
+        return _to_score((d.get("rating") or {}).get("average"))
+
+    def season(self, guids, season):
+        return None
+
+
+class _Trakt:
+    name = "trakt"
+    BASE = "https://api.trakt.tv"
+
+    def __init__(self, client_id):
+        self.headers = {"trakt-api-version": "2", "trakt-api-key": client_id}
+        self.rl = _RateLimiter(8, 1.0)
+
+    def _get(self, path):
+        self.rl.wait()
+        return _ext_get_json(self.BASE + path, headers=self.headers)
+
+    def show(self, guids):
+        sid = guids.get("imdb")
+        return _to_score((self._get(f"/shows/{sid}/ratings") or {}).get("rating")) if sid else None
+
+    def movie(self, guids):
+        sid = guids.get("imdb")
+        return _to_score((self._get(f"/movies/{sid}/ratings") or {}).get("rating")) if sid else None
+
+    def episode(self, guids, season, number):
+        sid = guids.get("imdb")
+        if not sid:
+            return None
+        d = self._get(f"/shows/{sid}/seasons/{season}/episodes/{number}/ratings") or {}
+        return _to_score(d.get("rating"))
+
+    def season(self, guids, season):
+        return None
+
+
+_RATING_ORDER = ["imdb", "rottentomatoes", "trakt", "tmdb", "tvmaze"]   # critic field priority
+_AUDIENCE_ORDER = ["tmdb", "tvmaze", "rottentomatoes", "trakt", "imdb"]  # audience field priority
+
+
+def _build_rating_providers(args):
+    provs = []
+    if getattr(args, "tmdb_key", None):
+        provs.append(_TMDB(args.tmdb_key))
+    if getattr(args, "omdb_key", None):
+        omdb = _OMDb(args.omdb_key)
+        provs.append(omdb)
+        provs.append(_OMDbRT(omdb))     # Rotten Tomatoes via the same OMDb calls
+    if not getattr(args, "no_tvmaze", False):
+        provs.append(_TVmaze())
+    if getattr(args, "trakt_id", None):
+        provs.append(_Trakt(args.trakt_id))
+    return provs
+
+
+def _gather_ratings(providers, type_num, guids, season=None, number=None):
+    found = {}
+    for p in providers:
+        try:
+            if type_num == 4:
+                v = p.episode(guids, season, number)
+            elif type_num == 3:
+                v = p.season(guids, season)
+            elif type_num == 1:
+                v = p.movie(guids)
+            else:
+                v = p.show(guids)
+        except Exception:
+            v = None
+        if v:
+            found[p.name] = round(v, 1)
+    return found
+
+
+def _pick_rating(found, order):
+    for name in order:
+        if found.get(name):
+            return found[name]
+    return None
+
+
+def _pick_rating_src(found, order):
+    for name in order:
+        if found.get(name):
+            return found[name], name
+    return None, None
+
+
+def _ratings_configure_keys(args):
+    """Enter/clear the TMDB / OMDb / Trakt keys and save them to the config file."""
+    cfg = getattr(args, "_cfg", None)
+    if cfg is None:
+        cfg = {}
+        args._cfg = cfg
+    clear_screen()
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}Rating sources{Style.RESET_ALL}")
+    print(f"{Style.DIM}TVmaze needs no key (TV shows only). TMDB, OMDb (IMDb) and Trakt each need a "
+          f"free API key/id (OMDb also provides Rotten Tomatoes).\nLeave a field blank to keep it; type '-' to clear it. Keys are saved "
+          f"to your config file.{Style.RESET_ALL}\n")
+
+    def mask(v):
+        return (v[:4] + "…") if v else "(not set)"
+
+    for label, argk, cfgk in (("TMDB API key", "tmdb_key", "tmdb_key"),
+                              ("OMDb API key", "omdb_key", "omdb_key"),
+                              ("Trakt client id", "trakt_id", "trakt_id")):
+        cur = getattr(args, argk, None)
+        val = ask_text(f"{label} [{mask(cur)}]").strip()
+        if val == "-":
+            setattr(args, argk, None)
+            cfg.pop(cfgk, None)
+        elif val:
+            setattr(args, argk, val)
+            cfg[cfgk] = val
+    try:
+        save_config(cfg)
+        log_done("Saved.")
+    except Exception as ex:
+        log_warn(f"Could not save the config: {ex}")
+    active = ", ".join(p.name for p in _build_rating_providers(args)) or "(none)"
+    log_info(f"Active sources now: {active}")
+    _pause_to_menu()
+
+
+def _apply_ratings(client, sec, providers, rows, overwrite, lock, args):
+    """Look up ratings for each selected item and build a plan, ALWAYS show it as a
+    preview first, and only write it after an explicit confirmation. Writing locks the
+    fields only if `lock` is set (off by default). Handles its own pauses; returns True
+    if something was actually written."""
+    default_tn = SECTION_TYPE_NUM.get(sec["type"])
+    total = len(rows)
+    clear_screen()
+    log_info(f"Looking up ratings for {total} item(s)…")
+    plan = []
+    for i, r in enumerate(rows, 1):
+        guids = r.get("guids") or {}
+        tn = r.get("type_num", default_tn)
+        e = {"title": r.get("label") or r["title"], "rk": r["rk"], "type_num": tn,
+             "cur": r.get("cur"), "aud": r.get("aud"),
+             "wr": None, "wa": None, "sr": None, "sa": None,
+             "status": ("no match" if not guids else "kept")}
+        if guids:
+            found = _gather_ratings(providers, tn, guids, r.get("season"), r.get("number"))
+            new_r, sr = _pick_rating_src(found, _RATING_ORDER)
+            new_a, sa = _pick_rating_src(found, _AUDIENCE_ORDER)
+            has_any = r.get("cur") is not None or r.get("aud") is not None
+            if overwrite or not has_any:      # fill-missing only touches unrated items
+                wr, wa = new_r, new_a
+            else:
+                wr = wa = None
+            if wr is not None or wa is not None:
+                e.update(wr=wr, wa=wa, sr=(sr if wr is not None else None),
+                         sa=(sa if wa is not None else None), status="change")
+        plan.append(e)
+        print(f"\r  {Fore.CYAN}{i * 100 // total:3d}%{Style.RESET_ALL} ({i}/{total})   ",
+              end="", flush=True)
+    print("\n")
+
+    changes = [e for e in plan if e["status"] == "change"]
+    nomatch = sum(1 for e in plan if e["status"] == "no match")
+    kept = len(plan) - len(changes) - nomatch
+
+    print(f"{Fore.MAGENTA}{Style.BRIGHT}Preview{Style.RESET_ALL}   "
+          f"({Fore.GREEN}{len(changes)} would change{Style.RESET_ALL} · {kept} kept · "
+          f"{nomatch} no match)   {Style.DIM}mode: "
+          f"{'overwrite' if overwrite else 'fill missing'} · lock: {'yes' if lock else 'no'}"
+          f"{Style.RESET_ALL}\n")
+    for e in changes[:40]:
+        had = e["cur"] is not None or e["aud"] is not None
+        marker = (f"{Fore.YELLOW}update{Style.RESET_ALL}" if had
+                  else f"{Fore.GREEN}add   {Style.RESET_ALL}")
+        parts = []
+        if e["wr"] is not None:
+            old = f"{e['cur']:.1f}\u2192" if e["cur"] is not None else ""
+            parts.append(f"rating {old}{Fore.GREEN}{e['wr']:.1f}{Style.RESET_ALL} ({e['sr']})")
+        if e["wa"] is not None:
+            old = f"{e['aud']:.1f}\u2192" if e["aud"] is not None else ""
+            parts.append(f"audience {old}{Fore.GREEN}{e['wa']:.1f}{Style.RESET_ALL} ({e['sa']})")
+        print(f"  {marker}  {e['title']}   {Style.DIM}·{Style.RESET_ALL}   " + "    ".join(parts))
+    if len(changes) > 40:
+        print(f"  {Style.DIM}… (+{len(changes) - 40} more){Style.RESET_ALL}")
+    print()
+
+    if not changes:
+        log_info("Nothing to change with the current selection and mode.")
+        _pause_to_menu()
+        return False
+    if args.dry_run:
+        log_info("Global --dry-run is on — this stays a preview, nothing is written.")
+        _pause_to_menu()
+        return False
+
+    # writing is the opt-in step: default answer is No, so a plain Enter just previews
+    if not args.yes:
+        ans = ask_yes_back(f"Write these {len(changes)} change(s)?"
+                           + (" and LOCK the fields" if lock else " (fields NOT locked)"),
+                           default=False)
+        if ans is None or not ans:
+            log_info("Preview only — nothing was written.")
+            _pause_to_menu()
+            return False
+
+    print()
+    upd = fail = 0
+    tot = len(changes)
+    for i, e in enumerate(changes, 1):
+        try:
+            client.set_rating(sec["key"], e["type_num"], e["rk"],
+                              rating=e["wr"], audience=e["wa"], lock=lock)
+            upd += 1
+        except Exception as ex:
+            fail += 1
+            print(f"\r  {Fore.RED}x{Style.RESET_ALL} {e['title']}: {ex}")
+        print(f"\r  {Fore.CYAN}{i * 100 // tot:3d}%{Style.RESET_ALL} ({i}/{tot})   ",
+              end="", flush=True)
+    print()
+    color = Fore.GREEN if not fail else Fore.YELLOW
+    print(f"{color}Done: updated {upd}" + (f", {fail} failed" if fail else "") + f".{Style.RESET_ALL}")
+    if lock:
+        log_info("Fields are locked, so a library refresh won't overwrite them.")
+    else:
+        log_info("Fields are NOT locked — a future Plex refresh may overwrite them "
+                 "(turn on locking to keep them).")
+    _pause_to_menu()
+    return upd > 0
+
+
+def _ratings_build_rows(items, type_num):
+    """Turn a level listing into checkbox rows carrying the match info (external-id
+    source, season & episode number) each level needs. Missing critic rating -> row
+    is pre-checked. Returns (rows, n_missing)."""
+    rows, n_missing = [], 0
+    for it in items:
+        cur = _to_score(it.get("rating"))
+        aud = _to_score(it.get("audienceRating"))
+        if cur is None:
+            n_missing += 1
+        if type_num == 4:            # episode
+            s, ep = it.get("parentIndex"), it.get("index")
+            try:
+                se = f"S{int(s):02d}E{int(ep):02d}"
+            except (TypeError, ValueError):
+                se = ""
+            label = f"{it.get('grandparentTitle') or ''} · {se} {it.get('title') or ''}".strip()
+            gk, season, number = it.get("grandparentRatingKey"), s, ep
+            sort_key = ((it.get("grandparentTitle") or "").lower(),
+                        s if s is not None else 0, ep if ep is not None else 0)
+        elif type_num == 3:          # season
+            s = it.get("index")
+            label = f"{it.get('parentTitle') or ''} · Season {s}".strip()
+            gk, season, number = it.get("parentRatingKey"), s, None
+            sort_key = ((it.get("parentTitle") or "").lower(), s if s is not None else 0, 0)
+        else:                        # movie / show
+            label = (f"{it['title']} ({it['year']})" if it.get("year") else (it.get("title") or "?"))
+            gk, season, number = it["rk"], None, None
+            sort_key = ((it.get("title") or "").lower(), 0, 0)
+        bits = [f"{Fore.YELLOW}\u2605{cur:.1f}{Style.RESET_ALL}" if cur is not None
+                else f"{Style.DIM}no rating{Style.RESET_ALL}"]
+        if aud is not None:
+            bits.append(f"{Style.DIM}aud {aud:.1f}{Style.RESET_ALL}")
+        rows.append({"rk": str(it["rk"]), "title": it.get("title") or label, "label": label,
+                     "selected": cur is None, "tag": "  ".join(bits), "cur": cur, "aud": aud,
+                     "type_num": type_num, "season": season, "number": number,
+                     "_gk": gk, "_sort": sort_key})
+    rows.sort(key=lambda r: r["_sort"])
+    return rows, n_missing
+
+
+def _ratings_resolve(client, rows):
+    """Read each picked item's REAL current rating (scalar field, or the Rating[] array
+    Plex shows as badges) and the external ids it needs to match online — in one batched
+    metadata read. This lets the preview tell 'add' from 'update', and keeps fill-missing
+    from touching items that already show a rating."""
+    if not rows:
+        return
+    md_map = client.get_metadata_many([r["rk"] for r in rows])
+    guids_by_rk = {str(k): _extract_ext_guids(v) for k, v in md_map.items()}
+    # a season/episode's ids live on its show; fetch any show not already loaded
+    extra = {str(r.get("_gk")) for r in rows
+             if r.get("_gk") and str(r.get("_gk")) not in md_map}
+    if extra:
+        for k, v in client.get_metadata_many(list(extra)).items():
+            guids_by_rk[str(k)] = _extract_ext_guids(v)
+    for r in rows:
+        md = md_map.get(str(r["rk"])) or {}
+        r["cur"] = _current_rating(md, "critic")
+        r["aud"] = _current_rating(md, "audience")
+        r["guids"] = guids_by_rk.get(str(r.get("_gk"))) or {}
+
+
+def _ratings_expand_shows(client, sec, show_rows):
+    """Turn selected show rows into 'everything in the show': the show itself plus all
+    of its seasons and episodes (one listing request each for the whole library, then
+    filtered to the picked shows)."""
+    show_rks = {str(r["rk"]) for r in show_rows}
+    rows = list(show_rows)          # the show-level rows themselves
+    try:
+        eps = [e for e in client.items_at_level(sec["key"], 4)
+               if str(e.get("grandparentRatingKey")) in show_rks]
+    except Exception:
+        eps = []
+    try:
+        seas = [s for s in client.items_at_level(sec["key"], 3)
+                if str(s.get("parentRatingKey")) in show_rks]
+    except Exception:
+        seas = []
+    rows += _ratings_build_rows(seas, 3)[0]
+    rows += _ratings_build_rows(eps, 4)[0]
+    return rows
+
+
+def _ratings_update(client, args, providers):
+    """Pick a library and select items. For a TV library you pick whole shows, and each
+    selected show updates everything in it (the show, its seasons and all episodes).
+    Ratings without a value are pre-checked; a preview + confirmation precede any write."""
+    lib_idx = 0
+    item_cursor = [0]
+    item_view = {}
+    while True:
+        sec, lib_idx, single = _pick_library(client, default=lib_idx)
+        if sec is None:
+            return False
+        is_show = sec["type"] == "show"
+        top_type = 2 if is_show else 1
+        unit = "show" if is_show else "movie"
+
+        clear_screen()
+        log_info(f"Loading {unit}s from '{sec['title']}'…")
+        try:
+            items = client.items_at_level(sec["key"], top_type)
+        except Exception as ex:
+            log_warn(f"Could not load the library: {ex}")
+            if single:
+                return False
+            continue
+        rows, n_missing = _ratings_build_rows(items, top_type)
+        if not rows:
+            log_warn("The library is empty.")
+            if single:
+                return False
+            continue
+
+        active = ", ".join(p.name for p in providers) or "(none)"
+        hint = ("Each selected show updates the show AND all its seasons & episodes."
+                if is_show else "Missing a rating are pre-checked.")
+        header = [
+            f"{Fore.CYAN}{sec['title']}{Style.RESET_ALL}   ({len(rows)} {unit}s · "
+            f"{Fore.YELLOW}{n_missing} without a rating{Style.RESET_ALL})   "
+            f"{Style.DIM}sources: {active}{Style.RESET_ALL}",
+            f"{Style.DIM}{hint} / = search · a = all · n = none · i = invert · "
+            f"Enter = continue{Style.RESET_ALL}",
+            "",
+        ]
+        res = checkbox_menu(f"Select {unit}s to fetch ratings for:", rows, header=header,
+                            start_pos=item_cursor[0], pos_out=item_cursor, ui_state=item_view,
+                            f9_cb=lambda checked: refresh_items(client, checked))
+        if res is None:
+            if single:
+                return False
+            continue
+        picked = [r for r in rows if r["selected"]]
+        if not picked:
+            log_info("Nothing selected.")
+            continue
+
+        # run options: default is preview-only (writing is confirmed later) and no lock
+        opts = _WL_STATE.setdefault("ratings_opts", {"overwrite": False, "lock": False})
+        opt_cur = 0
+        while True:
+            labels = [
+                "Run  (preview first, then confirm to write)",
+                f"Mode:  {'overwrite existing ratings' if opts['overwrite'] else 'fill only missing'}",
+                f"Lock fields after writing:  {'yes' if opts['lock'] else 'no  (default)'}",
+                "Back",
+            ]
+            oh = [
+                f"{Fore.CYAN}{len(picked)} {unit}(s) selected{Style.RESET_ALL}"
+                + (f"{Style.DIM}  (incl. their seasons & episodes){Style.RESET_ALL}" if is_show else "")
+                + f"   {Style.DIM}sources: {active}{Style.RESET_ALL}",
+                f"{Style.DIM}Runs as a preview by default; writing needs a separate confirmation. "
+                f"Locking is off by default (Plex may later overwrite unlocked values)."
+                f"{Style.RESET_ALL}",
+                "",
+            ]
+            oi = interactive_menu("Ratings run — options:", labels, default=opt_cur,
+                                  allow_cancel=True, header=oh)
+            if oi is None or oi == 3:
+                break                     # back to the item selection
+            opt_cur = oi
+            if oi == 1:
+                opts["overwrite"] = not opts["overwrite"]
+                continue
+            if oi == 2:
+                opts["lock"] = not opts["lock"]
+                continue
+            # oi == 0 -> expand shows to their content, resolve ids, preview / apply
+            clear_screen()
+            if is_show:
+                log_info("Expanding the selected shows to their seasons & episodes…")
+                run_rows = _ratings_expand_shows(client, sec, picked)
+            else:
+                run_rows = picked
+            log_info("Reading current ratings & external ids…")
+            _ratings_resolve(client, run_rows)
+            return _apply_ratings(client, sec, providers, run_rows,
+                                  opts["overwrite"], opts["lock"], args)
+
+
+def ratings_flow(client, args):
+    """Little menu to fill in / update movie & show ratings from online databases.
+    Handles its own pauses, so it reports False to the main menu."""
+    if getattr(args, "_cfg", None) is None:
+        args._cfg = {}
+    last = 0
+    while True:
+        providers = _build_rating_providers(args)
+        active = ", ".join(p.name for p in providers) or "(none)"
+        header = [
+            f"{Fore.MAGENTA}{Style.BRIGHT}Ratings{Style.RESET_ALL}  ·  {client.base_url}",
+            f"{Style.DIM}Fills in missing IMDb / Rotten Tomatoes / TMDB / TVmaze / Trakt scores for movies, shows & episodes. "
+            f"Previews first; writes only after you confirm; doesn't lock unless you turn it on."
+            f"{Style.RESET_ALL}",
+            f"{Style.DIM}Active sources: {active}"
+            + ("" if any(p.name != "tvmaze" for p in providers)
+               else "  (only TVmaze — add a TMDB/OMDb/Trakt key for movies)") + Style.RESET_ALL,
+            "",
+        ]
+        idx = interactive_menu("Ratings — choose an action:",
+                               ["Update ratings for a library",
+                                "Configure sources (TMDB / OMDb / Trakt keys)", "Back"],
+                               default=last, allow_cancel=True, header=header)
+        if idx is None or idx == 2:
+            return False
+        last = idx
+        if idx == 1:
+            _ratings_configure_keys(args)
+            continue
+        try:
+            _ratings_update(client, args, providers)   # owns its own preview/pause
+        except RuntimeError as ex:
+            clear_screen()
+            log_warn(f"Ratings update failed: {ex}")
+            _pause_to_menu()
+
+
 def _pause_to_menu():
     msg = f"\n{Style.DIM}Press Enter to return to the main menu…{Style.RESET_ALL}"
     if not _tui_supported():
@@ -6102,6 +6824,7 @@ def top_menu(client, args):
         ("Labels  —  add / remove / rename custom labels on shows & movies", labels_flow),
         ("Titles  —  find non-English titles and switch them to English", titles_flow),
         ("Watchlist  —  view / add / edit / remove titles on your Plex watchlist", watchlist_flow),
+        ("Ratings  —  fill in / update IMDb / Rotten Tomatoes / TMDB / TVmaze / Trakt scores for movies, shows & episodes", ratings_flow),
     ]
     last = 0
     while True:
@@ -6144,6 +6867,13 @@ def main():
                     help="Watched/unwatched mode: mark selection as WATCHED")
     ap.add_argument("--unwatched", action="store_true",
                     help="Watched/unwatched mode: mark selection as UNWATCHED")
+    ap.add_argument("--tmdb-key", dest="tmdb_key", default=os.environ.get("TMDB_API_KEY"),
+                    help="TMDB API key for the Ratings tool (else TMDB_API_KEY env / config)")
+    ap.add_argument("--omdb-key", dest="omdb_key", default=os.environ.get("OMDB_API_KEY"),
+                    help="OMDb (IMDb) API key for the Ratings tool (else OMDB_API_KEY env / config)")
+    ap.add_argument("--trakt-id", dest="trakt_id", default=os.environ.get("TRAKT_CLIENT_ID"),
+                    help="Trakt client id for the Ratings tool (else TRAKT_CLIENT_ID env / config)")
+    ap.add_argument("--no-tvmaze", action="store_true", help="Disable the TVmaze rating source")
     ap.add_argument("--config", help="Path to the config file (otherwise searched next to the script, in .config next to the script and parent folders, and in ~/.config)")
     ap.add_argument("--config-url", help="URL of a JSON config that OVERRIDES the local one (primary source; falls back to the local config if unreachable). Also settable via CONFIG_URL / PLEX_TOOLS_CONFIG_URL.")
     ap.add_argument("--no-local-config", action="store_true",
@@ -6170,6 +6900,14 @@ def main():
 
     cfg = load_config()
     client_id = get_client_id(cfg)
+
+    # Ratings-tool provider keys: CLI/env win, otherwise fall back to the config file.
+    # Stash cfg on args so the Ratings tool can persist keys the user enters in-app.
+    for _argk, _cfgk in (("tmdb_key", "tmdb_key"), ("omdb_key", "omdb_key"),
+                         ("trakt_id", "trakt_id")):
+        if not getattr(args, _argk, None):
+            setattr(args, _argk, cfg.get(_cfgk))
+    args._cfg = cfg
 
     if args.logout:
         for k in ("account_token", "user_token", "home_user"):
