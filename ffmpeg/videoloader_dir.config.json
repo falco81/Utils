@@ -70,6 +70,11 @@
     "Referer": "https://www.patreon.com/"
   },
   "PATREON_REFERER": "https://www.patreon.com/",
+  "PATREON_SEARCH_MAX_PAGES": 40,
+  "WISTIA_HEADERS": {
+    "Referer": "https://www.patreon.com/",
+    "Origin": "https://www.patreon.com"
+  },
   "ILLEGAL_WIN": [
     "\"",
     "*",

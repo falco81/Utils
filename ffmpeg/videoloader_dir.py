@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.22.1"
+SCRIPT_VERSION = "3.23.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -256,7 +256,7 @@ _REMOTE_CONFIG_KEYS = {
     # -- filenames / identity --
     'ASCII_FILENAMES', 'USER_AGENT', 'TEMP_SUBDIR',
     # -- per-site request headers (handy to hot-fix when a site tightens hot-link checks) --
-    'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER',
+    'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER', 'PATREON_SEARCH_MAX_PAGES', 'WISTIA_HEADERS',
     # -- display --
     'BAR_FORMAT', 'ARROW',
     # -- filename sanitising and the rename heuristics (worth tuning per language) --
@@ -287,7 +287,7 @@ _CONFIG_KEY_ORDER = (
     'ASCII_FILENAMES', 'AUTO_COOKIES', 'NTFY_TOPIC', 'NTFY_SERVER', 'NTFY_TOKEN', 'USER_AGENT',
     'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     'TEMP_SUBDIR', 'BAR_FORMAT', 'ARROW',
-    'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER',
+    'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER', 'PATREON_SEARCH_MAX_PAGES', 'WISTIA_HEADERS',
     'ILLEGAL_WIN', 'RESERVED_WIN', 'EMOJI_RANGES', 'SMALL_WORDS', 'VOWELS', 'DEFAULT_STOP',
 )
 
@@ -1682,6 +1682,47 @@ def get_campaign_id_for_creator(slug: str, session: requests.Session, verbose: b
             return str(data[0]['id'])
     except (requests.RequestException, ValueError):
         pass
+    # Last resort (2026): Patreon's own creator search. It returns campaigns with their page URL
+    # (the vanity field is often empty), so accept only an EXACT slug match on that URL or the
+    # vanity — a fuzzy search hit for a different creator must never be taken.
+    cid = _campaign_id_via_search(slug, session, verbose)
+    if cid:
+        return cid
+    return None
+
+
+def _campaign_id_via_search(slug: str, session: requests.Session, verbose: bool = False):
+    """Look a creator slug up through /api/search_feed/v1/campaign and return the campaign id of
+    the campaign whose page URL (or vanity) is exactly that slug, else None."""
+    want = (slug or '').strip().strip('/').lower()
+    if not want:
+        return None
+    params = {
+        'filter[query]': slug,
+        'filter[include_nsfw]': 'true',
+        'include': 'card_campaign.campaign',
+        'fields[campaign]': 'name,vanity,url',
+        'page[size]': '20',
+        'json-api-version': '1.0',
+        'json-api-use-default-includes': 'false',
+    }
+    try:
+        r = session.get("https://www.patreon.com/api/search_feed/v1/campaign?" + urlencode(params),
+                        headers={'Referer': PATREON_REFERER, 'Accept': 'application/json'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        d = r.json() or {}
+    except (requests.RequestException, ValueError):
+        return None
+    for x in (d.get('included') or []) + (d.get('data') or []):
+        if not isinstance(x, dict) or x.get('type') != 'campaign' or not x.get('id'):
+            continue
+        a = x.get('attributes') or {}
+        page_slug = (urlparse(a.get('url') or '').path or '').strip('/').split('/')[-1:] or ['']
+        cands = {str(a.get('vanity') or '').lower(), page_slug[0].lower()}
+        if want in cands:
+            if verbose:
+                print(f"[INFO] Patreon: creator '{slug}' is campaign {x['id']} (via search).")
+            return str(x['id'])
     return None
 
 
@@ -1760,6 +1801,162 @@ def list_collection_posts(collection_id: str, campaign_id, session: requests.Ses
     if campaign_id:
         params['filter[campaign_id]'] = campaign_id
     return _patreon_paged_posts(params, session, verbose, "posts")
+
+
+WISTIA_HEADERS = {'Referer': 'https://www.patreon.com/', 'Origin': 'https://www.patreon.com'}
+_WISTIA_ID_RE = re.compile(
+    r'wistia\.(?:com|net)/(?:medias|embed/iframe|embed/medias)/([0-9A-Za-z]{8,12})'
+    r'|[?&]wvideo=([0-9A-Za-z]{8,12})')
+
+
+def _wistia_id(text):
+    """The Wistia media id from any Wistia page/embed URL (or text containing one), else None."""
+    m = _WISTIA_ID_RE.search(text or '')
+    return (m.group(1) or m.group(2)) if m else None
+
+
+def _wistia_master(wid):
+    """Wistia's HLS master for a media id."""
+    return f"https://fast.wistia.net/embed/medias/{wid}.m3u8"
+
+
+def extract_patreon_search(input_str: str):
+    """Return the search text for a Patreon POST search URL, else None.
+
+    This is the page Patreon's search box opens:
+        https://www.patreon.com/explore/search?type=post&query=sh**ting%20stars
+    Only post searches are downloadable — a creator search (type=creator) lists campaigns, not
+    videos, so it is left alone."""
+    if 'patreon.com' not in input_str:
+        return None
+    pu = urlparse(input_str)
+    path = (pu.path or '').rstrip('/').lower()
+    if not (path.endswith('/explore/search') or path == '/search'):
+        return None
+    q = parse_qs(pu.query or '')
+    typ = (q.get('type') or ['post'])[0].strip().lower()
+    if typ not in ('post', 'posts', ''):
+        return None
+    text = (q.get('query') or q.get('q') or [''])[0].strip()
+    return text or None
+
+
+def _norm_search_text(s: str) -> str:
+    return re.sub(r'\s+', ' ', (s or '').strip().lower())
+
+
+# Exactly what the site itself sends to /api/search_feed/v1/post (taken from a live session), so
+# the endpoint returns the post bodies (post_file / embed / post_metadata) we extract from.
+_PATREON_SEARCH_PARAMS = {
+    'include': ('card_post,card_post.post,card_post.post.campaign,card_post.post.access_rules,'
+                'card_post.post.access_rules.tier,card_post.post.attachments_media,'
+                'card_post.post.audio,card_post.post.audio_preview,card_post.post.drop,'
+                'card_post.post.images,card_post.post.media,card_post.post.shows,'
+                'card_post.post.video,card_post.post.primary_image,card_post.post.authors'),
+    'fields[post]': ('content_json_string,current_user_can_view,embed,image,is_paid,'
+                     'min_cents_pledged_to_view,post_file,post_metadata,published_at,'
+                     'patreon_url,post_type,thumbnail,title,url'),
+    'fields[campaign]': 'name,url,vanity',
+    'filter[filter_by_user_subscription]': 'false',
+    'filter[is_for_preview]': 'false',
+    'sort': 'relevance',
+    'page[size]': '24',
+    'json-api-version': '1.0',
+    'json-api-use-default-includes': 'false',
+    'json-api-use-default-fields': 'false',
+}
+PATREON_SEARCH_MAX_PAGES = 40     # hard cap on result pages walked for one search
+
+
+def list_search_posts(query: str, session: requests.Session, verbose: bool):
+    """Walk Patreon's post search for `query` and return (posts, locked_titles).
+
+    Search is relevance-ranked and fuzzy ('sh**ting stars' also returns 'Not My Ting'), so only
+    posts whose TITLE contains the search text are kept, and walking stops at the first page
+    that contributes no such post — the real matches come first. Posts the account can't view
+    are returned separately as locked titles (they would only fail to download)."""
+    want = _norm_search_text(query)
+    params = dict(_PATREON_SEARCH_PARAMS)
+    params['filter[query]'] = query
+    url = "https://www.patreon.com/api/search_feed/v1/post?" + urlencode(params)
+    posts, locked, seen = [], [], set()
+    for page in range(1, PATREON_SEARCH_MAX_PAGES + 1):
+        try:
+            r = session.get(url, headers={'Referer': PATREON_REFERER,
+                                          'Accept': 'application/vnd.api+json'},
+                            timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+            d = r.json() or {}
+        except (requests.RequestException, ValueError):
+            print(f"[ERROR] Patreon search did not return JSON (page {page}). Your cookies may "
+                  f"be missing or expired.")
+            break
+        inc = [x for x in (d.get('included') or []) if isinstance(x, dict)]
+        by_id = {x.get('id'): x for x in inc if x.get('type') == 'post'}
+        # Keep the result ORDER: data[] lists the cards as 'post-<id>'.
+        order = []
+        for it in d.get('data') or []:
+            pid = str((it or {}).get('id') or '')
+            if pid.startswith('post-'):
+                order.append(pid[5:])
+        for pid in by_id:
+            if pid not in order:
+                order.append(pid)
+        matched_here = 0
+        for pid in order:
+            post = by_id.get(pid)
+            if not post or pid in seen:
+                continue
+            title = (post.get('attributes') or {}).get('title') or ''
+            if want not in _norm_search_text(title):
+                continue
+            seen.add(pid)
+            matched_here += 1
+            if (post.get('attributes') or {}).get('current_user_can_view') is False:
+                locked.append(title)
+            else:
+                posts.append(post)
+        if verbose:
+            print(f"[INFO] Patreon search page {page}: {matched_here} matching post(s).")
+        nxt = (d.get('links') or {}).get('next')
+        if not matched_here or not nxt:
+            break
+        url = nxt
+    return posts, locked
+
+
+def process_patreon_search(query, session: requests.Session, chunk_size: int,
+                           num_threads: int, folder_workers: int, recursive: bool,
+                           verbose: bool, select: bool = False, out_dir: str = None,
+                           max_connections: int = None, max_height: int = DEFAULT_MAX_HEIGHT,
+                           list_only: bool = False) -> None:
+    """Download the posts a Patreon post search finds (title must contain the search text)."""
+    print(f"[INFO] Searching Patreon posts for '{query}' ...")
+    posts, locked = list_search_posts(query, session, verbose)
+    if locked:
+        print(f"[INFO] {len(locked)} matching post(s) are locked for your account (tier) and "
+              f"are skipped: " + ", ".join(t[:40] for t in locked[:5])
+              + (" ..." if len(locked) > 5 else ""))
+    if not posts:
+        print(f"[ERROR] The search for '{query}' found no post you can view whose title "
+              f"contains it.")
+        print("        Check your Patreon cookies, or open the creator's tag page instead "
+              "(click the tag on a post) and pass that URL.")
+        return
+    global _patreon_creator, _active_collection_title
+    camps = {((p.get('relationships') or {}).get('campaign') or {}).get('data', {}).get('id')
+             for p in posts}
+    camps.discard(None)
+    _patreon_creator = get_creator_name(next(iter(camps)), session, verbose) \
+        if len(camps) == 1 else None
+    _active_collection_title = query
+    if _patreon_creator:
+        print(f"[INFO] Creator '{_patreon_creator}'")
+    elif len(camps) > 1:
+        print(f"[INFO] The matches come from {len(camps)} different creators.")
+    print(f"[INFO] Search '{query}': scanning {len(posts)} post(s) for Drive / Dropbox links "
+          f"and native videos ...")
+    _download_from_posts(posts, session, chunk_size, num_threads, folder_workers, recursive,
+                         verbose, select, out_dir, max_connections, max_height, list_only)
 
 
 def list_tag_posts(campaign_id: str, tag: str, session: requests.Session,
@@ -2257,6 +2454,8 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
                 tag = 'Mux'
             elif src == 'youtube':
                 tag = f"YouTube {h.get('youtube_id')}"
+            elif src == 'wistia':
+                tag = f"Wistia {h.get('wistia_id')}"
             else:
                 tag = f"Vimeo {h.get('vimeo_id')}"
             n += 1
@@ -4158,6 +4357,17 @@ def _primary_stream_from_post(post: dict) -> list:
     if yt:
         title = (emb.get('subject') or a.get('title') or yt).strip()
         out.append({'source': 'youtube', 'title': title, 'youtube_id': yt})
+        return out
+    # 2d) Wistia embed (e.g. <creator>.wistia.com/medias/<id>, wrapped by embedly as
+    #     fast.wistia.net/embed/iframe/<id>). Wistia serves every media as an HLS master at
+    #     fast.wistia.net/embed/medias/<id>.m3u8, so it becomes an ordinary native HLS stream
+    #     with a ready master URL — the whole native pipeline (list/select/download/resume)
+    #     handles it unchanged. Uses the POST title: the embed subject is the raw upload name.
+    wid = _wistia_id(url_field) or _wistia_id(unquote(html or ''))
+    if wid:
+        title = (a.get('title') or emb.get('subject') or wid).strip()
+        out.append({'source': 'wistia', 'title': title, 'wistia_id': wid,
+                    'master_url': _wistia_master(wid), 'headers': dict(WISTIA_HEADERS)})
         return out
 
     # If the post HAS a structured embed pointing at some other host we don't natively play,
@@ -10443,6 +10653,9 @@ def _classify_input(id_or_url: str):
     tagged = extract_patreon_tag_filter(id_or_url)
     if tagged:
         return 'patreon_tag', tagged
+    searched = extract_patreon_search(id_or_url)
+    if searched:
+        return 'patreon_search', searched
     pid = extract_patreon_collection_id(id_or_url)
     if pid:
         return 'patreon', pid
@@ -13035,6 +13248,16 @@ def main(id_or_url: str, output_file: str = None, chunk_size: int = DEFAULT_CHUN
                                 recursive, verbose, select=select, out_dir=out_dir,
                                 max_connections=max_connections, max_height=max_height,
                                 list_only=list_only)
+        elif kind == 'patreon_search':
+            _log_source(f"Patreon search '{target_id}'",
+                        "Drive + Dropbox + Streamable + native Vimeo/Mux HLS")
+            if output_file:
+                print("[WARN] -o/--output is ignored for a Patreon search; names come from the "
+                      "posts.")
+            process_patreon_search(target_id, session, chunk_size, num_threads, folder_workers,
+                                   recursive, verbose, select=select, out_dir=out_dir,
+                                   max_connections=max_connections, max_height=max_height,
+                                   list_only=list_only)
         elif kind == 'patreon_post':
             _log_source("Patreon post", "Drive + Dropbox + Streamable + native Vimeo/Mux HLS")
             if output_file:
