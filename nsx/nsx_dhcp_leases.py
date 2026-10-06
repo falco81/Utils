@@ -1,48 +1,66 @@
 #!/usr/bin/env python3
 """
-nsx_dhcp_leases.py - vypise a pripadne smaze DHCP leasy konkretniho segmentu v NSX 4.x
+nsx_dhcp_leases.py - list and optionally delete DHCP leases on a given NSX 4.x segment.
 
-Pouziva Policy API:
-  cteni:  GET  /policy/api/v1/infra/dhcp-server-configs/{config-id}/leases
-               ?connectivity_path=<tier-1 nebo segment path>&segment_path=<segment path>
-  mazani: POST /policy/api/v1/infra/segments/{segment-id}?action=delete_dhcp_leases
+Policy API endpoints used:
+  read:   GET  /policy/api/v1/infra/dhcp-server-configs/{config-id}/leases
+               ?connectivity_path=<tier-1 or segment path>&segment_path=<segment path>
+  delete: POST /policy/api/v1/infra/segments/{segment-id}?action=delete_dhcp_leases
           POST /policy/api/v1/infra/tier-1s/{t1-id}/segments/{segment-id}?action=delete_dhcp_leases
-          telo: {"leases": [{"ip": "...", "mac": "..."}]}
+          body: {"leases": [{"ip": "...", "mac": "..."}]}
 
-NSX pri mazani vyzaduje PRESNOU dvojici IP + MAC. Skript si proto leasy vzdy
-nejdriv nacte a dvojici doplni sam - staci zadat IP, nebo MAC, nebo obojí.
+NSX requires an EXACT ip + mac pair when deleting. The script therefore always
+fetches the current leases first and completes the pair for you - you only need
+to supply an IP, a MAC, or both.
 
-Segment lze zadat jako ID nebo display name.
+The segment can be given either as its ID or its display name.
 
-Priklady:
-    export NSX_PASSWORD='tajneheslo'
+Examples (Linux / macOS):
+    export NSX_PASSWORD='secret'
 
-    # vypis
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -u admin -s ls-prod-web --insecure
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -u admin -s ls-prod-web --json
+    # list
+    ./nsx_dhcp_leases.py -m nsx.example.com -u admin -s ls-prod-web --insecure
+    ./nsx_dhcp_leases.py -m nsx.example.com -u admin -s ls-prod-web --json
 
-    # smazani konkretnich leasu (lze opakovat, lze mixovat IP a MAC)
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --delete 10.20.30.105
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --delete 00:50:56:ae:6b:01
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web \
+    # delete specific leases (repeatable, IP and MAC may be mixed)
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --delete 10.20.30.105
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --delete 00:50:56:ae:6b:01
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web \
         --delete 10.20.30.105/00:50:56:ae:6b:01 --delete 10.20.30.9
 
-    # smazani vsech leasu na segmentu
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --delete-all --yes
+    # delete every lease on the segment
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --delete-all --yes
 
-    # smazani vsech leasu s konkretnim lease timem
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --lease-time 86400 --delete-all
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --lease-time '<600' --delete-all
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --lease-time 3600-7200 --delete-all
+    # delete every lease with a given lease time
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --lease-time 86400 --delete-all
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --lease-time '<600' --delete-all
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --lease-time 3600-7200 --delete-all
 
-    # obecny filtr na libovolne pole lease
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --filter 'mac=00:50:56:*' --delete-all
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --filter 'ip=10.20.30.1*'
+    # generic filter on any lease field
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --filter 'mac=00:50:56:*' --delete-all
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --filter 'ip=10.20.30.1*'
 
-    # nanecisto, nic se nemaze
-    ./nsx_dhcp_leases.py -m nsx.firma.cz -s ls-prod-web --delete-all --dry-run
+    # dry run, nothing is deleted
+    ./nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --delete-all --dry-run
 
-Zavislosti: requests  (pip install requests)
+Examples (Windows 10 / 11, cmd.exe or PowerShell):
+    cmd:        set NSX_PASSWORD=secret
+    PowerShell: $env:NSX_PASSWORD = 'secret'
+
+    py -3 nsx_dhcp_leases.py -m nsx.example.com -u admin -s ls-prod-web --insecure
+    py -3 nsx_dhcp_leases.py -m nsx.example.com -s ls-prod-web --lease-time 86400 --delete-all
+
+    Note for cmd.exe: quote values containing < or > with double quotes,
+    e.g. --lease-time "<600", otherwise the shell treats them as redirection.
+
+Exit codes:
+    0  success
+    1  nothing matched the given selection
+    2  error (connection, authentication, bad arguments, API error)
+    130 interrupted by the user
+
+Requirements: requests          (pip install requests)
+Optional:     colorama          (pip install colorama)  - colored output on Windows
 """
 
 import argparse
@@ -55,12 +73,128 @@ import sys
 try:
     import requests
 except ImportError:
-    sys.exit("Chybi modul 'requests'. Nainstaluj: pip install requests")
+    sys.exit("Missing module 'requests'. Install it with: pip install requests")
 
 
 API = "/policy/api/v1"
-DELETE_CHUNK = 100  # kolik leasu poslat v jednom POST requestu
+DELETE_CHUNK = 100  # how many leases to send in a single POST request
 
+EXIT_OK = 0
+EXIT_NO_MATCH = 1
+EXIT_ERROR = 2
+EXIT_INTERRUPTED = 130
+
+
+# ---------------------------------------------------------------- console / color
+
+def _enable_windows_vt_mode():
+    """
+    Turn on ANSI escape processing in the Windows 10+ console.
+
+    Used as a fallback when colorama is not installed. Windows 10 build 1511
+    and later supports VT sequences, but the flag is off by default for
+    conhost (cmd.exe). Windows Terminal and PowerShell 7 already have it on.
+    """
+    if os.name != "nt":
+        return True
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        ok = False
+        for handle_id in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            handle = kernel32.GetStdHandle(handle_id)
+            if handle in (0, -1):
+                continue
+            mode = wintypes.DWORD()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                continue
+            if kernel32.SetConsoleMode(
+                handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            ):
+                ok = True
+        return ok
+    except Exception:
+        return False
+
+
+def _fix_windows_encoding():
+    """
+    Make stdout/stderr UTF-8 safe on Windows.
+
+    The legacy console code page (cp852, cp1250, ...) raises
+    UnicodeEncodeError on characters coming back from the NSX API, for example
+    in segment display names. Falling back to 'replace' is better than crashing.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError, OSError):
+            pass
+
+
+class Palette:
+    """ANSI colors with a no-op mode, so every call site stays identical."""
+
+    _CODES = {
+        "head": "\033[1;36m",   # bold cyan
+        "ok": "\033[32m",       # green
+        "warn": "\033[33m",     # yellow
+        "err": "\033[1;31m",    # bold red
+        "danger": "\033[31m",   # red
+        "dim": "\033[90m",      # grey
+        "bold": "\033[1m",
+    }
+    _RESET = "\033[0m"
+
+    def __init__(self, enabled=True):
+        self.enabled = enabled
+
+    def __call__(self, style, text):
+        if not self.enabled or style not in self._CODES:
+            return str(text)
+        return f"{self._CODES[style]}{text}{self._RESET}"
+
+
+def setup_console(color_mode):
+    """
+    Initialise console output and return a Palette.
+
+    color_mode: 'auto' (color only on a real terminal), 'always', or 'never'.
+    Honors the NO_COLOR convention (https://no-color.org/).
+    """
+    _fix_windows_encoding()
+
+    if color_mode == "never" or os.environ.get("NO_COLOR"):
+        return Palette(False)
+
+    is_tty = sys.stdout.isatty()
+    if color_mode == "auto" and not is_tty:
+        return Palette(False)
+
+    # colorama is the reliable path on Windows: it wraps the streams and
+    # translates ANSI codes for consoles that cannot handle them natively.
+    try:
+        import colorama
+
+        colorama.init(strip=False if color_mode == "always" else None,
+                      convert=None, autoreset=False)
+        return Palette(True)
+    except ImportError:
+        pass
+    except Exception:
+        pass
+
+    if os.name == "nt" and not _enable_windows_vt_mode():
+        # Old console without VT support and without colorama - plain text.
+        return Palette(False)
+
+    return Palette(True)
+
+
+# ---------------------------------------------------------------- errors
 
 class NsxError(Exception):
     pass
@@ -69,6 +203,8 @@ class NsxError(Exception):
 class NotFound(NsxError):
     pass
 
+
+# ---------------------------------------------------------------- API client
 
 class NsxClient:
     def __init__(self, manager, user, password, verify=True, timeout=60):
@@ -89,27 +225,26 @@ class NsxClient:
                                timeout=self.timeout)
         except requests.exceptions.SSLError as e:
             raise NsxError(
-                f"Chyba TLS pri spojeni na {self.base}: {e}\n"
-                "Pouzij --ca-bundle s CA certifikatem, nebo --insecure (jen v labu)."
+                f"TLS error while connecting to {self.base}: {e}\n"
+                "Use --ca-bundle with the CA certificate, or --insecure (lab only)."
             )
         except requests.exceptions.RequestException as e:
-            raise NsxError(f"Spojeni na {url} selhalo: {e}")
+            raise NsxError(f"Request to {url} failed: {e}")
 
         if r.status_code == 404:
             raise NotFound(f"404 Not Found: {path}")
         if r.status_code in (401, 403):
             raise NsxError(
-                f"HTTP {r.status_code} - autentizace/opravneni selhalo. "
-                "Pro cteni staci read-only role, pro mazani je potreba zapis."
+                f"HTTP {r.status_code} - authentication or authorization failed. "
+                "Reading needs a read-only role; deleting needs write access."
             )
         if r.status_code >= 400:
-            detail = ""
             try:
                 b = r.json()
                 detail = b.get("error_message") or json.dumps(b)[:500]
             except ValueError:
                 detail = r.text[:500]
-            raise NsxError(f"HTTP {r.status_code} na {method} {path}: {detail}")
+            raise NsxError(f"HTTP {r.status_code} on {method} {path}: {detail}")
 
         if not r.content:
             return {}
@@ -125,16 +260,16 @@ class NsxClient:
         return self._request("POST", path, params=params, body=body)
 
 
-# ---------------------------------------------------------------- segment
+# ---------------------------------------------------------------- segment lookup
 
 def resolve_segment(client, ident):
-    """Najde segment podle ID nebo display name. Vraci kompletni objekt segmentu."""
+    """Find a segment by ID or display name. Returns the full segment object."""
     try:
         return client.get(f"{API}/infra/segments/{ident}")
     except NotFound:
         pass
 
-    # search API - najde i fixed segmenty pod /infra/tier-1s/<t1>/segments/<id>
+    # The search API also finds fixed segments under /infra/tier-1s/<t1>/segments/<id>
     query = f'resource_type:Segment AND (display_name:"{ident}" OR id:"{ident}")'
     try:
         res = client.get(f"{API}/search/query", params={"query": query, "page_size": 50})
@@ -143,12 +278,12 @@ def resolve_segment(client, ident):
 
     results = res.get("results") or []
     if not results:
-        raise NsxError(f"Segment '{ident}' nenalezen (ani jako ID, ani jako display name).")
+        raise NsxError(f"Segment '{ident}' not found (neither as an ID nor a display name).")
     if len(results) > 1:
         names = ", ".join(f"{x.get('display_name')} (id={x.get('id')})" for x in results[:10])
         raise NsxError(
-            f"Vice segmentu odpovida '{ident}': {names}\n"
-            "Zadej presne ID segmentu pomoci -s."
+            f"Multiple segments match '{ident}': {names}\n"
+            "Pass the exact segment ID with -s."
         )
 
     hit = results[0]
@@ -158,62 +293,63 @@ def resolve_segment(client, ident):
 
 def resolve_dhcp(client, segment, override_config=None, override_connectivity=None):
     """
-    Zjisti, ktery DHCP server config segment pouziva a jaky connectivity_path
-    se ma poslat do lease dotazu.
+    Work out which DHCP server config the segment uses and which connectivity_path
+    the lease query needs.
 
-    Pravidla dle NSX API:
-      - lokalni DHCP server primo na segmentu  -> connectivity_path = path segmentu
-      - DHCP server na Tier-0/Tier-1 gateway   -> connectivity_path = path gateway
+    Per the NSX API:
+      - DHCP server local to the segment  -> connectivity_path = segment path
+      - DHCP server on a Tier-0/Tier-1    -> connectivity_path = gateway path
     """
     seg_path = segment.get("path") or f"/infra/segments/{segment.get('id')}"
 
     if override_config:
-        return override_config, (override_connectivity or seg_path), "rucne zadano"
+        return override_config, (override_connectivity or seg_path), "manually specified"
 
     dhcp_cfg = segment.get("dhcp_config_path")
     if dhcp_cfg:
         if "/dhcp-relay-configs/" in dhcp_cfg:
             raise NsxError(
-                f"Segment '{segment.get('display_name')}' pouziva DHCP relay "
-                f"({dhcp_cfg}), ne DHCP server. Leasy drzi externi DHCP server, "
-                "NSX je nema a nemuze je ani smazat."
+                f"Segment '{segment.get('display_name')}' uses DHCP relay "
+                f"({dhcp_cfg}), not a DHCP server. The leases live on the external "
+                "DHCP server, so NSX can neither list nor delete them."
             )
-        return dhcp_cfg, (override_connectivity or seg_path), "lokalni DHCP na segmentu"
+        return dhcp_cfg, (override_connectivity or seg_path), "local DHCP server on the segment"
 
     conn_path = segment.get("connectivity_path")
     if not conn_path:
         raise NsxError(
-            f"Segment '{segment.get('display_name')}' nema dhcp_config_path ani "
-            "connectivity_path - neni na nem nakonfigurovany zadny DHCP server."
+            f"Segment '{segment.get('display_name')}' has neither dhcp_config_path "
+            "nor connectivity_path - no DHCP server is configured for it."
         )
 
     try:
         gw = client.get(f"{API}{conn_path}")
     except NsxError as e:
-        raise NsxError(f"Nepodarilo se nacist gateway {conn_path}: {e}")
+        raise NsxError(f"Could not read gateway {conn_path}: {e}")
 
     cfg_paths = gw.get("dhcp_config_paths") or []
     if not cfg_paths:
         raise NsxError(
-            f"Segment '{segment.get('display_name')}' nema vlastni DHCP config a "
-            f"pripojena gateway '{gw.get('display_name')}' ({conn_path}) take ne. "
-            "Na segmentu zrejme zadny NSX DHCP server nebezi."
+            f"Segment '{segment.get('display_name')}' has no DHCP config of its own, "
+            f"and the connected gateway '{gw.get('display_name')}' ({conn_path}) has "
+            "none either. There is most likely no NSX DHCP server on this segment."
         )
 
     cfg = cfg_paths[0]
     if "/dhcp-relay-configs/" in cfg:
         raise NsxError(
-            f"Gateway '{gw.get('display_name')}' pouziva DHCP relay ({cfg}), "
-            "ne DHCP server. NSX zadne leasy nedrzi."
+            f"Gateway '{gw.get('display_name')}' uses DHCP relay ({cfg}), "
+            "not a DHCP server. NSX holds no leases."
         )
-    return cfg, (override_connectivity or conn_path), f"DHCP server na gateway '{gw.get('display_name')}'"
+    return (cfg, (override_connectivity or conn_path),
+            f"DHCP server on gateway '{gw.get('display_name')}'")
 
 
-# ---------------------------------------------------------------- cteni leasu
+# ---------------------------------------------------------------- reading leases
 
 def fetch_leases(client, config_path, connectivity_path, segment_path,
                  enforcement_point=None, max_pages=200):
-    """Stahne vsechny leasy, vcetne strankovani pres cursor."""
+    """Fetch all leases, following the cursor through every page."""
     config_id = config_path.rstrip("/").split("/")[-1]
     url = f"{API}/infra/dhcp-server-configs/{config_id}/leases"
 
@@ -247,9 +383,9 @@ def fetch_leases(client, config_path, connectivity_path, segment_path,
     return leases, meta
 
 
-# ---------------------------------------------------------------- filtrovani
+# ---------------------------------------------------------------- filtering
 
-# aliasy, aby slo psat --filter ip=... misto ip_address=...
+# Aliases so you can write --filter ip=... instead of ip_address=...
 FIELD_ALIASES = {
     "ip": "ip_address",
     "address": "ip_address",
@@ -263,7 +399,7 @@ FIELD_ALIASES = {
 
 
 def _num(v):
-    """Pokusi se prevest hodnotu na cislo; vraci None, pokud to nejde."""
+    """Try to read the value as a number; return None if it is not numeric."""
     try:
         return float(str(v).strip())
     except (TypeError, ValueError):
@@ -272,24 +408,24 @@ def _num(v):
 
 def parse_match_spec(spec):
     """
-    Z textove specifikace udela predikat nad hodnotou pole.
+    Turn a textual spec into a predicate over a field value.
 
-    Podporuje:
-        86400          presna shoda (u cisel numericky, jinak textove)
-        >3600 >=3600   numericke porovnani (take <, <=, !=)
-        3600-7200      numericky rozsah (vcetne obou mezi)
-        00:50:56:*     glob (wildcard * a ?)
+    Supported forms:
+        86400          exact match (numeric when both sides are numbers, else text)
+        >3600 >=3600   numeric comparison (also <, <=, !=)
+        3600-7200      numeric range, both bounds inclusive
+        00:50:56:*     glob (wildcards * and ?)
     """
     s = str(spec).strip()
     if not s:
-        raise NsxError("Prazdna specifikace filtru.")
+        raise NsxError("Empty filter specification.")
 
     for op in (">=", "<=", "!=", ">", "<"):
         if s.startswith(op):
             rhs = s[len(op):].strip()
             rnum = _num(rhs)
             if rnum is None:
-                raise NsxError(f"Operator '{op}' vyzaduje cislo, dostal '{rhs}'.")
+                raise NsxError(f"Operator '{op}' needs a number, got '{rhs}'.")
 
             def pred(value, op=op, rnum=rnum):
                 vnum = _num(value)
@@ -302,7 +438,7 @@ def parse_match_spec(spec):
                 }[op]
             return pred
 
-    # rozsah 3600-7200 (jen kdyz jsou obe strany cisla, aby to nerozbilo MAC/datum)
+    # Range 3600-7200, only when both sides are numeric so MACs and dates survive.
     if "-" in s[1:]:
         lo_s, _, hi_s = s.partition("-")
         lo, hi = _num(lo_s), _num(hi_s)
@@ -312,13 +448,11 @@ def parse_match_spec(spec):
                 return vnum is not None and lo <= vnum <= hi
             return pred
 
-    # glob
     if any(ch in s for ch in "*?["):
         def pred(value, pat=s.lower()):
             return fnmatch.fnmatch(str(value or "").strip().lower(), pat)
         return pred
 
-    # presna shoda - numericky, pokud to jde (aby '3600' == '3600.0')
     snum = _num(s)
 
     def pred(value, s=s.lower(), snum=snum):
@@ -333,17 +467,18 @@ def parse_match_spec(spec):
 
 
 def build_filters(filter_args, lease_time_arg):
-    """Z --filter a --lease-time udela seznam dvojic (nazev_pole, predikat)."""
+    """Build a list of (field, predicate, original_spec) from --filter / --lease-time."""
     filters = []
 
     if lease_time_arg:
-        filters.append(("lease_time", parse_match_spec(lease_time_arg), lease_time_arg))
+        filters.append(("lease_time", parse_match_spec(lease_time_arg),
+                        f"lease_time={lease_time_arg}"))
 
     for raw in (filter_args or []):
         if "=" not in raw:
             raise NsxError(
-                f"Spatny format --filter '{raw}'. Ocekavam FIELD=HODNOTA, "
-                "napr. --filter lease_time=86400"
+                f"Bad --filter format '{raw}'. Expected FIELD=VALUE, "
+                "for example --filter lease_time=86400"
             )
         field, _, spec = raw.partition("=")
         field = field.strip().lower()
@@ -354,14 +489,14 @@ def build_filters(filter_args, lease_time_arg):
 
 
 def apply_filters(leases, filters):
-    """Vrati jen leasy, ktere vyhovuji VSEM filtrum (AND)."""
+    """Return only the leases matching ALL filters (AND)."""
     out = leases
     for field, pred, _raw in filters:
         out = [l for l in out if pred(l.get(field))]
     return out
 
 
-# ---------------------------------------------------------------- mazani leasu
+# ---------------------------------------------------------------- deleting leases
 
 def _norm_mac(v):
     if not v:
@@ -381,21 +516,22 @@ def _looks_like_mac(v):
 
 def parse_delete_spec(spec):
     """
-    Rozparsuje jeden --delete argument na dvojici (ip, mac); chybejici cast je None.
-    Prijima:  '10.20.30.5'
+    Parse one --delete argument into an (ip, mac) pair; a missing half is None.
+
+    Accepts:  '10.20.30.5'
               '00:50:56:ae:6b:01'
-              '10.20.30.5/00:50:56:ae:6b:01'   (take ',' nebo '|' jako oddelovac)
+              '10.20.30.5/00:50:56:ae:6b:01'   (',' and '|' work as separators too)
     """
     s = str(spec).strip()
     if not s:
-        raise NsxError("Prazdny --delete argument.")
+        raise NsxError("Empty --delete argument.")
 
     for sep in ("/", ",", "|"):
         if sep in s:
             a, b = s.split(sep, 1)
             a, b = a.strip(), b.strip()
             if _looks_like_mac(a) and not _looks_like_mac(b):
-                a, b = b, a  # uzivatel to zadal obracene
+                a, b = b, a  # the user wrote them the other way round
             return (_norm_ip(a) or None), (_norm_mac(b) or None)
 
     if _looks_like_mac(s):
@@ -405,8 +541,8 @@ def parse_delete_spec(spec):
 
 def select_leases_for_delete(leases, specs):
     """
-    Vybere z nactenych leasu ty, ktere odpovidaji zadanym --delete specifikacim.
-    Vraci (vybrane_leasy, nenalezene_specifikace).
+    Pick the leases matching the given --delete specs.
+    Returns (selected_leases, unmatched_specs).
     """
     chosen, seen, missing = [], set(), []
 
@@ -431,10 +567,10 @@ def select_leases_for_delete(leases, specs):
 
 def delete_leases(client, segment_path, leases, enforcement_point=None):
     """
-    Smaze zadane leasy. NSX vyzaduje presnou dvojici ip + mac.
-    POST na cestu segmentu funguje pro /infra/segments/<id> i pro
+    Delete the given leases. NSX needs an exact ip + mac pair for each one.
+    POSTing to the segment path covers both /infra/segments/<id> and
     /infra/tier-1s/<t1>/segments/<id>.
-    Vraci (pocet_odeslanych, seznam_preskocenych).
+    Returns (number_sent, skipped_leases).
     """
     entries, skipped = [], []
     for l in leases:
@@ -461,11 +597,17 @@ def delete_leases(client, segment_path, leases, enforcement_point=None):
     return sent, skipped
 
 
-# ---------------------------------------------------------------- vystup
+# ---------------------------------------------------------------- output
 
-def print_table(leases):
+def print_table(leases, c, highlight=False):
+    """
+    Print leases as an aligned ASCII table.
+
+    Plain ASCII on purpose: box-drawing characters break on legacy Windows
+    code pages. highlight=True colors the rows as deletion targets.
+    """
     cols = [
-        ("ip_address", "IP ADRESA"),
+        ("ip_address", "IP ADDRESS"),
         ("mac_address", "MAC"),
         ("hostname", "HOSTNAME"),
         ("subnet", "SUBNET"),
@@ -473,18 +615,20 @@ def print_table(leases):
         ("start_time", "START"),
         ("expire_time", "EXPIRE"),
     ]
-    # vyhodime sloupce, ktere jsou vsude prazdne (napr. hostname NSX casto nevraci)
-    cols = [c for c in cols if any(str(l.get(c[0], "")).strip() for l in leases)]
+    # Drop columns that are empty everywhere (NSX often omits hostname).
+    cols = [c_ for c_ in cols if any(str(l.get(c_[0], "")).strip() for l in leases)]
 
     widths = []
     for key, head in cols:
         widths.append(max([len(head)] + [len(str(l.get(key, "") or "-")) for l in leases]))
 
-    print("  ".join(h.ljust(w) for (_, h), w in zip(cols, widths)))
-    print("  ".join("-" * w for w in widths))
+    print(c("head", "  ".join(h.ljust(w) for (_, h), w in zip(cols, widths))))
+    print(c("dim", "  ".join("-" * w for w in widths)))
     for l in sorted(leases, key=lambda x: _ip_key(x.get("ip_address", ""))):
-        row = "  ".join(str(l.get(key, "") or "-").ljust(w) for (key, _), w in zip(cols, widths))
-        print(row.rstrip())
+        row = "  ".join(
+            str(l.get(key, "") or "-").ljust(w) for (key, _), w in zip(cols, widths)
+        ).rstrip()
+        print(c("danger", row) if highlight else row)
 
 
 def _ip_key(ip):
@@ -494,73 +638,82 @@ def _ip_key(ip):
         return (999, 999, 999, 999)
 
 
-def confirm(prompt):
+def warn(c, msg):
+    print(c("warn", f"WARNING: {msg}"), file=sys.stderr)
+
+
+def confirm(c, prompt):
     if not sys.stdin.isatty():
         raise NsxError(
-            "Potvrzeni neni mozne (stdin neni terminal). "
-            "Pro neinteraktivni beh pridej --yes."
+            "Cannot ask for confirmation (stdin is not a terminal). "
+            "Add --yes for non-interactive runs."
         )
     try:
-        ans = input(f"{prompt} [ano/NE]: ").strip().lower()
+        answer = input(c("warn", f"{prompt} [yes/NO]: ")).strip().lower()
     except (EOFError, KeyboardInterrupt):
+        print()
         return False
-    return ans in ("ano", "a", "yes", "y")
+    return answer in ("yes", "y")
 
 
 # ---------------------------------------------------------------- main
 
-def main():
+def build_parser():
     ap = argparse.ArgumentParser(
-        description="Vypise (a volitelne smaze) DHCP leasy konkretniho segmentu v NSX 4.x.",
+        description="List and optionally delete DHCP leases on an NSX 4.x segment.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Mazani: --delete lze opakovat; prijima IP, MAC, nebo 'IP/MAC'.",
+        epilog="--delete is repeatable and accepts an IP, a MAC, or 'IP/MAC'.",
     )
     ap.add_argument("-m", "--manager", required=True,
-                    help="FQDN nebo IP NSX Manageru (nebo VIP)")
+                    help="NSX Manager FQDN or IP (or the cluster VIP)")
     ap.add_argument("-u", "--user", default=os.environ.get("NSX_USER", "admin"),
-                    help="uzivatel (default: admin nebo $NSX_USER)")
+                    help="username (default: admin, or $NSX_USER)")
     ap.add_argument("-p", "--password", default=os.environ.get("NSX_PASSWORD"),
-                    help="heslo (lepe pres $NSX_PASSWORD; jinak se zepta)")
+                    help="password (prefer $NSX_PASSWORD; prompted for otherwise)")
     ap.add_argument("-s", "--segment", required=True,
-                    help="ID nebo display name segmentu")
+                    help="segment ID or display name")
 
     g = ap.add_mutually_exclusive_group()
     g.add_argument("--delete", action="append", metavar="IP|MAC|IP/MAC",
-                   help="smaze konkretni lease; lze zadat vicekrat")
+                   help="delete a specific lease; may be given several times")
     g.add_argument("--delete-all", action="store_true",
-                   help="smaze VSECHNY leasy na danem segmentu")
+                   help="delete EVERY lease on the segment (narrowed by filters)")
 
     ap.add_argument("--lease-time", metavar="SPEC",
-                    help="filtr na lease time: '86400', '>3600', '<=600', '3600-7200'")
+                    help="filter on lease time: '86400', '>3600', '<=600', '3600-7200'")
     ap.add_argument("--filter", action="append", metavar="FIELD=SPEC",
-                    help="obecny filtr na pole lease (ip, mac, lease_time, subnet, "
-                         "hostname, start_time, expire_time); podporuje >, <, >=, <=, "
-                         "!=, rozsah a wildcard *; lze zadat vicekrat (AND)")
+                    help="generic filter on a lease field (ip, mac, lease_time, subnet, "
+                         "hostname, start_time, expire_time); supports >, <, >=, <=, !=, "
+                         "ranges and * wildcards; repeatable (AND)")
 
     ap.add_argument("--yes", "-y", action="store_true",
-                    help="nepotvrzovat mazani (pro skripty/cron)")
+                    help="skip the deletion prompt (for scripts and scheduled jobs)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="jen ukaze, co by se smazalo; nic nemaze")
+                    help="show what would be deleted and delete nothing")
 
     ap.add_argument("--dhcp-config-path",
-                    help="rucne zadana cesta k DHCP server configu "
-                         "(/infra/dhcp-server-configs/xxx), obchazi autodetekci")
+                    help="explicit DHCP server config path "
+                         "(/infra/dhcp-server-configs/xxx), bypasses autodetection")
     ap.add_argument("--connectivity-path",
-                    help="rucne zadana connectivity_path (tier-0/tier-1/segment)")
+                    help="explicit connectivity_path (tier-0/tier-1/segment)")
     ap.add_argument("--enforcement-point",
-                    help="enforcement_point_path, napr. "
+                    help="enforcement_point_path, e.g. "
                          "/infra/sites/default/enforcement-points/default")
     ap.add_argument("--json", action="store_true",
-                    help="vystup jako JSON misto tabulky")
+                    help="emit JSON instead of a table")
+    ap.add_argument("--color", choices=("auto", "always", "never"), default="auto",
+                    help="colored output (default: auto - only on a terminal)")
     ap.add_argument("--insecure", action="store_true",
-                    help="nekontrolovat TLS certifikat (jen lab)")
-    ap.add_argument("--ca-bundle", help="cesta k CA certifikatu pro overeni TLS")
-    ap.add_argument("--timeout", type=int, default=60, help="timeout HTTP (s)")
-    args = ap.parse_args()
+                    help="skip TLS certificate verification (lab use only)")
+    ap.add_argument("--ca-bundle", help="path to the CA certificate used for TLS verification")
+    ap.add_argument("--timeout", type=int, default=60, help="HTTP timeout in seconds")
+    return ap
 
+
+def run(args, c):
     deleting = bool(args.delete or args.delete_all)
 
-    password = args.password or getpass.getpass(f"Heslo pro {args.user}@{args.manager}: ")
+    password = args.password or getpass.getpass(f"Password for {args.user}@{args.manager}: ")
 
     verify = args.ca_bundle if args.ca_bundle else True
     if args.insecure:
@@ -571,143 +724,154 @@ def main():
         except ImportError:
             pass
 
-    client = NsxClient(args.manager, args.user, password, verify=verify, timeout=args.timeout)
+    client = NsxClient(args.manager, args.user, password,
+                       verify=verify, timeout=args.timeout)
 
-    result = {}
-    try:
-        segment = resolve_segment(client, args.segment)
-        seg_path = segment.get("path") or f"/infra/segments/{segment.get('id')}"
+    segment = resolve_segment(client, args.segment)
+    seg_path = segment.get("path") or f"/infra/segments/{segment.get('id')}"
+    seg_name = segment.get("display_name")
 
-        cfg_path, conn_path, kind = resolve_dhcp(
-            client, segment,
-            override_config=args.dhcp_config_path,
-            override_connectivity=args.connectivity_path,
-        )
+    cfg_path, conn_path, kind = resolve_dhcp(
+        client, segment,
+        override_config=args.dhcp_config_path,
+        override_connectivity=args.connectivity_path,
+    )
 
-        all_leases, meta = fetch_leases(
-            client, cfg_path, conn_path, seg_path,
-            enforcement_point=args.enforcement_point,
-        )
+    all_leases, meta = fetch_leases(
+        client, cfg_path, conn_path, seg_path,
+        enforcement_point=args.enforcement_point,
+    )
 
-        filters = build_filters(args.filter, args.lease_time)
-        leases = apply_filters(all_leases, filters)
-        filter_desc = ", ".join(raw for _f, _p, raw in filters)
+    filters = build_filters(args.filter, args.lease_time)
+    leases = apply_filters(all_leases, filters)
+    filter_desc = ", ".join(raw for _f, _p, raw in filters)
 
-        # ------------------------------------------------ rezim vypisu
-        if not deleting:
-            if args.json:
-                print(json.dumps({
-                    "segment": {"id": segment.get("id"),
-                                "display_name": segment.get("display_name"),
-                                "path": seg_path},
-                    "dhcp_config_path": cfg_path,
-                    "connectivity_path": conn_path,
-                    "dhcp_server_id": meta.get("dhcp_server_id"),
-                    "timestamp": meta.get("timestamp"),
-                    "filters": filter_desc or None,
-                    "total_on_segment": len(all_leases),
-                    "lease_count": len(leases),
-                    "leases": leases,
-                }, indent=2, ensure_ascii=False))
-                return 0
+    # ---------------------------------------------------------- list mode
+    if not deleting:
+        if args.json:
+            print(json.dumps({
+                "segment": {"id": segment.get("id"), "display_name": seg_name,
+                            "path": seg_path},
+                "dhcp_config_path": cfg_path,
+                "connectivity_path": conn_path,
+                "dhcp_server_id": meta.get("dhcp_server_id"),
+                "timestamp": meta.get("timestamp"),
+                "filters": filter_desc or None,
+                "total_on_segment": len(all_leases),
+                "lease_count": len(leases),
+                "leases": leases,
+            }, indent=2, ensure_ascii=False))
+            return EXIT_OK
 
-            print(f"Segment:     {segment.get('display_name')} (id={segment.get('id')})")
-            print(f"DHCP:        {kind}")
-            print(f"  config:    {cfg_path}")
-            print(f"  conn path: {conn_path}")
-            if meta.get("dhcp_server_id"):
-                print(f"  server id: {meta['dhcp_server_id']}")
-            if filters:
-                print(f"Filtr:       {filter_desc}")
-                print(f"Pocet leasu: {len(leases)} (z {len(all_leases)} na segmentu)\n")
-            else:
-                print(f"Pocet leasu: {len(leases)}\n")
-            if not leases:
-                print("Zadne leasy neodpovidaji filtru." if filters
-                      else "Zadne aktivni leasy na tomto segmentu.")
-                return 0
-            print_table(leases)
-            return 0
-
-        # ------------------------------------------------ rezim mazani
-        if not leases:
-            msg = ("Zadne leasy neodpovidaji filtru, neni co mazat." if filters
-                   else "Na segmentu nejsou zadne leasy, neni co mazat.")
-            print(msg) if not args.json else print(json.dumps(
-                {"deleted": 0, "message": msg}, indent=2, ensure_ascii=False))
-            return 0
-
-        if args.delete_all:
-            targets, missing = list(leases), []
+        print(f"{c('bold', 'Segment:')}     {seg_name} (id={segment.get('id')})")
+        print(f"{c('bold', 'DHCP:')}        {kind}")
+        print(c("dim", f"  config:    {cfg_path}"))
+        print(c("dim", f"  conn path: {conn_path}"))
+        if meta.get("dhcp_server_id"):
+            print(c("dim", f"  server id: {meta['dhcp_server_id']}"))
+        if filters:
+            print(f"{c('bold', 'Filter:')}      {filter_desc}")
+            print(f"{c('bold', 'Leases:')}      {len(leases)} "
+                  f"(of {len(all_leases)} on the segment)\n")
         else:
-            targets, missing = select_leases_for_delete(leases, args.delete)
+            print(f"{c('bold', 'Leases:')}      {len(leases)}\n")
 
-        if missing:
-            for spec in missing:
-                print(f"VAROVANI: '{spec}' neodpovida zadnemu aktivnimu lease na segmentu.",
-                      file=sys.stderr)
+        if not leases:
+            print(c("warn", "No leases match the filter." if filters
+                            else "No active leases on this segment."))
+            return EXIT_OK
+        print_table(leases, c)
+        return EXIT_OK
 
-        if not targets:
-            print("Nic k smazani - zadna specifikace neodpovidala aktivnimu lease.",
-                  file=sys.stderr)
-            return 1
+    # ---------------------------------------------------------- delete mode
+    if not leases:
+        msg = ("No leases match the filter, nothing to delete." if filters
+               else "There are no leases on this segment, nothing to delete.")
+        if args.json:
+            print(json.dumps({"deleted": 0, "message": msg}, indent=2, ensure_ascii=False))
+        else:
+            print(c("warn", msg))
+        return EXIT_OK
 
-        if not args.json:
-            print(f"Segment: {segment.get('display_name')} (id={segment.get('id')})")
-            if filters:
-                print(f"Filtr:   {filter_desc}")
-            print(f"K smazani: {len(targets)} z {len(all_leases)} leasu na segmentu\n")
-            print_table(targets)
-            print()
+    if args.delete_all:
+        targets, missing = list(leases), []
+    else:
+        targets, missing = select_leases_for_delete(leases, args.delete)
 
-        if args.dry_run:
-            if args.json:
-                print(json.dumps({"dry_run": True, "would_delete": len(targets),
-                                  "leases": targets}, indent=2, ensure_ascii=False))
-            else:
-                print("DRY-RUN: nic nebylo smazano.")
-            return 0
+    for spec in missing:
+        warn(c, f"'{spec}' does not match any active lease on this segment.")
 
-        if not args.yes:
-            if args.delete_all and not filters:
-                what = f"VSECHNY leasy ({len(targets)})"
-            else:
-                what = f"{len(targets)} leasu"
-            if not confirm(f"Opravdu smazat {what} na segmentu "
-                           f"'{segment.get('display_name')}'?"):
-                print("Zruseno, nic se nesmazalo.")
-                return 0
+    if not targets:
+        print(c("err", "Nothing to delete - no selection matched an active lease."),
+              file=sys.stderr)
+        return EXIT_NO_MATCH
 
-        sent, skipped = delete_leases(client, seg_path, targets,
-                                      enforcement_point=args.enforcement_point)
+    if not args.json:
+        print(f"{c('bold', 'Segment:')}   {seg_name} (id={segment.get('id')})")
+        if filters:
+            print(f"{c('bold', 'Filter:')}    {filter_desc}")
+        print(f"{c('bold', 'To delete:')} "
+              f"{c('danger', str(len(targets)))} of {len(all_leases)} leases "
+              f"on the segment\n")
+        print_table(targets, c, highlight=True)
+        print()
 
-        for l in skipped:
-            print(f"VAROVANI: preskocen lease bez IP nebo MAC: {l}", file=sys.stderr)
+    if args.dry_run:
+        if args.json:
+            print(json.dumps({"dry_run": True, "would_delete": len(targets),
+                              "leases": targets}, indent=2, ensure_ascii=False))
+        else:
+            print(c("ok", "DRY RUN: nothing was deleted."))
+        return EXIT_OK
 
-        # overeni - znovu nacteme leasy
-        remaining, _ = fetch_leases(client, cfg_path, conn_path, seg_path,
-                                    enforcement_point=args.enforcement_point)
-        result = {
-            "segment": segment.get("display_name"),
-            "filters": filter_desc or None,
-            "requested": len(targets),
-            "sent": sent,
-            "skipped": len(skipped),
-            "remaining_on_segment": len(remaining),
-        }
+    if not args.yes:
+        what = (f"ALL {len(targets)} leases" if args.delete_all and not filters
+                else f"{len(targets)} lease(s)")
+        if not confirm(c, f"Really delete {what} on segment '{seg_name}'?"):
+            print(c("ok", "Cancelled, nothing was deleted."))
+            return EXIT_OK
 
-    except NsxError as e:
-        print(f"CHYBA: {e}", file=sys.stderr)
-        return 2
+    sent, skipped = delete_leases(client, seg_path, targets,
+                                  enforcement_point=args.enforcement_point)
+
+    for l in skipped:
+        warn(c, f"skipped a lease with no IP or MAC: {l}")
+
+    # Verify by re-reading the leases.
+    remaining, _ = fetch_leases(client, cfg_path, conn_path, seg_path,
+                                enforcement_point=args.enforcement_point)
+
+    result = {
+        "segment": seg_name,
+        "filters": filter_desc or None,
+        "requested": len(targets),
+        "sent": sent,
+        "skipped": len(skipped),
+        "remaining_on_segment": len(remaining),
+    }
 
     if args.json:
         print(json.dumps(result, indent=2, ensure_ascii=False))
     else:
-        print(f"Smazano: {result['sent']} leasu.")
-        print(f"Na segmentu zbyva: {result['remaining_on_segment']} leasu.")
-        print("\nPozn.: smazani lease neodebere IP uz bezicimu klientovi - "
-              "ten ji pouziva do dalsiho DHCP renew/reboot.")
-    return 0
+        print(c("ok", f"Deleted {sent} lease(s)."))
+        print(f"Remaining on the segment: {len(remaining)}")
+        print(c("dim", "\nNote: deleting a lease does not take the IP away from a "
+                       "running client - it keeps using it until the next DHCP "
+                       "renew or reboot."))
+    return EXIT_OK
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    c = setup_console(args.color)
+    try:
+        return run(args, c)
+    except NsxError as e:
+        print(c("err", f"ERROR: {e}"), file=sys.stderr)
+        return EXIT_ERROR
+    except KeyboardInterrupt:
+        print(c("warn", "\nInterrupted."), file=sys.stderr)
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":
