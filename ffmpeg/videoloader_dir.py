@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.23.0"
+SCRIPT_VERSION = "3.24.0"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -314,6 +314,7 @@ _NEVER_REMOTE_KEYS = {
     'SUBS_ONLY': "per-run (--subs-only)", 'MUSE_PASSWORD': "per-run (--password)",
     'CENC_KEYS': "per-run (--key/--keys)", 'FORCE_CONTAINER': "per-run (--container)",
     'POST_SOURCE': "per-run (--only)",
+    'PICK_TYPES': "per-run (--types)",
     # Derived automatically from USER_AGENT / YT_IOS_UA / VIMEO_REFERER after a config load.
     'STREAMABLE_HEADERS': "derived from USER_AGENT", 'TWITCH_HEADERS': "derived from USER_AGENT",
     'YOUTUBE_HEADERS': "derived from YT_IOS_UA", 'VIMEO_HEADERS': "derived from VIMEO_REFERER",
@@ -2260,6 +2261,125 @@ def _dropbox_probe(url: str, session: requests.Session, extra_headers: dict = No
     return size, name, working
 
 
+PICK_TYPES = None                 # --types: None = off (take every video type, the default);
+#                                   'ASK' = offer the types found as a checklist; or a list of
+#                                   type keys like ['streamable'] to keep without asking.
+
+# User-facing video "types" a Patreon post can link/embed, keyed by what --types accepts.
+_POST_TYPE_LABELS = {
+    'streamable': 'Streamable', 'youtube': 'YouTube', 'vimeo': 'Vimeo',
+    'mux': 'Patreon video (Mux)', 'wistia': 'Wistia', 'drive': 'Google Drive',
+    'dropbox': 'Dropbox', 'vidyard': 'Vidyard', 'muse': 'muse.ai', 'twitch': 'Twitch',
+}
+# Extra spellings accepted on the command line.
+_POST_TYPE_ALIASES = {
+    'yt': 'youtube', 'gdrive': 'drive', 'google': 'drive', 'googledrive': 'drive',
+    'muse.ai': 'muse', 'patreon': 'mux', 'streamable.com': 'streamable',
+    'vimeo.com': 'vimeo', 'youtube.com': 'youtube',
+}
+
+
+def _post_item_type(kind, item):
+    """The user-facing type key of one gathered post item (see _POST_TYPE_LABELS)."""
+    if kind in ('native', 'youtube'):
+        src = (item or {}).get('source') or ''
+        return src if src else 'native'
+    return kind
+
+
+def _parse_types_arg(value):
+    """--types value -> None (feature off), 'ASK' (prompt), or a list of type keys. Unknown
+    names are reported and dropped; 'native' expands to every Patreon-native player."""
+    if value is None:
+        return None
+    v = str(value).strip()
+    if not v or v.upper() == 'ASK':
+        return 'ASK'
+    out = []
+    for raw in re.split(r'[,\s]+', v.lower()):
+        if not raw:
+            continue
+        if raw == 'all':
+            return None
+        if raw == 'native':
+            out += ['mux', 'vimeo', 'wistia']
+            continue
+        key = _POST_TYPE_ALIASES.get(raw, raw)
+        if key not in _POST_TYPE_LABELS:
+            print(f"{CLR.YELLOW}[WARN]{CLR.RESET} --types: unknown type '{raw}' ignored. "
+                  f"Known: {', '.join(sorted(_POST_TYPE_LABELS))}, native, all.")
+            continue
+        if key not in out:
+            out.append(key)
+    return out or 'ASK'
+
+
+def _filter_post_groups_by_type(post_groups, folder_targets, pick):
+    """Apply --types to the gathered post items BEFORE naming/downloading.
+
+    Returns (post_groups, folder_targets, posts_with_media), or None when the user cancelled
+    or chose nothing. With 'ASK' and more than one type found, a checklist is shown (counts per
+    type); with a single type there is nothing to choose and everything is kept."""
+    counts, posts_per = {}, {}
+    for g in post_groups:
+        kinds_here = set()
+        for _o, item, kind in g['items']:
+            t = _post_item_type(kind, item)
+            counts[t] = counts.get(t, 0) + 1
+            kinds_here.add(t)
+        for t in kinds_here:
+            posts_per[t] = posts_per.get(t, 0) + 1
+    if folder_targets:
+        counts['drive'] = counts.get('drive', 0) + len(folder_targets)
+        posts_per['drive'] = posts_per.get('drive', 0) + len({t for _f, t in folder_targets})
+    found = sorted(counts, key=lambda t: (-counts[t], t))
+    if not found:
+        return post_groups, folder_targets, len(post_groups)
+
+    def _lab(t):
+        return (f"{_POST_TYPE_LABELS.get(t, t):<20} {counts[t]:>3} video(s) in "
+                f"{posts_per.get(t, 0)} post(s)")
+    print("[INFO] --types: video types found: "
+          + ", ".join(f"{_POST_TYPE_LABELS.get(t, t)} ({counts[t]})" for t in found) + ".")
+
+    if pick == 'ASK':
+        if len(found) == 1:
+            print(f"[INFO] --types: only {_POST_TYPE_LABELS.get(found[0], found[0])} found — "
+                  f"nothing to choose, taking it.")
+            return post_groups, folder_targets, len(post_groups)
+        if not getattr(sys.stdin, 'isatty', lambda: False)():
+            print(f"{CLR.RED}[ERROR]{CLR.RESET} --types needs an interactive console to ask. "
+                  f"Name the types instead, e.g.  --types {found[0]}")
+            return None
+        idxs = tui_select_many(f"Which video types to download? — {len(found)} found",
+                               [_lab(t) for t in found], preselected=[],
+                               header=[f"{CLR.CYAN}Space = toggle, Enter = confirm. Only the "
+                                       f"checked types are downloaded.{CLR.RESET}"])
+        if not idxs:
+            print("[INFO] --types: nothing selected — nothing will be downloaded.")
+            return None
+        keep = {found[i] for i in idxs}
+    else:
+        keep = set(pick)
+        missing = [t for t in pick if t not in counts]
+        if missing:
+            print("[INFO] --types: not present here: "
+                  + ", ".join(_POST_TYPE_LABELS.get(t, t) for t in missing) + ".")
+        if not keep & set(counts):
+            print("[INFO] --types: none of the requested types were found — nothing to download.")
+            return None
+
+    print("[INFO] --types: downloading only "
+          + ", ".join(_POST_TYPE_LABELS.get(t, t) for t in found if t in keep) + ".")
+    new_groups = []
+    for g in post_groups:
+        items = [it for it in g['items'] if _post_item_type(it[2], it[1]) in keep]
+        if items:
+            new_groups.append(dict(g, items=items))
+    new_folders = folder_targets if 'drive' in keep else []
+    return new_groups, new_folders, len(new_groups)
+
+
 def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers, recursive,
                          verbose, select, out_dir, max_connections, max_height, list_only):
     """Given a list of Patreon post objects, gather every Drive/Dropbox link and native
@@ -2374,6 +2494,14 @@ def _download_from_posts(posts, session, chunk_size, num_threads, folder_workers
         if group['items']:
             post_groups.append(group)
             posts_with_media += 1
+
+    # --types: keep only the chosen video types. Runs BEFORE naming, so a post left with one
+    # video keeps its plain title. Without --types this is skipped entirely (unchanged default).
+    if PICK_TYPES is not None:
+        _picked = _filter_post_groups_by_type(post_groups, folder_targets, PICK_TYPES)
+        if _picked is None:
+            return
+        post_groups, folder_targets, posts_with_media = _picked
 
     # Name alternate versions apart. A post that yielded more than one video gets its LINKED
     # videos marked "... full" (they are the full-length copies alongside a shorter embed); when
@@ -14902,6 +15030,7 @@ if __name__ == "__main__":
     parser.add_argument("--keys", default=None, metavar='FILE', help="Read decryption keys (one KID:KEY per line) from a file, same purpose as --key.")
     parser.add_argument("--container", choices=['auto', 'mp4', 'mkv'], default='auto', help="Force the final container: 'mp4' or 'mkv'. Default 'auto' = .mkv when there are multiple audio tracks or subtitles (names/languages show reliably), otherwise .mp4.")
     parser.add_argument("--only", choices=['all', 'embed', 'link'], default='all', help="For Patreon posts that hold more than one video: which to download. 'embed' = only the embedded player, 'link' = only videos linked in the post body (Drive/YouTube/Vimeo/Dropbox/...), 'all' (default) = both. When a post yields several, each file is named by origin (\"... embed\" / \"... link\") so you can tell the versions apart.")
+    parser.add_argument("--types", "--pick-types", dest="types", nargs="?", const="ASK", default=None, metavar="LIST", help="For a Patreon post, collection, tag page or search: choose which video TYPES to download when the posts link several (e.g. Streamable copies AND YouTube copies of the same episodes). Without a value, every type actually found is detected and offered as a checklist with counts; with a value it filters directly, no question asked (good for --url-list): --types streamable  or  --types streamable,vimeo. Types: streamable, youtube, vimeo, mux (Patreon's own video), wistia, drive, dropbox, vidyard, muse, twitch, 'native' (= mux+vimeo+wistia), 'all'. Without --types nothing changes: every video found is downloaded.")
     parser.add_argument("--no-recursive", action="store_true", help="Do not descend into subfolders when given a folder.")
     parser.add_argument("--no-auto-cookies", action="store_true", help="Do not auto-use a *.json cookie file found next to the script / in the current directory.")
     parser.add_argument("--insecure", "--no-check-certificate", "--no-check-certificates", dest="insecure", action="store_true", help="Never verify TLS certificates, on any connection (config, page scans, manifests, every download). Expired, self-signed or wrong-hostname certificates all work. Prints a warning once. Set INSECURE_TLS = True at the top of the script to make it permanent.")
@@ -14920,6 +15049,13 @@ if __name__ == "__main__":
     parser.add_argument("--version", action="version", version=f"%(prog)s {SCRIPT_VERSION}")
 
     args = parser.parse_args()
+    # `--types` takes an OPTIONAL value, so "--types https://…" would swallow the URL as the type
+    # list. A value that is clearly an address (or a file) is the target, not types: hand it back.
+    if args.types and ('://' in args.types or 'patreon.com' in args.types.lower()
+                       or os.path.exists(args.types)):
+        if not args.video_id:
+            args.video_id = args.types
+        args.types = 'ASK'
 
     print(f"[INFO] videoloader_dir v{SCRIPT_VERSION}")
 
@@ -15017,6 +15153,7 @@ if __name__ == "__main__":
     CENC_KEYS = _parse_cenc_keys(args.key, args.keys)
     FORCE_CONTAINER = args.container if args.container in ('mp4', 'mkv') else None
     POST_SOURCE = args.only
+    PICK_TYPES = _parse_types_arg(args.types)
     SUBS_ONLY = args.subs_only
     MUSE_PASSWORD = args.password
 
