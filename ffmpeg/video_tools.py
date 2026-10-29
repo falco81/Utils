@@ -8396,7 +8396,30 @@ def _ocr_parse_sup(path):
         return []
     i = 0; n = len(data)
     palettes = {}; objects = {}
-    events = []; comp = None
+    out = []; comp = None
+
+    def _lut_for(palid):
+        pal = palettes.get(palid) or (next(iter(palettes.values())) if palettes else {})
+        lut = np.zeros((256, 4), dtype=np.uint8)
+        for e, (Y, Cr, Cb, A) in pal.items():
+            R = Y + 1.402 * (Cr - 128)
+            G = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
+            B = Y + 1.772 * (Cb - 128)
+            lut[e] = [np.clip(R, 0, 255), np.clip(G, 0, 255), np.clip(B, 0, 255), A]
+        return lut
+
+    def _render(objs, palid):
+        """Decode the composition's object(s) to one RGBA bitmap NOW, while `objects` still holds the
+        current object (PGS reuses object ids across cues, so this must not be deferred)."""
+        oid = objs[0][0]
+        if oid not in objects:
+            return None
+        w, h, rle = objects[oid]
+        if w <= 0 or h <= 0 or w > 4096 or h > 2400:
+            return None
+        idx = _ocr_decode_rle_pgs(bytes(rle), w, h)
+        return _lut_for(palid)[idx]
+
     while i + 13 <= n:
         if data[i:i + 2] != b'PG':
             i += 1; continue
@@ -8418,9 +8441,10 @@ def _ocr_parse_sup(path):
                     y = struct.unpack('>H', pl[p + 6:p + 8])[0]
                     objs.append((oid, x, y)); p += 8
                 palid = pl[9] if len(pl) > 9 else 0
-                if numobj == 0:                              # empty = clear screen
-                    if events and events[-1]["end"] is None:
-                        events[-1]["end"] = t
+                if numobj == 0:                              # empty = clear screen (close last cue)
+                    if out and out[-1]["end"] is None:
+                        out[-1]["end"] = t
+                    comp = None
                 else:
                     comp = {"t": t, "objs": objs, "palid": palid}
             elif typ == 0x14:                                # PDS (palette)
@@ -8435,34 +8459,22 @@ def _ocr_parse_sup(path):
                     w = struct.unpack('>H', pl[7:9])[0]
                     h = struct.unpack('>H', pl[9:11])[0]
                     objects[oid] = [w, h, bytearray(pl[11:])]
-                elif oid in objects:                         # continuation
+                elif oid in objects:                         # continuation fragment
                     objects[oid][2] += pl[4:]
-            elif typ == 0x80:                                # END of display set
+            elif typ == 0x80:                                # END of display set -> render NOW
                 if comp and comp["objs"]:
-                    events.append({"start": comp["t"], "end": None,
-                                   "objs": comp["objs"], "palid": comp["palid"]})
+                    rgba = _render(comp["objs"], comp["palid"])
+                    if rgba is not None:
+                        if out and out[-1]["end"] is None:   # previous cue had no explicit clear
+                            out[-1]["end"] = comp["t"]
+                        out.append({"start": comp["t"], "end": None, "rgba": rgba})
                     comp = None
+                    objects.clear()                          # ids are reused per cue - don't leak bitmaps
         except Exception:
             continue
-    out = []
-    for ev in events:
+    for ev in out:
         if ev["end"] is None:
             ev["end"] = ev["start"] + 4.0
-        oid = ev["objs"][0][0]
-        if oid not in objects:
-            continue
-        w, h, rle = objects[oid]
-        if w <= 0 or h <= 0 or w > 4096 or h > 2160:
-            continue
-        idx = _ocr_decode_rle_pgs(bytes(rle), w, h)
-        pal = palettes.get(ev["palid"]) or (next(iter(palettes.values())) if palettes else {})
-        lut = np.zeros((256, 4), dtype=np.uint8)
-        for e, (Y, Cr, Cb, A) in pal.items():
-            R = Y + 1.402 * (Cr - 128)
-            G = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
-            B = Y + 1.772 * (Cb - 128)
-            lut[e] = [np.clip(R, 0, 255), np.clip(G, 0, 255), np.clip(B, 0, 255), A]
-        out.append({"start": ev["start"], "end": ev["end"], "rgba": lut[idx]})
     return out
 
 
