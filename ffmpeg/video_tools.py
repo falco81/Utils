@@ -220,6 +220,15 @@ FFMPEG_DOWNLOAD_URL = FFMPEG_DOWNLOAD_URLS[0]   # backwards compatibility
 MKVTOOLNIX_DOWNLOAD_URL = "https://nas.falco81.net/mkvtoolnix.7z"
 MKVTOOLNIX_DOWNLOAD_PAGE = "https://mkvtoolnix.download/downloads.html"
 
+# Tesseract OCR (Windows): a portable build the app can fetch on demand (first the local NAS,
+# then a public portable zip), unpacked into a cache folder next to the script. Language data
+# (.traineddata) for a given subtitle language is fetched from tessdata_fast when missing.
+TESSERACT_DOWNLOAD_URLS = [
+    "http://nas.falco81.net/tesseract-portable.zip",                        # default (local NAS)
+    "https://github.com/mikhailgarber/tesseract-portable/releases/latest",  # fallback (parsed for a win .tar.gz)
+]
+TESSDATA_URL = "https://raw.githubusercontent.com/tesseract-ocr/tessdata_fast/main/{lang}.traineddata"
+
 # User-Agent used for all HTTP downloads.
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
@@ -891,6 +900,155 @@ def ensure_mkvtoolnix(target_dir, allow_download):
         _linux_install_hint("mkvtoolnix")
 
     return mm, me
+
+
+_TESS_PROG_DIRS = [
+    r"C:\Program Files\Tesseract-OCR",
+    r"C:\Program Files\Tesseract",
+    r"C:\Program Files (x86)\Tesseract-OCR",
+    r"C:\Program Files (x86)\Tesseract",
+    r"C:\Tesseract-OCR",
+    r"C:\Tesseract",
+    os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR"),
+    os.path.expandvars(r"%LOCALAPPDATA%\Tesseract-OCR"),
+    os.path.expandvars(r"%ProgramFiles%\Tesseract-OCR"),
+    os.path.expandvars(r"%ProgramFiles%\Tesseract"),
+]
+
+
+def ensure_tesseract(target_dir=None, allow_download=True):
+    """Find the Tesseract OCR binary; download a portable build on demand (Windows only, last resort).
+    Mirrors ensure_mkvtoolnix: PATH/override -> typical install dirs -> cache -> download. Returns the
+    tesseract path or None. On Linux it only prints an install hint (no portable binary to fetch)."""
+    cache = _cache_dir(".tesseract")
+    p = find_tool(["tesseract", "tesseract.exe"])
+    if p:
+        return p
+    dirs = [d for d in _TESS_PROG_DIRS if d] + [target_dir or os.getcwd(), cache]
+    p = _find_cached("tesseract", dirs, max_depth=3)
+    if p:
+        return p
+    if not allow_download:
+        return None
+    if os.name != "nt":
+        _linux_install_hint("tesseract-ocr")
+        return None
+    log_info("Tesseract not found - downloading a portable build (one-time)...")
+    exts = (".zip", ".tar.gz", ".tgz", ".7z")
+    for u in TESSERACT_DOWNLOAD_URLS:
+        try:
+            if u.rstrip("/").endswith("/latest"):
+                # prefer the Windows x64 build; mikhailgarber ships 'x64-windows-static.tar.gz'
+                u2 = (_resolve_github_asset(u, exts, prefer=("x64-windows", "windows", "win64", "x64"))
+                      or _resolve_github_asset(u, exts))
+                if not u2:
+                    continue
+                u = u2
+            low = u.lower()
+            if not low.endswith(exts):
+                continue
+            os.makedirs(cache, exist_ok=True)
+            ext = ".tar.gz" if low.endswith((".tar.gz", ".tgz")) else os.path.splitext(low)[1]
+            arc = os.path.join(cache, "tesseract" + ext)
+            _download_to_file(u, arc, "Tesseract")
+            _extract_archive(arc, cache, u)
+            try:
+                os.remove(arc)
+            except OSError:
+                pass
+            p = _find_cached("tesseract", [cache], max_depth=5)
+            if p:
+                log_done(f"Tesseract ready: {p}")
+                return p
+        except Exception as e:
+            log_warn(f"Tesseract source failed ({u}): {str(e)[:120]}")
+    log_warn("Could not auto-install Tesseract. Install it manually from "
+             "https://github.com/UB-Mannheim/tesseract/releases (add it to PATH), "
+             "or set TESSERACT_DOWNLOAD_URLS to a portable build (.zip/.tar.gz).")
+    return None
+
+
+def _resolve_github_asset(latest_url, suffixes, prefer=None):
+    """Parse a GitHub '/releases/latest' for a downloadable asset whose name ends in one of
+    `suffixes`. When `prefer` (a list of substrings, most-wanted first) is given, the first asset
+    whose name contains one of them wins. Returns the absolute asset URL or None."""
+    import urllib.request
+    names_urls = []                                   # list of (name_lower, download_url)
+    # 1) try the JSON API (clean, but rate-limited to 60/h unauthenticated -> may 403)
+    try:
+        api = latest_url.replace("github.com/", "api.github.com/repos/")
+        req = urllib.request.Request(api, headers={"User-Agent": USER_AGENT,
+                                                    "Accept": "application/vnd.github+json"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        for a in data.get("assets", []):
+            names_urls.append(((a.get("name") or "").lower(), a.get("browser_download_url")))
+    except Exception as e:
+        dbg(f"github api failed ({str(e)[:60]}) - trying the releases page")
+    # 2) fallback: scrape the expanded_assets HTML (works without the API / when rate-limited)
+    if not names_urls:
+        try:
+            exp = latest_url.rstrip("/")
+            if exp.endswith("/latest"):
+                exp = exp[:-len("/latest")] + "/expanded_assets/latest"
+            req = urllib.request.Request(exp, headers={"User-Agent": USER_AGENT})
+            html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+            for m in re.finditer(r'href="(/[^"]+/releases/download/[^"]+)"', html):
+                href = m.group(1)
+                names_urls.append((href.rsplit("/", 1)[-1].lower(), "https://github.com" + href))
+        except Exception as e:
+            dbg(f"github html fallback failed: {str(e)[:70]}")
+    assets = [(nm, url) for nm, url in names_urls
+              if url and nm.endswith(tuple(suffixes)) and not nm.endswith(".sha256")]
+    if prefer:
+        for key in prefer:
+            for nm, url in assets:
+                if key in nm:
+                    return url
+        return None
+    for nm, url in assets:
+        if "portable" in nm:
+            return url
+    return assets[0][1] if assets else None
+
+
+def _tessdata_dir(tess_bin):
+    """The tessdata folder next to a Tesseract install (where .traineddata live)."""
+    base = os.path.dirname(os.path.abspath(tess_bin))
+    for c in (os.path.join(base, "tessdata"), os.path.join(os.path.dirname(base), "tessdata",),
+              os.path.join(base, "share", "tessdata")):
+        if os.path.isdir(c):
+            return c
+    d = os.path.join(base, "tessdata")                 # create one next to the binary
+    try:
+        os.makedirs(d, exist_ok=True)
+        return d
+    except OSError:
+        return base
+
+
+def ensure_tess_langdata(tess_bin, tess_lang, allow_download=True):
+    """Make sure the .traineddata for `tess_lang` exists; fetch it from tessdata_fast if missing.
+    `tess_lang` may be a '+'-joined set (e.g. 'kor+eng'). Returns True if all parts are present."""
+    tdir = _tessdata_dir(tess_bin)
+    ok = True
+    for lang in str(tess_lang).split("+"):
+        lang = lang.strip()
+        if not lang:
+            continue
+        if os.path.exists(os.path.join(tdir, f"{lang}.traineddata")):
+            continue
+        if not allow_download:
+            ok = False
+            continue
+        try:
+            log_info(f"Downloading Tesseract language data '{lang}' (one-time)...")
+            _download_to_file(TESSDATA_URL.format(lang=lang),
+                              os.path.join(tdir, f"{lang}.traineddata"), f"tessdata {lang}")
+        except Exception as e:
+            log_warn(f"Could not download Tesseract data for '{lang}': {str(e)[:100]}")
+            ok = False
+    return ok
 
 
 def extract_audio_wav(ffmpeg_bin: str, mkv_path: Path, audio_position: int, out_wav: Path, sample_rate: int = 16000,
@@ -8173,6 +8331,465 @@ def _subtitle_track_label(t):
     return f"#{t['id']}  {t['lang']:4} {t['codec']:16} {t.get('title', '')}".rstrip()
 
 
+# ======================================================================
+# OCR for IMAGE-BASED subtitles (PGS/VobSub) -> text .srt in the ORIGINAL
+# language. Bitmaps are decoded (PGS via a built-in reader, VobSub via
+# ffmpeg), then each line is read by Tesseract and/or an Ollama vision
+# model; when both run, the better of the two is kept per line.
+# ======================================================================
+_PGS_LANG_TO_TESS = {
+    "eng": "eng", "cze": "ces", "ces": "ces", "ger": "deu", "fre": "fra", "spa": "spa",
+    "ita": "ita", "por": "por", "dut": "nld", "pol": "pol", "rus": "rus", "jpn": "jpn",
+    "kor": "kor", "chi": "chi_sim", "zho": "chi_sim", "hun": "hun", "rum": "ron",
+    "swe": "swe", "dan": "dan", "fin": "fin", "gre": "ell", "tur": "tur", "ara": "ara",
+    "tha": "tha", "vie": "vie", "ind": "ind", "bul": "bul", "hrv": "hrv", "srp": "srp",
+    "slv": "slv", "slo": "slk", "ukr": "ukr", "heb": "heb", "hin": "hin",
+}
+
+
+def is_image_sub_codec(codec):
+    """True for bitmap subtitle codecs that need OCR (PGS, VobSub, XSUB, DVB)."""
+    c = (codec or "").lower().replace(" ", "").replace("_", "")
+    return any(k in c for k in ("pgs", "hdmvpgs", "dvdsub", "vobsub", "dvbsub", "xsub", "dvd"))
+
+
+def _ocr_decode_rle_pgs(rle, w, h):
+    """PGS run-length -> (h x w) uint8 array of palette indices."""
+    import numpy as np
+    out = np.zeros((h, w), dtype=np.uint8)
+    x = y = i = 0
+    n = len(rle)
+    while i < n and y < h:
+        b = rle[i]; i += 1
+        if b != 0:
+            if x < w:
+                out[y, x] = b
+            x += 1
+            continue
+        if i >= n:
+            break
+        b2 = rle[i]; i += 1
+        if b2 == 0:
+            y += 1; x = 0; continue
+        if b2 < 0x40:
+            run = b2; col = 0
+        elif b2 < 0x80:
+            run = ((b2 - 0x40) << 8) | rle[i]; i += 1; col = 0
+        elif b2 < 0xC0:
+            run = b2 - 0x80; col = rle[i]; i += 1
+        else:
+            run = ((b2 - 0xC0) << 8) | rle[i]; i += 1; col = rle[i]; i += 1
+        if col and x < w:
+            out[y, x:min(w, x + run)] = col
+        x += run
+    return out
+
+
+def _ocr_parse_sup(path):
+    """Read a PGS .sup file into display events: [{start,end,rgba(np HxWx4)}]. Robust to
+    multi-segment objects and palette updates. Returns [] on any structural problem."""
+    import struct
+    import numpy as np
+    try:
+        data = open(path, "rb").read()
+    except Exception:
+        return []
+    i = 0; n = len(data)
+    palettes = {}; objects = {}
+    events = []; comp = None
+    while i + 13 <= n:
+        if data[i:i + 2] != b'PG':
+            i += 1; continue
+        pts = struct.unpack('>I', data[i + 2:i + 6])[0]
+        typ = data[i + 10]
+        size = struct.unpack('>H', data[i + 11:i + 13])[0]
+        pl = data[i + 13:i + 13 + size]
+        i += 13 + size
+        t = pts / 90000.0
+        try:
+            if typ == 0x16:                                  # PCS (composition)
+                numobj = pl[10] if len(pl) > 10 else 0
+                objs = []; p = 11
+                for _ in range(numobj):
+                    if p + 8 > len(pl):
+                        break
+                    oid = struct.unpack('>H', pl[p:p + 2])[0]
+                    x = struct.unpack('>H', pl[p + 4:p + 6])[0]
+                    y = struct.unpack('>H', pl[p + 6:p + 8])[0]
+                    objs.append((oid, x, y)); p += 8
+                palid = pl[9] if len(pl) > 9 else 0
+                if numobj == 0:                              # empty = clear screen
+                    if events and events[-1]["end"] is None:
+                        events[-1]["end"] = t
+                else:
+                    comp = {"t": t, "objs": objs, "palid": palid}
+            elif typ == 0x14:                                # PDS (palette)
+                pid = pl[0]; pal = palettes.setdefault(pid, {})
+                q = 2
+                while q + 5 <= len(pl):
+                    pal[pl[q]] = (pl[q + 1], pl[q + 2], pl[q + 3], pl[q + 4]); q += 5
+            elif typ == 0x15:                                # ODS (object bitmap)
+                oid = struct.unpack('>H', pl[0:2])[0]
+                seqflag = pl[3]
+                if seqflag & 0x80:                           # first/only fragment
+                    w = struct.unpack('>H', pl[7:9])[0]
+                    h = struct.unpack('>H', pl[9:11])[0]
+                    objects[oid] = [w, h, bytearray(pl[11:])]
+                elif oid in objects:                         # continuation
+                    objects[oid][2] += pl[4:]
+            elif typ == 0x80:                                # END of display set
+                if comp and comp["objs"]:
+                    events.append({"start": comp["t"], "end": None,
+                                   "objs": comp["objs"], "palid": comp["palid"]})
+                    comp = None
+        except Exception:
+            continue
+    out = []
+    for ev in events:
+        if ev["end"] is None:
+            ev["end"] = ev["start"] + 4.0
+        oid = ev["objs"][0][0]
+        if oid not in objects:
+            continue
+        w, h, rle = objects[oid]
+        if w <= 0 or h <= 0 or w > 4096 or h > 2160:
+            continue
+        idx = _ocr_decode_rle_pgs(bytes(rle), w, h)
+        pal = palettes.get(ev["palid"]) or (next(iter(palettes.values())) if palettes else {})
+        lut = np.zeros((256, 4), dtype=np.uint8)
+        for e, (Y, Cr, Cb, A) in pal.items():
+            R = Y + 1.402 * (Cr - 128)
+            G = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
+            B = Y + 1.772 * (Cb - 128)
+            lut[e] = [np.clip(R, 0, 255), np.clip(G, 0, 255), np.clip(B, 0, 255), A]
+        out.append({"start": ev["start"], "end": ev["end"], "rgba": lut[idx]})
+    return out
+
+
+def _ocr_prep_image(rgba, pad=12):
+    """A subtitle bitmap (RGBA, bright text, transparent background) -> a clean
+    black-text-on-white PIL image, 2x upscaled, ready for Tesseract/vision OCR."""
+    import numpy as np
+    from PIL import Image
+    a = rgba.astype(np.float32)
+    al = a[:, :, 3] / 255.0
+    lum = (0.299 * a[:, :, 0] + 0.587 * a[:, :, 1] + 0.114 * a[:, :, 2]) * al
+    rows = np.where(lum.max(axis=1) > 20)[0]
+    cols = np.where(lum.max(axis=0) > 20)[0]
+    if len(rows) == 0 or len(cols) == 0:
+        return None
+    y0, y1 = rows[0], rows[-1] + 1
+    x0, x1 = cols[0], cols[-1] + 1
+    lum = lum[y0:y1, x0:x1]
+    inv = 255 - np.clip(lum, 0, 255).astype(np.uint8)       # bright text -> dark on white
+    im = Image.fromarray(inv, "L")
+    im = Image.new("L", (im.width + 2 * pad, im.height + 2 * pad), 255).copy() if False else im
+    from PIL import ImageOps
+    im = ImageOps.expand(im, border=pad, fill=255)
+    return im.resize((im.width * 2, im.height * 2), Image.LANCZOS)
+
+
+def _ocr_score_text(s):
+    """Rough confidence for an OCR string: reward letters/digits and sentence shape,
+    penalise lone symbols and gibberish. Used to pick the better of two OCR engines."""
+    if not s:
+        return 0.0
+    s = s.strip()
+    if not s:
+        return 0.0
+    good = sum(c.isalnum() or c in " ,.!?'\"-:;…가-힣一-鿿぀-ヿ" for c in s)
+    junk = sum(c in "|~`^_{}[]<>\\/@#" for c in s)
+    sc = good / len(s) - junk * 0.2
+    if s[:1].isupper():
+        sc += 0.05
+    return max(0.0, sc)
+
+
+def _ocr_merge_line(tess, vlm):
+    """Merge Tesseract and vision OCR for one cue. Returns (text, source)."""
+    import difflib
+    tess = re.sub(r"\s+", " ", (tess or "").strip())
+    vlm = re.sub(r"\s+", " ", (vlm or "").strip())
+    if not tess and not vlm:
+        return "", "none"
+    if not tess:
+        return vlm, "vlm"
+    if not vlm:
+        return tess, "tess"
+    st, sv = _ocr_score_text(tess), _ocr_score_text(vlm)
+    sim = difflib.SequenceMatcher(None, tess.lower(), vlm.lower()).ratio()
+    if sim >= 0.8:
+        return (tess, "both") if st >= sv else (vlm, "both")
+    return (tess, "tess") if st > sv + 0.05 else (vlm, "vlm")
+
+
+def _ocr_tesseract(pim, tess_lang, tess_bin):
+    """Run Tesseract on a prepared PIL image. Returns text or '' on failure."""
+    import tempfile
+
+    def _run(psm):
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False, dir=_temp_root()) as f:
+            tmp = f.name
+        try:
+            pim.save(tmp)
+            r = subprocess.run([tess_bin, tmp, "-", "--psm", psm, "-l", tess_lang],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            return re.sub(r"\n{2,}", "\n", (r.stdout or "").strip())
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+
+    try:
+        txt = _run("6")                              # assume a block (1-2 lines)
+        # a single-line cue is read more reliably by the raw-line modes; keep the best one
+        if "\n" not in txt:
+            for psm in ("7", "13"):
+                alt = _run(psm)
+                if alt and "\n" not in alt and _ocr_score_text(alt) > _ocr_score_text(txt):
+                    txt = alt
+        return txt
+    except Exception as e:
+        dbg(f"ocr tesseract failed: {str(e)[:70]}")
+        return ""
+
+
+def _ocr_vision(pim, model, src_lang):
+    """Read a subtitle bitmap with an Ollama vision model. Returns text or ''."""
+    import urllib.request
+    import io
+    try:
+        buf = io.BytesIO(); pim.convert("RGB").save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+        _OLLAMA_LOADED.add(model)
+        lang = _lang3_name(src_lang) if src_lang else "the original language"
+        body = {"model": model,
+                "prompt": f"This image is one subtitle line from a TV show, in {lang}. "
+                          "Transcribe the exact text you see, nothing else - no quotes, no notes, "
+                          "no translation. If there are two lines, keep the line break.",
+                "images": [b64], "stream": False, "options": {"temperature": 0}}
+        req = urllib.request.Request(_ollama_base() + "/api/generate",
+                                     data=json.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=120) as r:
+            txt = (json.loads(r.read().decode("utf-8")).get("response", "") or "").strip()
+        txt = re.sub(r'^["“„]|["”“]$', "", txt).strip()
+        return txt
+    except Exception as e:
+        dbg(f"ocr vision failed: {str(e)[:70]}")
+        return ""
+
+
+def _ocr_image_events(rgba_events, src_lang, engine, tess_bin, vlm_model, prefix=""):
+    """OCR a list of {start,end,rgba} events into subtitle events [{start,end,text}].
+    engine: 'tesseract' | 'vision' | 'both'. Progress bar via prefix."""
+    tess_lang = _PGS_LANG_TO_TESS.get((src_lang or "").lower(), "eng")
+    use_tess = engine in ("tesseract", "both") and tess_bin
+    use_vlm = engine in ("vision", "both") and vlm_model
+    if use_tess:
+        # make sure the .traineddata for this language is present (download it once if needed);
+        # fall back to English if the language pack cannot be obtained
+        if not ensure_tess_langdata(tess_bin, tess_lang, allow_download=True):
+            if tess_lang != "eng" and ensure_tess_langdata(tess_bin, "eng", allow_download=True):
+                log_warn(f"    Tesseract data for '{tess_lang}' unavailable - using English (OCR may be worse).")
+                tess_lang = "eng"
+    out = []
+    total = len(rgba_events)
+    for k, ev in enumerate(rgba_events):
+        pim = _ocr_prep_image(ev["rgba"])
+        t_txt = v_txt = ""
+        if pim is not None:
+            if use_tess:
+                t_txt = _ocr_tesseract(pim, tess_lang, tess_bin)
+            if use_vlm:
+                v_txt = _ocr_vision(pim, vlm_model, src_lang)
+        text, _src = _ocr_merge_line(t_txt, v_txt)
+        if text.strip():
+            out.append({"start": ev["start"], "end": ev["end"], "text": text.strip()})
+        if prefix:
+            _print_progress(k + 1, total, prefix=prefix, unit=" cues/s")
+    if prefix:
+        print()
+    return out
+
+
+def _ocr_extract_image_track(args, video, track, ffmpeg_bin, mkvextract_bin):
+    """Extract one IMAGE subtitle track to decodable bitmaps and return
+    [{start,end,rgba}]. PGS is read by the built-in reader; VobSub/other are
+    rendered via ffmpeg onto a transparent canvas. Returns [] on failure."""
+    video = Path(video)
+    is_mkv = video.suffix.lower() in MKVEXTRACT_CONTAINER_EXTS
+    codec = (track.get("codec") or "").lower()
+    tmpd = tempfile.mkdtemp(dir=_temp_root())
+    try:
+        if "pgs" in codec and is_mkv and mkvextract_bin:
+            sup = Path(tmpd) / "track.sup"
+            r = subprocess.run([mkvextract_bin, "tracks", str(video), f"{track['id']}:{sup}"],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if sup.exists() and sup.stat().st_size > 0:
+                evs = _ocr_parse_sup(str(sup))
+                if evs:
+                    return evs
+        if "pgs" in codec and ffmpeg_bin:                    # MP4-muxed PGS, or MKV fallback
+            sup = Path(tmpd) / "track_ff.sup"
+            pos = _sub_position_in_video(args, video, track)
+            r = subprocess.run([ffmpeg_bin, "-y", "-i", str(video), "-map", f"0:s:{pos}",
+                                "-c:s", "copy", str(sup)],
+                               capture_output=True, text=True, encoding="utf-8", errors="replace")
+            if sup.exists() and sup.stat().st_size > 0:
+                evs = _ocr_parse_sup(str(sup))
+                if evs:
+                    return evs
+        # generic bitmap path (VobSub, DVB, xsub, or PGS that the reader could not parse):
+        # render the subtitle stream over a transparent canvas and cut it into events.
+        if ffmpeg_bin:
+            return _ocr_render_via_ffmpeg(args, video, track, ffmpeg_bin, tmpd)
+    except Exception as e:
+        dbg(f"ocr extract failed: {str(e)[:90]}")
+    finally:
+        pass
+    return []
+
+
+def _ocr_available(args):
+    """What OCR back-ends are usable right now: (has_tesseract, tess_bin, vlm_models).
+    Finds Tesseract in PATH or a previously-downloaded cache (does NOT download here)."""
+    tess_bin = ensure_tesseract(allow_download=False)
+    vlm = [m for m in (_ollama_models() or []) if _is_vision_model(m)]
+    return bool(tess_bin), tess_bin, vlm
+
+
+def _ocr_pick_engine(args, interactive):
+    """Decide the OCR engine + models. Returns (engine, tess_bin, vlm_model) or (None,...)
+    when no OCR back-end exists. engine in {'tesseract','vision','both'}."""
+    has_tess, tess_bin, vlm = _ocr_available(args)
+    forced = getattr(args, "ocr_engine", None)
+    vlm_model = vlm[0] if vlm else None
+    if not has_tess and not vlm_model:
+        return None, None, None
+    # Tesseract can be auto-installed on demand (Windows portable build), so it counts as "offerable"
+    # even when not present yet; we only download it if the user actually picks it.
+    tess_offerable = has_tess or os.name == "nt"
+    if forced in ("tesseract", "vision", "both"):
+        if forced in ("tesseract", "both") and not has_tess and tess_offerable:
+            tess_bin = ensure_tesseract(allow_download=True) or tess_bin
+            has_tess = bool(tess_bin)
+        return forced, tess_bin, vlm_model           # explicit --ocr-engine wins, no prompt
+
+    def _tess_note():
+        return "" if has_tess else ("will be downloaded automatically" if tess_offerable
+                                    else "Tesseract not found (install it + language data)")
+    both_ok = (has_tess or tess_offerable) and vlm_model
+    opts = [
+        ("both", "Both (Tesseract + vision, keep the best per line) - most accurate",
+         bool(both_ok), "" if both_ok else "needs Tesseract (auto) and an Ollama vision model"),
+        ("tesseract", "Tesseract only - fast",
+         bool(has_tess or tess_offerable), _tess_note()),
+        ("vision", f"Vision only ({vlm_model or 'no Ollama vision model'}) - best on Korean/Chinese",
+         bool(vlm_model), "" if vlm_model else "no Ollama vision model (e.g. 'ollama pull qwen2.5vl')"),
+    ]
+    if not interactive:
+        eng = next((o[0] for o in opts if o[2]), None)
+    else:
+        labels = []
+        for _k, lbl, ok, note in opts:
+            if ok and note:
+                labels.append(f"{lbl}   [{note}]")            # available but needs a one-time download
+            elif ok:
+                labels.append(lbl)
+            else:
+                labels.append(f"{lbl}   [unavailable: {note}]")
+        _h = [f"{Fore.MAGENTA}=== OCR for image-based subtitles (PGS/VobSub) ==={Style.RESET_ALL}",
+              f"{Fore.CYAN}These subtitles are bitmaps - choose how to read them into text.{Style.RESET_ALL}",
+              ""]
+        _help = ["Runs both engines and keeps the better result for each line (slowest, best).",
+                 "Fast, works offline; Tesseract + language data are downloaded automatically if missing.",
+                 "Uses the Ollama vision model; best on Korean/Chinese/Japanese, slower."]
+        default_i = next((n for n, o in enumerate(opts) if o[2]), 0)
+        eng = None
+        while eng is None:
+            i = ask_pick("Which OCR engine should read the image subtitles?",
+                         labels, default=default_i, header=_h, help=_help)
+            if opts[i][2]:
+                eng = opts[i][0]
+            else:
+                log_warn(f"That engine is unavailable: {opts[i][3]}. Pick another one.")
+    # if the chosen engine needs Tesseract and it isn't installed yet, fetch it now
+    if eng in ("tesseract", "both") and not has_tess and tess_offerable:
+        tess_bin = ensure_tesseract(allow_download=True) or tess_bin
+        has_tess = bool(tess_bin)
+        if not has_tess:                              # download failed -> degrade gracefully
+            eng = "vision" if vlm_model else None
+    return eng, tess_bin, vlm_model
+
+
+def _ocr_image_track_to_events(args, video, track, ffmpeg_bin, mkvextract_bin,
+                               engine, tess_bin, vlm_model, prefix=""):
+    """Full image-track -> text events: decode bitmaps, OCR them, return SRT events."""
+    rgba = _ocr_extract_image_track(args, video, track, ffmpeg_bin, mkvextract_bin)
+    if not rgba:
+        dbg(f"ocr: no bitmaps decoded from track #{track.get('id')} ({track.get('codec')})")
+        return []
+    src_lang = track.get("lang") or "und"
+    return _ocr_image_events(rgba, src_lang, engine, tess_bin, vlm_model, prefix=prefix)
+
+
+def _sub_position_in_video(args, video, track):
+    """Index of a track among the video's SUBTITLE streams (for ffmpeg 0:s:N)."""
+    try:
+        mm = getattr(args, "mkvmerge", None) or find_tool(["mkvmerge", "mkvmerge.exe"])
+        allt = mkvmerge_tracks(mm, Path(video), "subtitles")
+        return [t["id"] for t in allt].index(track["id"])
+    except Exception:
+        return 0
+
+
+def _ocr_render_via_ffmpeg(args, video, track, ffmpeg_bin, tmpd):
+    """Fallback: use ffmpeg to produce per-cue bitmaps for a bitmap subtitle track
+    whose format the built-in PGS reader cannot parse (e.g. VobSub). Reads cue times
+    from the packets and renders each onto a transparent canvas."""
+    import numpy as np
+    from PIL import Image
+    pos = _sub_position_in_video(args, video, track)
+    # 1) cue start times + durations from the subtitle packets
+    pr = subprocess.run([_find_ffprobe(ffmpeg_bin) or "ffprobe", "-hide_banner", "-v", "error",
+                         "-select_streams", f"s:{pos}", "-show_entries",
+                         "packet=pts_time,duration_time", "-of", "csv=p=0", str(video)],
+                        capture_output=True, text=True, encoding="utf-8", errors="replace")
+    cues = []
+    for ln in (pr.stdout or "").splitlines():
+        parts = ln.split(",")
+        try:
+            st = float(parts[0])
+            du = float(parts[1]) if len(parts) > 1 and parts[1] not in ("", "N/A") else 3.0
+        except (ValueError, IndexError):
+            continue
+        if du <= 0 or du > 15:
+            du = 3.0
+        cues.append((st, du))
+    if not cues:
+        return []
+    # 2) render the middle of each cue onto a transparent canvas and crop
+    out = []
+    for k, (st, du) in enumerate(cues):
+        mid = st + min(du, 4.0) / 2.0
+        png = Path(tmpd) / f"c{k}.png"
+        subprocess.run([ffmpeg_bin, "-y", "-v", "error", "-ss", f"{mid:.3f}",
+                        "-f", "lavfi", "-i", "color=c=black@0.0:s=1920x1080:d=0.1,format=rgba",
+                        "-ss", f"{mid:.3f}", "-i", str(video),
+                        "-filter_complex", f"[0][1:s:{pos}]overlay=format=auto",
+                        "-frames:v", "1", str(png)],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if not png.exists():
+            continue
+        rgba = np.array(Image.open(png).convert("RGBA"))
+        if rgba[:, :, 3].max() < 10:                         # nothing visible
+            continue
+        out.append({"start": st, "end": st + du, "rgba": rgba})
+    return out
+
+
 def run_extract_subs(args, minimal=False):
     """Wizard: extracts subtitle tracks from videos (mkv/mp4/...) into .srt. Tracks
     are detected directly from the video; you interactively pick which (by language,
@@ -8198,6 +8815,8 @@ def run_extract_subs(args, minimal=False):
     sample = None
     sub_tracks = []
     text_tracks = []
+    image_tracks = []
+    ocr_possible = False
     if videos:
         log_info(f"Found {len(videos)} videos.")
         mkvmerge_bin, mkvextract_bin, ffmpeg_bin, _is_mkv = _resolve_tools_for_extract(args, Path(videos[0]))
@@ -8223,38 +8842,74 @@ def run_extract_subs(args, minimal=False):
                 "or the videos have no subtitles).")
         log_info(f"Found {len(sub_tracks)} tracks in the sample {sample.name}.")
         text_tracks = [t for t in sub_tracks if is_text_codec(t["codec"])]
-        if not text_tracks:
-            log_warn("The sample video has only image-based subtitles (PGS/VobSub). You can still try other "
-                     "videos via selection by language - text tracks are extracted, image ones skipped.")
+        image_tracks = [t for t in sub_tracks if is_image_sub_codec(t["codec"])]
+        _oeng, _otess, _ovlm = _ocr_pick_engine(args, False)   # just to know if OCR is possible
+        ocr_possible = bool(_oeng)
+        if not text_tracks and image_tracks and not ocr_possible:
+            log_warn("The sample video has only image-based subtitles (PGS/VobSub) and no OCR back-end "
+                     "is available. Install Tesseract (and language data), or run Ollama with a vision "
+                     "model (e.g. qwen2.5vl), to turn them into text.")
+        elif not text_tracks and image_tracks:
+            log_info("The sample has only image-based subtitles (PGS/VobSub) - they will be read by OCR.")
 
     _hdr = [f"{Fore.MAGENTA}=== Extract subtitles from videos ==={Style.RESET_ALL}"]
     if videos:
         _hdr.append(f"{Fore.CYAN}Found {len(videos)} videos. Sample: {sample.name}{Style.RESET_ALL}")
         _img = [t for t in sub_tracks if not is_text_codec(t["codec"])]
         if _img:
-            _hdr.append(f"{Fore.YELLOW}(Image-based tracks can't go to .srt: "
+            _tag = "via OCR" if ocr_possible else "no OCR back-end - skipped"
+            _hdr.append(f"{Fore.YELLOW}(Image-based tracks ({_tag}): "
                         + ", ".join(f"#{t['id']} {t['lang']}" for t in _img) + f"){Style.RESET_ALL}")
     _hdr.append("")
 
-    item_labels = [f"#{t['id']}  {t['lang']:4} {t['codec']:16} {t.get('title', '')}".rstrip()
-                   for t in text_tracks]
+    # offer text tracks and, when OCR is possible, image tracks too (tagged [OCR])
+    pick_tracks = list(text_tracks) + (image_tracks if ocr_possible else [])
+    item_labels = [f"#{t['id']}  {t['lang']:4} {t['codec']:16} "
+                   f"{'[OCR] ' if is_image_sub_codec(t['codec']) else ''}{t.get('title', '')}".rstrip()
+                   for t in pick_tracks]
+    _all_lbl = ("ALL subtitle tracks (text + OCR image ones) from each video"
+                if (ocr_possible and image_tracks)
+                else "ALL text subtitle tracks from each video")
     actions = ["Extract CHECKED tracks (check them above with space)",
                "by LANGUAGE (I'll type codes - robust for the whole folder)",
-               "ALL text subtitle tracks from each video"]
+               _all_lbl]
     act, checked = ask_checklist("Which subtitle tracks to extract?", item_labels, actions, header=_hdr)
 
     want_langs = None
     want_keys = None
     if act == 0:                       # extract the specific checked tracks
-        if checked and text_tracks:
-            sample_sel = _track_selectors(text_tracks)
+        if checked and pick_tracks:
+            sample_sel = _track_selectors(pick_tracks)
             want_keys = [sample_sel[i][0] for i in checked if 0 <= i < len(sample_sel)]
         if not want_keys:
-            log_info("Nothing checked - taking ALL text tracks.")
+            log_info("Nothing checked - taking ALL tracks.")
     elif act == 1:                     # by language
         raw = ask_text("Language codes separated by commas (e.g. eng,cze,ger; empty = all)", "")
         want_langs = [x.strip().lower() for x in raw.replace(" ", "").split(",") if x.strip()] or None
-    # act == 2 -> all text ones (want_langs=None, want_keys=None)
+    # act == 2 -> all tracks (want_langs=None, want_keys=None)
+
+    # Decide whether this run will actually OCR any image track, from the user's SELECTION above
+    # (not just from the sample's track list), so the engine prompt only appears when it's needed.
+    def _selection_has_image(tracks):
+        img = [t for t in tracks if is_image_sub_codec(t["codec"])]
+        if not img:
+            return False
+        if want_langs is not None:
+            return any(any((t["lang"] or "").lower().startswith(l) for l in want_langs) for t in img)
+        if want_keys is not None:
+            km = {k: t for k, _l, t in _track_selectors(tracks)}
+            return any(is_image_sub_codec(km[k]["codec"]) for k in want_keys if k in km)
+        return True                                   # act==2 -> all tracks, image ones included
+
+    will_ocr = ocr_possible and _selection_has_image(pick_tracks)
+    ocr_eng = ocr_tess = ocr_vlm = None
+    if will_ocr:
+        interactive_ocr = not minimal and not preset_is_replaying() and not getattr(args, "yes", False)
+        ocr_eng, ocr_tess, ocr_vlm = _ocr_pick_engine(args, interactive_ocr)
+        if ocr_eng:
+            log_info(f"    image-based subtitles will be read by OCR (engine: {ocr_eng}"
+                     + (f", vision model {ocr_vlm}" if ocr_vlm and ocr_eng in ('vision', 'both') else "")
+                     + ").")
 
     do_clean = False if minimal else ask_yes_no(
         "Rule-based text cleanup (spaces, punctuation, wrapping long lines)?", default_no=True)
@@ -8288,13 +8943,15 @@ def run_extract_subs(args, minimal=False):
             skipped += 1
             continue
         vtext = [t for t in vtracks if is_text_codec(t["codec"])]
+        vimg = [t for t in vtracks if is_image_sub_codec(t["codec"])] if ocr_eng else []
+        vpick = vtext + vimg                       # tracks eligible for selection in this video
         if want_langs is not None:
-            sel = [t for t in vtext if any(t["lang"].lower().startswith(l) for l in want_langs)]
+            sel = [t for t in vpick if any((t["lang"] or "").lower().startswith(l) for l in want_langs)]
         elif want_keys is not None:
-            vkeymap = {k: t for k, _l, t in _track_selectors(vtext)}
+            vkeymap = {k: t for k, _l, t in _track_selectors(vpick)}
             sel = [vkeymap[k] for k in want_keys if k in vkeymap]
         else:
-            sel = vtext
+            sel = vpick
         if not sel:
             # different track layout for this video -> re-scan and let the user fix it
             can_ask = not minimal and not preset_is_replaying() and not getattr(args, "yes", False)
@@ -8310,18 +8967,33 @@ def run_extract_subs(args, minimal=False):
         for t in sel:
             if t["id"] in done_ids:
                 continue
-            out_path = v.with_name(v.stem + f".{_track_tag(t, vtext)}.srt")
+            out_path = v.with_name(v.stem + f".{_track_tag(t, vpick)}.srt")
             if out_path.exists() and not overwrite:
                 log_info(f"{out_path.name}: already exists - skipping.")
                 done_ids.add(t["id"])
                 continue
-            events, chosen = extract_with_fallback(args, v, t, vtext, done_ids=done_ids,
-                                                   interactive=not minimal and not preset_is_replaying())
+            if is_image_sub_codec(t["codec"]):     # IMAGE subtitle -> OCR to text
+                _ff = getattr(args, "ffmpeg", None) or find_tool(["ffmpeg", "ffmpeg.exe"])
+                _me = getattr(args, "mkvextract", None) or find_tool(["mkvextract", "mkvextract.exe"])
+                log_info(f"    {v.name}: OCR of image subtitles #{t['id']} ({t['lang']}, {t['codec']}) "
+                         f"[{ocr_eng}]...")
+                events = _ocr_image_track_to_events(
+                    args, v, t, _ff, _me, ocr_eng, ocr_tess, ocr_vlm,
+                    prefix=f"  {v.stem[:34]} OCR ")
+                chosen = t
+                if not events:
+                    log_warn(f"    {v.name}: OCR produced no text from #{t['id']} - skipping that track.")
+                    done_ids.add(t["id"])
+                    continue
+            else:
+                events, chosen = extract_with_fallback(
+                    args, v, t, vtext, done_ids=done_ids,
+                    interactive=not minimal and not preset_is_replaying())
             if not events:
                 continue
             # if the fallback picked another track, name it by the actual track
             if chosen and chosen["id"] != t["id"]:
-                out_path = v.with_name(v.stem + f".{_track_tag(chosen, vtext)}.srt")
+                out_path = v.with_name(v.stem + f".{_track_tag(chosen, vpick)}.srt")
                 if out_path.exists() and not overwrite:
                     log_info(f"{out_path.name}: already exists - skipping.")
                     done_ids.add(chosen["id"])
@@ -19284,6 +19956,11 @@ DIFFERENT LANGUAGES (target vs reference):
                              "rule-based proofreading and a readability fix (9 chars/s, min 2.5s), saving <video>.cs.srt. "
                              "If several English tracks exist it asks which to use. Optionally a path to the directory "
                              "as a positional argument.")
+    parser.add_argument("--ocr-engine", dest="ocr_engine", choices=["tesseract", "vision", "both"],
+                        default=None,
+                        help="OCR engine for image-based subtitles (PGS/VobSub) when extracting them to "
+                             "text: 'tesseract', 'vision' (Ollama vision model), or 'both' (keep the best "
+                             "of the two per line). Default: ask, or 'both' when available.")
     parser.add_argument("--p2w", action="store_true",
                         help="Same as --p2 but WAIT for the free Google endpoint on a rate limit and retry "
                              "Google instead of failing over to another translator. Optionally a directory path.")
