@@ -136,7 +136,7 @@ SCAN_BROWSER_AUTO_HOSTS = {
     # "shop.example.org": 2,        # -> runs as: <url> --scan-browser 2
     # "portal.example.net": {"scan": 1, "m": 16},  # -> <url> --scan-browser 1 -m 16
 }
-SCRIPT_VERSION = "3.24.0"
+SCRIPT_VERSION = "3.25.1"
 SCAN_LINK_CAP = 300              # --follow-links: max same-site pages to visit from an index page
 SCAN_BROWSER_WAIT = 8           # --scan-browser: seconds to let the page's player start and fetch
 VIMEO_BROWSER_FALLBACK = True   # if a Vimeo video can't be resolved with plain HTTP (e.g. Patreon
@@ -257,6 +257,7 @@ _REMOTE_CONFIG_KEYS = {
     'ASCII_FILENAMES', 'USER_AGENT', 'TEMP_SUBDIR',
     # -- per-site request headers (handy to hot-fix when a site tightens hot-link checks) --
     'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER', 'PATREON_SEARCH_MAX_PAGES', 'WISTIA_HEADERS',
+    'DRIVE_VALIDATE_SOURCE', 'DRIVE_PROBE_TIMEOUT', 'DRIVE_PLAYBACK_KEY',
     # -- display --
     'BAR_FORMAT', 'ARROW',
     # -- filename sanitising and the rename heuristics (worth tuning per language) --
@@ -288,6 +289,7 @@ _CONFIG_KEY_ORDER = (
     'SCAN_AUTO_HOSTS', 'SCAN_BROWSER_AUTO_HOSTS',
     'TEMP_SUBDIR', 'BAR_FORMAT', 'ARROW',
     'VIMEO_REFERER', 'MUX_HEADERS', 'PATREON_REFERER', 'PATREON_SEARCH_MAX_PAGES', 'WISTIA_HEADERS',
+    'DRIVE_VALIDATE_SOURCE', 'DRIVE_PROBE_TIMEOUT', 'DRIVE_PLAYBACK_KEY',
     'ILLEGAL_WIN', 'RESERVED_WIN', 'EMOJI_RANGES', 'SMALL_WORDS', 'VOWELS', 'DEFAULT_STOP',
 )
 
@@ -308,6 +310,7 @@ _NEVER_REMOTE_KEYS = {
     'CLR': "runtime palette object built by setup_console()",
     'ASCII_BARS': "runtime, derived from FORCE_ASCII_BARS by setup_console()",
     'ALLOW_CORRUPT': "runtime flag set only by the --allow-corrupt CLI switch",
+    'ALLOW_DOWNGRADE': "runtime flag set only by the --allow-downgrade CLI switch",
     'MP4DECRYPT': "runtime cache of the resolved executable path",
     # Per-run choices that come from the command line.
     'AUDIO_SEL': "per-run (--audio)", 'SUB_SEL': "per-run (--sub)",
@@ -3239,8 +3242,200 @@ def download_single_threaded(url: str, session: requests.Session, filename: str,
     print(f"\n{filename} downloaded successfully.")
     return True
 
-def fetch_video(video_id: str, session: requests.Session, verbose: bool) -> tuple[str, str]:
-    """Resolve a Drive file id to its (playback_url, title). Returns (None, None) on failure."""
+DRIVE_VALIDATE_SOURCE = True      # Before downloading a Drive video, check with two tiny ranged
+#                                   reads (start + end of the file) that the chosen stream really
+#                                   serves data. Google sometimes advertises a 1080p transcode
+#                                   whose stored file is broken/unfinished: it announces the full
+#                                   size but never delivers the bytes, and the download sat at 0 %.
+#                                   Then the same-quality ADAPTIVE streams (what the browser plays)
+#                                   or the ORIGINAL file are used. A lower quality only with
+#                                   --allow-downgrade.
+DRIVE_PROBE_TIMEOUT = 25          # seconds each validation read may take
+DRIVE_PLAYBACK_KEY = "AIzaSyD_InbmSFufIEps5UAt2NmB_3LvBH3Sz_8"   # Drive web player's public API key
+ALLOW_DOWNGRADE = False           # --allow-downgrade: when no full-quality source works, accept a
+#                                   lower one instead of failing (default: best quality or nothing)
+
+# Which source each Drive file id ended up using, so a mid-download URL refresh (expired link)
+# stays on the SAME validated stream instead of jumping back to a broken one.
+_drive_choice = {}
+_drive_adaptive = {}              # file id -> {'video','audio','height'} chosen adaptive pair
+_drive_fail = {}                  # file id -> human reason when no acceptable source exists
+_drive_choice_lock = threading.Lock()
+_DRIVE_ADAPTIVE_PREFIX = 'drive-adaptive:'
+
+# Heights of Drive's progressive transcode itags, for ordering fallbacks best-first.
+_DRIVE_ITAG_HEIGHT = {'37': 1080, '46': 1080, '22': 720, '45': 720, '59': 480, '35': 480,
+                      '44': 480, '18': 360, '34': 360, '43': 360, '36': 240, '5': 240, '17': 144}
+
+
+def _drive_formats(page_content: str) -> dict:
+    """{itag: url} for every progressive stream in a get_video_info answer (fmt_stream_map)."""
+    out = {}
+    try:
+        val = (parse_qs(page_content or '').get('fmt_stream_map') or [''])[0]
+    except Exception:
+        val = ''
+    for part in val.split(','):
+        bits = part.split('|', 1)
+        if len(bits) == 2 and bits[0].strip().isdigit() and 'videoplayback' in bits[1]:
+            out[bits[0].strip()] = bits[1].strip()
+    return out
+
+
+def _drive_original_url(video_id: str) -> str:
+    return (f"https://drive.usercontent.google.com/download?id={video_id}"
+            f"&export=download&confirm=t")
+
+
+def _drive_confirm_url(html_text: str):
+    """Large files answer the download with a 'can't scan for viruses' form; rebuild the URL its
+    'Download anyway' button submits (action + hidden inputs). None if it is not that form."""
+    m = re.search(r'<form[^>]+id="download-form"[^>]+action="([^"]+)"', html_text or '')
+    if not m:
+        return None
+    action = html.unescape(m.group(1))
+    form = html_text[m.start():html_text.find('</form>', m.start()) + 1 or len(html_text)]
+    fields = dict(re.findall(r'<input[^>]+name="([^"]+)"[^>]+value="([^"]*)"', form))
+    return action + ('&' if '?' in action else '?') + urlencode(fields) if fields else None
+
+
+def _probe_range(url, session, start, end, need, timeout=None, headers=None):
+    """GET bytes start-end; return (ok, total_size, content_type). ok = a 206 that is not a page
+    and actually delivered at least `need` bytes within the time limit."""
+    deadline = time.time() + (timeout or DRIVE_PROBE_TIMEOUT)
+    hdrs = dict(headers or {'Referer': 'https://drive.google.com/'})
+    hdrs['Range'] = f'bytes={start}-{end}'
+    try:
+        with connection_slot():
+            with session.get(url, stream=True, headers=hdrs, allow_redirects=True,
+                             timeout=(CONNECT_TIMEOUT, timeout or DRIVE_PROBE_TIMEOUT)) as r:
+                ctype = (r.headers.get('Content-Type') or '').lower()
+                cr = r.headers.get('Content-Range', '')
+                tail = cr.rsplit('/', 1)[-1].strip() if '/' in cr else ''
+                total = int(tail) if tail.isdigit() else 0
+                if r.status_code != 206 or 'text/html' in ctype or 'json' in ctype:
+                    return False, total, ctype
+                got = 0
+                for chunk in r.iter_content(chunk_size=16384):
+                    got += len(chunk or b'')
+                    if got >= need or time.time() > deadline:
+                        break
+                return got >= need, total, ctype
+    except (requests.RequestException, ValueError):
+        return False, 0, ''
+
+
+def _drive_url_check(url, session, verbose=False, label='', headers=None):
+    """'ok' + size when the URL serves real bytes at BOTH ends of the file; 'nostart' when not
+    even the first bytes come (often just a momentary throttle); 'noend' when it announces a size
+    it cannot serve (a broken/unfinished transcode — the 0 % hang)."""
+    ok, total, _ct = _probe_range(url, session, 0, 65535, 4096, headers=headers)
+    if not ok or total <= 0:
+        if verbose:
+            tqdm.write(f"[DBG] Drive source {label}: no data at the start.")
+        return 'nostart', 0
+    if total > 131072:
+        ok2, _t2, _c2 = _probe_range(url, session, total - 65536, total - 1, 1024,
+                                     headers=headers)
+        if not ok2:
+            if verbose:
+                tqdm.write(f"[DBG] Drive source {label}: announces {total} bytes but cannot "
+                           f"serve the end — broken/unfinished.")
+            return 'noend', 0
+    return 'ok', total
+
+
+def _drive_url_works(url, session, verbose=False, label=''):
+    st, total = _drive_url_check(url, session, verbose, label)
+    return st == 'ok', total
+
+
+def _drive_original_working_url(video_id, session, verbose=False):
+    """The original-file download URL if it serves the file (following the large-file 'Download
+    anyway' form when shown), else None. Fails cleanly when the owner disabled downloads or the
+    file is over its download quota (Google answers with an HTML page then)."""
+    url = _drive_original_url(video_id)
+    ok, _total = _drive_url_works(url, session, verbose, 'original')
+    if ok:
+        return url
+    try:
+        r = session.get(url, headers={'Referer': 'https://drive.google.com/'},
+                        timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        if 'text/html' in (r.headers.get('Content-Type') or '').lower():
+            alt = _drive_confirm_url(r.text)
+            if alt and _drive_url_works(alt, session, verbose, 'original (confirmed)')[0]:
+                return alt
+    except requests.RequestException:
+        pass
+    return None
+
+
+_DRIVE_API_HEADERS = {'Origin': 'https://drive.google.com', 'Referer': 'https://drive.google.com/',
+                      'X-Goog-AuthUser': '0', 'X-Requested-With': 'XMLHttpRequest'}
+
+
+def _drive_playback_api(video_id, session, verbose=False):
+    """The Drive web player's own media API (what the browser uses to play the video). Returns
+    {'progressive': [...], 'adaptive': [...]} with itag/url/height/length/mime, or None."""
+    url = (f"https://workspacevideo-pa.clients6.google.com/v1/drive/media/{video_id}/playback"
+           f"?auditContext=forDisplay&key={DRIVE_PLAYBACK_KEY}")
+    try:
+        r = session.get(url, headers=_DRIVE_API_HEADERS, timeout=(CONNECT_TIMEOUT, META_READ_TIMEOUT))
+        txt = r.text or ''
+        if r.status_code != 200:
+            if verbose:
+                tqdm.write(f"[DBG] Drive playback API: HTTP {r.status_code}.")
+            return None
+        try:
+            d = json.loads(txt)
+        except ValueError:                                    # x-goog-encode-…: base64 body
+            d = json.loads(base64.b64decode(txt).decode('utf-8', 'replace'))
+    except (requests.RequestException, ValueError, TypeError):
+        return None
+    fsd = ((d.get('mediaStreamingData') or {}).get('formatStreamingData') or {})
+    out = {}
+    for kind, key in (('progressive', 'progressiveTranscodes'), ('adaptive', 'adaptiveTranscodes')):
+        lst = []
+        for t in fsd.get(key) or []:
+            tm = t.get('transcodeMetadata') or {}
+            if not t.get('url'):
+                continue
+            try:
+                length = int(tm.get('contentLength') or 0)
+            except ValueError:
+                length = 0
+            lst.append({'itag': str(t.get('itag')), 'url': t['url'], 'mime': tm.get('mimeType') or '',
+                        'height': int(tm.get('height') or 0), 'length': length,
+                        'bitrate': int(tm.get('maxContainerBitrate') or 0)})
+        out[kind] = lst
+    return out if (out.get('progressive') or out.get('adaptive')) else None
+
+
+def _drive_best_adaptive(api, min_height=0):
+    """(video, audio) best adaptive pair from the playback API with video height >= min_height,
+    preferring mp4/avc video and the best mp4 audio; None if not available."""
+    if not api:
+        return None
+    vids = [a for a in api.get('adaptive') or [] if a['mime'].startswith('video/') and a['height']]
+    auds = [a for a in api.get('adaptive') or [] if a['mime'].startswith('audio/')]
+    if not vids or not auds:
+        return None
+    vids.sort(key=lambda a: (a['height'], 'mp4' in a['mime'], a['bitrate']), reverse=True)
+    auds.sort(key=lambda a: ('mp4' in a['mime'], a['bitrate']), reverse=True)
+    if vids[0]['height'] < min_height:
+        return None
+    return vids[0], auds[0]
+
+
+def fetch_video(video_id: str, session: requests.Session, verbose: bool,
+                validate: bool = False) -> tuple[str, str]:
+    """Resolve a Drive file id to its (playback_url, title). Returns (None, None) on failure.
+
+    validate=True (resolve time) picks the BEST quality that really delivers data: the usual
+    stream, or — when that one is broken or lower than what the browser plays — the adaptive
+    video+audio pair (returned as a 'drive-adaptive:<id>' marker; see _download_drive_adaptive),
+    or the original file. A lower quality only with --allow-downgrade. The choice is remembered
+    per file, so later calls (URL refresh mid-download) stay on it."""
     drive_url = f'https://drive.google.com/u/0/get_video_info?docid={video_id}&drive_originator_app=303'
     if verbose:
         tqdm.write(f"[INFO] Accessing {drive_url}")
@@ -3253,7 +3448,173 @@ def fetch_video(video_id: str, session: requests.Session, verbose: bool) -> tupl
         tqdm.write(f"[INFO] get_video_info status: {response.status_code}")
         tqdm.write(f"[INFO] response length: {len(page_content)} chars")
 
-    return get_video_url(page_content, verbose)
+    video, title = get_video_url(page_content, verbose)
+    if not video:
+        return video, title
+    formats = _drive_formats(page_content)
+    legacy_itag = next((i for i, u in formats.items() if u == video), None)
+
+    with _drive_choice_lock:
+        prev = _drive_choice.get(video_id)
+    if prev and not validate:
+        kind, val = prev
+        if kind == 'original':
+            return val, title
+        if kind == 'adaptive':
+            return _DRIVE_ADAPTIVE_PREFIX + video_id, title
+        if kind == 'itag' and val in formats:
+            return formats[val], title
+    if not validate or not DRIVE_VALIDATE_SOURCE:
+        return video, title
+
+    def _choose(kind, val, url, note=None):
+        with _drive_choice_lock:
+            _drive_choice[video_id] = (kind, val)
+            _drive_fail.pop(video_id, None)
+        if note:
+            tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} {title or video_id}: {note}")
+        return url, title
+
+    def _try_adaptive(min_height):
+        pair = _drive_best_adaptive(api, min_height)
+        if not pair:
+            return None
+        v, a = pair
+        if (_drive_url_check(v['url'], session, verbose, f"adaptive video {v['height']}p")[0] == 'ok'
+                and _drive_url_check(a['url'], session, verbose, 'adaptive audio')[0] == 'ok'):
+            with _drive_choice_lock:
+                _drive_adaptive[video_id] = {'video': v['url'], 'audio': a['url'],
+                                             'height': v['height']}
+            return v['height']
+        return None
+
+    legacy_h = _DRIVE_ITAG_HEIGHT.get(legacy_itag or '', 0)
+    api = _drive_playback_api(video_id, session, verbose)
+    best_adapt = _drive_best_adaptive(api)
+    adapt_h = best_adapt[0]['height'] if best_adapt else 0
+    top_h = max(legacy_h, adapt_h)
+
+    # 1) The browser plays a HIGHER quality than the usual stream offers -> take that.
+    if adapt_h > legacy_h:
+        h = _try_adaptive(adapt_h)
+        if h:
+            return _choose('adaptive', None, _DRIVE_ADAPTIVE_PREFIX + video_id,
+                           f"using the {h}p video+audio streams (higher than the {legacy_h or '?'}p "
+                           f"single-file stream).")
+    # 2) The usual stream, unchanged whenever it works.
+    st, _sz = _drive_url_check(video, session, verbose, f"itag {legacy_itag}")
+    if st == 'ok':
+        return _choose('itag', legacy_itag, video)
+    # 3) Same top quality, other route: the adaptive pair (what the browser plays), the original.
+    if adapt_h >= top_h and adapt_h > 0 and adapt_h <= legacy_h:
+        h = _try_adaptive(top_h)
+        if h:
+            return _choose('adaptive', None, _DRIVE_ADAPTIVE_PREFIX + video_id,
+                           f"the single-file {legacy_h}p stream is broken (announces its size, "
+                           f"serves no data) — using the {h}p video+audio streams instead "
+                           f"(same quality, joined with ffmpeg).")
+    orig = _drive_original_working_url(video_id, session, verbose)
+    if orig:
+        return _choose('original', orig, orig,
+                       "the streaming copies are broken — downloading the ORIGINAL file instead.")
+    # 4) Lower quality: only when explicitly allowed.
+    if ALLOW_DOWNGRADE:
+        for itag in sorted(formats, key=lambda i: -_DRIVE_ITAG_HEIGHT.get(i, 0)):
+            if itag == legacy_itag:
+                continue
+            if _drive_url_check(formats[itag], session, verbose, f"itag {itag}")[0] == 'ok':
+                return _choose('itag', itag, formats[itag],
+                               f"--allow-downgrade: no {top_h}p source works — using "
+                               f"{_DRIVE_ITAG_HEIGHT.get(itag, '?')}p (itag {itag}).")
+        if api:
+            lower = sorted({a['height'] for a in api.get('adaptive') or []
+                            if a['mime'].startswith('video/') and 0 < a['height'] < top_h},
+                           reverse=True)
+            for hh in lower:
+                pair = _drive_best_adaptive(
+                    {'adaptive': [a for a in api['adaptive'] if not a['mime'].startswith('video/')
+                                  or a['height'] <= hh]}, hh)
+                if pair and _drive_url_check(pair[0]['url'], session, verbose, f"{hh}p")[0] == 'ok' \
+                        and _drive_url_check(pair[1]['url'], session, verbose, 'audio')[0] == 'ok':
+                    with _drive_choice_lock:
+                        _drive_adaptive[video_id] = {'video': pair[0]['url'],
+                                                     'audio': pair[1]['url'], 'height': hh}
+                    return _choose('adaptive', None, _DRIVE_ADAPTIVE_PREFIX + video_id,
+                                   f"--allow-downgrade: no {top_h}p source works — using {hh}p.")
+    # 5) Nothing at full quality. A stream that delivered NO bytes at all is usually just a
+    #    momentary throttle -> keep the old behaviour and try it. A stream proven broken
+    #    (announces a size it can't serve) would only hang -> fail honestly instead.
+    if st == 'nostart':
+        if verbose:
+            tqdm.write(f"[DBG] {title or video_id}: no source answered the check; trying the "
+                       f"default stream anyway.")
+        return video, title
+    reason = (f"the best quality ({top_h}p) is broken on Google's side and no other "
+              f"full-quality source works; re-run with --allow-downgrade to accept a lower "
+              f"quality")
+    with _drive_choice_lock:
+        _drive_fail[video_id] = reason
+    tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} {title or video_id}: {reason}.")
+    return None, title
+
+
+def _download_drive_adaptive(items, session, chunk_size, verbose, dest_subdir=None, record=True):
+    """Download Drive videos whose best quality exists only as separate video + audio streams
+    (what the browser's player uses): both go into .temp through the shared pooled engine, then
+    ffmpeg joins them losslessly. items: [(file_id, filename, title)]. Returns #finished."""
+    raw, plan = [], []
+    for fid, filename, title in items:
+        pair = _drive_adaptive.get(fid)
+        if not pair:
+            tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} {title}: lost its stream pair; skipped.")
+            continue
+        stem = os.path.splitext(filename)[0]
+        final = stem + _container_ext(False)
+        final_path = os.path.join(dest_subdir, final) if dest_subdir else final
+        if os.path.exists(final_path) and os.path.getsize(final_path) > 0:
+            tqdm.write(f"[INFO] Already have {os.path.basename(final_path)}, skipping.")
+            continue
+        hdrs = {'Referer': 'https://drive.google.com/', 'Origin': 'https://drive.google.com',
+                'User-Agent': USER_AGENT, 'Accept': '*/*'}
+        vname, aname = stem + '.drv.mp4', stem + '.dra.m4a'
+        raw.append({'direct_url': pair['video'], 'id': fid + ':v', 'title': vname,
+                    'name': vname, 'headers': hdrs})
+        raw.append({'direct_url': pair['audio'], 'id': fid + ':a', 'title': aname,
+                    'name': aname, 'headers': hdrs})
+        plan.append((title, final_path, os.path.join(TEMP_SUBDIR, vname),
+                     os.path.join(TEMP_SUBDIR, aname)))
+    if not plan:
+        return 0
+    print(f"[INFO] Drive: downloading {len(plan)} video(s) as separate best-quality video + "
+          f"audio streams (joined with ffmpeg afterwards).")
+    download_folder_pooled(raw, session, chunk_size, verbose, label="Drive (best quality)",
+                           conn_cap=16, seg_mib=8, dest_subdir=TEMP_SUBDIR, record=False)
+    if not ensure_ffmpeg(verbose):
+        print("[ERROR] ffmpeg is required to join the Drive video and audio streams.")
+        return 0
+    done = 0
+    for title, final_path, vfile, afile in plan:
+        vpath = os.path.join(os.getcwd(), vfile)
+        apath = os.path.join(os.getcwd(), afile)
+        if not (os.path.exists(vpath) and os.path.exists(apath)):
+            print(f"[WARN] {title}: video or audio stream missing (parts kept for resume).")
+            _record_undownloaded(title, 'video or audio stream did not finish')
+            continue
+        ok, err = _ffmpeg_mux(vpath, apath, final_path, verbose)
+        if not ok:
+            print(f"[WARN] {title}: joining video and audio failed: {err}")
+            _record_undownloaded(title, f'ffmpeg join failed: {err}')
+            continue
+        for p in (vpath, apath):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        if record:
+            _record_download(os.path.abspath(final_path))
+        tqdm.write(f"[OK] {os.path.basename(final_path)}")
+        done += 1
+    return done
 
 
 # Emoji / pictographs / symbols that break console rendering (and clutter filenames).
@@ -3329,10 +3690,17 @@ def process_single_video(video_id: str, session: requests.Session, output_file: 
 
     On failure (e.g. a 403 from an expired playback link) it re-fetches a fresh link and
     retries up to `attempts` times. Partial parts are kept, so retries resume."""
-    video, title = fetch_video(video_id, session, verbose)
+    video, title = fetch_video(video_id, session, verbose, validate=True)
     if not video:
+        if _drive_fail.get(video_id):
+            print(f"[WARN] {title or video_id}: {_drive_fail[video_id]}. Skipping.")
+            return False
         print(f"[WARN] Could not get a playback URL for {video_id} (not a video, private, or unavailable). Skipping.")
         return False
+    if video.startswith(_DRIVE_ADAPTIVE_PREFIX):
+        name = safe_filename(output_file or prefer_mp4_ext(title or f"{video_id}.mp4"), video_id)
+        return _download_drive_adaptive([(video_id, name, title or video_id)], session,
+                                        chunk_size, verbose) > 0
 
     # Respect an explicit -o name as-is; only normalize when the name comes from Drive.
     chosen_name = output_file or prefer_mp4_ext(title or f"{video_id}.mp4")
@@ -4028,9 +4396,19 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
                     preferred += '.mp4'
                 job.filename = safe_filename(prefer_mp4_ext(preferred), job.id)
             else:
-                url, title = fetch_video(job.id, session, verbose)
-                if not url:
+                url, title = fetch_video(job.id, session, verbose, validate=True)
+                if url and url.startswith(_DRIVE_ADAPTIVE_PREFIX):
+                    # Best quality exists only as separate video + audio streams: handled by
+                    # _download_drive_adaptive after the normal pool (see below).
+                    job.adaptive = True
+                    preferred = job.entry.get('name') if isinstance(job.entry, dict) else None
+                    if preferred and not os.path.splitext(preferred)[1]:
+                        preferred += (os.path.splitext(title or '')[1] or '.mp4')
+                    job.filename = safe_filename(prefer_mp4_ext(preferred or title
+                                                                or f"{job.id}.mp4"), job.id)
+                elif not url:
                     job.failed = True
+                    job.fail_reason = _drive_fail.get(job.id) or job.fail_reason
                 else:
                     job.url = url
                     job.size = get_file_size(url, session)
@@ -4069,7 +4447,11 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
             os.makedirs(dest_subdir, exist_ok=True)
         except OSError:
             pass
+    adaptive_jobs = []
     for job in jobs:
+        if getattr(job, 'adaptive', False) and not job.failed and job.filename:
+            adaptive_jobs.append(job)
+            continue
         if job.failed or not job.filename:
             tqdm.write(f"{CLR.YELLOW}[WARN]{CLR.RESET} Skipping (no playback URL): {job.title}")
             _record_undownloaded(job.title, getattr(job, 'fail_reason', None)
@@ -4111,6 +4493,10 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         ready.append(job)
 
     if not ready:
+        if adaptive_jobs:
+            _download_drive_adaptive([(j.id, j.filename, j.title) for j in adaptive_jobs],
+                                     session, chunk_size, verbose, dest_subdir, record)
+            return
         print("[ERROR] Nothing to download.")
         return
 
@@ -4286,6 +4672,9 @@ def download_folder_pooled(videos: list, session: requests.Session, chunk_size: 
         print("       - wait a while (Dropbox link limits reset over time) and re-run the SAME")
         print("         command — it resumes and skips finished files;")
         print("       - and/or use fewer connections, e.g. -m 6 or -m 4.")
+    if adaptive_jobs:
+        _download_drive_adaptive([(j.id, j.filename, j.title) for j in adaptive_jobs],
+                                 session, chunk_size, verbose, dest_subdir, record)
 
 
 def process_folder(folder_id: str, session: requests.Session, chunk_size: int, num_threads: int,
@@ -15014,6 +15403,7 @@ if __name__ == "__main__":
     parser.add_argument("--res", nargs='?', const='SCAN', default=None, metavar='HEIGHT', help="YouTube quality. Without a value (just --res) it SCANS and lists the available qualities and exits. With a value it downloads that quality: --res 1080, --res 720, --res 4k (=2160), --res 2k (=1440). No --res = best available (default).")
     parser.add_argument("--scan", nargs='?', const=True, default=None, metavar='N', help="Discovery mode: fetch ANY page URL, find every video it recognises (YouTube/Vimeo/Twitch/Drive/Dropbox embeds or links, plus direct .mp4/.m3u8/.mpd/.webm/.mov) and download them all. Give a number to grab only the N-th found item, e.g. --scan 2 (1-indexed, in discovery order).")
     parser.add_argument("--prefer-stream", dest="prefer_stream", choices=['auto', 'dash', 'hls', 'both'], default=None, help="Which manifest to keep when a page offers BOTH DASH (.mpd) and HLS (.m3u8): 'auto' (default) takes the first real (non-ad) full-length stream of either type; 'dash' grabs the .mpd; 'hls' grabs the .m3u8; 'both' keeps both. Overrides the PREFER_STREAM config value for this run.")
+    parser.add_argument("--allow-downgrade", action="store_true", help="Google Drive: when the best quality of a video is broken on Google's side and no other full-quality source works (the same-quality video+audio streams the browser plays, or the original file), accept a LOWER quality instead of skipping the video. Without it the script only ever downloads the best quality.")
     parser.add_argument("--allow-corrupt", action="store_true", help="If a video has a corrupt/damaged segment that makes the normal (lossless) mux fail, still produce a playable file by skipping the bad packets — the output may have a brief glitch where the damage was. OFF by default: normally such a video FAILS (and is retried / recorded) rather than saving a broken file.")
     parser.add_argument("--ad-max-seconds", dest="ad_max_seconds", type=int, default=None, metavar="SECS", help="A found manifest whose measured duration is this many seconds or fewer is treated as a pre-roll ad and skipped, so the browser scan waits for the full-length video (default 90). 0 disables the duration check. Overrides the AD_MAX_SECONDS config value for this run.")
     parser.add_argument("--davka-login", "--batch-login", "--dl", dest="davka_login", type=str, default=None, metavar="FILE", help="(alias: --dl) Like --davka-browser, but does NOT use any cookie file: each PAGE address is opened in the real browser using ONLY the login saved by --browser-login (a persistent browser profile). Nothing is injected, so this avoids the cookie-injection issues on Windows/WebView2. First run --browser-login once to sign in by hand; then --davka-login reuses that session for every entry. Same name/URL/key list format as --davka-browser.")
@@ -15231,6 +15621,8 @@ if __name__ == "__main__":
         AD_MAX_SECONDS = args.ad_max_seconds
     if args.allow_corrupt:
         ALLOW_CORRUPT = True
+    if args.allow_downgrade:
+        ALLOW_DOWNGRADE = True
 
     if sum(bool(x) for x in (args.video_id, args.url_list, args.davka,
                              args.davka_browser, args.davka_login)) > 1:

@@ -75,6 +75,9 @@
     "Referer": "https://www.patreon.com/",
     "Origin": "https://www.patreon.com"
   },
+  "DRIVE_VALIDATE_SOURCE": true,
+  "DRIVE_PROBE_TIMEOUT": 25,
+  "DRIVE_PLAYBACK_KEY": "AIzaSyD_InbmSFufIEps5UAt2NmB_3LvBH3Sz_8",
   "ILLEGAL_WIN": [
     "\"",
     "*",
