@@ -520,8 +520,11 @@ def sniff_file(path: Path) -> tuple[str, str]:
 #  Chunk parser (runs in worker processes)                                    #
 # --------------------------------------------------------------------------- #
 class ChunkParser:
-    def __init__(self, since, until, fname):
+    def __init__(self, since, until, fname, exclude=()):
         n = len(STR_COLS)
+        self.excl = re.compile("|".join(fnmatch.translate(x.lower()) for x in exclude)) if exclude else None
+        self._excl_cache = {}
+        self.excluded = 0
         self.maps = [{} for _ in range(n)]
         self.vals = [[] for _ in range(n)]
         self.codes = [array("I") for _ in range(n)]
@@ -577,7 +580,17 @@ class ChunkParser:
         out = self._oc.get(key)
         if out is None:
             out = self._oc[key] = classify(to_int(pt), to_int(rc))
-        user = short_user(user or fq)
+        full = user or fq
+        user = short_user(full)
+        if self.excl is not None:
+            hit = self._excl_cache.get(full)
+            if hit is None:
+                lf = full.lower()
+                hit = self._excl_cache[full] = bool(self.excl.match(lf) or self.excl.match(user.lower())
+                                                    or (fq and self.excl.match(fq.lower())))
+            if hit:
+                self.excluded += 1
+                return
         row = (out, pt, rc, srv, user, calling, called, client, client_ip, nas_ip, nas_id, policy, crp,
                self.label(AUTH_TYPES, auth), eap, self.label(ACCT_STATUS, acct),
                self.label(NAS_PORT_TYPES, port), self.fname)
@@ -656,13 +669,13 @@ class ChunkParser:
 
     def result(self, nbytes):
         return {"vals": self.vals, "codes": self.codes, "ts": self.ts, "loc": self.loc,
-                "skipped": self.skipped, "filtered": self.filtered, "fmts": sorted(self.fmts), "bytes": nbytes}
+                "skipped": self.skipped, "filtered": self.filtered, "excluded": self.excluded, "fmts": sorted(self.fmts), "bytes": nbytes}
 
 
 def parse_chunk(task):
     """Worker entry point (top level so it can be pickled on Windows)."""
-    path, mode, fmt, start, end, fname, since, until = task
-    p = ChunkParser(since, until, fname)
+    path, mode, fmt, start, end, fname, since, until, exclude = task
+    p = ChunkParser(since, until, fname, exclude)
     if mode == "bin":
         with open(path, "rb") as fh:
             fh.seek(start)
@@ -691,12 +704,12 @@ def parse_chunk(task):
     return p.result(end - start)
 
 
-def make_tasks(files, since, until):
+def make_tasks(files, since, until, exclude=()):
     tasks = []
     for fi, f in enumerate(files):
         size = f["size"]
         if f["mode"] != "bin" or size <= CHUNK_BYTES:
-            tasks.append((fi, (f["path"], f["mode"], f["fmt"], 0, size, f["display"], since, until)))
+            tasks.append((fi, (f["path"], f["mode"], f["fmt"], 0, size, f["display"], since, until, exclude)))
             continue
         bounds = [0]
         with open(f["path"], "rb") as fh:
@@ -711,7 +724,7 @@ def make_tasks(files, since, until):
                 pos = nxt + CHUNK_BYTES
         bounds.append(size)
         for a, b in zip(bounds, bounds[1:]):
-            tasks.append((fi, (f["path"], f["mode"], f["fmt"], a, b, f["display"], since, until)))
+            tasks.append((fi, (f["path"], f["mode"], f["fmt"], a, b, f["display"], since, until, exclude)))
     return tasks
 
 
@@ -728,7 +741,8 @@ class Store:
         self.ts = array("q")
         self.loc = array("q")
         self.fidx = array("H")
-        self.skipped = self.filtered = 0
+        self.skipped = self.filtered = self.excluded = 0
+        self.exclude_patterns = []
         self.formats = Counter()
         self._text_cache = (None, None)
 
@@ -755,6 +769,7 @@ class Store:
         self.files[fi]["events"] = self.files[fi].get("events", 0) + n
         self.skipped += res["skipped"]
         self.filtered += res["filtered"]
+        self.excluded += res.get("excluded", 0)
         for f in res["fmts"]:
             self.formats[f] += 1
             self.files[fi]["format"] = f
@@ -922,6 +937,7 @@ def build_data_js(st: Store, elapsed: float, embed_raw: bool) -> str:
             "files": [{"name": f["display"], "path": str(f["path"]), "size": f["size"],
                        "events": f.get("events", 0), "format": f.get("format", "")} for f in st.files],
             "formats": dict(st.formats), "skipped": st.skipped, "filtered": st.filtered,
+            "excluded": st.excluded, "exclude_patterns": st.exclude_patterns,
             "parse_seconds": round(elapsed, 2),
         },
         "n": n, "t0": ts[0] if n else 0, "ts": ts_spec,
@@ -995,13 +1011,17 @@ def main(argv=None) -> int:
                "  %(prog)s C:\\Windows\\System32\\LogFiles\n"
                "  %(prog)s IN2610.log IN2611.log\n"
                "  %(prog)s D:\\logs -r --pattern \"IN*.log\" --since 2026-11-01\n"
-               "  %(prog)s D:\\logs --export report.html --no-gui",
+               "  %(prog)s D:\\logs --export report.html --no-gui\n"
+               "  %(prog)s -x testaccount -x \"svc_*\"",
     )
     ap.add_argument("paths", nargs="*", help="Log file(s), wildcards and/or directories (default: current folder)")
     ap.add_argument("-p", "--pattern", default="*.log", help="File name pattern inside directories (default: *.log)")
     ap.add_argument("-r", "--recursive", action="store_true", help="Search directories recursively")
     ap.add_argument("--since", help="Only events from this date/time (YYYY-MM-DD[ HH:MM])")
     ap.add_argument("--until", help="Only events up to this date/time (YYYY-MM-DD[ HH:MM])")
+    ap.add_argument("-x", "--exclude-user", action="append", default=[], metavar="USER",
+                    help="Skip events of this user (repeatable or comma separated, wildcards * ? allowed, "
+                         "case-insensitive, matches 'user' and 'DOMAIN\\user'), e.g. -x testaccount -x \"svc_*\"")
     ap.add_argument("-j", "--jobs", type=int, default=os.cpu_count() or 1,
                     help=f"Parallel worker processes (default: {os.cpu_count()})")
     ap.add_argument("-o", "--export", metavar="FILE.html", help="Save the dashboard as one standalone HTML file")
@@ -1040,6 +1060,10 @@ def main(argv=None) -> int:
         err(str(e))
         return 2
 
+    exclude = tuple(x.strip() for v in args.exclude_user for x in v.split(",") if x.strip())
+    if exclude:
+        info(f"Excluding users {c(', '.join(exclude), Fore.YELLOW, True)}")
+
     paths_found = discover(paths, args.pattern, args.recursive)
     if not paths_found:
         err(f"No log files found (pattern: {args.pattern}).")
@@ -1055,11 +1079,12 @@ def main(argv=None) -> int:
     info(f"Found {c(len(files), Fore.WHITE, True)} file(s), {c(human_size(total_size), Fore.WHITE, True)}")
 
     # ---- parse (parallel) ----------------------------------------------------
-    tasks = make_tasks(files, since, until)
+    tasks = make_tasks(files, since, until, exclude)
     jobs = max(1, min(args.jobs, len(tasks)))
     info(f"Parsing with {c(jobs, Fore.WHITE, True)} worker process(es), {len(tasks)} chunk(s)")
     print()
     store = Store(files)
+    store.exclude_patterns = list(exclude)
     t0 = time.perf_counter()
     done_bytes, events = 0, 0
     pending, next_i = {}, 0
@@ -1089,7 +1114,7 @@ def main(argv=None) -> int:
                 except Exception as e:  # noqa: BLE001
                     print()
                     err(f"Failed to parse {tasks[i][1][0]}: {e}")
-                    res = ChunkParser(since, until, "").result(tasks[i][1][4] - tasks[i][1][3])
+                    res = ChunkParser(since, until, "", exclude).result(tasks[i][1][4] - tasks[i][1][3])
                 done_bytes += res["bytes"]
                 events += len(res["ts"])
                 consume(i, res)
@@ -1113,6 +1138,10 @@ def main(argv=None) -> int:
         warn(f"Skipped {store.skipped:,} unrecognized line(s)")
     if store.filtered:
         info(f"Excluded {store.filtered:,} event(s) outside --since/--until range")
+    if store.excluded:
+        info(f"Excluded {c(f'{store.excluded:,}', Fore.YELLOW, True)} event(s) of excluded user(s)")
+    elif exclude:
+        warn("No events matched the --exclude-user pattern(s)")
     if not len(store):
         err("No events were parsed - is this really an NPS log?")
         return 1
@@ -1666,7 +1695,8 @@ function applyFilters() {
 function initHeader() {
   const m = D.meta;
   const range = N ? `${fmtDate(TS[0])} → ${fmtDate(TS[N - 1])}` : 'no data';
-  $('#subtitle').textContent = `${fmt(N)} events · ${m.files.length} file(s) · ${range}`;
+  $('#subtitle').textContent = `${fmt(N)} events · ${m.files.length} file(s) · ${range}` +
+    (m.excluded ? ` · ${fmt(m.excluded)} excluded (${m.exclude_patterns.join(', ')})` : '');
   $('#foot').textContent = `${m.app} v${m.version} · generated ${m.generated} · parsed in ${m.parse_seconds}s` +
      (m.skipped ? ` · ${fmt(m.skipped)} unrecognized lines skipped` : '') + ` · formats: ${Object.keys(m.formats).join(', ') || 'n/a'}`;
   const servers = COL.srv.dict.map((s, c) => [s, c]).filter(([s]) => s).sort((a, b) => a[0].localeCompare(b[0]));
