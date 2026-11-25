@@ -49,7 +49,9 @@ import time
 import webbrowser
 from array import array
 from collections import Counter
+import multiprocessing
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta
 from itertools import islice
 from pathlib import Path
@@ -1096,29 +1098,42 @@ def main(argv=None) -> int:
             store.merge(pending.pop(next_i), tasks[next_i][0])
             next_i += 1
 
-    progress_bar(0, total_size, 0, t0)
-    if jobs == 1:
-        for i, (_, t) in enumerate(tasks):
-            res = parse_chunk(t)
+    def run_serial(indexes):
+        nonlocal done_bytes, events
+        for i in indexes:
+            res = parse_chunk(tasks[i][1])
             done_bytes += res["bytes"]
             events += len(res["ts"])
             consume(i, res)
             progress_bar(done_bytes, total_size, events, t0)
+
+    progress_bar(0, total_size, 0, t0)
+    if jobs == 1:
+        run_serial(range(len(tasks)))
     else:
-        with ProcessPoolExecutor(max_workers=jobs) as ex:
-            futs = {ex.submit(parse_chunk, t): i for i, (_, t) in enumerate(tasks)}
-            for fut in as_completed(futs):
-                i = futs[fut]
-                try:
-                    res = fut.result()
-                except Exception as e:  # noqa: BLE001
-                    print()
-                    err(f"Failed to parse {tasks[i][1][0]}: {e}")
-                    res = ChunkParser(since, until, "", exclude).result(tasks[i][1][4] - tasks[i][1][3])
-                done_bytes += res["bytes"]
-                events += len(res["ts"])
-                consume(i, res)
-                progress_bar(done_bytes, total_size, events, t0)
+        finished = set()
+        try:
+            with ProcessPoolExecutor(max_workers=jobs) as ex:
+                futs = {ex.submit(parse_chunk, t): i for i, (_, t) in enumerate(tasks)}
+                for fut in as_completed(futs):
+                    i = futs[fut]
+                    try:
+                        res = fut.result()
+                    except BrokenProcessPool:
+                        raise
+                    except Exception as e:  # noqa: BLE001 - a bad chunk must not stop the others
+                        print()
+                        err(f"Failed to parse {tasks[i][1][0]}: {e}")
+                        res = ChunkParser(since, until, "", exclude).result(tasks[i][1][4] - tasks[i][1][3])
+                    finished.add(i)
+                    done_bytes += res["bytes"]
+                    events += len(res["ts"])
+                    consume(i, res)
+                    progress_bar(done_bytes, total_size, events, t0)
+        except (BrokenProcessPool, OSError) as e:
+            print()
+            warn(f"Parallel workers failed ({e.__class__.__name__}) - continuing in a single process")
+            run_serial([i for i in range(len(tasks)) if i not in finished])
     print()
     if store.sort_by_time():
         info("Events re-ordered by time")
@@ -1167,16 +1182,20 @@ def main(argv=None) -> int:
     info(f"Dashboard data prepared in {time.perf_counter() - tb:.1f}s "
          f"({human_size((tmp / 'data.js').stat().st_size)}) → {c(str(tmp / 'dashboard.html'), Fore.WHITE)}")
 
-    if args.browser or not HAS_WEBVIEW:
-        if not HAS_WEBVIEW:
-            warn("pywebview is not installed (pip install pywebview) - opening the default browser instead")
+    def open_in_browser():
         webbrowser.open(html_path.as_uri())
+        info("Dashboard opened in the default web browser.")
         info("Press Enter to quit (the .temp folder will be cleaned up)...")
         try:
             input()
         except (EOFError, KeyboardInterrupt):
             pass
         return 0
+
+    if args.browser or not HAS_WEBVIEW:
+        if not HAS_WEBVIEW:
+            warn("pywebview is not installed (pip install pywebview) - opening the default browser instead")
+        return open_in_browser()
 
     info("Opening dashboard window...")
     try:
@@ -1192,7 +1211,13 @@ def main(argv=None) -> int:
         background_color="#0b1020",
         text_select=True,
     )
-    webview.start(debug=args.debug)
+    try:
+        webview.start(debug=args.debug)
+    except Exception as e:  # noqa: BLE001 - e.g. missing .NET / WebView2 runtime or broken .exe build
+        msg = str(e).strip().splitlines()[0] if str(e).strip() else e.__class__.__name__
+        warn(f"Could not open the pywebview window: {msg}")
+        warn("Falling back to the default web browser (raw attributes on click are not available there).")
+        return open_in_browser()
     ok("Window closed, cleaning up .temp - bye.")
     return 0
 
@@ -2294,6 +2319,9 @@ boot();
 """
 
 if __name__ == "__main__":
+    # Required for frozen executables (PyInstaller): worker processes re-launch the .exe
+    # and must not run main() / parse the command line again.
+    multiprocessing.freeze_support()
     try:
         sys.exit(main())
     except KeyboardInterrupt:
